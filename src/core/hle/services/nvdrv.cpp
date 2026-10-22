@@ -13,6 +13,7 @@ namespace nv {
 constexpr u32 kSuccess = 0;
 constexpr u32 kNotImplemented = 1;
 constexpr u32 kBadParameter = 4;
+constexpr u32 kTimeout = 5;
 constexpr u32 kConfigVarNotFound = 0x30006;
 
 // ---------------------------------------------------------------- nvmap objects
@@ -252,12 +253,18 @@ struct GpuChannelDev final : Device {
             for (u32 i = 0; i < n; i++)
                 entries[i] = Arg<u64>(in, hdr_size + i * 8);
         auto& g = gpu::G();
-        g.Submit(entries.data(), n);
-        // Every submission completes immediately for now.
-        const u32 inc = (flags & (1u << 8)) ? Arg<u32>(in, 20) : 1;
-        u32 value = g.SyncpointValue(syncpt);
-        if (flags & 2)
-            value = g.IncrementSyncpoint(syncpt, std::max<u32>(inc, 1));
+        // flags: bit0 wait on the input fence, bit1 the driver appends a syncpoint increment,
+        // bit8 the pushbuffer itself increments the channel syncpoint by fence.value (NVN's mode).
+        u32 driver_incr = 0, value;
+        if (flags & (1u << 8)) {
+            value = g.ReserveSyncpoint(syncpt, Arg<u32>(in, 20));
+        } else if (flags & 2) {
+            driver_incr = 1;
+            value = g.ReserveSyncpoint(syncpt, 1);
+        } else {
+            value = g.SyncpointMax(syncpt);
+        }
+        g.Submit(std::move(entries), syncpt, driver_incr);
         out.resize(std::max<size_t>(out.size(), 0x18));
         std::memcpy(out.data(), in.data(), std::min<size_t>(0x18, in.size()));
         Set<u32>(out, 16, syncpt);
@@ -297,9 +304,9 @@ struct GpuChannelDev final : Device {
             return kSuccess;
         case 0x16: return kSuccess; // GET_ERROR_NOTIFICATION
         case 0x17: return kSuccess;
-        case 0x1A: // ALLOC_GPFIFO_EX2 {num_entries, flags, unk0, unk1, unk2, fence{id,value}, unk3}
-            Set<u32>(out, 20, syncpt);
-            Set<u32>(out, 24, gpu::G().SyncpointValue(syncpt));
+        case 0x1A: // ALLOC_GPFIFO_EX2 {num_entries, flags, unk0, fence_out{id,value}, unk1, unk2, unk3}
+            Set<u32>(out, 12, syncpt);
+            Set<u32>(out, 16, gpu::G().SyncpointMax(syncpt));
             return kSuccess;
         case 0x1B: // KICKOFF_PB_WITH_ATTR: entries come in the Ioctl2 inline buffer
             if (t_inline_in && !t_inline_in->empty())
@@ -326,17 +333,26 @@ struct CtrlDev final : Device {
         auto& g = gpu::G();
         switch (cmd & 0xFF) {
         case 0x14: // SYNCPT_READ {id, value}
-        case 0x1A: // SYNCPT_READ_MAX
             Set<u32>(out, 4, g.SyncpointValue(Arg<u32>(in, 0)));
+            return kSuccess;
+        case 0x1A: // SYNCPT_READ_MAX
+            Set<u32>(out, 4, g.SyncpointMax(Arg<u32>(in, 0)));
             return kSuccess;
         case 0x15: // SYNCPT_INCR
             g.IncrementSyncpoint(Arg<u32>(in, 0));
             return kSuccess;
-        case 0x16: // SYNCPT_WAIT {id, thresh, timeout}
+        case 0x16:   // SYNCPT_WAIT {id, thresh, timeout}
+        case 0x19: { // SYNCPT_WAITEX {id, thresh, timeout, value}
+            const u32 id = Arg<u32>(in, 0), thresh = Arg<u32>(in, 4);
+            const s32 timeout = Arg<s32>(in, 8);
+            if (!g.WaitSyncpoint(id, thresh, timeout < 0 ? -1 : s64(timeout) * 1000)) {
+                LOG_DEBUG("nvdrv", "syncpoint wait timeout (ioctl {:#x}): id {} thresh {} value {} max {} (timeout {}) raw {}",
+                          cmd, id, thresh, g.SyncpointValue(id), g.SyncpointMax(id), timeout, common::ToHex(in));
+                return kTimeout;
+            }
+            Set<u32>(out, 12, g.SyncpointValue(id));
             return kSuccess;
-        case 0x19: // SYNCPT_WAITEX {id, thresh, timeout, value}
-            Set<u32>(out, 12, g.SyncpointValue(Arg<u32>(in, 0)));
-            return kSuccess;
+        }
         case 0x1B: { // GET_CONFIG
             const std::string domain(reinterpret_cast<const char*>(in.data()), strnlen((const char*)in.data(), 0x41));
             const std::string param(reinterpret_cast<const char*>(in.data() + 0x41),
@@ -346,10 +362,17 @@ struct CtrlDev final : Device {
         }
         case 0x1D:   // EVENT_WAIT {fence id, thresh, timeout, value}
         case 0x1E: { // EVENT_WAIT_ASYNC
-            const u32 id = Arg<u32>(in, 0);
+            const u32 id = Arg<u32>(in, 0), thresh = Arg<u32>(in, 4);
+            const s32 timeout = Arg<s32>(in, 8);
+            if (!g.WaitSyncpoint(id, thresh, timeout < 0 ? -1 : s64(timeout) * 1000)) {
+                LOG_DEBUG("nvdrv", "syncpoint wait timeout (ioctl {:#x}): id {} thresh {} value {} max {} (timeout {}) raw {}",
+                          cmd, id, thresh, g.SyncpointValue(id), g.SyncpointMax(id), timeout, common::ToHex(in));
+                return kTimeout;
+            }
             Set<u32>(out, 12, g.SyncpointValue(id));
             return kSuccess;
         }
+        case 0x1C: return kSuccess; // CLEAR_EVENT_WAIT
         case 0x1F: return kSuccess; // EVENT_REGISTER
         case 0x20: return kSuccess; // EVENT_UNREGISTER
         case 0x21: return kSuccess; // EVENT_KILL

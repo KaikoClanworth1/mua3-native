@@ -1,8 +1,10 @@
 #pragma once
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
+struct ID3D11ShaderResourceView;
 
 #include "common/common.h"
 #include "core/config.h"
@@ -22,6 +24,7 @@ public:
     bool PumpEvents();
     void BeginFrame();
     void EndFrame(); // draws the overlay and presents
+    void PaceFrame(); // sleeps until the next UI frame (60 Hz)
 
     // Latest guest frame as RGBA8 (linear layout) if available.
     void UploadFrame(const u8* rgba, u32 width, u32 height, u32 pitch);
@@ -33,6 +36,9 @@ public:
     void ToggleFullscreen();
 
     std::function<void()> draw_overlay; // ImGui calls
+    // Supplies the latest rendered game frame (called with context_mutex held).
+    std::function<ID3D11ShaderResourceView*(u32& w, u32& h)> frame_source;
+    std::recursive_mutex* context_mutex = nullptr;
 
 private:
     void CreateBackbuffer();
@@ -47,6 +53,7 @@ private:
     struct ID3D11ShaderResourceView* frame_srv_ = nullptr;
     u32 frame_w_ = 0, frame_h_ = 0;
     bool vsync_ = true, focused_ = true, fullscreen_ = false;
+    std::chrono::steady_clock::time_point next_frame_{};
     std::mutex frame_mutex_;
     std::vector<u8> pending_frame_;
     u32 pending_w_ = 0, pending_h_ = 0;

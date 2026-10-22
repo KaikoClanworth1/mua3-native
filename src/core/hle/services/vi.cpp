@@ -186,15 +186,15 @@ void Transact(u32 code, std::vector<u8> in, ParcelWriter& out) {
             cpu = o->addr + s.offset;
         else if (auto o2 = nv::Map().GetById(s.nvmap))
             cpu = o2->addr + s.offset;
-        if (gpu::G().on_present)
-            gpu::G().on_present(cpu, s.width, s.height, s.stride, s.format);
+        gpu::G().QueuePresent({cpu, s.width, s.height, s.stride, s.format});
         PaceFrame(q, swap_interval);
         q.frames++;
         const auto now = std::chrono::steady_clock::now();
         if (now - q.fps_t0 > std::chrono::seconds(5)) {
             const double secs = std::chrono::duration<double>(now - q.fps_t0).count();
-            LOG_INFO("vi", "Presenting: {:.1f} fps (gpu submits {}, methods {})", q.frames / secs, gpu::G().submits,
-                     gpu::G().methods);
+            auto& g = gpu::G();
+            LOG_INFO("vi", "Presenting: {:.1f} fps (gpu submits {}, methods {}) gpu busy {:.0f}% (draw {:.0f}%)", q.frames / secs,
+                     g.submits.load(), g.methods.load(), g.busy_ns.exchange(0) / (secs * 1e7), g.draw_ns.exchange(0) / (secs * 1e7));
             q.frames = 0;
             q.fps_t0 = now;
         }

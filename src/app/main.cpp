@@ -7,14 +7,18 @@
 #include <windows.h>
 #include <timeapi.h>
 
+#include "common/profiler.h"
 #include "core/config.h"
 #include "core/kernel/kernel.h"
 #include "core/system.h"
 #include "core/hle/hid.h"
+#include "gpu/d3d11/renderer_d3d11.h"
 #include "gpu/gpu.h"
 #include "platform/platform.h"
 
 namespace {
+
+gpu::D3D11Renderer* g_renderer = nullptr;
 
 struct Stats {
     std::atomic<u64> presents{0};
@@ -52,13 +56,37 @@ void DrawOverlay(const core::Config& cfg, platform::Input& input, bool& show) {
     auto& g = gpu::G();
     ImGui::Text("Game frames presented: %llu (%.1f fps)", (unsigned long long)g_stats.presents.load(), g_stats.fps);
     ImGui::Text("Swapchain: %ux%u", g_stats.width.load(), g_stats.height.load());
-    ImGui::Text("GPU submits: %llu   methods: %llu", (unsigned long long)g.submits, (unsigned long long)g.methods);
+    ImGui::Text("GPU submits: %llu   methods: %llu   draws: %llu", (unsigned long long)g.submits.load(),
+                (unsigned long long)g.methods.load(), (unsigned long long)g.draws.load());
     ImGui::Text("Input: %s   Audio: %s", input.DeviceName().c_str(), platform::Audio().BackendName().c_str());
     ImGui::Separator();
     ImGui::TextWrapped("CPU: dynarmic JIT (interim)   GPU: command stream accepted, D3D11 renderer pending");
     if (ImGui::Button("Dump guest threads to log"))
         core::Sys().Kern().DumpAllThreads();
+    ImGui::SameLine();
+    if (ImGui::Button("Dump render targets") && g_renderer)
+        g_renderer->dump_surfaces_ = true;
     ImGui::End();
+
+    if (g_renderer) {
+        static bool show_tex = std::getenv("MUA3_TEXVIEW") != nullptr;
+        if (show_tex) {
+            ImGui::SetNextWindowPos(ImVec2(500, 48), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize(ImVec2(760, 640), ImGuiCond_FirstUseEver);
+            ImGui::Begin("Textures", &show_tex);
+            int n = 0;
+            for (auto& t : g_renderer->RecentTextures()) {
+                const float scale = 96.0f / std::max<u32>(std::max(t.w, t.h), 1);
+                ImGui::BeginGroup();
+                ImGui::Image((ImTextureID)t.srv.Get(), ImVec2(t.w * scale, t.h * scale));
+                ImGui::Text("%ux%u %02x%s", t.w, t.h, t.fmt, t.rt ? " RT" : "");
+                ImGui::EndGroup();
+                if (++n % 6)
+                    ImGui::SameLine();
+            }
+            ImGui::End();
+        }
+    }
 }
 
 } // namespace
@@ -96,10 +124,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    gpu::G().on_present = [](u64, u32 w, u32 h, u32, u32) {
+    gpu::G().on_present = [](const gpu::PresentInfo& p) {
         g_stats.presents++;
-        g_stats.width = w;
-        g_stats.height = h;
+        g_stats.width = p.width;
+        g_stats.height = p.height;
     };
 
     if (headless) {
@@ -127,15 +155,43 @@ int main(int argc, char** argv) {
     input.Init(cfg.input);
     platform::Audio().Init(cfg.audio, cfg.volume);
 
+    gpu::D3D11Renderer renderer(display.Device(), display.Context());
+    gpu::G().SetRenderer(&renderer);
+    g_renderer = &renderer;
+    // Test aid: MUA3_DUMP_RT=<seconds> dumps all colour render targets once.
+    if (const char* t = std::getenv("MUA3_DUMP_RT"))
+        std::thread([s = std::atoi(t)] {
+            std::this_thread::sleep_for(std::chrono::seconds(s));
+            g_renderer->dump_surfaces_ = true;
+        }).detach();
+    display.context_mutex = &gpu::ContextMutex();
+    display.frame_source = [&](u32& w, u32& h) { return renderer.LatestFrame(w, h); };
+
     bool show_overlay = cfg.show_debug_overlay;
     display.draw_overlay = [&] { DrawOverlay(cfg, input, show_overlay); };
 
     sys.Start();
+    // Test aid: MUA3_PROFILE=<delay seconds> samples the GPU thread for 10 s.
+    if (const char* p = std::getenv("MUA3_PROFILE"))
+        common::StartSamplingProfiler(gpu::G().NativeThreadHandle(), "GPU thread", 10, std::atoi(p));
     auto next_dump = std::chrono::steady_clock::now() + std::chrono::seconds(watch_seconds);
+    if (autopress_after > 0) // test aid: tap A every 3 s after N seconds
+        std::thread([autopress_after] {
+            std::this_thread::sleep_for(std::chrono::seconds(autopress_after));
+            for (;;) {
+                LOG_INFO("Main", "autopress: A");
+                hle::hid::SetPad(0, hle::hid::PadInput{true, hle::hid::A});
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                hle::hid::SetPad(0, hle::hid::PadInput{true});
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+            }
+        }).detach();
     while (display.PumpEvents()) {
-        input.Update(display.Focused());
+        if (autopress_after <= 0) // the test aid drives player 1 itself
+            input.Update(display.Focused());
         display.BeginFrame();
         display.EndFrame();
+        display.PaceFrame();
         if (watch_seconds > 0 && std::chrono::steady_clock::now() >= next_dump) {
             sys.Kern().DumpAllThreads();
             next_dump += std::chrono::seconds(watch_seconds);

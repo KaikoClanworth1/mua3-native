@@ -45,9 +45,8 @@ bool Display::Init(const core::Config& cfg, const char* title) {
     sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
     const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
     UINT dflags = 0;
-#ifndef NDEBUG
-    dflags |= D3D11_CREATE_DEVICE_DEBUG;
-#endif
+    if (std::getenv("MUA3_D3D_DEBUG"))
+        dflags |= D3D11_CREATE_DEVICE_DEBUG;
     HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, dflags, levels, 2,
                                                D3D11_SDK_VERSION, &sd, &swapchain_, &device_, nullptr, &ctx_);
     if (FAILED(hr) && (dflags & D3D11_CREATE_DEVICE_DEBUG))
@@ -72,6 +71,13 @@ bool Display::Init(const core::Config& cfg, const char* title) {
     }
     CreateBackbuffer();
     vsync_ = cfg.vsync;
+    {
+        ID3D10Multithread* mt = nullptr;
+        if (SUCCEEDED(ctx_->QueryInterface(__uuidof(ID3D10Multithread), (void**)&mt))) {
+            mt->SetMultithreadProtected(TRUE);
+            mt->Release();
+        }
+    }
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -182,23 +188,56 @@ void Display::BeginFrame() {
 }
 
 void Display::DrawFrameTexture() {
-    if (!frame_srv_)
+    ID3D11ShaderResourceView* srv = frame_srv_;
+    u32 fw = frame_w_, fh = frame_h_;
+    if (frame_source) {
+        u32 w = 0, h = 0;
+        if (auto* s = frame_source(w, h); s && w && h)
+            srv = s, fw = w, fh = h;
+    }
+    if (!srv || !fw || !fh)
         return;
     const ImVec2 ds = ImGui::GetIO().DisplaySize;
-    const float sx = ds.x / frame_w_, sy = ds.y / frame_h_;
+    const float sx = ds.x / fw, sy = ds.y / fh;
     const float s = std::min(sx, sy);
-    const float w = frame_w_ * s, h = frame_h_ * s;
+    const float w = fw * s, h = fh * s;
     const ImVec2 p0((ds.x - w) * 0.5f, (ds.y - h) * 0.5f);
-    ImGui::GetBackgroundDrawList()->AddImage((ImTextureID)frame_srv_, p0, ImVec2(p0.x + w, p0.y + h));
+    ImGui::GetBackgroundDrawList()->AddImage((ImTextureID)srv, p0, ImVec2(p0.x + w, p0.y + h));
 }
 
 void Display::EndFrame() {
+    std::unique_lock<std::recursive_mutex> lk;
+    if (context_mutex)
+        lk = std::unique_lock(*context_mutex);
     ImGui::Render();
     const float clear[4] = {0, 0, 0, 1};
     ctx_->OMSetRenderTargets(1, &rtv_, nullptr);
     ctx_->ClearRenderTargetView(rtv_, clear);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-    swapchain_->Present(vsync_ ? 1 : 0, 0);
+    // Don't hold the context lock while Present waits for vblank: the GPU thread needs the context.
+    if (lk.owns_lock())
+        lk.unlock();
+    // Never block inside Present: it holds the D3D device lock the GPU thread needs. With flip-discard and
+    // sync interval 0 DWM still composes without tearing; the UI loop paces itself (PaceFrame).
+    swapchain_->Present(0, 0);
+}
+
+void Display::PaceFrame() {
+    using namespace std::chrono;
+    static thread_local HANDLE timer =
+        CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    const auto period = duration_cast<steady_clock::duration>(duration<double>(1.0 / 60.0));
+    auto now = steady_clock::now();
+    if (next_frame_ < now - period)
+        next_frame_ = now;
+    next_frame_ += period;
+    const auto wait = next_frame_ - now;
+    if (wait > microseconds(500) && timer) {
+        LARGE_INTEGER due;
+        due.QuadPart = -LONGLONG(duration_cast<nanoseconds>(wait).count() / 100);
+        SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
+        WaitForSingleObject(timer, INFINITE);
+    }
 }
 
 } // namespace platform

@@ -7,3 +7,6 @@ save/
 *.log
 mua3.ini
 external/
+screenshots/
+shader_dump/
+shader_cache/

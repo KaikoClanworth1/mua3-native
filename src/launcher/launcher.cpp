@@ -396,6 +396,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     while (display.PumpEvents()) {
         display.BeginFrame();
         display.EndFrame();
+        display.PaceFrame();
     }
     st.progress.cancel = true;
     if (st.worker.joinable())
