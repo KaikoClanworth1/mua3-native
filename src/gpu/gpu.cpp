@@ -554,6 +554,25 @@ void Gpu::CallMethod(u32 subch, u32 method, u32 arg, bool last_in_batch) {
         return;
     }
     if (cls == 0xB1C0) { // compute: report semaphore (dispatch not yet supported)
+        if (method == 0xAF) { // LAUNCH: the queue meta data (QMD) lives at LAUNCH_DESC_LOC << 8
+            static u32 launches = 0;
+            if (launches++ < 40) {
+                u32 q[0x40]{};
+                ReadGpu(u64(r[0xAD]) << 8, q, sizeof(q));
+                const u64 code = (u64(r[0x582] & 0xFF) << 32) | r[0x583];
+                LOG_INFO("GPU", "compute launch #{}: code {:#x}+{:#x} grid {}x{}x{} block {}x{}x{} shared {:#x} cb mask {:#x} "
+                                "cb0 {:#x}/{:#x}",
+                         launches, code, q[8], q[0xC] & 0x7FFFFFFF, q[0xD] & 0xFFFF, q[0xD] >> 16, q[0x12] >> 16, q[0x13] & 0xFFFF,
+                         q[0x13] >> 16, q[0x11] & 0x3FFFF, q[0x14] & 0xFF, (u64(q[0x1E] & 0xFF) << 32) | q[0x1D], q[0x1E] >> 15);
+                // Dump the program behind a zeroed 0x50-byte header so the graphics tooling can disassemble it.
+                const fs::path dump = fmt::format("shader_dump/compute_{:x}.bin", q[8]);
+                if (!fs::exists(dump)) {
+                    std::vector<u8> prog(0x50 + 0x8000, 0);
+                    ReadGpuPartial(code + q[8], prog.data() + 0x50, 0x8000);
+                    common::WriteFile(dump, prog);
+                }
+            }
+        }
         if (method == 0x6C3) {
             const u64 addr = (u64(r[0x6C0] & 0xFF) << 32) | r[0x6C1];
             if ((arg & 3) == 0) {

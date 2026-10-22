@@ -57,14 +57,26 @@ void TextureCache::Invalidate(u64 gpu_va, u64 size) {
 }
 
 ID3D11ShaderResourceView* TextureCache::Fallback(const shader::TextureUse& use) {
-    const int kind = use.dim == shader::TexDim::Tex3D ? 1 : use.dim == shader::TexDim::Cube ? 2 : use.array ? 3 : 0;
+    const int kind = use.dim == shader::TexDim::Buffer ? 4 : use.dim == shader::TexDim::Tex3D ? 1
+                   : use.dim == shader::TexDim::Cube ? 2 : use.array ? 3 : 0;
     if (fallbacks_[kind])
         return fallbacks_[kind].Get();
     const u32 px[6] = {0xFF808080, 0xFF808080, 0xFF808080, 0xFF808080, 0xFF808080, 0xFF808080};
     D3D11_SUBRESOURCE_DATA sd[6];
     for (auto& d : sd)
         d = {px, 4, 4};
-    if (kind == 1) {
+    if (kind == 4) {
+        const u32 zero[4]{};
+        D3D11_BUFFER_DESC bd{16, D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE, 0, 0, 0};
+        const D3D11_SUBRESOURCE_DATA bdata{zero, 0, 0};
+        ComPtr<ID3D11Buffer> b;
+        dev_->CreateBuffer(&bd, &bdata, &b);
+        D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = DXGI_FORMAT_R32_UINT;
+        sv.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+        sv.Buffer.NumElements = 4;
+        dev_->CreateShaderResourceView(b.Get(), &sv, &fallbacks_[kind]);
+    } else if (kind == 1) {
         D3D11_TEXTURE3D_DESC td{1, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE, 0, 0};
         ComPtr<ID3D11Texture3D> t;
         dev_->CreateTexture3D(&td, sd, &t);
@@ -173,6 +185,7 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
         u64 offset, size;
     };
     std::vector<Level> levels;
+    auto pitch = [&](const Level& l) { return tic.IsBuffer() ? l.bw * bpb : tic.Pitch(); };
     u64 layer_size = 0;
     for (u32 m = 0; m < mips; m++) {
         Level l{};
@@ -188,7 +201,7 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
         while (l.bdl > 0 && (1u << (l.bdl - 1)) >= l.d)
             l.bdl--;
         l.offset = layer_size;
-        l.size = block_linear ? BlockLinearSize(l.bw, l.bh, l.d, bpb, l.bhl, l.bdl) : u64(tic.Pitch()) * l.bh * l.d;
+        l.size = block_linear ? BlockLinearSize(l.bw, l.bh, l.d, bpb, l.bhl, l.bdl) : u64(pitch(l)) * l.bh * l.d;
         layer_size += l.size;
         levels.push_back(l);
     }
@@ -216,7 +229,7 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
                 Deswizzle(src, lin.data(), l.bw, l.bh, l.d, bpb, l.bhl, l.bdl, row);
             else
                 for (u32 y = 0; y < l.bh * l.d; y++)
-                    std::memcpy(&lin[size_t(y) * row], src + size_t(y) * tic.Pitch(), row);
+                    std::memcpy(&lin[size_t(y) * row], src + size_t(y) * pitch(l), row);
             if (astc) {
                 std::vector<u8> rgba(size_t(l.w) * l.h * 4);
                 DecodeAstc(lin.data(), rgba.data(), l.w, l.h, fi.block_w, fi.block_h);
@@ -240,13 +253,40 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
     HRESULT hr;
     D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
     sv.Format = fi.dxgi;
-    if (type == 2 && use.dim == shader::TexDim::Tex3D) {
+    if (use.dim == shader::TexDim::Buffer) {
+        // Texel buffer: a typed D3D11 buffer over the first level's texels.
+        const u32 elems = levels[0].bw;
+        D3D11_BUFFER_DESC bd{u32(sub[0].size()), D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE, 0, 0, 0};
+        const D3D11_SUBRESOURCE_DATA bdata{sub[0].data(), 0, 0};
+        ComPtr<ID3D11Buffer> b;
+        hr = dev_->CreateBuffer(&bd, &bdata, &b);
+        tex->res = b;
+        sv.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+        sv.Buffer.FirstElement = 0;
+        sv.Buffer.NumElements = elems;
+    } else if (type == 2 && use.dim == shader::TexDim::Tex3D) {
         D3D11_TEXTURE3D_DESC td{width, height, depth, mips, fi.dxgi, D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE, 0, 0};
         ComPtr<ID3D11Texture3D> t;
         hr = dev_->CreateTexture3D(&td, init.data(), &t);
         tex->res = t;
         sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE3D;
         sv.Texture3D.MipLevels = mips;
+    } else if (use.dim == shader::TexDim::Tex1D) {
+        // 1D textures and texel buffers: the shader declares Texture1D(Array), which needs a 1D resource.
+        if (width > D3D11_REQ_TEXTURE1D_U_DIMENSION)
+            LOG_WARN("Texture", "1D texture of {} texels exceeds the D3D11 limit; truncated", width);
+        D3D11_TEXTURE1D_DESC td{std::min<u32>(width, D3D11_REQ_TEXTURE1D_U_DIMENSION), mips, layers, fi.dxgi,
+                                D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+        ComPtr<ID3D11Texture1D> t;
+        hr = dev_->CreateTexture1D(&td, init.data(), &t);
+        tex->res = t;
+        if (use.array) {
+            sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE1DARRAY;
+            sv.Texture1DArray = {0, mips, 0, layers};
+        } else {
+            sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE1D;
+            sv.Texture1D = {0, mips};
+        }
     } else {
         const bool cube = use.dim == shader::TexDim::Cube && layers % 6 == 0;
         D3D11_TEXTURE2D_DESC td{width, height, mips, layers, fi.dxgi, {1, 0}, D3D11_USAGE_IMMUTABLE,

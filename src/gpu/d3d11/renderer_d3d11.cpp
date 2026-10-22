@@ -187,7 +187,8 @@ DXGI_FORMAT AttribFormat(u32 f) {
                     DXGI_FORMAT_R8G8B8A8_SINT);
     case 0x18: return pick(U, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8_SNORM, DXGI_FORMAT_R8G8_UINT, DXGI_FORMAT_R8G8_SINT);
     case 0x1D: return pick(U, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8_SNORM, DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R8_SINT);
-    case 0x30: return type == 4 ? DXGI_FORMAT_R10G10B10A2_UINT : DXGI_FORMAT_R10G10B10A2_UNORM;
+    // D3D11 has no signed 10:10:10:2: SNORM/SINT come in as raw UINT bits (the VS variant sign-extends SNORM).
+    case 0x30: return type == 2 ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R10G10B10A2_UINT;
     case 0x31: return DXGI_FORMAT_R11G11B10_FLOAT;
     default: return U;
     }
@@ -628,6 +629,10 @@ void D3D11Renderer::Draw() {
             const u32 b = f & 0x1F;
             if ((f & 0x40) || b >= 16 || !(m.Reg(kVertexArray + b * 4) & 0x1000) || AttribFormat(f) == DXGI_FORMAT_UNKNOWN)
                 continue; // fed from the float default slot
+            if (((f >> 21) & 0x3F) == 0x30 && ((f >> 27) & 7) == 1) {
+                key.attr_snorm10 |= 1u << i;
+                continue;
+            }
             switch ((f >> 27) & 7) {
             case 3: key.attr_sint |= 1u << i; break;
             case 4: key.attr_uint |= 1u << i; break;
@@ -1156,8 +1161,8 @@ void D3D11Renderer::Draw() {
             NoteTexture(srvs[t.slot], tic.Address(), tic.Width(), tic.Height(), tic.Format(),
                         FindSurfaceByGpu(tic.Address()) != nullptr);
             if (trace_draw_)
-                LOG_INFO("Renderer", "    {} tex slot {} handle {:#x} tic {} addr {:#x} fmt {:#x} type {} {}x{} {}", is_vs ? "VS" : "PS",
-                         t.slot, handle, tic_idx, tic.Address(), tic.Format(), tic.Type(), tic.Width(), tic.Height(),
+                LOG_INFO("Renderer", "    {} tex slot {} handle {:#x} tic {} addr {:#x} fmt {:#x} type {} {}x{} w0 {:#x} swz {:#x} srgb {} mips {} {}", is_vs ? "VS" : "PS",
+                         t.slot, handle, tic_idx, tic.Address(), tic.Format(), tic.Type(), tic.Width(), tic.Height(), tic.w[0], swz, tic.Srgb(), tic.MaxMip(),
                          FindSurfaceByGpu(tic.Address()) ? "(render target)" : "");
             drv.swizzle[t.slot][0] = swz;
             if (t.sampler < 16)
@@ -1260,6 +1265,41 @@ void D3D11Renderer::Present(const PresentInfo& p) {
         }
     }
     presented_cpu_.insert(p.cpu_addr);
+    {
+        std::vector<PixelReq> reqs;
+        {
+            std::lock_guard l(pixel_mutex_);
+            reqs.swap(pixel_reqs_);
+        }
+        for (const PixelReq& r : reqs) {
+            Surface* sf = FindSurfaceByGpu(r.va);
+            if (!sf || r.x >= sf->width || r.y >= sf->height) {
+                LOG_INFO("Renderer", "PIXEL {:#x} ({},{}): no such surface/texel", r.va, r.x, r.y);
+                continue;
+            }
+            D3D11_TEXTURE2D_DESC td;
+            sf->tex->GetDesc(&td);
+            td.Width = td.Height = 1;
+            td.Usage = D3D11_USAGE_STAGING;
+            td.BindFlags = 0;
+            td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            ComPtr<ID3D11Texture2D> st;
+            if (FAILED(dev_->CreateTexture2D(&td, nullptr, &st)))
+                continue;
+            if (sf->depth) // depth-stencil copies must be whole-resource; read the full copy instead
+                continue;
+            const D3D11_BOX box{r.x, r.y, 0, r.x + 1, r.y + 1, 1};
+            ctx_->CopySubresourceRegion(st.Get(), 0, 0, 0, 0, sf->tex.Get(), 0, &box);
+            D3D11_MAPPED_SUBRESOURCE mp;
+            if (SUCCEEDED(ctx_->Map(st.Get(), 0, D3D11_MAP_READ, 0, &mp))) {
+                u32 words[4]{};
+                std::memcpy(words, mp.pData, 16);
+                ctx_->Unmap(st.Get(), 0);
+                LOG_INFO("Renderer", "PIXEL {:#x} fmt {:#x} ({},{}): {:08x} {:08x} {:08x} {:08x}", r.va, sf->format, r.x, r.y,
+                         words[0], words[1], words[2], words[3]);
+            }
+        }
+    }
     if (dump_surfaces_.exchange(false)) {
         int n = 0;
         const std::string dir = fmt::format("screenshots/rt/{}", frame_counter_);

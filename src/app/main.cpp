@@ -138,6 +138,11 @@ void PollCommandFile(platform::Input* input) {
                 g_renderer->RequestFrameShot(fs::u8path(arg));
             } else if (cmd == "dump") {
                 core::Sys().Kern().DumpAllThreads(arg == "host");
+            } else if (cmd == "pixel" && g_renderer) { // pixel <surface gpu va hex> <x> <y>
+                std::string c, va;
+                u32 x = 0, y = 0;
+                std::istringstream(line) >> c >> va >> x >> y;
+                g_renderer->ReadPixel(std::strtoull(va.c_str(), nullptr, 16), x, y);
             } else if (cmd == "dumprt" && g_renderer) {
                 g_renderer->dump_surfaces_ = true;
             } else if (cmd == "tracedraws" && g_renderer) {

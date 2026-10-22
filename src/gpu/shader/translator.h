@@ -9,7 +9,8 @@ namespace gpu::shader {
 
 enum class Stage { Vertex, Fragment, Geometry, Compute };
 
-enum class TexDim : u8 { Tex1D, Tex2D, Tex3D, Cube };
+// Buffer: 1D texel fetches, declared as Buffer<> (texel buffers outgrow D3D11's 16384-texel Texture1D).
+enum class TexDim : u8 { Tex1D, Tex2D, Tex3D, Cube, Buffer };
 
 struct TextureUse {
     u32 cbuf_offset = 0; // byte offset of the handle in the texture constant buffer

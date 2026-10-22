@@ -121,7 +121,7 @@ bool ShaderCache::Build(HostShader& s, bool slow) {
 
 fs::path ShaderCache::CachePath(const HostShader& s, const char* target) const {
     // Bump kTranslatorVersion whenever the translator output changes, to invalidate cached bytecode.
-    constexpr int kTranslatorVersion = 24;
+    constexpr int kTranslatorVersion = 25;
     return cache_dir_ / fmt::format("{:016x}_{}_v{}.dxbc", s.hash, target, kTranslatorVersion);
 }
 
@@ -235,7 +235,7 @@ HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size) {
 }
 
 HostShader* ShaderCache::GetVariant(HostShader* base, const VariantKey& v) {
-    if (!base || !(v.attr_uint | v.attr_sint | v.tex_uint | v.tex_sint) || base->state != HostShader::Ready)
+    if (!base || !(v.attr_uint | v.attr_sint | v.attr_snorm10 | v.tex_uint | v.tex_sint) || base->state != HostShader::Ready)
         return base;
     const u64 key = base->hash ^ (Hash64(&v, sizeof(v)) * 0x9E3779B97F4A7C15ull);
     auto it = shaders_.find(key);
@@ -273,6 +273,24 @@ HostShader* ShaderCache::GetVariant(HostShader* base, const VariantKey& v) {
                 src.replace(l, load.size(), fmt::format("    vin{0} = asuint(float4(input.a{0}));", i));
         }
     }
+    // Packed signed-normalized 10:10:10:2 attributes: raw bits in, sign extension and scaling here.
+    for (u32 i = 0; i < 32 && vsin != std::string::npos; i++) {
+        if (!((v.attr_snorm10 >> i) & 1))
+            continue;
+        const std::string decl = fmt::format("    float4 a{0} : ATTR{0};", i);
+        const size_t at = src.find(decl, vsin);
+        if (at == std::string::npos)
+            continue;
+        src.replace(at, decl.size(), fmt::format("    uint4 a{0} : ATTR{0};", i));
+        const std::string load = fmt::format("    vin{0} = asuint(input.a{0});", i);
+        const size_t l = src.find(load, vsin);
+        if (l != std::string::npos)
+            src.replace(l, load.size(), fmt::format("    vin{0} = asuint(Snorm1010102(input.a{0}));", i));
+    }
+    if (v.attr_snorm10 && vsin != std::string::npos)
+        src.insert(vsin, "float4 Snorm1010102(uint4 v) {\n"
+                         "    const int4 s = int4(v << uint4(22u, 22u, 22u, 30u)) >> int4(22, 22, 22, 30);\n"
+                         "    return max(float4(s) / float4(511.0f, 511.0f, 511.0f, 1.0f), -1.0f);\n}\n");
     // Integer textures: typed declarations, and loads reinterpreted so the shader sees the raw integer bits.
     for (u32 t = 0; t < 32; t++) {
         if (!((v.tex_uint | v.tex_sint) & (1u << t)))

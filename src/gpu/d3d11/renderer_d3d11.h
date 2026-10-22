@@ -76,6 +76,8 @@ public:
     std::mutex shot_mutex_;
     fs::path shot_path_;
     std::atomic<bool> dump_surfaces_{false};
+    // Debug: log the raw texel at (x, y) of surface `gpu_va` at the next present (mua3_cmd "pixel").
+    void ReadPixel(u64 gpu_va, u32 x, u32 y) { std::lock_guard l(pixel_mutex_); pixel_reqs_.push_back({gpu_va, x, y}); }
     std::atomic<int> trace_draws_{0}; // debug: log the next N draws into the presented surface
     std::atomic<u64> trace_rt_{0};    // ... or into this surface (gpu va) when set
     // Debug pixel history: draws of frame `pick_frame_` touching (pick_x_, pick_y_) (fractions of the target size).
@@ -109,6 +111,12 @@ private:
     u64 code_lo_ = ~0ull, code_hi_ = 0;                   // range of code those addresses cover
     void EmulateCullingGs();
     float pick_x_ = 0, pick_y_ = 0;
+    struct PixelReq {
+        u64 va;
+        u32 x, y;
+    };
+    std::mutex pixel_mutex_;
+    std::vector<PixelReq> pixel_reqs_;
     Surface* GetColorSurface(u32 index);
     Surface* GetDepthSurface();
     Surface* GetSurface(u64 gpu_va, u32 width, u32 height, u32 format, bool depth, u32 tile_mode = 0);

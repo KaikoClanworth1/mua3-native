@@ -522,11 +522,10 @@ void Translator::TexSample(u64 insn, u32 pc, Op op) {
         bool array = false;
         u32 slot;
         switch (enc) {
-        case 0: dim = TexDim::Tex1D; slot = TexSlot(cbuf_off, dim, false, false);
-            load = fmt::format("tex{}.Load(int2(int({}), 0))", slot, R(ra)); break;
-        case 1: // 1D, explicit LOD in rb
-            dim = TexDim::Tex1D; slot = TexSlot(cbuf_off, dim, false, false);
-            load = fmt::format("tex{}.Load(int2(int({}), int({})))", slot, R(ra), R(rb)); break;
+        case 0: // 1D, LOD 0
+        case 1: // 1D, explicit LOD in rb (texel buffers have one level)
+            dim = TexDim::Buffer; slot = TexSlot(cbuf_off, dim, false, false);
+            load = fmt::format("tex{}.Load(int({}))", slot, R(ra)); break;
         case 2: // 2D, LOD 0, x in ra and y in rb (shaders put them in neighbouring registers)
             slot = TexSlot(cbuf_off, dim, false, false);
             load = fmt::format("tex{}.Load(int3(int({}), int({}), 0))", slot, R(ra), R(rb)); break;
@@ -569,11 +568,16 @@ void Translator::TexSample(u64 insn, u32 pc, Op op) {
         if (array)
             coords += ", " + aidx;
         const std::string lod = lod_ll ? fmt::format("int({})", R(rb)) : "0";
-        const u32 slot = TexSlot(cbuf_off, dim, array, false);
-        const u32 n = ncoord + (array ? 1 : 0) + 1;
         std::vector<u32> regs;
         for (u32 i = 0; i < 4; i++)
             regs.push_back(d == RZ ? RZ : d + i);
+        if (dim == TexDim::Tex1D && !array) { // texel buffer fetch
+            const u32 slot = TexSlot(cbuf_off, TexDim::Buffer, false, false);
+            EmitTexWrites(mask, regs, fmt::format("tex{}.Load({})", slot, coords), slot);
+            return;
+        }
+        const u32 slot = TexSlot(cbuf_off, dim, array, false);
+        const u32 n = ncoord + (array ? 1 : 0) + 1;
         EmitTexWrites(mask, regs, fmt::format("tex{}.Load(int{}({}, {}))", slot, n, coords, lod), slot);
         return;
     }
@@ -1809,6 +1813,7 @@ float4 ApplySwizzle(float4 v, uint s) {
         case TexDim::Tex2D: type = t.array ? "Texture2DArray" : "Texture2D"; break;
         case TexDim::Tex3D: type = "Texture3D"; break;
         case TexDim::Cube: type = t.array ? "TextureCubeArray" : "TextureCube"; break;
+        case TexDim::Buffer: type = "Buffer"; break;
         }
         head += fmt::format("{}<float4> tex{} : register(t{});\n", type, t.slot, t.slot);
         const u32 sreg = own_samplers ? u32(ti) : std::min<u32>(t.slot, 15);

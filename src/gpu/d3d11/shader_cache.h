@@ -44,6 +44,7 @@ public:
     // integer element types. Returns `base` when nothing is an integer type.
     struct VariantKey {
         u32 attr_uint = 0, attr_sint = 0, attr_scaled = 0; // vertex attributes (scaled = convert to float)
+        u32 attr_snorm10 = 0; // A2B10G10R10 SNORM (no DXGI format): fetched as UINT, sign-extended in the shader
         u32 tex_uint = 0, tex_sint = 0;                     // texture slots with integer formats
     };
     HostShader* GetVariant(HostShader* base, const VariantKey& v);

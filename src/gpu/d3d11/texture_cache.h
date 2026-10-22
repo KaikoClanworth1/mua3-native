@@ -24,7 +24,9 @@ struct TicEntry {
     u32 BlockDepth() const { return (w[3] >> 6) & 7; }
     u32 MaxMip() const { return (w[3] >> 28) & 0xF; }
     u32 Pitch() const { return (w[3] & 0xFFFF) << 5; }
-    u32 Width() const { return (w[4] & 0xFFFF) + 1; }
+    // Header version 0 is a 1D buffer: linear, no pitch, and word 3 holds the upper half of the width.
+    bool IsBuffer() const { return HeaderVersion() == 0; }
+    u32 Width() const { return (IsBuffer() ? ((w[3] & 0xFFFF) << 16) | (w[4] & 0xFFFF) : (w[4] & 0xFFFF)) + 1; }
     bool Srgb() const { return (w[4] >> 22) & 1; }
     u32 Type() const { return (w[4] >> 23) & 0xF; }
     u32 Height() const { return (w[5] & 0xFFFF) + 1; }
@@ -62,7 +64,7 @@ private:
     std::unordered_map<u64, ComPtr<ID3D11SamplerState>> samplers_;
     ID3D11ShaderResourceView* Fallback(const shader::TextureUse& use);
     ComPtr<ID3D11ShaderResourceView> fallback_;
-    ComPtr<ID3D11ShaderResourceView> fallbacks_[4]; // 2D, 3D, cube, 2D array
+    ComPtr<ID3D11ShaderResourceView> fallbacks_[5]; // 2D, 3D, cube, 2D array, buffer
     u64 frame_ = 0;
 };
 
