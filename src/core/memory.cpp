@@ -1,0 +1,195 @@
+#include "core/memory.h"
+
+#include <windows.h>
+
+namespace core {
+
+Memory::Memory() {
+    base_ = static_cast<u8*>(VirtualAlloc(nullptr, layout::kSpaceEnd, MEM_RESERVE, PAGE_NOACCESS));
+    if (!base_)
+        PANIC("Failed to reserve {} GB of address space for the guest", layout::kSpaceEnd >> 30);
+    page_bits_ = std::vector<std::atomic<u64>>(size_t(layout::kSpaceEnd >> 12 >> 6));
+    LOG_INFO("Memory", "Guest address space reserved at host {:p}", (void*)base_);
+}
+
+void Memory::MarkPages(u64 addr, u64 size, bool committed) {
+    for (u64 p = addr >> 12, e = (addr + size + 0xFFF) >> 12; p < e; p++) {
+        const u64 bit = 1ull << (p & 63);
+        if (committed)
+            page_bits_[size_t(p >> 6)].fetch_or(bit);
+        else
+            page_bits_[size_t(p >> 6)].fetch_and(~bit);
+    }
+}
+
+Memory::~Memory() {
+    if (base_)
+        VirtualFree(base_, 0, MEM_RELEASE);
+}
+
+bool Memory::IsValid(u64 addr, u64 size) const {
+    if (addr >= layout::kSpaceEnd || addr + size > layout::kSpaceEnd || addr + size < addr || !size)
+        return size == 0 && addr < layout::kSpaceEnd;
+    for (u64 p = addr >> 12, e = (addr + size - 1) >> 12; p <= e; p++)
+        if (!(page_bits_[size_t(p >> 6)].load(std::memory_order_relaxed) & (1ull << (p & 63))))
+            return false;
+    return true;
+}
+
+std::string Memory::ReadString(u64 addr, size_t max) const {
+    std::string s;
+    if (!IsValid(addr))
+        return s;
+    for (size_t i = 0; i < max; i++) {
+        const char c = char(base_[addr + i]);
+        if (!c)
+            break;
+        s.push_back(c);
+    }
+    return s;
+}
+
+void Memory::SplitAt(u64 addr) {
+    auto it = vmas_.upper_bound(addr);
+    if (it == vmas_.begin())
+        return;
+    --it;
+    const u64 start = it->first;
+    if (start == addr || start + it->second.size <= addr)
+        return;
+    Vma tail = it->second;
+    tail.size = start + it->second.size - addr;
+    it->second.size = addr - start;
+    vmas_.emplace(addr, tail);
+}
+
+void Memory::Insert(u64 addr, u64 size, u32 state, u32 perm, u32 attr) {
+    SplitAt(addr);
+    SplitAt(addr + size);
+    vmas_.erase(vmas_.lower_bound(addr), vmas_.lower_bound(addr + size));
+    if (state != MS_Free)
+        vmas_.emplace(addr, Vma{size, state, perm, attr});
+}
+
+bool Memory::Map(u64 addr, u64 size, u32 state, u32 perm) {
+    std::lock_guard lk(vma_mutex_);
+    if (!size)
+        return true;
+    if (addr + size > layout::kSpaceEnd || (addr & 0xFFF) || (size & 0xFFF))
+        return false;
+    if (!VirtualAlloc(base_ + addr, size, MEM_COMMIT, PAGE_READWRITE)) {
+        LOG_ERROR("Memory", "Commit failed at {:#x} size {:#x} (err {})", addr, size, GetLastError());
+        return false;
+    }
+    Insert(addr, size, state, perm, 0);
+    MarkPages(addr, size, true);
+    used_ += size;
+    return true;
+}
+
+bool Memory::Unmap(u64 addr, u64 size) {
+    std::lock_guard lk(vma_mutex_);
+    if (!size)
+        return true;
+    MarkPages(addr, size, false);
+    VirtualFree(base_ + addr, size, MEM_DECOMMIT);
+    Insert(addr, size, MS_Free, MP_None, 0);
+    used_ = used_ > size ? used_ - size : 0;
+    return true;
+}
+
+void Memory::SetState(u64 addr, u64 size, u32 state, u32 perm) {
+    std::lock_guard lk(vma_mutex_);
+    Insert(addr, size, state, perm, 0);
+}
+
+void Memory::SetPerm(u64 addr, u64 size, u32 perm) {
+    std::lock_guard lk(vma_mutex_);
+    SplitAt(addr);
+    SplitAt(addr + size);
+    for (auto it = vmas_.lower_bound(addr); it != vmas_.end() && it->first < addr + size; ++it)
+        it->second.perm = perm;
+}
+
+void Memory::SetAttr(u64 addr, u64 size, u32 mask, u32 value) {
+    std::lock_guard lk(vma_mutex_);
+    SplitAt(addr);
+    SplitAt(addr + size);
+    for (auto it = vmas_.lower_bound(addr); it != vmas_.end() && it->first < addr + size; ++it)
+        it->second.attr = (it->second.attr & ~mask) | (value & mask);
+}
+
+MemoryInfo Memory::Query(u64 addr) {
+    std::lock_guard lk(vma_mutex_);
+    MemoryInfo mi{};
+    if (addr >= layout::kSpaceEnd) {
+        mi.addr = layout::kSpaceEnd;
+        mi.size = 0ull - layout::kSpaceEnd;
+        mi.state = MS_Inaccessible;
+        return mi;
+    }
+    auto it = vmas_.upper_bound(addr);
+    if (it != vmas_.begin()) {
+        auto prev = std::prev(it);
+        if (prev->first + prev->second.size > addr) {
+            mi.addr = prev->first;
+            mi.size = prev->second.size;
+            mi.state = prev->second.state;
+            mi.perm = prev->second.perm;
+            mi.attr = prev->second.attr;
+            // Merge adjacent identical regions, like the kernel does.
+            for (auto n = it; n != vmas_.end() && n->first == mi.addr + mi.size && n->second.state == mi.state &&
+                              n->second.perm == mi.perm && n->second.attr == mi.attr;
+                 ++n)
+                mi.size += n->second.size;
+            return mi;
+        }
+    }
+    // Free gap
+    u64 start = 0;
+    if (it != vmas_.begin()) {
+        auto prev = std::prev(it);
+        start = prev->first + prev->second.size;
+    }
+    const u64 end = it == vmas_.end() ? layout::kSpaceEnd : it->first;
+    mi.addr = start;
+    mi.size = end - start;
+    mi.state = MS_Free;
+    return mi;
+}
+
+u64 Memory::FindFree(u64 region, u64 region_size, u64 size, u64 align) {
+    std::lock_guard lk(vma_mutex_);
+    u64 addr = common::AlignUp(region, align);
+    const u64 end = region + region_size;
+    while (addr + size <= end) {
+        auto it = vmas_.upper_bound(addr);
+        if (it != vmas_.begin()) {
+            auto prev = std::prev(it);
+            if (prev->first + prev->second.size > addr) {
+                addr = common::AlignUp(prev->first + prev->second.size, align);
+                continue;
+            }
+        }
+        if (it == vmas_.end() || it->first >= addr + size)
+            return addr;
+        addr = common::AlignUp(it->first + it->second.size, align);
+    }
+    return 0;
+}
+
+bool Memory::SetHeapSize(u64 size) {
+    std::lock_guard lk(vma_mutex_);
+    if (size > layout::kHeapSize)
+        return false;
+    if (size > heap_size_) {
+        if (!Map(layout::kHeapBase + heap_size_, size - heap_size_, MS_Normal, MP_RW))
+            return false;
+    } else if (size < heap_size_) {
+        Unmap(layout::kHeapBase + size, heap_size_ - size);
+    }
+    heap_size_ = size;
+    return true;
+}
+
+} // namespace core

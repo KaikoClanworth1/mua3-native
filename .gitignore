@@ -1,0 +1,9 @@
+build/
+game/
+Isos/
+isos/
+keys/
+save/
+*.log
+mua3.ini
+external/
