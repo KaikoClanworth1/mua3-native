@@ -56,6 +56,9 @@ private:
     ID3D11DeviceContext* ctx_;
     D3D11Renderer& r_;
     std::unordered_map<u64, std::unique_ptr<CachedTexture>> textures_;
+    std::unordered_map<u64, int> pages_; // 64 KB GPU pages covered by cached textures -> texture count
+    void TrackPages(const CachedTexture& t, int delta);
+    void Erase(std::unordered_map<u64, std::unique_ptr<CachedTexture>>::iterator& it);
     std::unordered_map<u64, ComPtr<ID3D11SamplerState>> samplers_;
     ID3D11ShaderResourceView* Fallback(const shader::TextureUse& use);
     ComPtr<ID3D11ShaderResourceView> fallback_;

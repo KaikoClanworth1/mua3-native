@@ -21,6 +21,8 @@ class TextureCache;
 std::recursive_mutex& ContextMutex();
 
 // A render target or depth buffer living on the host GPU, keyed by its guest GPU address.
+struct HostShader;
+
 struct Surface {
     u64 gpu_va = 0, cpu_va = 0;
     u32 width = 0, height = 0, format = 0;
@@ -35,6 +37,10 @@ struct Surface {
     ComPtr<ID3D11Texture2D> sub_tex;
     ComPtr<ID3D11ShaderResourceView> sub_srv;
     u32 sub_w = 0, sub_h = 0;
+    // Snapshot sampled while this surface is also bound as a target of the same draw (see HazardSrv).
+    ComPtr<ID3D11Texture2D> copy_tex;
+    ComPtr<ID3D11ShaderResourceView> copy_srv;
+    u64 copy_serial = ~0ull;
     u64 last_use = 0;
 };
 
@@ -55,6 +61,10 @@ public:
     std::mutex& FrameMutex() { return frame_mutex_; }
 
     Surface* FindSurfaceByGpu(u64 gpu_va);
+    // A texture aliasing a render/depth target bound for the current draw: D3D11 would force that shader
+    // resource to null (the guest legally samples e.g. depth while stencil-testing against it), so it reads a
+    // copy taken just before the draw. Returns null when the surface is not bound.
+    ID3D11ShaderResourceView* HazardSrv(Surface* s);
     Surface* FindSurfaceByCpu(u64 cpu_va);
 
     void DumpSurface(Surface* s, const fs::path& path);
@@ -93,7 +103,11 @@ private:
     std::string trace_vb_;
     std::vector<u8> trace_vb_data_;
     u32 trace_vb_stride_ = 0;
-    u64 skip_reason_[5]{}; // shader not ready, topology, no indices, index range, input layout
+    u64 skip_reason_[6]{}; // shader not ready, topology, no indices, index range, input layout, GS without output
+    std::unordered_map<u64, bool> gs_emits_; // geometry program address -> has OUT instructions
+    std::unordered_map<u64, HostShader*> shader_by_addr_; // code address ^ stage -> shader
+    u64 code_lo_ = ~0ull, code_hi_ = 0;                   // range of code those addresses cover
+    void EmulateCullingGs();
     float pick_x_ = 0, pick_y_ = 0;
     Surface* GetColorSurface(u32 index);
     Surface* GetDepthSurface();
@@ -104,6 +118,8 @@ private:
     ID3D11DeviceContext* ctx_;
     std::unordered_map<u64, std::unique_ptr<Surface>> surfaces_;
     u64 frame_counter_ = 0;
+    Surface* bound_[9]{}; // colour targets 0-7 and depth of the draw being set up
+    u64 draw_serial_ = 0;
 
     std::unique_ptr<ShaderCache> shaders_;
     std::unique_ptr<TextureCache> textures_;

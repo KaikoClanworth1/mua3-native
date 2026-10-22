@@ -99,6 +99,7 @@ private:
     void ThreadMain();
     void RunCommands(const std::vector<u64>& entries);
     void ProcessPushbuffer(u64 gpu_va, u32 words);
+    u32 dma_mode_ = 0, dma_subch_ = 0, dma_method_ = 0, dma_count_ = 0, dma_k_ = 0; // pending method data
     void CallMethod(u32 subch, u32 method, u32 arg, bool last_in_batch);
     void FlushMacro();
     void RunDma(const u32* regs, u32 launch);

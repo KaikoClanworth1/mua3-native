@@ -276,7 +276,21 @@ void Gpu::ProcessPushbuffer(u64 gpu_va, u32 words) {
         LOG_WARN("GPU", "Pushbuffer at unmapped GPU VA {:#x}", gpu_va);
         return;
     }
-    for (u32 i = 0; i < words;) {
+    // A method's data words may continue in the next GPFIFO entry: NVN submits indirect draw/dispatch arguments
+    // as a data-only entry right after the macro call header. The pending method therefore persists across calls.
+    u32 i = 0;
+    auto consume = [&] {
+        while (dma_count_ && i < words) {
+            const u32 method = dma_mode_ == 1   ? dma_method_ + dma_k_
+                               : dma_mode_ == 5 ? dma_method_ + (dma_k_ ? 1 : 0)
+                                                : dma_method_;
+            dma_count_--;
+            dma_k_++;
+            CallMethod(dma_subch_, method, w[i++], dma_count_ == 0);
+        }
+    };
+    consume();
+    while (i < words) {
         const u32 hdr = w[i++];
         const u32 mode = hdr >> 29;
         const u32 subch = (hdr >> 13) & 7;
@@ -284,19 +298,17 @@ void Gpu::ProcessPushbuffer(u64 gpu_va, u32 words) {
         const u32 count = (hdr >> 16) & 0x1FFF;
         switch (mode) {
         case 1: // increasing
-            for (u32 k = 0; k < count && i < words; k++)
-                CallMethod(subch, method + k, w[i++], k + 1 == count);
-            break;
         case 3: // non-increasing
-            for (u32 k = 0; k < count && i < words; k++)
-                CallMethod(subch, method, w[i++], k + 1 == count);
+        case 5: // increase once
+            dma_mode_ = mode;
+            dma_subch_ = subch;
+            dma_method_ = method;
+            dma_count_ = count;
+            dma_k_ = 0;
+            consume();
             break;
         case 4: // inline immediate
             CallMethod(subch, method, count, true);
-            break;
-        case 5: // increase once
-            for (u32 k = 0; k < count && i < words; k++)
-                CallMethod(subch, method + (k ? 1 : 0), w[i++], k + 1 == count);
             break;
         default:
             break;

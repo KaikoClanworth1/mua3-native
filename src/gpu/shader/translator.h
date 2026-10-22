@@ -17,7 +17,8 @@ struct TextureUse {
     bool array = false;
     bool shadow = false; // depth compare
     bool is_int = false;
-    u32 slot = 0;        // HLSL t/s register
+    u32 slot = 0;        // HLSL t register
+    u32 sampler = 0;     // HLSL s register
 };
 
 struct TranslateResult {
@@ -25,10 +26,13 @@ struct TranslateResult {
     std::string hlsl;
     std::string error;
     std::vector<TextureUse> textures;
+    u32 cbuf_rows[18]{};         // highest statically read 16-byte row + 1, per constant buffer
+    u32 cbuf_dyn_mask = 0;       // constant buffers read with dynamic offsets (bound as raw views at t32+i)
     u32 cbuf_mask = 0;           // constant buffers referenced
     u32 attrib_in_mask = 0;      // VS: generic inputs used
     u32 rt_mask = 0;             // PS: render targets written (bit per RT)
     bool writes_depth = false;
+    bool structured = false; // emitted as nested if/else and natural loops
     bool uses_loop = false;
     std::set<std::string> unimplemented;
 };

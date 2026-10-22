@@ -1,5 +1,6 @@
 #include "gpu/d3d11/shader_cache.h"
 
+#include <cctype>
 #include <cstdlib>
 #include <d3dcompiler.h>
 #include <windows.h>
@@ -120,7 +121,7 @@ bool ShaderCache::Build(HostShader& s, bool slow) {
 
 fs::path ShaderCache::CachePath(const HostShader& s, const char* target) const {
     // Bump kTranslatorVersion whenever the translator output changes, to invalidate cached bytecode.
-    constexpr int kTranslatorVersion = 19;
+    constexpr int kTranslatorVersion = 24;
     return cache_dir_ / fmt::format("{:016x}_{}_v{}.dxbc", s.hash, target, kTranslatorVersion);
 }
 
@@ -233,10 +234,10 @@ HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size) {
     return raw;
 }
 
-HostShader* ShaderCache::GetVsVariant(HostShader* base, u32 uint_mask, u32 sint_mask, u32 scaled_mask) {
-    if (!base || !(uint_mask | sint_mask) || base->state != HostShader::Ready)
+HostShader* ShaderCache::GetVariant(HostShader* base, const VariantKey& v) {
+    if (!base || !(v.attr_uint | v.attr_sint | v.tex_uint | v.tex_sint) || base->state != HostShader::Ready)
         return base;
-    const u64 key = base->hash ^ (Hash64(&uint_mask, 4) * 3) ^ (Hash64(&sint_mask, 4) * 5) ^ (Hash64(&scaled_mask, 4) * 7);
+    const u64 key = base->hash ^ (Hash64(&v, sizeof(v)) * 0x9E3779B97F4A7C15ull);
     auto it = shaders_.find(key);
     if (it != shaders_.end())
         return it->second.get();
@@ -244,29 +245,56 @@ HostShader* ShaderCache::GetVsVariant(HostShader* base, u32 uint_mask, u32 sint_
     s->stage = base->stage;
     s->hash = key;
     s->is_variant = true;
+    LOG_INFO("Shader", "variant {:016x} of {:016x} (tex uint {:#x} sint {:#x})", key, base->hash, v.tex_uint, v.tex_sint);
     s->info = base->info;
     std::string& src = s->info.hlsl;
     // Debug overrides of the base shader apply to its variants too.
-    const fs::path override_path = fs::path("shader_override") / fmt::format("{:016x}.vs.hlsl", base->hash);
+    const fs::path override_path = fs::path("shader_override") /
+        fmt::format("{:016x}.{}.hlsl", base->hash, base->stage == shader::Stage::Vertex ? "vs" : "ps");
     if (fs::exists(override_path)) {
         const auto text = common::ReadFile(override_path);
         src.assign(text.begin(), text.end());
         s->no_cache = true;
     }
+    // Integer vertex attributes: integer inputs (the input assembler hands the integers through unchanged).
     const size_t vsin = src.find("struct VSIn {");
     for (u32 i = 0; i < 32 && vsin != std::string::npos; i++) {
-        if (!((uint_mask | sint_mask) & (1u << i)))
+        if (!((v.attr_uint | v.attr_sint) & (1u << i)))
             continue;
         const std::string decl = fmt::format("    float4 a{0} : ATTR{0};", i);
         const size_t at = src.find(decl, vsin);
         if (at == std::string::npos)
             continue;
-        src.replace(at, decl.size(), fmt::format("    {}4 a{} : ATTR{};", (sint_mask >> i) & 1 ? "int" : "uint", i, i));
-        if ((scaled_mask >> i) & 1) {
+        src.replace(at, decl.size(), fmt::format("    {}4 a{} : ATTR{};", (v.attr_sint >> i) & 1 ? "int" : "uint", i, i));
+        if ((v.attr_scaled >> i) & 1) {
             const std::string load = fmt::format("    vin{0} = asuint(input.a{0});", i);
             const size_t l = src.find(load, vsin);
             if (l != std::string::npos)
                 src.replace(l, load.size(), fmt::format("    vin{0} = asuint(float4(input.a{0}));", i));
+        }
+    }
+    // Integer textures: typed declarations, and loads reinterpreted so the shader sees the raw integer bits.
+    for (u32 t = 0; t < 32; t++) {
+        if (!((v.tex_uint | v.tex_sint) & (1u << t)))
+            continue;
+        const std::string elem = (v.tex_sint >> t) & 1 ? "int4" : "uint4";
+        const std::string reg = fmt::format("<float4> tex{} : register(t{});", t, t);
+        const size_t d = src.find(reg);
+        if (d == std::string::npos)
+            continue;
+        src.replace(d, reg.size(), fmt::format("<{}> tex{} : register(t{});", elem, t, t));
+        const std::string call = fmt::format("tex{}.Load(", t);
+        for (size_t at = 0; (at = src.find(call, at)) != std::string::npos;) {
+            if (at > 0 && (std::isalnum(u8(src[at - 1])) || src[at - 1] == '_')) {
+                at += call.size();
+                continue;
+            }
+            size_t q = at + call.size();
+            for (int depth = 1; q < src.size() && depth; q++)
+                depth += src[q] == '(' ? 1 : src[q] == ')' ? -1 : 0;
+            src.insert(q, ")");
+            src.insert(at, "asfloat(");
+            at = q + 9;
         }
     }
     auto* raw = s.get();

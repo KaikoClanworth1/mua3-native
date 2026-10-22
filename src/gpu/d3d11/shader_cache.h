@@ -39,10 +39,14 @@ public:
     ~ShaderCache();
     // `code` = guest program starting at its SPH, `size` bytes available.
     HostShader* Get(shader::Stage stage, const u8* code, size_t size);
-    // Vertex shader whose inputs match the draw's attribute types: attributes in `uint_mask`/`sint_mask` are
-    // declared uint4/int4 (the input assembler hands integers through), `scaled_mask` ones are then converted
-    // to float like Maxwell's USCALED/SSCALED. Returns `base` when no attribute is an integer type.
-    HostShader* GetVsVariant(HostShader* base, u32 uint_mask, u32 sint_mask, u32 scaled_mask);
+    // Shader re-declared to match the draw's integer data: integer vertex attributes become uint4/int4 inputs
+    // (scaled ones converted to float like Maxwell's USCALED/SSCALED) and integer textures are declared with
+    // integer element types. Returns `base` when nothing is an integer type.
+    struct VariantKey {
+        u32 attr_uint = 0, attr_sint = 0, attr_scaled = 0; // vertex attributes (scaled = convert to float)
+        u32 tex_uint = 0, tex_sint = 0;                     // texture slots with integer formats
+    };
+    HostShader* GetVariant(HostShader* base, const VariantKey& v);
     size_t Count() const { return shaders_.size(); }
     std::atomic<u32> failures{0};
     std::atomic<u32> pending{0};

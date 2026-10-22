@@ -1,3 +1,4 @@
+#include <cstdlib>
 // Maxwell SASS -> HLSL (Shader Model 5.0) translator.
 #include "gpu/shader/translator.h"
 
@@ -95,11 +96,14 @@ private:
     }
     std::string Cbuf(u32 index, u32 byte_off) {
         res_.cbuf_mask |= 1u << index;
+        if (index < 18)
+            res_.cbuf_rows[index] = cbuf_rows_[index] = std::max(cbuf_rows_[index], (byte_off >> 4) + 1);
         static const char* comp = "xyzw";
         return fmt::format("c{}[{}].{}", index, byte_off >> 4, comp[(byte_off >> 2) & 3]);
     }
     std::string CbufDyn(u32 index, const std::string& byte_addr) {
         res_.cbuf_mask |= 1u << index;
+        res_.cbuf_dyn_mask |= 1u << index;
         return fmt::format("CbufLoad{}({})", index, byte_addr);
     }
 
@@ -227,8 +231,9 @@ private:
 
     // ---------------------------------------------------------------- textures
     u32 TexSlot(u32 cbuf_off, TexDim dim, bool array, bool shadow);
-    std::string Sampler(u32 slot) { return fmt::format("smp{}", std::min<u32>(slot, 15)); }
-    std::string CmpSampler(u32 slot) { return fmt::format("smpc{}", std::min<u32>(slot, 15)); }
+    std::string Sampler(u32 slot) { return fmt::format("smp{}", slot); }
+    u32 cbuf_rows_[18]{}; // highest statically referenced row + 1, per constant buffer
+    std::string CmpSampler(u32 slot) { return fmt::format("smpc{}", slot); }
     std::set<u32> declared_smp_, declared_smpc_;
     void EmitTexWrites(u32 mask, const std::vector<u32>& regs, const std::string& value, u32 slot);
     // TEXS/TLDS/TLD4S without the FP32 flag: the selected components are packed as half2, two per register.
@@ -238,6 +243,32 @@ private:
     // ---------------------------------------------------------------- flow
     bool DiscoverBlocks();
     bool AnalyzeStacks();
+
+    // ---------------------------------------------------------------- structured emission
+    // Block bodies plus their terminators, re-emitted as nested if/else and natural loops (FXC handles these
+    // well; the generic block-dispatch loop can take it minutes). Returns false for shapes it does not model.
+    struct Term {
+        enum Kind { Fall, Jump, Cond, Exit, CondExit } kind = Fall;
+        std::string cond;      // Cond / CondExit
+        u32 target = ~0u;      // block id, or ~0u for "outside the program"
+        std::string exit_code; // Exit / CondExit
+    };
+    struct SBlock {
+        std::string body;
+        Term term;
+    };
+    std::vector<SBlock> sblocks_;
+    std::string sout_;
+    int sindent_ = 1;
+    struct LoopCtx {
+        u32 header = ~0u, exit = ~0u;
+    };
+    bool BuildStructuredBlocks();
+    bool EmitStructured(std::string& body);
+    bool Seq(u32 first, u32 last, u32 end_target, LoopCtx ctx, u32 skip_header);
+    bool Goto(u32 from, u32 target, u32 last, u32 end_target, LoopCtx ctx);
+    void SLine(const std::string& l) { sout_.append(size_t(sindent_) * 4, ' ').append(l).append("\n"); }
+    void SText(const std::string& text);
     void EmitInstruction(u32 pc, u64 insn, Op op);
     void EmitJump(u32 target);
     void EmitExit();
@@ -425,8 +456,8 @@ void Translator::TexSample(u64 insn, u32 pc, Op op) {
         case 10: dim = TexDim::Tex3D; coords = fmt::format("float3({}, {}, {})", coord(ra), coord(ra + 1), coord(rb)); break;
         case 11: dim = TexDim::Tex3D; lk = 1; coords = fmt::format("float3({}, {}, {})", coord(ra), coord(ra + 1), coord(rb)); break;
         case 12: dim = TexDim::Cube; coords = fmt::format("float3({}, {}, {})", coord(ra), coord(ra + 1), coord(rb)); break;
-        case 13: dim = TexDim::Cube; lk = 2; lod = coord(rb);
-            coords = fmt::format("float3({}, {}, {})", coord(ra), coord(ra + 1), coord(ra + 2)); break;
+        case 13: dim = TexDim::Cube; lk = 2; lod = coord(rb + 1);
+            coords = fmt::format("float3({}, {}, {})", coord(ra), coord(ra + 1), coord(rb)); break;
         default: Unimpl(op, pc, insn); return;
         }
         const u32 slot = TexSlot(cbuf_off, dim, array, shadow);
@@ -909,6 +940,72 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
         const std::string b = FAbsNeg(SrcBF(insn, form3(op, Op::FMNMX_reg, Op::FMNMX_cbuf)), Bit(insn, 49), Bit(insn, 45));
         const std::string av = FAbsNeg(F(a), Bit(insn, 46), Bit(insn, 48));
         SetF(d, fmt::format("{} ? min({}, {}) : max({}, {})", P(u32(Bits(insn, 39, 3)), Bit(insn, 42)), av, b, av, b));
+        return;
+    }
+    // ---------------- double precision (register pairs: low word in rN, high word in rN+1)
+    case Op::DADD_reg: case Op::DADD_cbuf: case Op::DADD_imm:
+    case Op::DMUL_reg: case Op::DMUL_cbuf: case Op::DMUL_imm:
+    case Op::DFMA_reg: case Op::DFMA_rc: case Op::DFMA_cr: case Op::DFMA_imm:
+    case Op::DMNMX_reg: case Op::DMNMX_cbuf: case Op::DMNMX_imm:
+    case Op::DSETP_reg: case Op::DSETP_cbuf: case Op::DSETP_imm: {
+        auto dreg = [&](u32 r) { return r == RZ ? std::string("0.0") : fmt::format("asdouble({}, {})", R(r), R(r + 1)); };
+        auto dcbuf = [&]() {
+            const u32 bank = u32(Bits(insn, 34, 5)), off = u32(Bits(insn, 20, 14)) * 4;
+            return fmt::format("asdouble({}, {})", Cbuf(bank, off), Cbuf(bank, off + 4));
+        };
+        // 20-bit immediates hold the top bits of the double.
+        auto dimm = [&]() {
+            const u32 hi = (u32(Bits(insn, 20, 19)) << 12) | (u32(Bit(insn, 56)) << 31);
+            return fmt::format("asdouble(0u, {})", Hex(hi));
+        };
+        auto dabsneg = [](std::string v, bool abs, bool neg) {
+            if (abs) v = "abs(" + v + ")";
+            if (neg) v = "(-" + v + ")";
+            return v;
+        };
+        auto src_b = [&](Op reg, Op cbuf) {
+            return op == reg ? dreg(u32(Bits(insn, 20, 8))) : op == cbuf ? dcbuf() : dimm();
+        };
+        auto store = [&](const std::string& v) {
+            Line(fmt::format("{{ double dv_ = {}; uint lo_, hi_; asuint(dv_, lo_, hi_); {} = lo_; {} = hi_; }}", v,
+                             d == RZ ? "tmpu.x" : R(d), d == RZ ? "tmpu.y" : R(d + 1)));
+        };
+        const std::string av = dreg(a);
+        if (op == Op::DADD_reg || op == Op::DADD_cbuf || op == Op::DADD_imm) {
+            store(fmt::format("{} + {}", dabsneg(av, Bit(insn, 46), Bit(insn, 48)),
+                              dabsneg(src_b(Op::DADD_reg, Op::DADD_cbuf), Bit(insn, 49), Bit(insn, 45))));
+        } else if (op == Op::DMUL_reg || op == Op::DMUL_cbuf || op == Op::DMUL_imm) {
+            store(fmt::format("{} * {}", av, dabsneg(src_b(Op::DMUL_reg, Op::DMUL_cbuf), false, Bit(insn, 48))));
+        } else if (op == Op::DMNMX_reg || op == Op::DMNMX_cbuf || op == Op::DMNMX_imm) {
+            const std::string bv = dabsneg(src_b(Op::DMNMX_reg, Op::DMNMX_cbuf), Bit(insn, 49), Bit(insn, 45));
+            const std::string a2 = dabsneg(av, Bit(insn, 46), Bit(insn, 48));
+            store(fmt::format("{} ? min({}, {}) : max({}, {})", P(u32(Bits(insn, 39, 3)), Bit(insn, 42)), a2, bv, a2, bv));
+        } else if (op == Op::DSETP_reg || op == Op::DSETP_cbuf || op == Op::DSETP_imm) {
+            const std::string bv = dabsneg(src_b(Op::DSETP_reg, Op::DSETP_cbuf), Bit(insn, 44), Bit(insn, 6));
+            const std::string a2 = dabsneg(av, Bit(insn, 7), Bit(insn, 43));
+            const std::string sp = P(u32(Bits(insn, 39, 3)), Bit(insn, 42));
+            const u32 bop = u32(Bits(insn, 45, 2));
+            // isnan() has no double overload in SM5: compare through placeholders and use x != x instead.
+            std::string cmp = FCompare(u32(Bits(insn, 48, 4)), "DA_", "DB_");
+            for (const char* ph : {"DA_", "DB_"}) {
+                const std::string from = fmt::format("isnan({})", ph), to = fmt::format("({0} != {0})", ph);
+                for (size_t at; (at = cmp.find(from)) != std::string::npos;)
+                    cmp.replace(at, from.size(), to);
+            }
+            for (auto [ph, v] : {std::pair<const char*, const std::string*>{"DA_", &a2}, {"DB_", &bv}})
+                for (size_t at; (at = cmp.find(ph)) != std::string::npos;)
+                    cmp.replace(at, 3, "(" + *v + ")");
+            Line(fmt::format("tmpb = {};", cmp));
+            SetP(u32(Bits(insn, 3, 3)), Bop(bop, "tmpb", sp));
+            SetP(u32(Bits(insn, 0, 3)), Bop(bop, "!tmpb", sp));
+        } else { // DFMA
+            std::string b, c;
+            if (op == Op::DFMA_reg) { b = dreg(u32(Bits(insn, 20, 8))); c = dreg(u32(Bits(insn, 39, 8))); }
+            else if (op == Op::DFMA_rc) { b = dreg(u32(Bits(insn, 39, 8))); c = dcbuf(); }
+            else if (op == Op::DFMA_cr) { b = dcbuf(); c = dreg(u32(Bits(insn, 39, 8))); }
+            else { b = dimm(); c = dreg(u32(Bits(insn, 39, 8))); }
+            store(fmt::format("fma({}, {}, {})", av, dabsneg(b, false, Bit(insn, 48)), dabsneg(c, false, Bit(insn, 49))));
+        }
         return;
     }
     case Op::MUFU: {
@@ -1693,11 +1790,19 @@ float4 ApplySwizzle(float4 v, uint s) {
     for (u32 i = 0; i < 13; i++) {
         if (!(res_.cbuf_mask & (1u << i)))
             continue;
-        head += fmt::format("cbuffer CB{0} : register(b{0}) {{ uint4 c{0}[4096]; }};\n", i);
-        head += fmt::format("uint CbufLoad{0}(uint a) {{ return c{0}[(a >> 4u) & 4095u][(a >> 2u) & 3u]; }}\n", i);
+        // Static reads index a cbuffer sized to what the shader uses; dynamic reads go through a raw view of the
+        // same data (FXC can spend minutes analysing dynamic indexing of a large cbuffer array inside loops).
+        head += fmt::format("cbuffer CB{0} : register(b{0}) {{ uint4 c{0}[{1}]; }};\n", i, std::max<u32>(cbuf_rows_[i], 1));
+        if (res_.cbuf_dyn_mask & (1u << i)) {
+            head += fmt::format("ByteAddressBuffer cbd{0} : register(t{1});\n", i, 32 + i);
+            head += fmt::format("uint CbufLoad{0}(uint a) {{ return cbd{0}.Load(a & 0xFFFCu); }}\n", i);
+        }
     }
-    // Textures
-    for (auto& t : res_.textures) {
+    // Textures. D3D11 has only 16 sampler registers: with at most 16 textures each gets its own (in use order),
+    // otherwise textures past slot 15 share s15. Sampler names stay per texture slot and map onto registers.
+    const bool own_samplers = res_.textures.size() <= 16;
+    for (size_t ti = 0; ti < res_.textures.size(); ti++) {
+        auto& t = res_.textures[ti];
         const char* type = "Texture2D";
         switch (t.dim) {
         case TexDim::Tex1D: type = t.array ? "Texture1DArray" : "Texture1D"; break;
@@ -1706,13 +1811,231 @@ float4 ApplySwizzle(float4 v, uint s) {
         case TexDim::Cube: type = t.array ? "TextureCubeArray" : "TextureCube"; break;
         }
         head += fmt::format("{}<float4> tex{} : register(t{});\n", type, t.slot, t.slot);
-        // Only 16 sampler registers: textures past slot 15 share s15 (declared once per register and kind).
-        const u32 sreg = std::min<u32>(t.slot, 15);
+        const u32 sreg = own_samplers ? u32(ti) : std::min<u32>(t.slot, 15);
+        t.sampler = sreg;
         if (declared_smp_.insert(sreg).second)
-            head += fmt::format("SamplerState smp{} : register(s{});\n", sreg, sreg);
+            head += fmt::format("SamplerState smp_r{} : register(s{});\n", sreg, sreg);
         if (t.shadow && declared_smpc_.insert(sreg).second)
-            head += fmt::format("SamplerComparisonState smpc{} : register(s{});\n", sreg, sreg);
+            head += fmt::format("SamplerComparisonState smpc_r{} : register(s{});\n", sreg, sreg);
+        head += fmt::format("#define smp{} smp_r{}\n", t.slot, sreg);
+        if (t.shadow)
+            head += fmt::format("#define smpc{} smpc_r{}\n", t.slot, sreg);
     }
+}
+
+bool Translator::BuildStructuredBlocks() {
+    sblocks_.assign(blocks_.size(), {});
+    for (auto& [start, b] : blocks_) {
+        cur_block_ = start;
+        out_.clear();
+        indent_ = 0;
+        SBlock& sb = sblocks_[b.id];
+        bool has_term = false;
+        for (u32 pc = b.start; pc < b.end; pc = NextPc(pc)) {
+            const u64 insn = At(pc);
+            const Op op = Decode(insn);
+            const u32 pidx = u32(Bits(insn, 16, 3));
+            const bool pneg = Bit(insn, 19);
+            const bool guarded = !(pidx == PT && !pneg);
+            const std::string guard = P(pidx, pneg);
+            const bool is_flow = op == Op::BRA || op == Op::EXIT || op == Op::SYNC || op == Op::BRK || op == Op::CONT;
+            if (is_flow) {
+                if (NextPc(pc) != b.end)
+                    return false; // flow in the middle of a block
+                std::string cond = guarded ? guard : "";
+                const u32 cct = u32(Bits(insn, 0, 5));
+                if (cct != 15) {
+                    const std::string t = CcTest(cct);
+                    cond = cond.empty() ? t : "(" + cond + " && " + t + ")";
+                }
+                Term& t = sb.term;
+                if (op == Op::EXIT) {
+                    std::string saved;
+                    saved.swap(out_);
+                    EmitExit();
+                    t.exit_code.swap(out_);
+                    out_.swap(saved);
+                    t.kind = cond.empty() ? Term::Exit : Term::CondExit;
+                } else {
+                    const u32 target = op == Op::BRA ? BranchTarget(pc, insn)
+                                                     : (sync_target_.count(pc) ? sync_target_[pc] : 0xFFFFFFFFu);
+                    auto it = blocks_.find(target);
+                    t.target = it == blocks_.end() ? ~0u : it->second.id;
+                    t.kind = cond.empty() ? Term::Jump : Term::Cond;
+                }
+                t.cond = cond;
+                has_term = true;
+                continue;
+            }
+            if (guarded) {
+                Line(fmt::format("if ({}) {{", guard));
+                indent_++;
+            }
+            if (op == Op::TEX || op == Op::TEX_b || op == Op::TEXS || op == Op::TLD || op == Op::TLD_b ||
+                op == Op::TLDS || op == Op::TLD4 || op == Op::TLD4_b || op == Op::TLD4S || op == Op::TXQ ||
+                op == Op::TXQ_b || op == Op::TMML || op == Op::TMML_b)
+                TexSample(insn, pc, op);
+            else
+                EmitInstruction(pc, insn, op);
+            if (guarded) {
+                indent_--;
+                Line("}");
+            }
+        }
+        if (!has_term) {
+            auto next = blocks_.find(b.end);
+            sb.term.kind = Term::Fall;
+            sb.term.target = next == blocks_.end() ? ~0u : next->second.id;
+        }
+        sb.body.swap(out_);
+    }
+    return true;
+}
+
+void Translator::SText(const std::string& text) {
+    size_t p = 0;
+    while (p < text.size()) {
+        size_t e = text.find('\n', p);
+        if (e == std::string::npos)
+            e = text.size();
+        if (e > p)
+            sout_.append(size_t(sindent_) * 4, ' ').append(text, p, e - p).append("\n");
+        p = e + 1;
+    }
+}
+
+// A jump out of block `from`: continue/break/return, or falling out of the region it ends.
+bool Translator::Goto(u32 from, u32 target, u32 last, u32 end_target, LoopCtx ctx) {
+    if (target == ~0u) {
+        SLine("return_flag = true; return; // jump outside program");
+        return true;
+    }
+    if (target == ctx.header) {
+        SLine("continue;");
+        return true;
+    }
+    if (target == ctx.exit) {
+        SLine("break;");
+        return true;
+    }
+    return from + 1 == last && target == end_target;
+}
+
+bool Translator::Seq(u32 first, u32 last, u32 end_target, LoopCtx ctx, u32 skip_header) {
+    const u32 n = u32(sblocks_.size());
+    u32 i = first;
+    while (i < last) {
+        // Loop header: the latest back edge into i closes the loop.
+        if (i != skip_header) {
+            u32 latch = ~0u;
+            for (u32 j = i; j < n; j++) {
+                const Term& t = sblocks_[j].term;
+                if ((t.kind == Term::Jump || t.kind == Term::Cond) && t.target == i)
+                    latch = j;
+            }
+            if (latch != ~0u) {
+                const u32 loop_end = latch + 1;
+                if (loop_end > last)
+                    return false;
+                SLine("[loop] for (uint li_ = 0u; ; li_++) {");
+                sindent_++;
+                SLine("if (li_ >= 4096u) { loop_capped = true; break; }");
+                if (!Seq(i, loop_end, loop_end, LoopCtx{i, loop_end}, i))
+                    return false;
+                SLine("break;");
+                sindent_--;
+                SLine("}");
+                i = loop_end;
+                continue;
+            }
+        }
+        const SBlock& b = sblocks_[i];
+        SText(b.body);
+        const Term& t = b.term;
+        switch (t.kind) {
+        case Term::Exit:
+            SText(t.exit_code);
+            i++;
+            continue;
+        case Term::CondExit:
+            SLine(fmt::format("if ({}) {{", t.cond));
+            sindent_++;
+            SText(t.exit_code);
+            sindent_--;
+            SLine("}");
+            i++;
+            continue;
+        case Term::Fall:
+        case Term::Jump:
+            if (t.target == i + 1 && (i + 1 < last || t.target == end_target)) {
+                i++;
+                continue;
+            }
+            if (!Goto(i, t.target, last, end_target, ctx))
+                return false;
+            i++;
+            continue;
+        case Term::Cond: {
+            const u32 tg = t.target;
+            if (tg == ~0u || tg == ctx.header || tg == ctx.exit) {
+                SLine(fmt::format("if ({}) {{", t.cond));
+                sindent_++;
+                Goto(i, tg, last, end_target, ctx);
+                sindent_--;
+                SLine("}");
+                // Not taken: fall through to the next block.
+                if (i + 1 >= last && end_target != i + 1 && !Goto(i, i + 1, last, end_target, ctx))
+                    return false;
+                i++;
+                continue;
+            }
+            if (tg <= i + 1 || tg > last)
+                return false;
+            // if-else: the then-part ends with a jump over the else-part to a join point.
+            const Term& tl = sblocks_[tg - 1].term;
+            if (tl.kind == Term::Jump && tl.target != ~0u && tl.target > tg && tl.target <= last &&
+                tl.target != ctx.exit) {
+                const u32 join = tl.target;
+                SLine(fmt::format("if (!({})) {{", t.cond));
+                sindent_++;
+                if (!Seq(i + 1, tg, join, ctx, ~0u))
+                    return false;
+                sindent_--;
+                SLine("} else {");
+                sindent_++;
+                if (!Seq(tg, join, join, ctx, ~0u))
+                    return false;
+                sindent_--;
+                SLine("}");
+                i = join;
+                continue;
+            }
+            SLine(fmt::format("if (!({})) {{", t.cond));
+            sindent_++;
+            if (!Seq(i + 1, tg, tg, ctx, ~0u))
+                return false;
+            sindent_--;
+            SLine("}");
+            i = tg;
+            continue;
+        }
+        }
+    }
+    return true;
+}
+
+bool Translator::EmitStructured(std::string& body) {
+    if (std::getenv("MUA3_NO_STRUCTURED"))
+        return false;
+    if (!BuildStructuredBlocks())
+        return false;
+    sout_.clear();
+    sindent_ = 1;
+    if (!Seq(0, u32(sblocks_.size()), ~0u, LoopCtx{}, ~0u))
+        return false;
+    SLine("return_flag = true;");
+    body = std::move(sout_);
+    return true;
 }
 
 bool Translator::Run() {
@@ -1723,6 +2046,9 @@ bool Translator::Run() {
 
     // Body
     std::string body;
+    const bool structured = EmitStructured(body);
+    res_.structured = structured;
+    if (!structured) {
     out_.clear();
     indent_ = 1;
     // Only the blocks between the earliest back-edge target and the latest back-edge source need the dispatch
@@ -1835,6 +2161,7 @@ bool Translator::Run() {
         }
     }
     body = std::move(out_);
+    }
 
     // Assemble
     std::string src;

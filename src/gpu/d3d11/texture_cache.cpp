@@ -22,11 +22,35 @@ TextureCache::TextureCache(ID3D11Device* dev, ID3D11DeviceContext* ctx, D3D11Ren
     dev_->CreateShaderResourceView(t.Get(), nullptr, &fallback_);
 }
 
+void TextureCache::TrackPages(const CachedTexture& t, int delta) {
+    if (!t.size)
+        return;
+    for (u64 p = t.gpu_va >> 16, e = (t.gpu_va + t.size - 1) >> 16; p <= e; p++) {
+        auto& n = pages_[p];
+        n += delta;
+        if (n <= 0)
+            pages_.erase(p);
+    }
+}
+
+void TextureCache::Erase(std::unordered_map<u64, std::unique_ptr<CachedTexture>>::iterator& it) {
+    TrackPages(*it->second, -1);
+    it = textures_.erase(it);
+}
+
 void TextureCache::Invalidate(u64 gpu_va, u64 size) {
+    if (!size)
+        return;
+    // Most writes (constant uploads, index lists) touch no cached texture: check the page index first.
+    bool hit = false;
+    for (u64 p = gpu_va >> 16, e = (gpu_va + size - 1) >> 16; p <= e && !hit; p++)
+        hit = pages_.count(p) != 0;
+    if (!hit)
+        return;
     for (auto it = textures_.begin(); it != textures_.end();) {
         auto& t = *it->second;
         if (t.gpu_va < gpu_va + size && gpu_va < t.gpu_va + t.size)
-            it = textures_.erase(it);
+            Erase(it);
         else
             ++it;
     }
@@ -76,8 +100,11 @@ ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::T
         if (s->depth)
             swizzle = 0xB1A; // depth samples come back in .x
         const u32 w = tic.Width(), h = tic.Height();
-        if (s->depth || w == 0 || h == 0 || w > s->width || h > s->height || (w == s->width && h == s->height))
+        if (s->depth || w == 0 || h == 0 || w > s->width || h > s->height || (w == s->width && h == s->height)) {
+            if (ID3D11ShaderResourceView* copy = r_.HazardSrv(s))
+                return copy;
             return s->srv.Get();
+        }
         // The texture covers only part of the target: sample a copy of exactly that region.
         if (s->sub_w != w || s->sub_h != h) {
             D3D11_TEXTURE2D_DESC td;
@@ -111,7 +138,7 @@ ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::T
             return it->second->srv.Get();
         }
         reuploads++;
-        textures_.erase(it);
+        Erase(it);
     }
     auto* srv = Upload(tic, use, key);
     return srv ? srv : Fallback(use);
@@ -264,6 +291,7 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
         off += n;
     }
     auto* srv = tex->srv.Get();
+    TrackPages(*tex, +1);
     textures_[key] = std::move(tex);
     return srv;
 }
