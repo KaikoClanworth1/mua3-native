@@ -1,3 +1,4 @@
+#include <cstdio>
 // Translates dumped Maxwell shaders (shader_dump/*.vs.bin|*.ps.bin) to HLSL and compiles them with FXC.
 //   shadertool <file.bin> [--print]        translate one shader and print the HLSL
 //   shadertool <dir>                       translate + compile every dump, report failures/unimplemented ops
@@ -41,7 +42,9 @@ int main(int argc, char** argv) {
         fmt::print("usage: shadertool <file.bin|dir> [--print|--disasm]\n");
         return 1;
     }
-    if (std::string(argv[1]) == "--hlsl" && argc >= 4) { // compile a raw HLSL file: --hlsl <file> <target>
+    if (std::string(argv[1]) == "--hlsl" && argc >= 4) { // compile a raw HLSL file: --hlsl <file> <target> [flags]
+        if (argc >= 5)
+            g_flags = UINT(std::stoul(argv[4], nullptr, 0));
         const auto d = common::ReadFile(fs::u8path(argv[2]));
         std::string err;
         const bool ok = CompileHlsl(std::string(d.begin(), d.end()), argv[3], err);
@@ -74,9 +77,22 @@ int main(int argc, char** argv) {
         const bool cs = f.filename().string().rfind("compute_", 0) == 0;
         const Stage stage = cs ? Stage::Compute : vs ? Stage::Vertex : Stage::Fragment;
         TranslateOptions copt;
-        if (cs) { // shape is not in the program; good enough for inspection
+        if (cs) { // compute_<offset>_<X>x<Y>x<Z>_<shared hex>.bin carries the launch shape
             copt.block[0] = 64;
             copt.shared_bytes = 0x400;
+            unsigned off = 0, bx = 0, by = 0, bz = 0, sh = 0;
+            if (std::sscanf(f.filename().string().c_str(), "compute_%x_%ux%ux%u_%x", &off, &bx, &by, &bz, &sh) == 5) {
+                copt.block[0] = bx, copt.block[1] = by, copt.block[2] = bz;
+                copt.shared_bytes = sh;
+            }
+            fs::path cbp = f;
+            cbp.replace_extension(".cb1");
+            if (fs::exists(cbp)) {
+                static std::vector<u8> cb1;
+                cb1 = common::ReadFile(cbp);
+                copt.cbuf1 = cb1.data();
+                copt.cbuf1_size = u32(cb1.size());
+            }
         }
         auto r = Translate(stage, data.data(), data.size(), copt);
         if (r.uses_loop) { // like the game: loop shaders sample with explicit LOD 0

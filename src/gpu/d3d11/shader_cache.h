@@ -27,6 +27,7 @@ struct HostShader {
     ComPtr<ID3D11PixelShader> ps;
     ComPtr<ID3D11ComputeShader> cs;
     shader::TranslateOptions opt; // compute: workgroup shape and shared memory from the launch
+    std::vector<u8> cbuf1;        // compute: constant buffer 1 at first launch (opt.cbuf1 points here)
     std::vector<u8> code; // guest program (kept until compiled)
     std::vector<u8> dxbc; // vertex shaders keep their bytecode for input layouts
     bool is_variant = false; // vertex shader re-declared for integer vertex attributes (info.hlsl is final)

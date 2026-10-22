@@ -81,6 +81,7 @@ void ShaderCache::Worker(bool slow) {
 bool ShaderCache::Build(HostShader& s, bool slow) {
     const char* tag = StageTag(s.stage);
     if (!s.is_variant && !s.translated) {
+        s.opt.cbuf1 = s.cbuf1.empty() ? nullptr : s.cbuf1.data();
         s.info = shader::Translate(s.stage, s.code.data(), s.code.size(), s.opt);
         if (s.info.ok && (s.info.uses_loop || s.stage == shader::Stage::Compute)) {
             // Gradient ops inside loops are rejected by FXC: loop shaders sample with explicit LOD 0.
@@ -130,7 +131,7 @@ bool ShaderCache::Build(HostShader& s, bool slow) {
 
 fs::path ShaderCache::CachePath(const HostShader& s, const char* target) const {
     // Bump kTranslatorVersion whenever the translator output changes, to invalidate cached bytecode.
-    constexpr int kTranslatorVersion = 26;
+    constexpr int kTranslatorVersion = 28;
     return cache_dir_ / fmt::format("{:016x}_{}_v{}.dxbc", s.hash, target, kTranslatorVersion);
 }
 
@@ -224,8 +225,10 @@ bool ShaderCache::Compile(HostShader& s, const std::string& hlsl, std::string& e
 HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size, const shader::TranslateOptions* opt) {
     size = shader::ProgramSize(code, size);
     u64 hash = Hash64(code, size) ^ (u64(stage) << 60);
-    if (opt) // the launch shape is compiled into compute shaders
-        hash ^= Hash64(opt, sizeof(*opt)) * 0x9E3779B97F4A7C15ull;
+    if (opt) { // the launch shape is compiled into compute shaders
+        const u32 shape[4] = {opt->block[0], opt->block[1], opt->block[2], opt->shared_bytes};
+        hash ^= Hash64(shape, sizeof(shape)) * 0x9E3779B97F4A7C15ull;
+    }
     auto it = shaders_.find(hash);
     if (it != shaders_.end())
         return it->second.get();
@@ -234,8 +237,13 @@ HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size, c
     s->stage = stage;
     s->hash = hash;
     s->code.assign(code, code + size);
-    if (opt)
+    if (opt) {
         s->opt = *opt;
+        if (opt->cbuf1)
+            s->cbuf1.assign(opt->cbuf1, opt->cbuf1 + opt->cbuf1_size);
+        s->opt.cbuf1 = s->cbuf1.empty() ? nullptr : s->cbuf1.data();
+        s->opt.cbuf1_size = u32(s->cbuf1.size());
+    }
     const char* tag = StageTag(stage);
     common::WriteFile(dump_dir_ / fmt::format("{:016x}.{}.bin", hash, tag), std::span(code, size));
     auto* raw = s.get();

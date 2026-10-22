@@ -36,6 +36,7 @@ struct TranslateResult {
     u32 rt_mask = 0;             // PS: render targets written (bit per RT)
     bool writes_depth = false;
     bool uses_gmem = false; // compute: reads/writes guest global memory through drv_gmem windows
+    std::vector<u32> images; // compute: bound image (SUST) handle offsets in the texture constant buffer, by slot
     bool structured = false; // emitted as nested if/else and natural loops
     bool uses_loop = false;
     std::set<std::string> unimplemented;
@@ -46,6 +47,9 @@ struct TranslateOptions {
     // Compute: workgroup shape and shared memory size come from the launch descriptor (QMD), not the program.
     u32 block[3] = {1, 1, 1};
     u32 shared_bytes = 0;
+    // Constant buffer 1 contents at translation time (compute): BRX jump tables live there. Not owned.
+    const u8* cbuf1 = nullptr;
+    u32 cbuf1_size = 0;
 };
 
 // `code` points at the shader program header (SPH, 0x50 bytes) followed by instructions; `size` in bytes.

@@ -1,6 +1,7 @@
 #include "gpu/gpu.h"
 
 #include <chrono>
+#include <set>
 
 #include <windows.h>
 
@@ -560,18 +561,28 @@ void Gpu::CallMethod(u32 subch, u32 method, u32 arg, bool last_in_batch) {
             ReadGpu(u64(r[0xAD]) << 8, q, sizeof(q));
             if (renderer_)
                 renderer_->Dispatch(r, q);
-            if (launches++ < 8) {
-                const u64 code = (u64(r[0x582] & 0xFF) << 32) | r[0x583];
-                LOG_INFO("GPU", "compute launch #{}: code {:#x}+{:#x} grid {}x{}x{} block {}x{}x{} shared {:#x} cb mask {:#x} "
-                                "cb0 {:#x}/{:#x}",
+            const u64 code = (u64(r[0x582] & 0xFF) << 32) | r[0x583];
+            if (launches++ < 8)
+                LOG_INFO("GPU", "compute launch #{}: code {:#x}+{:#x} grid {}x{}x{} block {}x{}x{} shared {:#x} cb mask {:#x}",
                          launches, code, q[8], q[0xC] & 0x7FFFFFFF, q[0xD] & 0xFFFF, q[0xD] >> 16, q[0x12] >> 16, q[0x13] & 0xFFFF,
-                         q[0x13] >> 16, q[0x11] & 0x3FFFF, q[0x14] & 0xFF, (u64(q[0x1E] & 0xFF) << 32) | q[0x1D], q[0x1E] >> 15);
-                // Dump the program behind a zeroed 0x50-byte header so the graphics tooling can disassemble it.
-                const fs::path dump = fmt::format("shader_dump/compute_{:x}.bin", q[8]);
-                if (!fs::exists(dump)) {
-                    std::vector<u8> prog(0x50 + 0x8000, 0);
-                    ReadGpuPartial(code + q[8], prog.data() + 0x50, 0x8000);
-                    common::WriteFile(dump, prog);
+                         q[0x13] >> 16, q[0x11] & 0x3FFFF, q[0x14] & 0xFF);
+            // Dump each program once behind a zeroed 0x50-byte header (graphics tooling layout); the launch shape
+            // goes in the name because it is not part of the program.
+            const fs::path dump = fmt::format("shader_dump/compute_{:x}_{}x{}x{}_{:x}.bin", q[8], q[0x12] >> 16, q[0x13] & 0xFFFF,
+                                              q[0x13] >> 16, q[0x11] & 0x3FFFF);
+            static std::set<u32> dumped;
+            if (dumped.insert(q[8]).second && !fs::exists(dump)) {
+                std::vector<u8> prog(0x50 + 0x40000, 0);
+                ReadGpuPartial(code + q[8], prog.data() + 0x50, 0x40000);
+                common::WriteFile(dump, prog);
+                // Its constant buffer 1 too: jump tables for BRX live there.
+                if (q[0x14] & 2) {
+                    const u64 cb1 = (u64(q[0x20] & 0xFF) << 32) | q[0x1F];
+                    std::vector<u8> cb(std::min<u32>(q[0x20] >> 15, 0x10000), 0);
+                    ReadGpuPartial(cb1, cb.data(), cb.size());
+                    fs::path cbp = dump;
+                    cbp.replace_extension(".cb1");
+                    common::WriteFile(cbp, cb);
                 }
             }
         }

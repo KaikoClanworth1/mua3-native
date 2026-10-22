@@ -201,6 +201,7 @@ struct DriverConstants {
     u32 swizzle[32][4];
     u32 misc[4];
     u32 gmem[8][4]; // compute global memory windows: base lo, base hi, size
+    u32 image[8][4]; // compute images: base lo, base hi, width | height << 16, depth | mode << 16 | bh << 24 | bd << 28
 };
 
 } // namespace
@@ -507,11 +508,21 @@ void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
         cs = it->second;
     } else {
         // Compute programs have no SPH: put them behind a zeroed one like the graphics stages expect.
-        std::vector<u8> buf(0x50 + 0x10000, 0);
-        const size_t got = g.ReadGpuPartial(prog, buf.data() + 0x50, 0x10000);
+        std::vector<u8> buf(0x50 + 0x40000, 0);
+        const size_t got = g.ReadGpuPartial(prog, buf.data() + 0x50, 0x40000);
         if (got < 0x10)
             return;
+        std::vector<u8> cb1;
+        if (q[0x14] & 2) { // jump tables for BRX
+            const u64 a = (u64(q[0x20] & 0xFF) << 32) | q[0x1F];
+            cb1.assign(std::min<u32>(q[0x20] >> 15, 0x10000), 0);
+            g.ReadGpuPartial(a, cb1.data(), cb1.size());
+            opt.cbuf1 = cb1.data();
+            opt.cbuf1_size = u32(cb1.size());
+        }
         cs = shaders_->Get(shader::Stage::Compute, buf.data(), 0x50 + got, &opt);
+        opt.cbuf1 = nullptr;
+        opt.cbuf1_size = 0;
         compute_by_key_[key] = cs;
         code_lo_ = std::min(code_lo_, prog);
         code_hi_ = std::max(code_hi_, prog + got);
@@ -633,6 +644,65 @@ void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
             if (log)
                 LOG_INFO("Renderer", "  gmem window {}: {:#x} size {:#x}", i, a, size);
         }
+    }
+    // ---- images (SUST): mapped as extra global memory windows over their guest storage
+    u32 next_window = 0;
+    while (next_window < shader::kGmemWindows && win_size[next_window])
+        next_window++;
+    for (u32 k = 0; k < cs->info.images.size() && k < 8; k++) {
+        u32 h = 0;
+        g.ReadGpu(cb_addr[tex_cb] + cs->info.images[k], &h, 4);
+        TicEntry tic;
+        g.ReadGpu(tic_base + u64(h & 0xFFFFF) * 32, tic.w.data(), 32);
+        const u32 fmt = tic.Format(), rt = tic.RType();
+        const u32 mode = fmt == 0x03 ? 1u : fmt == 0x01 ? 2u : (fmt == 0x08 && rt == 2) ? 3u : fmt == 0x0F ? 4u
+                       : fmt == 0x0C && rt == 7 ? 5u : fmt == 0x04 ? 6u : 0u;
+        const u32 bpb = mode == 2 ? 16 : (mode == 1 || mode == 6) ? 8 : 4;
+        const u32 w = tic.Width(), hgt = tic.Type() == 0 ? 1 : tic.Height(), dep = tic.Type() == 2 ? tic.Depth() : 1;
+        // Same small-image block shrinking as the texture cache's level 0.
+        u32 bh = tic.BlockHeight(), bd = tic.BlockDepth();
+        while (bh > 0 && (8u << (bh - 1)) >= hgt)
+            bh--;
+        while (bd > 0 && (1u << (bd - 1)) >= dep)
+            bd--;
+        const u64 size = BlockLinearSize(w, hgt, dep, bpb, bh, bd);
+        if (!mode || next_window >= shader::kGmemWindows || size > (64u << 20)) {
+            static std::set<u32> warned;
+            if (warned.insert(fmt | (rt << 8)).second)
+                LOG_WARN("Renderer", "compute image store: unsupported format {:#x}/{} or no free window", fmt, rt);
+            continue;
+        }
+        const u64 a = tic.Address();
+        const u32 i = next_window++;
+        GmemWindow& gw = gmem_[i];
+        if (gw.capacity < size) {
+            gw = {};
+            gw.capacity = u32(common::AlignUp(size, 1u << 16));
+            D3D11_BUFFER_DESC bd_{gw.capacity, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0,
+                                  D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
+            dev_->CreateBuffer(&bd_, nullptr, &gw.buf);
+            D3D11_BUFFER_DESC sd{gw.capacity, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0};
+            dev_->CreateBuffer(&sd, nullptr, &gw.staging);
+            D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+            ud.Format = DXGI_FORMAT_R32_TYPELESS;
+            ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+            ud.Buffer = {0, gw.capacity / 4, D3D11_BUFFER_UAV_FLAG_RAW};
+            dev_->CreateUnorderedAccessView(gw.buf.Get(), &ud, &gw.uav);
+        }
+        gw.uploaded.assign(size_t(size), 0);
+        g.ReadGpuPartial(a, gw.uploaded.data(), size_t(size));
+        const D3D11_BOX box{0, 0, 0, u32(size), 1, 1};
+        ctx_->UpdateSubresource(gw.buf.Get(), 0, &box, gw.uploaded.data(), u32(size), u32(size));
+        uavs[i] = gw.uav.Get();
+        win_addr[i] = a;
+        win_size[i] = u32(size);
+        drv.gmem[i][0] = u32(a);
+        drv.gmem[i][1] = u32(a >> 32);
+        drv.gmem[i][2] = u32(size);
+        drv.image[k][0] = u32(a);
+        drv.image[k][1] = u32(a >> 32);
+        drv.image[k][2] = w | (hgt << 16);
+        drv.image[k][3] = dep | (mode << 16) | (bh << 24) | (bd << 28);
     }
     ID3D11Buffer* drv_cb = dc.Constant(1001, &drv, sizeof(drv));
     // Render targets may be sampled by the kernel: unbind them from the output stage.

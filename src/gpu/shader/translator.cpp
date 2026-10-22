@@ -249,7 +249,9 @@ private:
     // Block bodies plus their terminators, re-emitted as nested if/else and natural loops (FXC handles these
     // well; the generic block-dispatch loop can take it minutes). Returns false for shapes it does not model.
     struct Term {
-        enum Kind { Fall, Jump, Cond, Exit, CondExit } kind = Fall;
+        enum Kind { Fall, Jump, Cond, Exit, CondExit, Switch } kind = Fall;
+        std::string sel;                               // Switch: selector register
+        std::vector<std::pair<u32, u32>> cases;        // Switch: (selector value, block id)
         std::string cond;      // Cond / CondExit
         u32 target = ~0u;      // block id, or ~0u for "outside the program"
         std::string exit_code; // Exit / CondExit
@@ -267,6 +269,9 @@ private:
     bool BuildStructuredBlocks();
     bool EmitStructured(std::string& body);
     std::string sfail_;
+    // BRX (indirect branch) jump tables, resolved from constant buffer 1: pc -> (table value, target pc).
+    std::map<u32, std::vector<std::pair<u32, u32>>> brx_;
+    bool ResolveBrx(u32 pc, u64 insn);
     // Forward jumps out of a region's last block: the condition is kept in a flag and the blocks it skips
     // are wrapped in if (!flag) by the enclosing sequence.
     std::set<u32> pending_fwd_, fwd_used_;
@@ -756,6 +761,23 @@ bool Translator::DiscoverBlocks() {
                 work.push_back(target);
                 break;
             }
+            case Op::BRX:
+                if (!ResolveBrx(pc, insn)) {
+                    res_.error = fmt::format("BRX at {:#x}: jump table not found", pc);
+                    return false;
+                }
+                for (auto& [value, target] : brx_[pc]) {
+                    leaders.insert(target);
+                    work.push_back(target);
+                    if (target <= pc)
+                        has_back_edge_ = true;
+                }
+                if (!unconditional) {
+                    leaders.insert(next);
+                    work.push_back(next);
+                }
+                end = true;
+                break;
             case Op::EXIT:
             case Op::SYNC:
             case Op::BRK:
@@ -801,7 +823,7 @@ bool Translator::DiscoverBlocks() {
         block_of_[pc] = cur.start;
         const Op op = Decode(At(pc));
         prev = pc;
-        if (op == Op::BRA || op == Op::EXIT || op == Op::SYNC || op == Op::BRK || op == Op::CONT) {
+        if (op == Op::BRA || op == Op::BRX || op == Op::EXIT || op == Op::SYNC || op == Op::BRK || op == Op::CONT) {
             cur.end = NextPc(pc);
             blocks_[cur.start] = cur;
             open = false;
@@ -869,6 +891,12 @@ bool Translator::AnalyzeStacks() {
                     push_successor(next, stack);
                 break;
             }
+            case Op::BRX:
+                for (auto& [value, target] : brx_[pc])
+                    push_successor(target, stack);
+                if (!unconditional)
+                    push_successor(next, stack);
+                break;
             case Op::EXIT:
                 if (!unconditional || Bits(insn, 0, 5) != 15)
                     push_successor(next, stack);
@@ -876,10 +904,57 @@ bool Translator::AnalyzeStacks() {
             default:
                 break;
             }
-            if (next == b.end && op != Op::BRA && op != Op::EXIT && op != Op::SYNC && op != Op::BRK &&
+            if (next == b.end && op != Op::BRA && op != Op::BRX && op != Op::EXIT && op != Op::SYNC && op != Op::BRK &&
                 op != Op::CONT)
                 push_successor(next, stack);
         }
+    }
+    return true;
+}
+
+// BRX Ra, offset: target = pc + 8 + offset + Ra, where Ra was loaded from a jump table in constant buffer 1
+// (LDC c[1][Ri + off]) after the index was clamped (IMNMX with an immediate bound). Reads the table entries.
+bool Translator::ResolveBrx(u32 pc, u64 insn) {
+    if (brx_.count(pc))
+        return true;
+    const u32 ra = u32(Bits(insn, 8, 8));
+    const s32 off = s32(u32(Bits(insn, 20, 24)) << 8) >> 8;
+    const u32 base = u32(s32(pc + 8) + off);
+    u32 cb_index = ~0u, cb_off = 0;
+    s32 bound = -1;
+    for (u32 q = pc, steps = 0; q >= 16 && steps < 48; steps++) {
+        q -= 8;
+        if (q % 32 == 0)
+            continue;
+        const u64 j = At(q);
+        const Op o = Decode(j);
+        if (cb_index == ~0u) {
+            if (o == Op::LDC && u32(Bits(j, 0, 8)) == ra) {
+                cb_index = u32(Bits(j, 36, 5));
+                cb_off = u32(s32(u32(Bits(j, 20, 16)) << 16) >> 16);
+            }
+            continue;
+        }
+        if (o == Op::IMNMX_imm) {
+            bound = s32(u32(Bits(j, 20, 19)) | (Bit(j, 56) ? 0xFFF80000u : 0u));
+            break;
+        }
+    }
+    if (cb_index != 1 || bound < 0 || bound > 255 || !opt_.cbuf1)
+        return false;
+    auto& entries = brx_[pc];
+    for (u32 k = 0; k <= u32(bound); k++) {
+        const u32 at = cb_off + k * 4;
+        if (at + 4 > opt_.cbuf1_size)
+            return false;
+        u32 v;
+        std::memcpy(&v, opt_.cbuf1 + at, 4);
+        u32 t = base + v;
+        if (t % 32 == 0) // never a scheduling control word
+            t += 8;
+        if (!Valid(t))
+            return false;
+        entries.push_back({v, t});
     }
     return true;
 }
@@ -904,7 +979,7 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
     auto form3 = [](Op o, Op reg, Op cbuf) { return o == reg ? 0 : o == cbuf ? 1 : 2; };
 
     switch (op) {
-    case Op::NOP: case Op::DEPBAR: case Op::MEMBAR: case Op::SSY: case Op::PBK: case Op::PCNT:
+    case Op::NOP: case Op::DEPBAR: case Op::MEMBAR: case Op::RET: case Op::SSY: case Op::PBK: case Op::PCNT:
     case Op::CCTL: case Op::CCTLL: case Op::FCHK_reg: case Op::FCHK_cbuf: case Op::FCHK_imm:
         return;
 
@@ -1472,7 +1547,39 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
         const u32 shift = op == Op::LEA_lo_cbuf ? u32(Bits(insn, 47, 5)) : u32(Bits(insn, 39, 5));
         std::string av = R(a);
         if (Bit(insn, 45)) av = "(0u - " + av + ")";
-        SetR(d, fmt::format("({} << {}u) + {}", av, shift, b));
+        const std::string xin = Bit(insn, 46) ? " + (cc_c ? 1u : 0u)" : "";
+        if (Bit(insn, 47)) { // .CC: the carry feeds the LEA.HI.X computing the address's upper word
+            cc_used_ = true;
+            Line(fmt::format("tmpu.x = {} << {}u; tmpu.y = {}; tmpu.z = tmpu.x + tmpu.y{};", av, shift, b, xin));
+            Line("cc_c = tmpu.z < tmpu.x || (tmpu.z == tmpu.x && tmpu.y != 0u); cc_z = tmpu.z == 0u; cc_s = int(tmpu.z) < 0;");
+            SetR(d, "tmpu.z");
+            return;
+        }
+        if (!xin.empty())
+            cc_used_ = true;
+        SetR(d, fmt::format("({} << {}u) + {}{}", av, shift, b, xin));
+        return;
+    }
+    case Op::LEA_hi_reg: case Op::LEA_hi_cbuf: {
+        // d = low word of ((c:a) >> (32 - scale)) + b: the upper half of a scaled 64-bit offset.
+        const bool reg = op == Op::LEA_hi_reg;
+        const std::string b = reg ? R(u32(Bits(insn, 20, 8))) : CbufOperand(insn);
+        const u32 scale = reg ? u32(Bits(insn, 28, 5)) : u32(Bits(insn, 51, 5));
+        const bool neg = reg ? Bit(insn, 37) : Bit(insn, 56);
+        const bool x = reg ? Bit(insn, 38) : Bit(insn, 57);
+        const u32 hs = 32 - scale;
+        Line(fmt::format("tmpu.x = {}; tmpu.y = {};", R(a), R(u32(Bits(insn, 39, 8)))));
+        if (neg) // 64-bit negate
+            Line("tmpu.y = ~tmpu.y + (tmpu.x == 0u ? 1u : 0u); tmpu.x = 0u - tmpu.x;");
+        if (hs == 0)
+            Line("tmpu.z = tmpu.x;");
+        else if (hs >= 32)
+            Line(fmt::format("tmpu.z = tmpu.y >> {}u;", hs - 32));
+        else
+            Line(fmt::format("tmpu.z = (tmpu.x >> {}u) | (tmpu.y << {}u);", hs, 32 - hs));
+        if (x)
+            cc_used_ = true;
+        SetR(d, fmt::format("tmpu.z + {}{}", b, x ? " + (cc_c ? 1u : 0u)" : ""));
         return;
     }
 
@@ -1613,6 +1720,73 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
         }
         return;
     }
+    case Op::SUST: {
+        // Formatted (.P) store to a bound image: the texel is packed and written to guest memory through a global
+        // memory window, at its block-linear address (drv_image[k] describes image k).
+        const bool bound = Bit(insn, 51), raw = Bit(insn, 52);
+        if (stage_ != Stage::Compute || !bound || raw) {
+            res_.unimplemented.insert(raw ? "SUST_D" : bound ? "SUST" : "SUST_bindless");
+            return;
+        }
+        uses_gmem_ = true;
+        const u32 handle_off = u32(Bits(insn, 36, 13)) * 4;
+        u32 k = 0;
+        while (k < res_.images.size() && res_.images[k] != handle_off)
+            k++;
+        if (k == res_.images.size())
+            res_.images.push_back(handle_off);
+        const u32 type = u32(Bits(insn, 33, 3)); // 0 1D, 1 1D buffer, 2 1D array, 3 2D, 4 2D array, 5 3D
+        const u32 cr = a;
+        std::string x = R(cr), y = "0u", z = "0u";
+        if (type == 3 || type == 4 || type == 5)
+            y = R(cr == RZ ? RZ : cr + 1);
+        if (type == 4 || type == 5)
+            z = R(cr == RZ ? RZ : cr + 2);
+        if (type == 2)
+            z = R(cr == RZ ? RZ : cr + 1);
+        const u32 mask = u32(Bits(insn, 20, 4));
+        std::string v[4] = {"0u", "0u", "0u", "0u"};
+        u32 reg = d;
+        for (u32 c = 0; c < 4; c++)
+            if (mask & (1u << c))
+                v[c] = R(reg == RZ ? RZ : reg++);
+        Line(fmt::format("ImageStore({}u, {}, {}, {}, uint4({}, {}, {}, {}), {}u);", k, x, y, z, v[0], v[1], v[2], v[3], mask));
+        return;
+    }
+    case Op::CAL: {
+        // Subroutines here are short straight-line helpers ending in RET: inline the body at the call site.
+        u32 t = BranchTarget(pc, insn);
+        for (u32 n = 0; n < 256 && Valid(t); n++, t = NextPc(t)) {
+            const u64 si = At(t);
+            const Op so = Decode(si);
+            if (so == Op::RET)
+                return;
+            if (so == Op::BRA || so == Op::BRX || so == Op::CAL || so == Op::SSY || so == Op::SYNC || so == Op::EXIT ||
+                so == Op::PBK || so == Op::BRK) {
+                res_.unimplemented.insert("CAL_branching");
+                return;
+            }
+            const u32 pidx = u32(Bits(si, 16, 3));
+            const bool pneg = Bit(si, 19);
+            const bool guarded = !(pidx == PT && !pneg);
+            if (guarded) {
+                Line(fmt::format("if ({}) {{", P(pidx, pneg)));
+                indent_++;
+            }
+            if (so == Op::TEX || so == Op::TEX_b || so == Op::TEXS || so == Op::TLD || so == Op::TLD_b || so == Op::TLDS ||
+                so == Op::TLD4 || so == Op::TLD4_b || so == Op::TLD4S || so == Op::TXQ || so == Op::TXQ_b ||
+                so == Op::TMML || so == Op::TMML_b)
+                TexSample(si, t, so);
+            else
+                EmitInstruction(t, si, so);
+            if (guarded) {
+                indent_--;
+                Line("}");
+            }
+        }
+        res_.unimplemented.insert("CAL_no_ret");
+        return;
+    }
     case Op::BAR:
         if (stage_ == Stage::Compute)
             Line("GroupMemoryBarrierWithGroupSync();");
@@ -1670,9 +1844,24 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
         SetR(d, "tmpu.y");
         return;
     }
-    case Op::RED:
-        res_.unimplemented.insert("RED");
+    case Op::RED: { // reduction: a global atomic without a result. Data 0-7, address 8-15, size 20, op 23, offset 28.
+        if (stage_ != Stage::Compute) {
+            res_.unimplemented.insert("RED");
+            return;
+        }
+        uses_gmem_ = true;
+        const s32 off = s32(u32(Bits(insn, 28, 20)) << 12) >> 12;
+        const std::string hi = Bit(insn, 48) && a != RZ ? R(a + 1) : "0u";
+        if (off >= 0)
+            Line(fmt::format("tmpu.x = {0} + {1}; tmpu.y = {2} + ((tmpu.x < {0}) ? 1u : 0u);", R(a), Hex(u32(off)), hi));
+        else
+            Line(fmt::format("tmpu.x = {0} - {1}; tmpu.y = {2} - (({0} < {1}) ? 1u : 0u);", R(a), Hex(u32(-off)), hi));
+        const u32 size = u32(Bits(insn, 20, 3));
+        if (size != 0 && size != 1)
+            res_.unimplemented.insert(fmt::format("RED_size{}", size));
+        Line(fmt::format("GmemAtomic({}u, tmpu.x, tmpu.y, {});", u32(Bits(insn, 23, 3)), R(d)));
         return;
+    }
     case Op::LDG: case Op::STG: case Op::ATOM: {
         if (stage_ != Stage::Compute) { // global memory windows are only bound for compute dispatches
             res_.unimplemented.insert(OpName(op));
@@ -1923,6 +2112,7 @@ cbuffer Driver : register(b13) {
     uint4 tex_swizzle[32];   // x: packed swizzle
     uint4 drv_misc;          // x: base instance, y: alpha test func, z: alpha ref (float bits), w: alpha test enable
     uint4 drv_gmem[8];       // compute global memory windows: x base lo, y base hi, z size
+    uint4 drv_image[8];      // compute images (SUST): base, size and layout (see ImageStore)
 };
 float2 H2(uint v) { return float2(f16tof32(v & 0xFFFFu), f16tof32(v >> 16)); }
 uint P2(float2 v) { return f32tof16(v.x) | (f32tof16(v.y) << 16); }
@@ -1991,6 +2181,21 @@ bool Translator::BuildStructuredBlocks() {
             const bool guarded = !(pidx == PT && !pneg);
             const std::string guard = P(pidx, pneg);
             const bool is_flow = op == Op::BRA || op == Op::EXIT || op == Op::SYNC || op == Op::BRK || op == Op::CONT;
+            if (op == Op::BRX) {
+                if (NextPc(pc) != b.end || guarded)
+                    return false;
+                Term& t = sb.term;
+                t.kind = Term::Switch;
+                t.sel = R(u32(Bits(insn, 8, 8)));
+                for (auto& [value, target] : brx_[pc]) {
+                    auto it = blocks_.find(target);
+                    if (it == blocks_.end())
+                        return false;
+                    t.cases.push_back({value, it->second.id});
+                }
+                has_term = true;
+                continue;
+            }
             if (is_flow) {
                 if (NextPc(pc) != b.end)
                     return false; // flow in the middle of a block
@@ -2092,6 +2297,22 @@ bool Translator::Seq(u32 first, u32 last, u32 end_target, LoopCtx ctx, u32 skip_
             i = t;
             continue;
         }
+        // A flagged forward jump escapes this region altogether: the rest of the region must not run either, and
+        // the flag stays pending for the enclosing region that contains its target.
+        if (auto f = std::find_if(pending_fwd_.begin(), pending_fwd_.end(), [&](u32 t) { return t > last; });
+            f != pending_fwd_.end()) {
+            const u32 t = *f;
+            pending_fwd_.erase(f);
+            SLine(fmt::format("if (!fwd{}) {{", t));
+            sindent_++;
+            if (!Seq(i, last, end_target, ctx, skip_header))
+                return false;
+            sindent_--;
+            SLine("}");
+            pending_fwd_.insert(t);
+            i = last;
+            continue;
+        }
         // Loop header: the latest back edge into i closes the loop.
         if (i != skip_header) {
             u32 latch = ~0u;
@@ -2132,10 +2353,53 @@ bool Translator::Seq(u32 first, u32 last, u32 end_target, LoopCtx ctx, u32 skip_
             SLine("}");
             i++;
             continue;
+        case Term::Switch: {
+            // Cases are the contiguous regions between the distinct targets; the highest target is the join.
+            std::vector<u32> ids;
+            for (auto& c : t.cases)
+                ids.push_back(c.second);
+            std::sort(ids.begin(), ids.end());
+            ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+            const u32 join = ids.back();
+            if (ids.front() <= i || join > last)
+                return SFail(fmt::format("switch at {} targets {}..{} outside region {}..{}", i, ids.front(), join, first, last));
+            SLine(fmt::format("uint sw{} = {};", i, t.sel));
+            for (size_t k = 0; k + 1 < ids.size(); k++) {
+                std::string cond;
+                for (auto& c : t.cases)
+                    if (c.second == ids[k])
+                        cond += fmt::format("{}sw{} == {}", cond.empty() ? "" : " || ", i, Hex(c.first));
+                SLine(fmt::format("{}if ({}) {{", k ? "} else " : "", cond));
+                sindent_++;
+                if (!Seq(ids[k], ids[k + 1], join, ctx, ~0u))
+                    return false;
+                sindent_--;
+            }
+            if (ids.size() > 1)
+                SLine("}");
+            i = join;
+            continue;
+        }
         case Term::Fall:
         case Term::Jump:
             if (t.target == i + 1 && (i + 1 < last || t.target == end_target)) {
                 i++;
+                continue;
+            }
+            if (t.target != ~0u && t.target > last && t.target != ctx.header && t.target != ctx.exit &&
+                (ctx.exit == ~0u || t.target < ctx.exit)) {
+                SLine(fmt::format("fwd{} = true;", t.target));
+                pending_fwd_.insert(t.target);
+                fwd_used_.insert(t.target);
+                if (i + 1 < last) {
+                    SLine(fmt::format("if (!fwd{}) {{", t.target));
+                    sindent_++;
+                    if (!Seq(i + 1, last, end_target, ctx, ~0u))
+                        return false;
+                    sindent_--;
+                    SLine("}");
+                }
+                i = last;
                 continue;
             }
             if (!Goto(i, t.target, last, end_target, ctx))
@@ -2156,11 +2420,21 @@ bool Translator::Seq(u32 first, u32 last, u32 end_target, LoopCtx ctx, u32 skip_
                 i++;
                 continue;
             }
-            if (tg > last && i + 1 == last && tg != ~0u && (ctx.exit == ~0u || tg < ctx.exit)) {
+            if (tg > last && tg != ~0u && (ctx.exit == ~0u || tg < ctx.exit)) {
+                // Forward jump out of this region: remember it in a flag, skip the rest of the region, and let
+                // the enclosing sequence skip everything up to the target.
                 SLine(fmt::format("fwd{} = {};", tg, t.cond));
                 pending_fwd_.insert(tg);
                 fwd_used_.insert(tg);
-                i++;
+                if (i + 1 < last) {
+                    SLine(fmt::format("if (!fwd{}) {{", tg));
+                    sindent_++;
+                    if (!Seq(i + 1, last, end_target, ctx, ~0u))
+                        return false;
+                    sindent_--;
+                    SLine("}");
+                }
+                i = last;
                 continue;
             }
             if (tg <= i + 1 || tg > last)
@@ -2275,6 +2549,32 @@ bool Translator::Run() {
             const bool guarded = !(pidx == PT && !pneg);
             const std::string guard = P(pidx, pneg);
             const bool is_flow = op == Op::BRA || op == Op::EXIT || op == Op::SYNC || op == Op::BRK || op == Op::CONT;
+            if (op == Op::BRX) {
+                if (guarded) {
+                    Line(fmt::format("if ({}) {{", guard));
+                    indent_++;
+                }
+                Line(fmt::format("tmpu.w = {};", R(u32(Bits(insn, 8, 8)))));
+                bool first = true;
+                for (auto& [value, target] : brx_[pc]) {
+                    Line(fmt::format("{}if (tmpu.w == {}) {{", first ? "" : "else ", Hex(value)));
+                    indent_++;
+                    EmitJump(target);
+                    indent_--;
+                    Line("}");
+                    first = false;
+                }
+                if (guarded) {
+                    indent_--;
+                    auto next = blocks_.find(b.end);
+                    Line("} else {");
+                    if (next != blocks_.end())
+                        Line(fmt::format("    blk = {}u;", next->second.id));
+                    Line("}");
+                }
+                terminated = true;
+                continue;
+            }
             if (is_flow) {
                 std::string cond = guarded ? guard : "";
                 const u32 cct = u32(Bits(insn, 0, 5));
@@ -2468,6 +2768,38 @@ bool Translator::Run() {
                                    "        else gmem{0}.InterlockedExchange(off, v, o);\n        break;\n", i);
             }
             src += "    default: break;\n    }\n    return o;\n}\n";
+            if (!res_.images.empty()) {
+                // drv_image[k]: x/y base address, z width | height << 16, w depth | mode << 16 | bh << 24 | bd << 28.
+                // Modes: 1 RGBA16F, 2 RGBA32 raw, 3 RGBA8 UNORM, 4 R32 raw, 5 RG16F, 6 RG32 raw.
+                src += R"HLSL(uint GobOffset(uint x, uint y) {
+    return ((x % 64u) / 32u) * 256u + ((y % 8u) / 2u) * 64u + ((x % 32u) / 16u) * 32u + (y % 2u) * 16u + (x % 16u);
+}
+void ImageStore(uint k, uint x, uint y, uint z, uint4 v, uint mask) {
+    uint4 im = drv_image[k];
+    uint w = im.z & 0xFFFFu, h = im.z >> 16, d = im.w & 0xFFFFu, mode = (im.w >> 16) & 0xFFu;
+    uint bh = (im.w >> 24) & 7u, bd = (im.w >> 28) & 7u;
+    if (mode == 0u || x >= w || y >= h || z >= d) return;
+    uint bpb = mode == 2u ? 16u : (mode == 1u || mode == 6u) ? 8u : 4u;
+    uint gobs_x = (w * bpb + 63u) / 64u, gobs_y = (h + 7u) / 8u;
+    uint blocks_y = (gobs_y + (1u << bh) - 1u) >> bh;
+    uint block_size = 512u << (bh + bd), rows = 8u << bh;
+    uint xb = x * bpb;
+    uint off = ((z >> bd) * blocks_y + y / rows) * gobs_x * block_size +
+               ((z & ((1u << bd) - 1u)) * (1u << bh) + (y % rows) / 8u) * 512u + (xb / 64u) * block_size + GobOffset(xb, y);
+    uint4 t = v;
+    uint n = 1u;
+    if (mode == 1u) { t.x = f32tof16(asfloat(v.x)) | (f32tof16(asfloat(v.y)) << 16); t.y = f32tof16(asfloat(v.z)) | (f32tof16(asfloat(v.w)) << 16); n = 2u; }
+    else if (mode == 2u) n = 4u;
+    else if (mode == 3u) { uint4 b = uint4(saturate(asfloat(v)) * 255.0f + 0.5f); t.x = b.x | (b.y << 8) | (b.z << 16) | (b.w << 24); }
+    else if (mode == 5u) t.x = f32tof16(asfloat(v.x)) | (f32tof16(asfloat(v.y)) << 16);
+    else if (mode == 6u) n = 2u;
+    uint lo = im.x + off, hi = im.y + (lo < im.x ? 1u : 0u);
+    GmemStore(lo, hi, t.x);
+    if (n > 1u) GmemStore(lo + 4u, hi, t.y);
+    if (n > 2u) { GmemStore(lo + 8u, hi, t.z); GmemStore(lo + 12u, hi, t.w); }
+}
+)HLSL";
+            }
         }
         if (uses_smem_)
             src += fmt::format("groupshared uint smem[{}];\n", SmemWords());
