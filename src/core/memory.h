@@ -101,6 +101,13 @@ public:
 
     std::mutex& Lock() { return mutex_; }
 
+    // Write tracking (used to invalidate host copies of guest textures written by the CPU).
+    // Pages are write-protected until the first write, which marks them dirty.
+    void TrackWrites(u64 addr, u64 size);
+    // True if any page in the range was written since it was last tracked.
+    bool ConsumeDirty(u64 addr, u64 size);
+    bool HandleWriteFault(uintptr_t host_addr);
+
 private:
     struct Vma {
         u64 size;
@@ -115,6 +122,8 @@ private:
 
     u8* base_ = nullptr;
     std::vector<std::atomic<u64>> page_bits_; // 1 bit per committed 4 KiB page
+    std::vector<std::atomic<u64>> tracked_bits_, dirty_bits_;
+    std::mutex track_mutex_;
     std::map<u64, Vma> vmas_; // non-free regions only
     u64 heap_size_ = 0;
     u64 used_ = 0;

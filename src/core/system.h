@@ -1,4 +1,6 @@
 #pragma once
+#include <atomic>
+#include <memory>
 #include <memory>
 #include "common/common.h"
 #include "core/config.h"
@@ -28,6 +30,8 @@ public:
     const std::vector<LoadedModule>& Modules() const { return modules_; }
     const LoadedModule* ModuleFor(u64 addr) const;
     std::string Symbolize(u64 addr) const;
+    void InstallTraces();
+    void ArmTraces();
 
     Memory& Mem() { return *memory_; }
     kernel::Kernel& Kern() { return *kernel_; }
@@ -38,6 +42,8 @@ private:
     std::unique_ptr<Memory> memory_;
     std::unique_ptr<kernel::Kernel> kernel_;
     std::vector<LoadedModule> modules_;
+    std::vector<std::shared_ptr<std::atomic<u64>>> trace_counters_;
+    std::atomic<bool> trace_armed_{true};
     u64 main_stack_top_ = 0;
     u32 main_stack_size_ = 0x100000;
     s32 main_prio_ = 44;

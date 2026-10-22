@@ -435,6 +435,68 @@ struct CtrlGpuDev final : Device {
     std::shared_ptr<kernel::Event> QueryEvent(u32 id) override { return events[id & 1]; }
 };
 
+// Host1x client engines (nvhost-nvdec, nvhost-vic, nvhost-nvjpg): command submission with syncpoint fences.
+// Work completes immediately; decoded output is not produced yet (video frames stay black).
+struct Host1xDev final : Device {
+    explicit Host1xDev(u32 sp) : syncpt(sp) {}
+    u32 syncpt;
+    std::shared_ptr<kernel::Event> event = MakeEvent("host1x", true);
+
+    u32 Ioctl(u32 cmd, std::vector<u8>& in, std::vector<u8>& out) override {
+        out = in;
+        auto& g = gpu::G();
+        if (((cmd >> 8) & 0xFF) == 0x48) // channel ioctls ('H'): SET_NVMAP_FD etc.
+            return kSuccess;
+        switch (cmd & 0xFF) {
+        case 0x01: { // SUBMIT {cmdbuf_count, reloc_count, syncpt_count, fence_count} + arrays
+            const u32 ncmd = Arg<u32>(in, 0), nreloc = Arg<u32>(in, 4), nsync = Arg<u32>(in, 8),
+                      nfence = Arg<u32>(in, 12);
+            size_t off = 16 + size_t(ncmd) * 12 + size_t(nreloc) * 16 + size_t(nreloc) * 4;
+            const size_t sync_off = off;
+            off += size_t(nsync) * 20;
+            for (u32 i = 0; i < nfence; i++) {
+                const size_t s = sync_off + size_t(std::min(i, nsync ? nsync - 1 : 0)) * 20;
+                const u32 id = nsync ? Arg<u32>(in, s) : syncpt;
+                const u32 incr = nsync ? Arg<u32>(in, s + 4) : 1;
+                const u32 value = g.ReserveSyncpoint(id, incr);
+                g.IncrementSyncpoint(id, incr);
+                Set<u32>(out, off + i * 4, value); // fence thresholds are one u32 each
+            }
+            if (!nfence)
+                for (u32 i = 0; i < nsync; i++) {
+                    const u32 id = Arg<u32>(in, sync_off + i * 20), incr = Arg<u32>(in, sync_off + i * 20 + 4);
+                    g.ReserveSyncpoint(id, incr);
+                    g.IncrementSyncpoint(id, incr);
+                }
+            return kSuccess;
+        }
+        case 0x02: // GET_SYNCPOINT {param, value}
+            Set<u32>(out, 4, syncpt);
+            return kSuccess;
+        case 0x03: // GET_WAITBASE
+            Set<u32>(out, 4, 0);
+            return kSuccess;
+        case 0x07: return kSuccess; // SET_SUBMIT_TIMEOUT
+        case 0x09:                  // MAP_BUFFER {num_entries, data_address, attach_host_ch_das, pad} + {handle, address}
+        case 0x0A: {                // UNMAP_BUFFER
+            const u32 n = Arg<u32>(in, 0);
+            for (u32 i = 0; i < n; i++) {
+                const u32 handle = Arg<u32>(in, 12 + i * 8);
+                u32 addr = 0;
+                if ((cmd & 0xFF) == 0x09)
+                    if (auto o = Map().Get(handle))
+                        addr = u32(o->addr >> 8) | 1; // any stable non-zero device address
+                Set<u32>(out, 12 + i * 8 + 4, addr);
+            }
+            return kSuccess;
+        }
+        }
+        LOG_DEBUG("nvdrv", "{}: ioctl {:#x} ignored", name, cmd);
+        return kSuccess;
+    }
+    std::shared_ptr<kernel::Event> QueryEvent(u32) override { return event; }
+};
+
 struct NullDev final : Device {
     u32 Ioctl(u32 cmd, std::vector<u8>& in, std::vector<u8>& out) override {
         out = in;
@@ -472,6 +534,8 @@ public:
                 dev = std::make_shared<CtrlDev>();
             else if (path == "/dev/nvhost-ctrl-gpu")
                 dev = std::make_shared<CtrlGpuDev>();
+            else if (path == "/dev/nvhost-nvdec" || path == "/dev/nvhost-vic" || path == "/dev/nvhost-nvjpg")
+                dev = std::make_shared<Host1xDev>(s.next_syncpt++);
             else
                 dev = std::make_shared<NullDev>();
             dev->name = path;

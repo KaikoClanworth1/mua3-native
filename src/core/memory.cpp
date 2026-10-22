@@ -4,12 +4,86 @@
 
 namespace core {
 
+static Memory* g_tracking_memory = nullptr;
+
+// First write to a write-tracked page: mark it dirty, make it writable again and retry the instruction.
+// Works for JIT code and host code alike (vectored handlers run before dynarmic's own fault handling).
+static LONG CALLBACK WriteTrackingHandler(EXCEPTION_POINTERS* ep) {
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || !g_tracking_memory)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (ep->ExceptionRecord->ExceptionInformation[0] != 1) // not a write
+        return EXCEPTION_CONTINUE_SEARCH;
+    const auto host = static_cast<uintptr_t>(ep->ExceptionRecord->ExceptionInformation[1]);
+    return g_tracking_memory->HandleWriteFault(host) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+}
+
 Memory::Memory() {
     base_ = static_cast<u8*>(VirtualAlloc(nullptr, layout::kSpaceEnd, MEM_RESERVE, PAGE_NOACCESS));
     if (!base_)
         PANIC("Failed to reserve {} GB of address space for the guest", layout::kSpaceEnd >> 30);
     page_bits_ = std::vector<std::atomic<u64>>(size_t(layout::kSpaceEnd >> 12 >> 6));
+    tracked_bits_ = std::vector<std::atomic<u64>>(page_bits_.size());
+    dirty_bits_ = std::vector<std::atomic<u64>>(page_bits_.size());
+    g_tracking_memory = this;
+    AddVectoredExceptionHandler(1, WriteTrackingHandler);
     LOG_INFO("Memory", "Guest address space reserved at host {:p}", (void*)base_);
+}
+
+bool Memory::HandleWriteFault(uintptr_t host_addr) {
+    const uintptr_t b = reinterpret_cast<uintptr_t>(base_);
+    if (host_addr < b || host_addr >= b + layout::kSpaceEnd)
+        return false;
+    const u64 page = (host_addr - b) >> 12;
+    const u64 bit = 1ull << (page & 63);
+    auto& tw = tracked_bits_[size_t(page >> 6)];
+    if (!(tw.load() & bit)) {
+        // Another thread may have just unprotected it; if the page is writable now, retry.
+        MEMORY_BASIC_INFORMATION mbi{};
+        VirtualQuery(base_ + (page << 12), &mbi, sizeof(mbi));
+        return mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_READWRITE);
+    }
+    dirty_bits_[size_t(page >> 6)].fetch_or(bit);
+    DWORD old;
+    VirtualProtect(base_ + (page << 12), 0x1000, PAGE_READWRITE, &old);
+    tw.fetch_and(~bit);
+    return true;
+}
+
+void Memory::TrackWrites(u64 addr, u64 size) {
+    if (!size || !IsValid(addr, size))
+        return;
+    std::lock_guard lk(track_mutex_);
+    const u64 first = addr >> 12, last = (addr + size - 1) >> 12;
+    u64 run_start = 0;
+    bool in_run = false;
+    for (u64 p = first; p <= last + 1; p++) {
+        bool need = false;
+        if (p <= last) {
+            const u64 bit = 1ull << (p & 63);
+            dirty_bits_[size_t(p >> 6)].fetch_and(~bit);
+            need = !(tracked_bits_[size_t(p >> 6)].fetch_or(bit) & bit);
+        }
+        if (need && !in_run) {
+            run_start = p;
+            in_run = true;
+        } else if (!need && in_run) {
+            DWORD old;
+            VirtualProtect(base_ + (run_start << 12), (p - run_start) << 12, PAGE_READONLY, &old);
+            in_run = false;
+        }
+    }
+}
+
+bool Memory::ConsumeDirty(u64 addr, u64 size) {
+    if (!size)
+        return false;
+    bool dirty = false;
+    for (u64 p = addr >> 12, e = (addr + size - 1) >> 12; p <= e; p++) {
+        const u64 bit = 1ull << (p & 63);
+        if (dirty_bits_[size_t(p >> 6)].load(std::memory_order_relaxed) & bit)
+            dirty = true;
+    }
+    return dirty;
 }
 
 void Memory::MarkPages(u64 addr, u64 size, bool committed) {
@@ -92,6 +166,11 @@ bool Memory::Unmap(u64 addr, u64 size) {
     if (!size)
         return true;
     MarkPages(addr, size, false);
+    for (u64 p = addr >> 12, e = (addr + size + 0xFFF) >> 12; p < e; p++) {
+        const u64 bit = 1ull << (p & 63);
+        tracked_bits_[size_t(p >> 6)].fetch_and(~bit);
+        dirty_bits_[size_t(p >> 6)].fetch_and(~bit);
+    }
     VirtualFree(base_ + addr, size, MEM_DECOMMIT);
     Insert(addr, size, MS_Free, MP_None, 0);
     used_ = used_ > size ? used_ - size : 0;

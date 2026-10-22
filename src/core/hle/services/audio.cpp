@@ -1,6 +1,9 @@
 // audren:u / audout:u. The renderer protocol is answered so the game's sound library runs;
 // mixing to the host device (XAudio2/SDL) hooks in at RequestUpdate.
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <thread>
 
 #include "core/hle/service.h"
@@ -27,6 +30,10 @@ class IAudioRenderer final : public Service {
 public:
     IAudioRenderer(u32 rate, u32 samples, u32 mix_buffers) : Service("audren:IAudioRenderer") {
         quiet_ = true;
+        if (rate)
+            rate_ = rate;
+        if (samples)
+            samples_ = samples;
         Reg(0, "GetSampleRate", [rate](Request& r) { r.Push<u32>(rate); });
         Reg(1, "GetSampleCount", [samples](Request& r) { r.Push<u32>(samples); });
         Reg(2, "GetMixBufferCount", [mix_buffers](Request& r) { r.Push<u32>(mix_buffers); });
@@ -67,29 +74,42 @@ private:
             std::memcpy(e, &state, 4);
             out.insert(out.end(), e, e + 0x10);
         }
-        // Voices: report wave buffers as consumed so streaming keeps moving.
+        // Voices: run each voice's wave-buffer queue at its sample rate so the game's buffer
+        // bookkeeping (release, stop and flush waits) behaves like the DSP.
         const size_t voices_at = pools_at + mempools_in + voice_res_in;
         for (u32 i = 0; i < n_voices; i++) {
             u8 e[0x10]{};
             const size_t v = voices_at + i * 0x170;
             if (v + 0x170 <= in.size()) {
-                const bool in_use = in[v + 4] != 0;
-                if (in_use) {
-                    played_[i % 1024] += 240;
-                    const u64 played = played_[i % 1024];
-                    std::memcpy(e, &played, 8);
-                    const u32 consumed = 1;
-                    std::memcpy(e + 8, &consumed, 4);
-                }
+                VoiceState& vs = voices_[i % kMaxVoices];
+                UpdateVoice(vs, &in[v]);
+                std::memcpy(e, &vs.played, 8);
+                std::memcpy(e + 8, &vs.consumed, 4);
             }
             out.insert(out.end(), e, e + 0x10);
         }
-        out.insert(out.end(), size_t(n_effects) * 0x10, 0);
+        // Effects: EffectInfo::InParameter is 0xC0 bytes (+0 type, +1 is_new, +2 enabled). The server's
+        // StoreStatus reports 3 (enabled) or 4 (disabled); IsAuxRemovable waits for the latter before the
+        // game may tear an effect (and the voice routed through it) down.
+        const size_t effects_at = voices_at + voices_in;
+        for (u32 i = 0; i < n_effects; i++) {
+            u8 e[0x10]{};
+            const size_t fx = effects_at + size_t(i) * 0xC0;
+            if (fx + 0xC0 <= in.size() && in[fx] != 0)
+                e[0] = in[fx + 2] ? 3 : 4;
+            out.insert(out.end(), e, e + 0x10);
+        }
         out.insert(out.end(), size_t(n_sinks) * 0x20, 0);
         out.insert(out.end(), 0x10, 0); // performance
         out.insert(out.end(), 0xB0, 0); // behavior
         std::vector<u8> render_info(0x10);
-        elapsed_frames_++;
+        if (++elapsed_frames_ % 2000 == 0) {
+            u32 queued = 0;
+            for (u32 i = 0; i < std::min(n_voices, kMaxVoices); i++)
+                for (auto& b : voices_[i].buffers)
+                    queued += b.queued;
+            LOG_INFO("audren", "{} updates ({} voices, {} queued wave buffers)", elapsed_frames_, n_voices, queued);
+        }
         std::memcpy(render_info.data(), &elapsed_frames_, 8);
         out.insert(out.end(), render_info.begin(), render_info.end());
 
@@ -110,9 +130,102 @@ private:
         }
     }
 
+    // Server-side view of one voice (the DSP's wave-buffer ring).
+    struct VoiceState {
+        struct Buffer {
+            bool queued = false;
+            bool loop = false;
+            s64 remaining = 0; // samples left to play
+        } buffers[4];
+        u32 cursor = 0;   // ring slot being played
+        u64 played = 0;   // samples played since the last stop
+        u32 consumed = 0; // total wave buffers released back to the game
+        double frac = 0;
+        bool stopped = true; // a fresh voice starts out stopped
+        u8 last_state = 0xFF;
+        bool last_in_use = false;
+    };
+    static constexpr u32 kMaxVoices = 1024;
+
+    // VoiceInfo::InParameter (0x170 bytes): +0x08 is_new, +0x09 in_use, +0x0A play state
+    // (0 started, 1 stopped, 2 paused), +0x0C sample rate, +0x1C pitch, +0x60 wave buffers [4] x 0x38
+    // (+0x10 start offset, +0x14 end offset, +0x18 loop, +0x1A sent to DSP), +0x159 flush count.
+    void UpdateVoice(VoiceState& vs, const u8* p) {
+        auto rd32 = [&](size_t o) { return common::Read<u32>(p + o); };
+        const bool is_new = p[0x08] != 0, in_use = p[0x09] != 0;
+        const u8 play_state = p[0x0A];
+        static const bool trace = std::getenv("MUA3_TRACE_VOICES") != nullptr;
+        if (trace && (is_new || play_state != vs.last_state || in_use != vs.last_in_use || p[0x159]))
+            LOG_INFO("audren", "voice {} new {} in_use {} state {} -> {} rate {} flush {} consumed {} played {}",
+                     common::Read<u32>(p), is_new, in_use, vs.last_state, play_state, common::Read<u32>(p + 0x0C),
+                     p[0x159], vs.consumed, vs.played);
+        if (is_new)
+            vs = VoiceState{};
+        vs.last_state = play_state;
+        vs.last_in_use = in_use;
+        if (!in_use)
+            return;
+        // New wave buffers (sent_to_DSP == 0) always (re)initialise their ring slot, like the server does.
+        for (u32 k = 0; k < 4; k++) {
+            const u8* wb = p + 0x60 + k * 0x38;
+            if (wb[0x1A] || common::Read<u64>(wb) == 0)
+                continue; // owned by the DSP already, or an empty slot
+            auto& b = vs.buffers[k];
+            const s32 start = common::Read<s32>(wb + 0x10), end = common::Read<s32>(wb + 0x14);
+            b.queued = true;
+            b.loop = wb[0x18] != 0;
+            b.remaining = std::max<s64>(end - start, 1);
+        }
+        auto release_front = [&] {
+            vs.buffers[vs.cursor] = {};
+            vs.consumed++;
+            vs.cursor = (vs.cursor + 1) % 4;
+        };
+        // Flush: the server counts every flushed slot as consumed, valid or not.
+        for (u32 n = p[0x159]; n > 0; n--)
+            release_front();
+        if (play_state == 1) { // RequestStop -> Stopped: the valid buffers ahead of the play cursor are returned
+            if (!vs.stopped) {
+                for (u32 k = 0; k < 4 && vs.buffers[vs.cursor].queued; k++)
+                    release_front();
+                vs.played = 0;
+                vs.frac = 0;
+                vs.stopped = true;
+            }
+            return;
+        }
+        vs.stopped = false;
+        if (play_state != 0 || !started_)
+            return;
+        float pitch;
+        std::memcpy(&pitch, p + 0x1C, 4);
+        if (!(pitch > 0.0f && pitch < 16.0f))
+            pitch = 1.0f;
+        const double want = double(rd32(0x0C) ? rd32(0x0C) : rate_) * samples_ / rate_ * pitch + vs.frac;
+        s64 todo = s64(want);
+        vs.frac = want - double(todo);
+        for (u32 guard = 0; todo > 0 && guard < 8; guard++) {
+            auto& b = vs.buffers[vs.cursor];
+            if (!b.queued)
+                break;
+            const s64 n = std::min(todo, b.remaining);
+            b.remaining -= n;
+            todo -= n;
+            vs.played += u64(n);
+            if (b.remaining > 0)
+                break;
+            if (b.loop) {
+                b.remaining = 1; // looping buffers are never released; keep them alive
+                break;
+            }
+            release_front();
+        }
+    }
+
+    u32 rate_ = 48000, samples_ = 240;
     bool started_ = false;
     u64 elapsed_frames_ = 0;
-    u64 played_[1024]{};
+    VoiceState voices_[kMaxVoices];
 };
 
 class IAudioDevice final : public Service {

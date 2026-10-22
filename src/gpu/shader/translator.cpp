@@ -23,6 +23,14 @@ u32 NextPc(u32 pc) {
 }
 
 s32 BranchOffset(u64 insn) { return s32(u32(Bits(insn, 20, 24)) << 8) >> 8; }
+// Branch/SSY/PBK/PCNT targets are relative to the raw following word (pc + 8), even when that word is a
+// scheduling control word; a target that lands on a control word means the instruction after it.
+u32 BranchTarget(u32 pc, u64 insn) {
+    u32 t = u32(s32(pc + 8) + BranchOffset(insn));
+    if (t % 32 == 0)
+        t += 8;
+    return t;
+}
 
 std::string Hex(u32 v) { return fmt::format("0x{:X}u", v); }
 
@@ -219,8 +227,12 @@ private:
 
     // ---------------------------------------------------------------- textures
     u32 TexSlot(u32 cbuf_off, TexDim dim, bool array, bool shadow);
-    std::string Sampler(u32 slot) { return fmt::format("smp{}", slot); }
+    std::string Sampler(u32 slot) { return fmt::format("smp{}", std::min<u32>(slot, 15)); }
+    std::string CmpSampler(u32 slot) { return fmt::format("smpc{}", std::min<u32>(slot, 15)); }
+    std::set<u32> declared_smp_, declared_smpc_;
     void EmitTexWrites(u32 mask, const std::vector<u32>& regs, const std::string& value, u32 slot);
+    // TEXS/TLDS/TLD4S without the FP32 flag: the selected components are packed as half2, two per register.
+    void EmitTexWritesF16(u32 mask, u32 d0, u32 d1, const std::string& value, u32 slot);
     void TexSample(u64 insn, u32 pc, Op op);
 
     // ---------------------------------------------------------------- flow
@@ -340,6 +352,23 @@ void Translator::EmitTexWrites(u32 mask, const std::vector<u32>& regs, const std
     }
 }
 
+void Translator::EmitTexWritesF16(u32 mask, u32 d0, u32 d1, const std::string& value, u32 slot) {
+    Line(fmt::format("tmp4 = {};", slot == ~0u ? value : fmt::format("ApplySwizzle({}, tex_swizzle[{}].x)", value, slot)));
+    static const char* cs = "xyzw";
+    std::vector<std::string> comps;
+    for (u32 c = 0; c < 4; c++)
+        if (mask & (1u << c))
+            comps.push_back(fmt::format("tmp4.{}", cs[c]));
+    auto pair = [&](size_t i) {
+        return fmt::format("P2(float2({}, {}))", i < comps.size() ? comps[i] : "0.0f",
+                           i + 1 < comps.size() ? comps[i + 1] : "0.0f");
+    };
+    if (!comps.empty())
+        SetR(d0, pair(0));
+    if (comps.size() > 2)
+        SetR(d1, pair(2));
+}
+
 void Translator::TexSample(u64 insn, u32 pc, Op op) {
     const bool vs = stage_ != Stage::Fragment;
     auto lodsuffix = [&](const std::string& normal) { return (vs || opt_.force_lod0) ? std::string() : normal; };
@@ -353,8 +382,8 @@ void Translator::TexSample(u64 insn, u32 pc, Op op) {
         const std::string t = fmt::format("tex{}", slot);
         if (!dref.empty()) {
             if (lod_kind == 0 && !vs && !opt_.force_lod0)
-                return fmt::format("{}.SampleCmp(smpc{}, {}, {}).xxxx", t, slot, coords, dref);
-            return fmt::format("{}.SampleCmpLevelZero(smpc{}, {}, {}).xxxx", t, slot, coords, dref);
+                return fmt::format("{}.SampleCmp({}, {}, {}).xxxx", t, CmpSampler(slot), coords, dref);
+            return fmt::format("{}.SampleCmpLevelZero({}, {}, {}).xxxx", t, CmpSampler(slot), coords, dref);
         }
         if (lod_kind == 1 || ((vs || opt_.force_lod0) && lod_kind != 2))
             return fmt::format("{}.SampleLevel({}, {}, 0.0f)", t, Sampler(slot), coords);
@@ -401,8 +430,11 @@ void Translator::TexSample(u64 insn, u32 pc, Op op) {
         default: Unimpl(op, pc, insn); return;
         }
         const u32 slot = TexSlot(cbuf_off, dim, array, shadow);
-        EmitTexWrites(mask, {d0, d0 == RZ ? RZ : d0 + 1, d1, d1 == RZ ? RZ : d1 + 1}, sample(slot, coords, lk, lod, dref),
-                      slot);
+        if (!Bit(insn, 59)) // bit 59 clear: half-precision results packed in pairs
+            EmitTexWritesF16(mask, d0, d1, sample(slot, coords, lk, lod, dref), slot);
+        else
+            EmitTexWrites(mask, {d0, d0 == RZ ? RZ : d0 + 1, d1, d1 == RZ ? RZ : d1 + 1},
+                          sample(slot, coords, lk, lod, dref), slot);
         return;
     }
     case Op::TEX:
@@ -461,10 +493,12 @@ void Translator::TexSample(u64 insn, u32 pc, Op op) {
         switch (enc) {
         case 0: dim = TexDim::Tex1D; slot = TexSlot(cbuf_off, dim, false, false);
             load = fmt::format("tex{}.Load(int2(int({}), 0))", slot, R(ra)); break;
-        case 1: slot = TexSlot(cbuf_off, dim, false, false);
+        case 1: // 1D, explicit LOD in rb
+            dim = TexDim::Tex1D; slot = TexSlot(cbuf_off, dim, false, false);
+            load = fmt::format("tex{}.Load(int2(int({}), int({})))", slot, R(ra), R(rb)); break;
+        case 2: // 2D, LOD 0, x in ra and y in rb (shaders put them in neighbouring registers)
+            slot = TexSlot(cbuf_off, dim, false, false);
             load = fmt::format("tex{}.Load(int3(int({}), int({}), 0))", slot, R(ra), R(rb)); break;
-        case 2: slot = TexSlot(cbuf_off, dim, false, false);
-            load = fmt::format("tex{}.Load(int3(int({}), int({}), int({})))", slot, R(ra), R(ra + 1), R(rb)); break;
         case 4: slot = TexSlot(cbuf_off, dim, false, false);
             load = fmt::format("tex{}.Load(int3(int({}), int({}), 0))", slot, R(ra), R(ra + 1)); break;
         case 8: slot = TexSlot(cbuf_off, dim, false, false);
@@ -477,7 +511,10 @@ void Translator::TexSample(u64 insn, u32 pc, Op op) {
             load = fmt::format("tex{}.Load(int4(int({}), int({}), int({}), 0))", slot, R(ra + 1), R(rb), R(ra)); break;
         default: Unimpl(op, pc, insn); return;
         }
-        EmitTexWrites(mask, {d0, d0 == RZ ? RZ : d0 + 1, d1, d1 == RZ ? RZ : d1 + 1}, load, slot);
+        if (!Bit(insn, 59)) // bit 59 clear: half-precision results packed in pairs
+            EmitTexWritesF16(mask, d0, d1, load, slot);
+        else
+            EmitTexWrites(mask, {d0, d0 == RZ ? RZ : d0 + 1, d1, d1 == RZ ? RZ : d1 + 1}, load, slot);
         return;
     }
     case Op::TLD:
@@ -523,8 +560,12 @@ void Translator::TexSample(u64 insn, u32 pc, Op op) {
         }
         const u32 slot = TexSlot(cbuf_off, TexDim::Tex2D, false, dc);
         static const char* g[] = {"GatherRed", "GatherGreen", "GatherBlue", "GatherAlpha"};
-        const std::string v = dc ? fmt::format("tex{}.GatherCmp(smpc{}, {}, {})", slot, slot, coords, dref)
+        const std::string v = dc ? fmt::format("tex{}.GatherCmp({}, {}, {})", slot, CmpSampler(slot), coords, dref)
                                  : fmt::format("tex{}.{}({}, {})", slot, g[comp], Sampler(slot), coords);
+        if (Bit(insn, 55)) {
+            EmitTexWritesF16(0xF, d0, d1, v, ~0u);
+            return;
+        }
         Line(fmt::format("tmp4 = {};", v));
         SetF(d0, "tmp4.x");
         if (d0 != RZ) SetF(d0 + 1, "tmp4.y");
@@ -561,7 +602,7 @@ void Translator::TexSample(u64 insn, u32 pc, Op op) {
         std::string dref = dc ? coord(meta++) : "";
         const u32 slot = TexSlot(cbuf_off, dim, array, dc);
         static const char* g[] = {"GatherRed", "GatherGreen", "GatherBlue", "GatherAlpha"};
-        const std::string v = dc ? fmt::format("tex{}.GatherCmp(smpc{}, {}, {})", slot, slot, coords, dref)
+        const std::string v = dc ? fmt::format("tex{}.GatherCmp({}, {}, {})", slot, CmpSampler(slot), coords, dref)
                                  : fmt::format("tex{}.{}({}, {})", slot, g[comp], Sampler(slot), coords);
         Line(fmt::format("tmp4 = {};", v));
         static const char* cs = "xyzw";
@@ -633,7 +674,7 @@ bool Translator::DiscoverBlocks() {
             bool end = false;
             switch (op) {
             case Op::BRA: {
-                const u32 target = u32(s32(next) + BranchOffset(insn));
+                const u32 target = BranchTarget(pc, insn);
                 const bool cc_always = Bits(insn, 0, 5) == 15;
                 leaders.insert(target);
                 work.push_back(target);
@@ -649,7 +690,7 @@ bool Translator::DiscoverBlocks() {
             case Op::SSY:
             case Op::PBK:
             case Op::PCNT: {
-                const u32 target = u32(s32(next) + BranchOffset(insn));
+                const u32 target = BranchTarget(pc, insn);
                 leaders.insert(target);
                 work.push_back(target);
                 break;
@@ -665,7 +706,7 @@ bool Translator::DiscoverBlocks() {
                 end = true;
                 break;
             case Op::Invalid:
-                res_.unimplemented.insert(fmt::format("invalid_{:04x}", u32(insn >> 48)));
+                res_.unimplemented.insert(fmt::format("invalid_{:04x}@{:x}", u32(insn >> 48), pc));
                 break;
             default:
                 break;
@@ -736,9 +777,9 @@ bool Translator::AnalyzeStacks() {
                 work.push_back({t, s});
             };
             switch (op) {
-            case Op::SSY: stack.push_back({'S', u32(s32(next) + BranchOffset(insn))}); break;
-            case Op::PBK: stack.push_back({'B', u32(s32(next) + BranchOffset(insn))}); break;
-            case Op::PCNT: stack.push_back({'C', u32(s32(next) + BranchOffset(insn))}); break;
+            case Op::SSY: stack.push_back({'S', BranchTarget(pc, insn)}); break;
+            case Op::PBK: stack.push_back({'B', BranchTarget(pc, insn)}); break;
+            case Op::PCNT: stack.push_back({'C', BranchTarget(pc, insn)}); break;
             case Op::SYNC:
             case Op::BRK:
             case Op::CONT: {
@@ -761,7 +802,7 @@ bool Translator::AnalyzeStacks() {
                 break;
             }
             case Op::BRA: {
-                const u32 target = u32(s32(next) + BranchOffset(insn));
+                const u32 target = BranchTarget(pc, insn);
                 push_successor(target, stack);
                 if (!unconditional || Bits(insn, 0, 5) != 15)
                     push_successor(next, stack);
@@ -785,8 +826,7 @@ bool Translator::AnalyzeStacks() {
 void Translator::EmitJump(u32 target) {
     auto it = blocks_.find(target);
     if (it == blocks_.end()) {
-        Line("return_flag = true; // jump outside program");
-        Line(has_back_edge_ ? "break;" : "");
+        Line("return_flag = true; return; // jump outside program");
         return;
     }
     Line(fmt::format("blk = {}u;", it->second.id));
@@ -922,8 +962,9 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
     case Op::F2F_reg: case Op::F2F_cbuf: case Op::F2F_imm: {
         std::string s = FAbsNeg(SrcBF(insn, form3(op, Op::F2F_reg, Op::F2F_cbuf)), Bit(insn, 49), Bit(insn, 45));
         const u32 src_size = u32(Bits(insn, 10, 2)), dst_size = u32(Bits(insn, 8, 2));
-        if (src_size == 1) // f16 source (low half)
-            s = FAbsNeg(fmt::format("f16tof32({} & 0xFFFFu)", SrcB(insn, form3(op, Op::F2F_reg, Op::F2F_cbuf))),
+        if (src_size == 1) // f16 source; bit 41 selects the high half
+            s = FAbsNeg(fmt::format("f16tof32(({} >> {}u) & 0xFFFFu)", SrcB(insn, form3(op, Op::F2F_reg, Op::F2F_cbuf)),
+                                    Bit(insn, 41) ? 16 : 0),
                         Bit(insn, 49), Bit(insn, 45));
         if (Bit(insn, 42)) { // round to integer
             static const char* rf[] = {"round", "floor", "ceil", "trunc"};
@@ -939,6 +980,10 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
     }
     case Op::F2I_reg: case Op::F2I_cbuf: case Op::F2I_imm: {
         std::string s = FAbsNeg(SrcBF(insn, form3(op, Op::F2I_reg, Op::F2I_cbuf)), Bit(insn, 49), Bit(insn, 45));
+        if (Bits(insn, 10, 2) == 1) // f16 source; bit 41 selects the high half
+            s = FAbsNeg(fmt::format("f16tof32(({} >> {}u) & 0xFFFFu)", SrcB(insn, form3(op, Op::F2I_reg, Op::F2I_cbuf)),
+                                    Bit(insn, 41) ? 16 : 0),
+                        Bit(insn, 49), Bit(insn, 45));
         static const char* rf[] = {"round", "floor", "ceil", "trunc"};
         s = fmt::format("{}({})", rf[Bits(insn, 39, 2)], s);
         const bool is_signed = Bit(insn, 12);
@@ -1396,16 +1441,21 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
         const u32 index = u32(Bits(insn, 36, 5));
         const s32 off = s32(u32(Bits(insn, 20, 16)) << 16) >> 16;
         const u32 size = u32(Bits(insn, 48, 3));
-        const std::string addr = fmt::format("({} + {})", R(a), Hex(u32(off)));
         if (a == RZ) {
             SetR(d, Cbuf(index, u32(off)));
             if (size == 5 && d != RZ)
                 SetR(d + 1, Cbuf(index, u32(off) + 4));
             return;
         }
-        SetR(d, CbufDyn(index, addr));
-        if (size == 5 && d != RZ)
-            SetR(d + 1, CbufDyn(index, addr + " + 4u"));
+        // The destination pair may overlap the address register: evaluate the address first.
+        Line(fmt::format("tmpu.w = {} + {};", R(a), Hex(u32(off))));
+        if (size == 5 && d != RZ) {
+            Line(fmt::format("tmpu.z = {};", CbufDyn(index, "tmpu.w + 4u")));
+            SetR(d, CbufDyn(index, "tmpu.w"));
+            SetR(d + 1, "tmpu.z");
+        } else {
+            SetR(d, CbufDyn(index, "tmpu.w"));
+        }
         return;
     }
     case Op::LDL: case Op::STL: {
@@ -1413,12 +1463,16 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
         const s32 off = s32(u32(Bits(insn, 20, 24)) << 8) >> 8;
         const u32 size = u32(Bits(insn, 48, 3));
         const u32 words = size == 5 ? 2 : size == 6 ? 4 : 1;
-        const std::string addr = fmt::format("(({} + {}) >> 2u)", R(a), Hex(u32(off)));
-        for (u32 i = 0; i < words; i++) {
-            if (op == Op::LDL)
-                SetR(d == RZ ? RZ : d + i, fmt::format("lmem[({} + {}u) & 1023u]", addr, i));
-            else
-                Line(fmt::format("lmem[({} + {}u) & 1023u] = {};", addr, i, R(d == RZ ? RZ : d + i)));
+        // Evaluate the address once: a multi-word load may overwrite the address register.
+        Line(fmt::format("tmpu.w = ({} + {}) >> 2u;", R(a), Hex(u32(off))));
+        if (op == Op::LDL) {
+            for (u32 i = 0; i < words; i++)
+                Line(fmt::format("tmpu4_[{}] = lmem[(tmpu.w + {}u) & 1023u];", i, i));
+            for (u32 i = 0; i < words; i++)
+                SetR(d == RZ ? RZ : d + i, fmt::format("tmpu4_[{}]", i));
+        } else {
+            for (u32 i = 0; i < words; i++)
+                Line(fmt::format("lmem[(tmpu.w + {}u) & 1023u] = {};", i, R(d == RZ ? RZ : d + i)));
         }
         return;
     }
@@ -1467,15 +1521,16 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
         bool sat = false;
         const bool is_fma = op == Op::HFMA2_reg || op == Op::HFMA2_rc || op == Op::HFMA2_cr || op == Op::HFMA2_imm ||
                             op == Op::HFMA2_32I;
+        // HMUL2_reg has no A negate and HMUL2_cbuf no B negate (those bits mean something else there).
         if (!is_fma && !is32)
-            av = absneg(av, Bit(insn, 44), Bit(insn, 43));
+            av = absneg(av, Bit(insn, 44), op != Op::HMUL2_reg && Bit(insn, 43));
         switch (op) {
         case Op::HADD2_reg: case Op::HMUL2_reg:
             bv = absneg(half_op(R(u32(Bits(insn, 20, 8))), u32(Bits(insn, 28, 2))), Bit(insn, 30), Bit(insn, 31));
             sat = Bit(insn, 32);
             break;
         case Op::HADD2_cbuf: case Op::HMUL2_cbuf:
-            bv = absneg(half_op(CbufOperand(insn), 1), Bit(insn, 54), Bit(insn, 56));
+            bv = absneg(half_op(CbufOperand(insn), 1), Bit(insn, 54), op == Op::HADD2_cbuf && Bit(insn, 56));
             sat = Bit(insn, 52);
             break;
         case Op::HADD2_imm: case Op::HMUL2_imm:
@@ -1607,7 +1662,7 @@ void Translator::EmitExit() {
         }
     }
     Line("return_flag = true;");
-    Line(has_back_edge_ ? "break;" : "return;");
+    Line("return;");
 }
 
 void Translator::EmitPrologue(std::string& head) {
@@ -1651,9 +1706,12 @@ float4 ApplySwizzle(float4 v, uint s) {
         case TexDim::Cube: type = t.array ? "TextureCubeArray" : "TextureCube"; break;
         }
         head += fmt::format("{}<float4> tex{} : register(t{});\n", type, t.slot, t.slot);
-        head += fmt::format("SamplerState smp{} : register(s{});\n", t.slot, std::min<u32>(t.slot, 15));
-        if (t.shadow)
-            head += fmt::format("SamplerComparisonState smpc{} : register(s{});\n", t.slot, std::min<u32>(t.slot, 15));
+        // Only 16 sampler registers: textures past slot 15 share s15 (declared once per register and kind).
+        const u32 sreg = std::min<u32>(t.slot, 15);
+        if (declared_smp_.insert(sreg).second)
+            head += fmt::format("SamplerState smp{} : register(s{});\n", sreg, sreg);
+        if (t.shadow && declared_smpc_.insert(sreg).second)
+            head += fmt::format("SamplerComparisonState smpc{} : register(s{});\n", sreg, sreg);
     }
 }
 
@@ -1667,14 +1725,35 @@ bool Translator::Run() {
     std::string body;
     out_.clear();
     indent_ = 1;
+    // Only the blocks between the earliest back-edge target and the latest back-edge source need the dispatch
+    // loop; keeping the rest outside keeps FXC (and the driver compiler) fast on shaders with small loops.
+    u32 loop_lo = ~0u, loop_hi = 0;
     if (has_back_edge_) {
-        Line("uint blk = 0u;");
-        Line("[loop] for (uint iter_ = 0u; iter_ < 65536u; iter_++) {");
-        indent_++;
-    } else {
-        Line("uint blk = 0u;");
+        for (auto& [start, b] : blocks_) {
+            for (u32 pc = b.start; pc < b.end; pc = NextPc(pc)) {
+                const u64 insn = At(pc);
+                const Op op = Decode(insn);
+                u32 target = ~0u;
+                if (op == Op::BRA)
+                    target = BranchTarget(pc, insn);
+                else if ((op == Op::SYNC || op == Op::BRK || op == Op::CONT) && sync_target_.count(pc))
+                    target = sync_target_[pc];
+                auto t = blocks_.find(target);
+                if (t != blocks_.end() && t->second.id <= b.id) {
+                    loop_lo = std::min(loop_lo, t->second.id);
+                    loop_hi = std::max(loop_hi, b.id);
+                }
+            }
+        }
     }
+    Line("uint blk = 0u;");
     for (auto& [start, b] : blocks_) {
+        if (b.id == loop_lo) {
+            // Each iteration dispatches one basic block; cap runaway loops so a bad translation cannot hang the GPU.
+            Line("[loop] for (uint iter_ = 0u; ; iter_++) {");
+            indent_++;
+            Line("if (iter_ >= 1024u) { loop_capped = true; break; }");
+        }
         cur_block_ = start;
         Line(fmt::format("[branch] if (blk == {}u) {{ // block {:#x}", b.id, start));
         indent_++;
@@ -1696,7 +1775,7 @@ bool Translator::Run() {
                 }
                 u32 target = 0;
                 if (op == Op::BRA)
-                    target = u32(s32(NextPc(pc)) + BranchOffset(insn));
+                    target = BranchTarget(pc, insn);
                 else if (op != Op::EXIT)
                     target = sync_target_.count(pc) ? sync_target_[pc] : 0xFFFFFFFF;
                 if (!cond.empty()) {
@@ -1745,15 +1824,15 @@ bool Translator::Run() {
             if (next != blocks_.end())
                 Line(fmt::format("blk = {}u;", next->second.id));
             else
-                Line(has_back_edge_ ? "break;" : "return_flag = true;");
+                Line("return_flag = true; return;");
         }
         indent_--;
         Line("}");
-    }
-    if (has_back_edge_) {
-        Line("break;");
-        indent_--;
-        Line("}");
+        if (b.id == loop_hi && loop_lo != ~0u) {
+            Line("break; // no back edge taken: leave the loop");
+            indent_--;
+            Line("}");
+        }
     }
     body = std::move(out_);
 
@@ -1761,7 +1840,8 @@ bool Translator::Run() {
     std::string src;
     EmitPrologue(src);
     std::string decls;
-    decls += "static bool return_flag = false;\nstatic float4 tmp4;\nstatic uint4 tmpu;\nstatic bool tmpb;\n";
+    decls += "static bool return_flag = false;\nstatic float4 tmp4;\nstatic uint4 tmpu;\nstatic uint tmpu4_[4];\nstatic bool tmpb;\n";
+    decls += "static bool loop_capped = false; // a translated loop ran away (pixel shaders then output magenta)\n";
     for (u32 r : regs_used_)
         decls += fmt::format("static uint r{} = 0u;\n", r);
     for (u32 p : preds_used_)
@@ -1793,7 +1873,7 @@ bool Translator::Run() {
             src += fmt::format("    float4 a{0} : ATTR{0};\n", i);
         src += "};\n";
         src += "VSOut main(VSIn input) {\n";
-        src += "    vertex_id = input.vid; instance_id = input.iid;\n";
+        src += "    vertex_id = input.vid; instance_id = input.iid + drv_misc.x;\n";
         for (u32 i : vs_inputs_)
             src += fmt::format("    vin{0} = asuint(input.a{0});\n", i);
         src += "    Run();\n    VSOut o;\n    o.pos = o_pos;\n";
@@ -1830,6 +1910,8 @@ bool Translator::Run() {
         for (u32 a : in_attrs_)
             src += fmt::format("    in_attr{0} = i.a{0};\n", a);
         src += "    Run();\n";
+        if (has_back_edge_)
+            src += "    if (loop_capped) out_color0 = float4(1, 0, 1, 1);\n";
         src += "    if (drv_misc.w != 0u) { float ref = asfloat(drv_misc.z); float a = out_color0.w; uint f = drv_misc.y;\n"
                "        bool at_pass = f == 1u ? false : f == 2u ? a < ref : f == 3u ? a == ref : f == 4u ? a <= ref : f == 5u ? a > ref"
                " : f == 6u ? a != ref : f == 7u ? a >= ref : true; if (!at_pass) discard; }\n";

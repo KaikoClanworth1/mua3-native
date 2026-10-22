@@ -1,0 +1,17 @@
+# Title -> New Game -> first save slot -> confirm -> difficulty Mighty -> confirm (seconds from launch)
+75 PLUS
+78 Y
+82 PLUS
+86 A
+90 A
+96 LEFT
+98 A
+104 A
+110 LEFT
+112 A
+# then skip anything that asks for confirmation
+125 A
+135 A
+145 A
+155 A
+165 A

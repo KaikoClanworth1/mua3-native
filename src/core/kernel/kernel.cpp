@@ -229,6 +229,31 @@ void Kernel::InstallHook(u64 addr, std::string name, HookFn fn) {
     cpus_->InvalidateAll(addr, 8);
 }
 
+void Kernel::InstallTrace(u64 addr, std::string name, HookFn fn) {
+    constexpr u64 kTrampolineSize = 0x10000, kSlot = 32;
+    if (!trampolines_) {
+        trampolines_ = mem_.FindFree(core::layout::kKernelMapBase, 0x1000000000ull, kTrampolineSize);
+        mem_.Map(trampolines_, kTrampolineSize, core::MS_Normal, core::MP_RW); // not Code: rtld scans code regions for modules
+    }
+    if (trampoline_used_ + kSlot > kTrampolineSize)
+        return;
+    const u64 tramp = trampolines_ + trampoline_used_;
+    trampoline_used_ += kSlot;
+    // +0 original instruction, +4 ldr x16, [pc+12], +8 br x16, +16 return address (addr + 4)
+    mem_.Write<u32>(tramp, mem_.Read<u32>(addr));
+    mem_.Write<u32>(tramp + 4, 0x58000070u);
+    mem_.Write<u32>(tramp + 8, 0xD61F0200u);
+    mem_.Write<u32>(tramp + 12, 0xD503201Fu);
+    mem_.Write<u64>(tramp + 16, addr + 4);
+    const u32 idx = u32(hooks.size());
+    hooks.emplace_back(std::move(name), [fn = std::move(fn), tramp](Thread* t) {
+        fn(t);
+        t->cpu->SetPC(tramp);
+    });
+    mem_.Write<u32>(addr, 0xD4000001u | ((0x1000u + idx) << 5));
+    cpus_->InvalidateAll(addr, 4);
+}
+
 void Kernel::HandleSvc(Thread* t, u32 imm) {
     if (imm >= 0x1000) {
         const u32 idx = imm - 0x1000;
@@ -308,7 +333,7 @@ static void DumpHostStack(Thread* t) {
     LOG_INFO("Kernel", "{}", s);
 }
 
-void Kernel::DumpAllThreads() {
+void Kernel::DumpAllThreads(bool host_stacks) {
     std::vector<ThreadPtr> ts;
     {
         std::lock_guard lk(threads_mutex_);
@@ -324,9 +349,20 @@ void Kernel::DumpAllThreads() {
             continue;
         }
         const u32 svc = t->current_svc;
+        if (svc && host_stacks) {
+            DumpHostStack(t.get());
+            continue;
+        }
         if (svc) {
-            LOG_INFO("Kernel", "Thread {} ({}) blocked in SVC {:#x}, lr={}", t->id, t->name, svc,
-                     core::Sys().Symbolize(t->cpu->Reg(30)));
+            // The thread is parked in an SVC callback, so its guest registers are stable enough to walk.
+            std::string bt;
+            u64 fp = t->cpu->Reg(29);
+            for (int i = 0; i < 10 && fp && mem_.IsValid(fp, 16); i++) {
+                bt += " <- " + core::Sys().Symbolize(mem_.Read<u64>(fp + 8));
+                fp = mem_.Read<u64>(fp);
+            }
+            LOG_INFO("Kernel", "Thread {} ({}) blocked in SVC {:#x}{}, lr={}{}", t->id, t->name, svc,
+                     svc == 0x21 ? " (" + t->current_ipc + ")" : std::string(), core::Sys().Symbolize(t->cpu->Reg(30)), bt);
             continue;
         }
         Thread* raw = t.get();
@@ -340,6 +376,13 @@ void Kernel::DumpAllThreads() {
         if (!t->dump_ack)
             DumpHostStack(t.get());
     }
+}
+
+void Kernel::DumpThreadRegs(u32 thread_id) {
+    std::lock_guard lk(threads_mutex_);
+    for (auto& t : threads_)
+        if (t->id == thread_id && t->cpu)
+            DumpThreadState(t.get(), true);
 }
 
 void Kernel::HandleException(Thread* t, u64 pc, int kind) {

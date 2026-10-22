@@ -1,5 +1,7 @@
 #include "gpu/d3d11/renderer_d3d11.h"
 
+#include <set>
+
 #include <algorithm>
 
 #include <d3d11sdklayers.h>
@@ -323,7 +325,7 @@ Surface* D3D11Renderer::FindSurfaceByCpu(u64 cpu_va) {
     return best;
 }
 
-Surface* D3D11Renderer::GetSurface(u64 gpu_va, u32 width, u32 height, u32 format, bool depth) {
+Surface* D3D11Renderer::GetSurface(u64 gpu_va, u32 width, u32 height, u32 format, bool depth, u32 tile_mode) {
     if (!gpu_va || !width || !height || width > 16384 || height > 16384)
         return nullptr;
     auto it = surfaces_.find(gpu_va);
@@ -333,6 +335,8 @@ Surface* D3D11Renderer::GetSurface(u64 gpu_va, u32 width, u32 height, u32 format
             s->last_use = frame_counter_;
             return s;
         }
+        LOG_DEBUG("Renderer", "Surface {:#x} redefined: {}x{} fmt {:#x} -> {}x{} fmt {:#x} (contents dropped)", gpu_va,
+                  s->width, s->height, s->format, width, height, format);
         surfaces_.erase(it);
     }
     const RtFormatInfo fi = depth ? ZetaFormat(format) : RtFormat(format);
@@ -352,7 +356,23 @@ Surface* D3D11Renderer::GetSurface(u64 gpu_va, u32 width, u32 height, u32 format
     D3D11_TEXTURE2D_DESC td{width, height, 1, 1, Typeless(fi.dxgi), {1, 0}, D3D11_USAGE_DEFAULT,
                             UINT(D3D11_BIND_SHADER_RESOURCE | (depth ? D3D11_BIND_DEPTH_STENCIL : D3D11_BIND_RENDER_TARGET)),
                             0, 0};
-    if (FAILED(dev_->CreateTexture2D(&td, nullptr, &s->tex))) {
+    // A render target is guest memory on the Switch: start from what the guest left there (e.g. values the CPU
+    // seeded), deswizzled from the block-linear layout. Pitch-linear targets just start cleared.
+    std::vector<u8> initial;
+    D3D11_SUBRESOURCE_DATA init{};
+    const bool pitch_linear = (tile_mode >> 12) & 1;
+    if (!depth && !pitch_linear && s->cpu_va) {
+        const u32 bh = (tile_mode >> 4) & 0xF;
+        const u64 size = BlockLinearSize(width, height, 1, fi.bpp, bh, 0);
+        std::vector<u8> raw(size_t(size), 0);
+        if (G().ReadGpuPartial(gpu_va, raw.data(), raw.size()) == raw.size()) {
+            initial.resize(size_t(width) * height * fi.bpp);
+            Deswizzle(raw.data(), initial.data(), width, height, 1, fi.bpp, bh, 0, width * fi.bpp);
+            init.pSysMem = initial.data();
+            init.SysMemPitch = width * fi.bpp;
+        }
+    }
+    if (FAILED(dev_->CreateTexture2D(&td, init.pSysMem ? &init : nullptr, &s->tex))) {
         LOG_ERROR("Renderer", "Surface creation failed {}x{} fmt {:#x}", width, height, format);
         return nullptr;
     }
@@ -385,7 +405,7 @@ Surface* D3D11Renderer::GetColorSurface(u32 i) {
     const u32 fmt = m.Reg(base + 4);
     if (fmt == 0)
         return nullptr;
-    return GetSurface(m.Addr(base), m.Reg(base + 2), m.Reg(base + 3), fmt, false);
+    return GetSurface(m.Addr(base), m.Reg(base + 2), m.Reg(base + 3), fmt, false, m.Reg(base + 5));
 }
 
 Surface* D3D11Renderer::GetDepthSurface() {
@@ -442,8 +462,33 @@ void D3D11Renderer::Draw() {
     if (!vs)
         vs = load_shader(0, shader::Stage::Vertex);
     HostShader* ps = load_shader(5, shader::Stage::Fragment);
+    if (vs && vs->state == HostShader::Ready) {
+        // Integer vertex attributes need integer shader inputs (a float4 input would get converted values).
+        u32 uint_mask = 0, sint_mask = 0, scaled_mask = 0;
+        for (u32 i = 0; i < 32; i++) {
+            if (!(vs->info.attrib_in_mask & (1u << i)))
+                continue;
+            const u32 f = m.Reg(kVertexAttribFormat + i);
+            const u32 b = f & 0x1F;
+            if ((f & 0x40) || b >= 16 || !(m.Reg(kVertexArray + b * 4) & 0x1000) || AttribFormat(f) == DXGI_FORMAT_UNKNOWN)
+                continue; // fed from the float default slot
+            switch ((f >> 27) & 7) {
+            case 3: sint_mask |= 1u << i; break;
+            case 4: uint_mask |= 1u << i; break;
+            case 5: uint_mask |= 1u << i; scaled_mask |= 1u << i; break;
+            case 6: sint_mask |= 1u << i; scaled_mask |= 1u << i; break;
+            default: break;
+            }
+        }
+        vs = shaders_->GetVsVariant(vs, uint_mask, sint_mask, scaled_mask);
+    }
     if (!vs || vs->state != HostShader::Ready || (ps && ps->state != HostShader::Ready)) {
-        draws_skipped++;
+        draws_skipped++, skip_reason_[0]++;
+        static std::set<u64> pending_logged;
+        for (HostShader* sh : {vs, ps})
+            if (sh && sh->state == HostShader::Pending && pending_logged.size() < 64 && pending_logged.insert(sh->hash).second)
+                LOG_INFO("Renderer", "draw waiting on {} {:016x}{}", sh->stage == shader::Stage::Vertex ? "vs" : "ps",
+                         sh->hash, sh->is_variant ? " (int-attribute variant)" : "");
         static int logged = 0;
         if ((!vs || vs->state == HostShader::Failed) && logged < 3) {
             logged++;
@@ -483,6 +528,14 @@ void D3D11Renderer::Draw() {
     if (sc_enable & 1) {
         const u32 x = m.Reg(0x381), y = m.Reg(0x382);
         sr = {LONG(x & 0xFFFF), LONG(y & 0xFFFF), LONG(x >> 16), LONG(y >> 16)};
+    }
+    // Pixel history (debug "pick x y"): restrict every draw of one frame to that pixel and count samples.
+    const bool counting = occl_frame_ == frame_counter_; // debug "occl": samples written by every draw
+    const bool picking = (pick_frame_ == frame_counter_ && colors[0] && colors[0]->width >= 1280 / 2) || counting;
+    if (picking && !counting) {
+        const u32 px = u32(pick_x_ * colors[0]->width), py = u32(pick_y_ * colors[0]->height);
+        sr = {std::max<LONG>(sr.left, LONG(px)), std::max<LONG>(sr.top, LONG(py)), std::min<LONG>(sr.right, LONG(px + 1)),
+              std::min<LONG>(sr.bottom, LONG(py + 1))};
     }
     ctx_->RSSetScissorRects(1, &sr);
 
@@ -610,17 +663,17 @@ void D3D11Renderer::Draw() {
         topo = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP;
         break;
     default:
-        draws_skipped++;
+        draws_skipped++, skip_reason_[1]++;
         return;
     }
     if (indices.empty()) {
-        draws_skipped++;
+        draws_skipped++, skip_reason_[2]++;
         return;
     }
     min_v = *std::min_element(indices.begin(), indices.end());
     max_v = *std::max_element(indices.begin(), indices.end());
     if (max_v - min_v > 4000000) {
-        draws_skipped++;
+        draws_skipped++, skip_reason_[3]++;
         return;
     }
     ctx_->IASetPrimitiveTopology(topo);
@@ -652,8 +705,10 @@ void D3D11Renderer::Draw() {
         } else {
             const u32 divisor = m.Reg(kVertexArray + b * 4 + 3);
             if (divisor) {
+                // Maxwell issues one draw per instance; the buffer is uploaded starting at this
+                // instance's element, so every draw reads element 0.
                 e.InputSlotClass = D3D11_INPUT_PER_INSTANCE_DATA;
-                e.InstanceDataStepRate = divisor;
+                e.InstanceDataStepRate = 1;
             }
             used_buf[b] = true;
         }
@@ -674,7 +729,7 @@ void D3D11Renderer::Draw() {
         }
         layout = it->second.Get();
         if (!layout) {
-            draws_skipped++;
+            draws_skipped++, skip_reason_[4]++;
             return;
         }
     }
@@ -692,8 +747,8 @@ void D3D11Renderer::Draw() {
         const u64 limit = m.Addr(kVertexArrayLimit + b * 2);
         u64 begin, end;
         if (divisor) {
-            begin = addr;
-            end = std::min<u64>(limit + 1, addr + u64(stride) * (dr.instance / divisor + 1) + 64);
+            begin = addr + u64(stride) * (dr.instance / divisor);
+            end = std::min<u64>(limit + 1, begin + stride + 64);
         } else {
             begin = addr + u64(min_v) * stride;
             end = std::min<u64>(limit + 1, addr + u64(max_v + 1) * stride + 64);
@@ -707,6 +762,16 @@ void D3D11Renderer::Draw() {
         g.ReadGpu(begin, tmp.data(), size);
         vbufs[b] = dc.Vertex(b, tmp.data(), u32(tmp.size()));
         strides[b] = stride;
+        if (trace_draws_ > 0 && b == 0) {
+            trace_vb_data_.assign(tmp.begin(), tmp.begin() + size);
+            trace_vb_stride_ = stride;
+        }
+        if (trace_draws_ > 0 && b == 0) { // raw bytes of the first two vertices, for the draw trace
+            trace_vb_ = fmt::format("b0 stride {} div {} first {} min_v {} max_v {} limit {:#x} need {:#x}:", stride, divisor,
+                                    begin - addr, min_v, max_v, limit + 1 - addr, u64(max_v + 1) * stride);
+            for (u32 i = 0; i < std::min<u32>(size, stride * 2); i++)
+                trace_vb_ += fmt::format("{}{:02x}", i % 4 ? "" : " ", tmp[i]);
+        }
     }
     if (need_default) {
         if (!dc.default_attrib) {
@@ -719,17 +784,101 @@ void D3D11Renderer::Draw() {
         strides[31] = 0;
     }
     ctx_->IASetVertexBuffers(0, 32, vbufs, strides, offsets);
-    drv.misc[0] = 0;
+    drv.misc[0] = dr.instance; // added to SV_InstanceID (always 0: each Maxwell draw is one instance)
     drv.misc[1] = m.Reg(kAlphaTestFunc) >= 0x200 ? m.Reg(kAlphaTestFunc) - 0x200 + 1 : m.Reg(kAlphaTestFunc);
     drv.misc[2] = m.Reg(kAlphaTestRef);
     drv.misc[3] = m.Reg(kAlphaTestEnable) & 1;
 
     // Trace every draw into the presented surface once (debug aid, MUA3_TRACE_DRAWS).
-    trace_draw_ = trace_draws_ > 0 && colors[0] && presented_cpu_.count(colors[0]->cpu_va);
+    // With trace_rt_ set, trace draws that write that surface (any MRT slot) instead.
+    trace_draw_ = false;
+    if (trace_draws_ > 0) {
+        const u64 want = trace_rt_;
+        if (want == ~0ull) // "all": every draw
+            trace_draw_ = true;
+        for (u32 i = 0; i < count && !trace_draw_; i++)
+            trace_draw_ = colors[i] && (want ? colors[i]->gpu_va == want : presented_cpu_.count(colors[i]->cpu_va) != 0);
+    }
     if (trace_draw_) {
         trace_draws_--;
-        LOG_INFO("Renderer", "TRACE draw vs {:016x} ps {:016x} n {} rt0 {:#x} blend0 {} cmask {:#x} depth {}", vs->hash,
-                 ps ? ps->hash : 0, indices.size(), colors[0]->gpu_va, m.Reg(kBlendEnable), m.Reg(kColorMask), depth ? 1 : 0);
+        std::string rts;
+        for (u32 i = 0; i < count; i++)
+            rts += colors[i] ? fmt::format(" {:#x}/{:#x}", colors[i]->gpu_va, colors[i]->format) : " -";
+        std::string attrs;
+        for (u32 i = 0; i < 32; i++)
+            if (vs->info.attrib_in_mask & (1u << i)) {
+                const u32 f = m.Reg(kVertexAttribFormat + i);
+                attrs += fmt::format(" {}:b{}+{}/s{:x}t{}{}", i, f & 0x1F, (f >> 7) & 0x3FFF, (f >> 21) & 0x3F, (f >> 27) & 7,
+                                     (f & 0x40) ? "c" : "");
+            }
+        std::string cbs;
+        for (u32 i = 0; i < 18; i++)
+            if (vs->info.cbuf_mask & (1u << i))
+                cbs += fmt::format(" c{}={:#x}@{:#x}", i, m.CBuf(0, i).size, m.CBuf(0, i).address);
+        std::string progs;
+        for (u32 pidx = 0; pidx < 6; pidx++) {
+            const u32 cfg = m.Reg(kShaderConfig + pidx * 0x10);
+            progs += fmt::format(" p{}={}{:x}", pidx, cfg & 1 ? "on:" : "", (cfg >> 4) & 0xF);
+        }
+        LOG_INFO("Renderer", "TRACE attrs{} | {} | vs cbufs{} | progs{} topo {} | base vertex {:#x} base instance {:#x} idxfmt {} first {}",
+                 attrs, trace_vb_, cbs, progs, dr.topology, m.Reg(0x50D), m.Reg(0x50E), m.Reg(kIndexFormat), dr.first);
+        // CPU check of the first triangle: attribute-5 positions through bone 0 (c3[14..16]) and c3[10..13].
+        if ((vs->info.cbuf_mask & 8) && trace_vb_stride_ && indices.size() >= 3) {
+            float c[20][4]{};
+            g.ReadGpu(m.CBuf(0, 3).address, c, std::min<size_t>(sizeof(c), m.CBuf(0, 3).size));
+            const u32 f5 = m.Reg(kVertexAttribFormat + 5), off5 = (f5 >> 7) & 0x3FFF;
+            std::string tri;
+            for (u32 k = 0; k < 3; k++) {
+                const size_t at = size_t(indices[k] - min_v) * trace_vb_stride_ + off5;
+                if (at + 12 > trace_vb_data_.size())
+                    break;
+                float p[4] = {0, 0, 0, 1};
+                std::memcpy(p, &trace_vb_data_[at], 12);
+                float w[4] = {0, 0, 0, 1};
+                for (int r = 0; r < 3; r++)
+                    w[r] = p[0] * c[14 + r][0] + p[1] * c[14 + r][1] + p[2] * c[14 + r][2] + c[14 + r][3];
+                float clip[4];
+                for (int col = 0; col < 4; col++)
+                    clip[col] = w[0] * c[10][col] + w[1] * c[11][col] + w[2] * c[12][col] + c[13][col];
+                tri += fmt::format(" v{}=({:g},{:g},{:g}) ndc=({:.3f},{:.3f},{:.4f})", indices[k], p[0], p[1], p[2],
+                                   clip[0] / clip[3], clip[1] / clip[3], clip[2] / clip[3]);
+            }
+            u32 behind = 0, far_off = 0, total = 0;
+            float min_w = 1e30f;
+            for (size_t k = 0; k + 2 < indices.size(); k += 3) {
+                bool b = false, f = false;
+                for (int e = 0; e < 3; e++) {
+                    const size_t at = size_t(indices[k + e] - min_v) * trace_vb_stride_ + off5;
+                    if (at + 12 > trace_vb_data_.size())
+                        continue;
+                    float p[3];
+                    std::memcpy(p, &trace_vb_data_[at], 12);
+                    float w[3];
+                    for (int r = 0; r < 3; r++)
+                        w[r] = p[0] * c[14 + r][0] + p[1] * c[14 + r][1] + p[2] * c[14 + r][2] + c[14 + r][3];
+                    float clip[4];
+                    for (int col = 0; col < 4; col++)
+                        clip[col] = w[0] * c[10][col] + w[1] * c[11][col] + w[2] * c[12][col] + c[13][col];
+                    min_w = std::min(min_w, clip[3]);
+                    b |= clip[3] <= 0;
+                    f |= std::abs(clip[0] / clip[3]) > 4 || std::abs(clip[1] / clip[3]) > 4;
+                }
+                total++, behind += b, far_off += f;
+            }
+            LOG_INFO("Renderer", "TRACE tri{} | tris {} behind-camera {} far {} min_w {:g}", tri, total, behind, far_off, min_w);
+        }
+        if (vs->info.cbuf_mask & 8) {
+            float rows[20][4]{};
+            g.ReadGpu(m.CBuf(0, 3).address, rows, std::min<size_t>(sizeof(rows), m.CBuf(0, 3).size));
+            std::string r;
+            for (auto& row : rows)
+                r += fmt::format(" ({:g},{:g},{:g},{:g})", row[0], row[1], row[2], row[3]);
+            LOG_INFO("Renderer", "TRACE c3[0..19]{}", r);
+        }
+        LOG_INFO("Renderer", "TRACE draw vs {:016x} ps {:016x} n {} rts{} blend0 {} cmask {:#x} depth {} ztest {} zwrite {} zfunc {:#x}",
+                 vs->hash, ps ? ps->hash : 0, indices.size(), rts, m.Reg(kBlendEnable), m.Reg(kColorMask),
+                 depth ? fmt::format("{:#x}/{:#x}", depth->gpu_va, depth->format) : "-", m.Reg(kDepthTestEnable),
+                 m.Reg(kDepthWriteEnable), m.Reg(kDepthTestFunc));
     }
     // ---- per stage resources
     auto bind_stage = [&](HostShader* s, u32 stage_index, bool is_vs) {
@@ -816,7 +965,23 @@ void D3D11Renderer::Draw() {
                  depth ? 1 : 0, m.Reg(kVertexAttribFormat), m.Reg(kVertexAttribFormat + 1), m.Reg(kVertexArray),
                  m.Addr(kVertexArray + 1));
     }
-    ctx_->DrawIndexedInstanced(u32(indices.size()), 1, 0, base_vertex, dr.instance);
+    ComPtr<ID3D11Query> pick_query;
+    if (picking) {
+        D3D11_QUERY_DESC qd{D3D11_QUERY_OCCLUSION, 0};
+        dev_->CreateQuery(&qd, &pick_query);
+        ctx_->Begin(pick_query.Get());
+    }
+    ctx_->DrawIndexedInstanced(u32(indices.size()), 1, 0, base_vertex, 0);
+    if (pick_query) {
+        ctx_->End(pick_query.Get());
+        UINT64 samples = 0;
+        while (ctx_->GetData(pick_query.Get(), &samples, sizeof(samples), 0) == S_FALSE) {
+        }
+        if (samples || counting)
+            LOG_INFO("Renderer", "{} draw vs {:016x} ps {:016x} rt0 {:#x} n {} blend {} zwrite {} samples {}",
+                     counting ? "OCCL" : "PICK", vs->hash, ps ? ps->hash : 0, colors[0] ? colors[0]->gpu_va : 0,
+                     indices.size(), m.Reg(kBlendEnable), m.Reg(kDepthWriteEnable), samples);
+    }
     draws_ok++;
 
     // Release texture bindings so render targets can be re-bound as outputs.
@@ -847,17 +1012,30 @@ void D3D11Renderer::Present(const PresentInfo& p) {
     textures_->NextFrame();
     Surface* s = FindSurfaceByCpu(p.cpu_addr);
     last_present_cpu_ = p.cpu_addr;
+    {
+        std::lock_guard lk(shot_mutex_);
+        if (!shot_path_.empty() && s) {
+            DumpSurface(s, shot_path_);
+            LOG_INFO("Renderer", "Saved frame to {}", shot_path_.string());
+            shot_path_.clear();
+        }
+    }
     presented_cpu_.insert(p.cpu_addr);
     if (dump_surfaces_.exchange(false)) {
         int n = 0;
+        const std::string dir = fmt::format("screenshots/rt/{}", frame_counter_);
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+        LOG_INFO("Renderer", "dumping {} surfaces to {}", surfaces_.size(), dir);
         for (auto& [k, sf] : surfaces_)
             if (!sf->depth)
-                DumpSurface(sf.get(), fmt::format("screenshots/debug3/surf_{:02}_{:x}_{}x{}_{:x}{}.bmp", n++, sf->gpu_va,
+                DumpSurface(sf.get(), fmt::format("{}/surf_{:02}_{:x}_{}x{}_{:x}{}.bmp", dir, n++, sf->gpu_va,
                                                   sf->width, sf->height, sf->format, sf.get() == s ? "_present" : ""));
     }
     if (frame_counter_ % 150 == 1) {
-        LOG_INFO("Renderer", "Present cpu {:#x} {}x{}: surface {} | draws ok {} skipped {} clears {} surfaces {} shaders {} (failed {})",
+        LOG_INFO("Renderer", "Present cpu {:#x} {}x{}: surface {} | draws ok {} skipped {} [shader {} topo {} empty {} range {} layout {}] clears {} surfaces {} shaders {} (failed {})",
                  p.cpu_addr, p.width, p.height, s ? fmt::format("{:#x}", s->gpu_va) : "none", draws_ok, draws_skipped,
+                 skip_reason_[0], skip_reason_[1], skip_reason_[2], skip_reason_[3], skip_reason_[4],
                  clears, surfaces_.size(), shaders_->Count(), shaders_->failures.load());
         if (!s)
             for (auto& [k, sf] : surfaces_)
@@ -954,7 +1132,7 @@ void D3D11Renderer::NoteTexture(ID3D11ShaderResourceView* srv, u64 addr, u32 w, 
         if (r.addr == addr)
             return;
     recent_.insert(recent_.begin(), RecentTexture{srv, addr, w, h, fmt, rt});
-    if (recent_.size() > 48)
+    if (recent_.size() > 256)
         recent_.pop_back();
 }
 

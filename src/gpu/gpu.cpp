@@ -179,6 +179,9 @@ bool Gpu::WaitSyncpoint(u32 id, u32 value, s64 timeout_us) {
         return true;
     std::unique_lock lk(sync_mutex_);
     auto done = [&] { return s32(syncpoints_[id] - value) >= 0; };
+    if (!done() && timeout_us < 0)
+        LOG_INFO("GPU", "waiting for syncpoint {} >= {} (now {}, max {}, timeout {}us)", id, value, syncpoints_[id].load(),
+                  syncpoint_max_[id].load(), timeout_us);
     if (timeout_us < 0) {
         sync_cv_.wait(lk, done);
         return true;
@@ -197,6 +200,10 @@ void Gpu::Submit(std::vector<u64> entries, u32 syncpt_id, u32 syncpt_incr) {
         queue_.push_back(std::move(j));
     }
     queue_cv_.notify_one();
+    // Debug: MUA3_SYNC_GPU=1 runs command submission synchronously (rules out CPU/GPU races).
+    static const bool sync = std::getenv("MUA3_SYNC_GPU") != nullptr;
+    if (sync)
+        WaitIdle();
 }
 
 void Gpu::QueuePresent(const PresentInfo& p) {

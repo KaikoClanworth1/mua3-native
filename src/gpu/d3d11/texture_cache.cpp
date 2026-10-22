@@ -2,6 +2,7 @@
 
 #include <set>
 
+#include "core/memory.h"
 #include "gpu/d3d11/renderer_d3d11.h"
 #include "gpu/d3d11/shader_cache.h"
 #include "gpu/formats.h"
@@ -74,13 +75,43 @@ ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::T
         s->last_use = frame_;
         if (s->depth)
             swizzle = 0xB1A; // depth samples come back in .x
-        return s->srv.Get();
+        const u32 w = tic.Width(), h = tic.Height();
+        if (s->depth || w == 0 || h == 0 || w > s->width || h > s->height || (w == s->width && h == s->height))
+            return s->srv.Get();
+        // The texture covers only part of the target: sample a copy of exactly that region.
+        if (s->sub_w != w || s->sub_h != h) {
+            D3D11_TEXTURE2D_DESC td;
+            s->tex->GetDesc(&td);
+            td.Width = w;
+            td.Height = h;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            D3D11_SHADER_RESOURCE_VIEW_DESC sv;
+            s->srv->GetDesc(&sv);
+            s->sub_tex.Reset();
+            s->sub_srv.Reset();
+            if (FAILED(dev_->CreateTexture2D(&td, nullptr, &s->sub_tex)) ||
+                FAILED(dev_->CreateShaderResourceView(s->sub_tex.Get(), &sv, &s->sub_srv)))
+                return s->srv.Get();
+            s->sub_w = w;
+            s->sub_h = h;
+        }
+        const D3D11_BOX box{0, 0, 0, w, h, 1};
+        ctx_->CopySubresourceRegion(s->sub_tex.Get(), 0, 0, 0, 0, s->tex.Get(), 0, &box);
+        return s->sub_srv.Get();
     }
     const u64 key = Hash64(tic.w.data(), 32) ^ (u64(use.dim) << 56) ^ (u64(use.array) << 60);
     auto it = textures_.find(key);
     if (it != textures_.end()) {
-        it->second->last_use = frame_;
-        return it->second->srv.Get();
+        // Re-decode if the CPU wrote to the guest copy since we uploaded it (e.g. glyph caches).
+        bool dirty = false;
+        for (auto& [a, s] : it->second->cpu_ranges)
+            dirty |= G().Mem().ConsumeDirty(a, s);
+        if (!dirty) {
+            it->second->last_use = frame_;
+            return it->second->srv.Get();
+        }
+        reuploads++;
+        textures_.erase(it);
     }
     auto* srv = Upload(tic, use, key);
     return srv ? srv : Fallback(use);
@@ -221,6 +252,17 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
     }
     if (FAILED(dev_->CreateShaderResourceView(tex->res.Get(), &sv, &tex->srv)))
         return nullptr;
+    // Track CPU writes to the backing memory.
+    for (u64 off = 0; off < total;) {
+        u64 run = 0;
+        const u64 cpu = G().As().TranslateRun(tic.Address() + off, run);
+        if (!cpu || !run)
+            break;
+        const u64 n = std::min(run, total - off);
+        tex->cpu_ranges.emplace_back(cpu, n);
+        G().Mem().TrackWrites(cpu, n);
+        off += n;
+    }
     auto* srv = tex->srv.Get();
     textures_[key] = std::move(tex);
     return srv;

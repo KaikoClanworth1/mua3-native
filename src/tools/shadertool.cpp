@@ -72,6 +72,11 @@ int main(int argc, char** argv) {
             continue;
         }
         auto r = Translate(vs ? Stage::Vertex : Stage::Fragment, data.data(), data.size());
+        if (r.uses_loop) { // like the game: loop shaders sample with explicit LOD 0
+            TranslateOptions opt;
+            opt.force_lod0 = true;
+            r = Translate(vs ? Stage::Vertex : Stage::Fragment, data.data(), data.size(), opt);
+        }
         for (auto& u : r.unimplemented)
             unimpl[u]++;
         std::string err;

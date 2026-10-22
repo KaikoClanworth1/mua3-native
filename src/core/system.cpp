@@ -1,3 +1,6 @@
+#include <cstdlib>
+#include <atomic>
+#include <sstream>
 #include "core/system.h"
 
 #include <algorithm>
@@ -152,6 +155,7 @@ bool System::Load(std::string& error) {
     }
     for (auto& mod : modules_)
         LoadSymbols(*memory_, mod);
+    InstallTraces();
 
     // Main thread stack
     const u64 stack_size = common::AlignUp(main_stack_size_, 0x1000);
@@ -159,6 +163,46 @@ bool System::Load(std::string& error) {
     memory_->Map(stack, stack_size, MS_Stack, MP_RW);
     main_stack_top_ = stack + stack_size;
     return true;
+}
+
+// MUA3_TRACE_FN=main+0x10f3ac0,sdk+0x85670,...: log each entry to these guest functions (debugging aid).
+void System::InstallTraces() {
+    const char* env = std::getenv("MUA3_TRACE_FN");
+    if (!env)
+        return;
+    trace_armed_ = std::getenv("MUA3_TRACE_DEFER") == nullptr; // deferred: wait for the "trace" command
+    std::stringstream ss(env);
+    for (std::string item; std::getline(ss, item, ',');) {
+        const size_t plus = item.find('+');
+        if (plus == std::string::npos)
+            continue;
+        const std::string modname = item.substr(0, plus);
+        const u64 off = std::strtoull(item.c_str() + plus + 1, nullptr, 16);
+        for (auto& m : modules_) {
+            if (m.name != modname)
+                continue;
+            auto count = std::make_shared<std::atomic<u64>>(0);
+            trace_counters_.push_back(count);
+            kernel_->InstallTrace(m.base + off, item, [this, item, count](kernel::Thread* t) {
+                if (!trace_armed_)
+                    return;
+                const u64 n = (*count)++;
+                if (n >= 300 && n % 10000)
+                    return;
+                auto& c = *t->cpu;
+                LOG_INFO("Trace", "{} #{} t{} x0={:#x} x1={:#x} x2={:#x} x3={:#x} lr={}", item, n, t->id, c.Reg(0),
+                         c.Reg(1), c.Reg(2), c.Reg(3), Symbolize(c.Reg(30)));
+            });
+            LOG_INFO("Trace", "tracing {}", item);
+        }
+    }
+}
+
+void System::ArmTraces() {
+    for (auto& c : trace_counters_)
+        *c = 0;
+    trace_armed_ = true;
+    LOG_INFO("Trace", "tracing armed");
 }
 
 void System::Start() {

@@ -126,6 +126,7 @@ public:
     // Address arbiter
     u64 arbiter_addr = 0;
     std::atomic<u32> current_svc{0}; // SVC being serviced (0 = running guest code)
+    std::string current_ipc;          // service/command being called (debug)
 };
 using ThreadPtr = std::shared_ptr<Thread>;
 
@@ -186,12 +187,16 @@ public:
     // HLE function hooks: replaces the guest function at `addr` with `fn`.
     using HookFn = std::function<void(Thread*)>;
     void InstallHook(u64 addr, std::string name, HookFn fn);
+    // Debug tracing: runs `fn` on entry to the guest function at `addr`, then executes the function
+    // normally (its first instruction is relocated to a trampoline, so it must not be PC-relative).
+    void InstallTrace(u64 addr, std::string name, HookFn fn);
 
     // Allocate a 0x200-byte TLS slot.
     u64 AllocTls();
     void DumpThreadState(Thread* t, bool error = true);
+    void DumpThreadRegs(u32 thread_id); // registers + backtrace of one guest thread (debug command)
     // Logs where every guest thread is (running threads are briefly interrupted).
-    void DumpAllThreads();
+    void DumpAllThreads(bool host_stacks = false);
 
     u64 program_id = 0x010060700AC50000ull;
     u64 random_entropy[4]{};
@@ -201,6 +206,7 @@ public:
 
 private:
     void ThreadMain(ThreadPtr t);
+    u64 trampolines_ = 0, trampoline_used_ = 0;
     void SvcDispatch(Thread* t, u32 id);
 
     core::Memory& mem_;

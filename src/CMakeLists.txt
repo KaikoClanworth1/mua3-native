@@ -33,3 +33,5 @@ target_link_libraries(MUA3Launcher PRIVATE nxloader platform windowscodecs)
 
 add_executable(shadertool tools/shadertool.cpp)
 target_link_libraries(shadertool PRIVATE nxcore d3dcompiler)
+
+add_executable(stackdump tools/stackdump.cpp)

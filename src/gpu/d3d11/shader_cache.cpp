@@ -1,5 +1,6 @@
 #include "gpu/d3d11/shader_cache.h"
 
+#include <cstdlib>
 #include <d3dcompiler.h>
 #include <windows.h>
 
@@ -32,7 +33,11 @@ ShaderCache::ShaderCache(ID3D11Device* dev) : dev_(dev) {
     fs::create_directories(cache_dir_, ec);
     const unsigned n = std::clamp(std::thread::hardware_concurrency() / 2, 2u, 6u);
     for (unsigned i = 0; i < n; i++)
-        workers_.emplace_back([this] { Worker(); });
+        workers_.emplace_back([this] { Worker(false); });
+    // Loop shaders compile out of process (FXC can run for minutes on them); two workers so one slow shader
+    // does not hold up the rest.
+    for (int i = 0; i < 2; i++)
+        std::thread([this] { Worker(true); }).detach();
 }
 
 ShaderCache::~ShaderCache() {
@@ -45,36 +50,52 @@ ShaderCache::~ShaderCache() {
         t.join();
 }
 
-void ShaderCache::Worker() {
-    SetThreadDescription(GetCurrentThread(), L"ShaderCompiler");
+void ShaderCache::Worker(bool slow) {
+    SetThreadDescription(GetCurrentThread(), slow ? L"ShaderCompiler (slow)" : L"ShaderCompiler");
+    auto& q = slow ? slow_queue_ : queue_;
     for (;;) {
         HostShader* s;
         {
             std::unique_lock lk(mutex_);
-            cv_.wait(lk, [&] { return stop_ || !queue_.empty(); });
+            cv_.wait(lk, [&] { return stop_ || !q.empty(); });
             if (stop_)
                 return;
-            s = queue_.front();
-            queue_.pop_front();
+            s = q.front();
+            q.pop_front();
         }
-        Build(*s);
-        pending--;
+        if (Build(*s, slow))
+            pending--;
     }
 }
 
-void ShaderCache::Build(HostShader& s) {
+bool ShaderCache::Build(HostShader& s, bool slow) {
     const char* tag = s.stage == shader::Stage::Vertex ? "vs" : "ps";
-    s.info = shader::Translate(s.stage, s.code.data(), s.code.size());
-    std::string err;
-    if (s.info.ok) {
-        if (!Compile(s, s.info.hlsl, err) && s.info.uses_loop) {
-            // Gradient ops inside loops are rejected by FXC; retry with explicit LOD 0.
+    if (!s.is_variant && !s.translated) {
+        s.info = shader::Translate(s.stage, s.code.data(), s.code.size());
+        if (s.info.ok && s.info.uses_loop) {
+            // Gradient ops inside loops are rejected by FXC: loop shaders sample with explicit LOD 0.
             shader::TranslateOptions opt;
             opt.force_lod0 = true;
             s.info = shader::Translate(s.stage, s.code.data(), s.code.size(), opt);
-            err.clear();
-            Compile(s, s.info.hlsl, err);
         }
+        s.translated = true;
+    }
+    const char* target = s.stage == shader::Stage::Vertex ? "vs_5_0" : "ps_5_0";
+    if (!slow && s.info.ok && s.info.uses_loop && !fs::exists(CachePath(s, target))) {
+        {
+            std::lock_guard lk(mutex_);
+            slow_queue_.push_back(&s);
+        }
+        cv_.notify_all();
+        return false;
+    }
+    std::string err;
+    if (s.is_variant) {
+        Compile(s, s.info.hlsl, err, slow);
+    } else if (s.info.ok && s.info.uses_loop && std::getenv("MUA3_NO_LOOP_SHADERS")) {
+        err = "loop shaders disabled (MUA3_NO_LOOP_SHADERS)";
+    } else if (s.info.ok) {
+        Compile(s, s.info.hlsl, err, slow);
     } else {
         err = s.info.error;
     }
@@ -94,24 +115,85 @@ void ShaderCache::Build(HostShader& s) {
     s.code.clear();
     s.code.shrink_to_fit();
     s.state = s.ok ? HostShader::Ready : HostShader::Failed;
+    return true;
 }
 
-bool ShaderCache::Compile(HostShader& s, const std::string& hlsl, std::string& err) {
-    const char* target = s.stage == shader::Stage::Vertex ? "vs_5_0" : "ps_5_0";
+fs::path ShaderCache::CachePath(const HostShader& s, const char* target) const {
     // Bump kTranslatorVersion whenever the translator output changes, to invalidate cached bytecode.
-    constexpr int kTranslatorVersion = 7;
-    const fs::path cached = cache_dir_ / fmt::format("{:016x}_{}_v{}.dxbc", s.hash, target, kTranslatorVersion);
-    std::vector<u8> blob = common::ReadFile(cached);
+    constexpr int kTranslatorVersion = 19;
+    return cache_dir_ / fmt::format("{:016x}_{}_v{}.dxbc", s.hash, target, kTranslatorVersion);
+}
+
+bool ShaderCache::Compile(HostShader& s, const std::string& hlsl, std::string& err, bool out_of_process) {
+    const char* target = s.stage == shader::Stage::Vertex ? "vs_5_0" : "ps_5_0";
+    fs::path cached = s.no_cache ? fs::path() : CachePath(s, target);
+    std::vector<u8> blob = s.no_cache ? std::vector<u8>() : common::ReadFile(cached);
+    // Debug aid: shader_override/<hash>.<vs|ps>.hlsl replaces the translated HLSL (never cached).
+    std::string source = hlsl;
+    const fs::path override_path =
+        fs::path("shader_override") / fmt::format("{:016x}.{}.hlsl", s.hash, s.stage == shader::Stage::Vertex ? "vs" : "ps");
+    if (fs::exists(override_path)) {
+        const auto text = common::ReadFile(override_path);
+        source.assign(text.begin(), text.end());
+        blob.clear();
+        cached.clear();
+        LOG_INFO("Shader", "using override {}", override_path.string());
+    }
+    if (blob.empty() && out_of_process) {
+        // Run FXC in a child process we can kill: some loop shaders make it spin for many minutes.
+        const auto tmp = fs::temp_directory_path() / fmt::format("mua3_shader_{:016x}", s.hash);
+        const fs::path in = tmp.string() + ".hlsl", out = tmp.string() + ".dxbc";
+        common::WriteFile(in, std::span(reinterpret_cast<const u8*>(source.data()), source.size()));
+        wchar_t exe[MAX_PATH];
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring cmd = L"\"" + std::wstring(exe) + L"\" --compile-shader \"" + in.wstring() + L"\" \"" +
+                           out.wstring() + L"\" " + std::wstring(target, target + std::strlen(target));
+        STARTUPINFOW si{sizeof(si)};
+        PROCESS_INFORMATION pi{};
+        if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS,
+                            nullptr, nullptr, &si, &pi)) {
+            err = "could not start shader compiler process";
+            return false;
+        }
+        DWORD code = 1;
+        if (WaitForSingleObject(pi.hProcess, 120000) == WAIT_TIMEOUT) {
+            TerminateProcess(pi.hProcess, 1);
+            WaitForSingleObject(pi.hProcess, 5000);
+            err = "FXC timed out (2 min)";
+        } else {
+            GetExitCodeProcess(pi.hProcess, &code);
+        }
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        if (err.empty()) {
+            if (code == 0) {
+                blob = common::ReadFile(out);
+                if (!cached.empty())
+                    common::WriteFile(cached, blob);
+            } else {
+                const auto e = common::ReadFile(out.string() + ".err");
+                err.assign(e.begin(), e.end());
+            }
+        }
+        std::error_code ec;
+        fs::remove(in, ec);
+        fs::remove(out, ec);
+        fs::remove(out.string() + ".err", ec);
+        if (!err.empty())
+            return false;
+    }
     if (blob.empty()) {
         ComPtr<ID3DBlob> code, errors;
-        const HRESULT hr = D3DCompile(hlsl.data(), hlsl.size(), nullptr, nullptr, nullptr, "main", target,
-                                      D3DCOMPILE_OPTIMIZATION_LEVEL1 | D3DCOMPILE_IEEE_STRICTNESS, 0, &code, &errors);
+        const UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL1 | D3DCOMPILE_IEEE_STRICTNESS;
+        const HRESULT hr = D3DCompile(source.data(), source.size(), nullptr, nullptr, nullptr, "main", target, flags, 0,
+                                      &code, &errors);
         if (FAILED(hr)) {
             err = errors ? std::string((const char*)errors->GetBufferPointer(), errors->GetBufferSize()) : "D3DCompile failed";
             return false;
         }
         blob.assign((const u8*)code->GetBufferPointer(), (const u8*)code->GetBufferPointer() + code->GetBufferSize());
-        common::WriteFile(cached, blob);
+        if (!cached.empty())
+            common::WriteFile(cached, blob);
     }
     HRESULT hr;
     if (s.stage == shader::Stage::Vertex) {
@@ -149,6 +231,69 @@ HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size) {
     }
     cv_.notify_one();
     return raw;
+}
+
+HostShader* ShaderCache::GetVsVariant(HostShader* base, u32 uint_mask, u32 sint_mask, u32 scaled_mask) {
+    if (!base || !(uint_mask | sint_mask) || base->state != HostShader::Ready)
+        return base;
+    const u64 key = base->hash ^ (Hash64(&uint_mask, 4) * 3) ^ (Hash64(&sint_mask, 4) * 5) ^ (Hash64(&scaled_mask, 4) * 7);
+    auto it = shaders_.find(key);
+    if (it != shaders_.end())
+        return it->second.get();
+    auto s = std::make_unique<HostShader>();
+    s->stage = base->stage;
+    s->hash = key;
+    s->is_variant = true;
+    s->info = base->info;
+    std::string& src = s->info.hlsl;
+    // Debug overrides of the base shader apply to its variants too.
+    const fs::path override_path = fs::path("shader_override") / fmt::format("{:016x}.vs.hlsl", base->hash);
+    if (fs::exists(override_path)) {
+        const auto text = common::ReadFile(override_path);
+        src.assign(text.begin(), text.end());
+        s->no_cache = true;
+    }
+    const size_t vsin = src.find("struct VSIn {");
+    for (u32 i = 0; i < 32 && vsin != std::string::npos; i++) {
+        if (!((uint_mask | sint_mask) & (1u << i)))
+            continue;
+        const std::string decl = fmt::format("    float4 a{0} : ATTR{0};", i);
+        const size_t at = src.find(decl, vsin);
+        if (at == std::string::npos)
+            continue;
+        src.replace(at, decl.size(), fmt::format("    {}4 a{} : ATTR{};", (sint_mask >> i) & 1 ? "int" : "uint", i, i));
+        if ((scaled_mask >> i) & 1) {
+            const std::string load = fmt::format("    vin{0} = asuint(input.a{0});", i);
+            const size_t l = src.find(load, vsin);
+            if (l != std::string::npos)
+                src.replace(l, load.size(), fmt::format("    vin{0} = asuint(float4(input.a{0}));", i));
+        }
+    }
+    auto* raw = s.get();
+    shaders_[key] = std::move(s);
+    pending++;
+    {
+        std::lock_guard lk(mutex_);
+        queue_.push_back(raw);
+    }
+    cv_.notify_one();
+    return raw;
+}
+
+bool CompileShaderFile(const char* in_path, const char* out_path, const char* target) {
+    const auto src = common::ReadFile(fs::u8path(in_path));
+    ComPtr<ID3DBlob> code, errors;
+    const HRESULT hr = D3DCompile(src.data(), src.size(), nullptr, nullptr, nullptr, "main", target,
+                                  D3DCOMPILE_OPTIMIZATION_LEVEL1 | D3DCOMPILE_IEEE_STRICTNESS, 0, &code, &errors);
+    if (FAILED(hr)) {
+        if (errors)
+            common::WriteFile(fs::u8path(std::string(out_path) + ".err"),
+                              std::span(static_cast<const u8*>(errors->GetBufferPointer()), errors->GetBufferSize()));
+        return false;
+    }
+    common::WriteFile(fs::u8path(out_path),
+                      std::span(static_cast<const u8*>(code->GetBufferPointer()), code->GetBufferSize()));
+    return true;
 }
 
 } // namespace gpu

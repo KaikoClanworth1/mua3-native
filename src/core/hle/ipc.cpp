@@ -286,6 +286,7 @@ Result ServiceManager::HandleSyncRequest(kernel::Thread* t, Handle h, u64 msg, u
         r.cmd = hdr[2];
         if (payload_size > 16)
             r.args.assign(m.Ptr<u8>(payload + 16), m.Ptr<u8>(payload + payload_size));
+        t->current_ipc = fmt::format("{} cmd {}", target->Name(), r.cmd);
         target->Dispatch(r);
         respond(domain);
         return 0;

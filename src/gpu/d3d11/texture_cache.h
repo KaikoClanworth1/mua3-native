@@ -34,6 +34,7 @@ struct TicEntry {
 struct CachedTexture {
     u64 key = 0;
     u64 gpu_va = 0, size = 0;
+    std::vector<std::pair<u64, u64>> cpu_ranges; // guest CPU ranges backing it (write-tracked)
     ComPtr<ID3D11Resource> res;
     ComPtr<ID3D11ShaderResourceView> srv;
     u64 last_use = 0;
@@ -47,6 +48,7 @@ public:
     ID3D11SamplerState* GetSampler(const u32* tsc, bool compare);
     void Invalidate(u64 gpu_va, u64 size);
     void NextFrame() { frame_++; }
+    u64 reuploads = 0;
 
 private:
     ID3D11ShaderResourceView* Upload(const TicEntry& tic, const shader::TextureUse& use, u64 key);

@@ -30,6 +30,11 @@ struct Surface {
     ComPtr<ID3D11RenderTargetView> rtv;
     ComPtr<ID3D11DepthStencilView> dsv;
     ComPtr<ID3D11ShaderResourceView> srv;
+    // Copy of the top-left region for textures that alias this target with a smaller size (the game may
+    // render a 1x1 value into a 16x1 target): sampling the full target would read unwritten texels.
+    ComPtr<ID3D11Texture2D> sub_tex;
+    ComPtr<ID3D11ShaderResourceView> sub_srv;
+    u32 sub_w = 0, sub_h = 0;
     u64 last_use = 0;
 };
 
@@ -53,7 +58,19 @@ public:
     Surface* FindSurfaceByCpu(u64 cpu_va);
 
     void DumpSurface(Surface* s, const fs::path& path);
+    // Saves the next presented frame (debug / automation).
+    void RequestFrameShot(const fs::path& path) {
+        std::lock_guard lk(shot_mutex_);
+        shot_path_ = path;
+    }
+    std::mutex shot_mutex_;
+    fs::path shot_path_;
     std::atomic<bool> dump_surfaces_{false};
+    std::atomic<int> trace_draws_{0}; // debug: log the next N draws into the presented surface
+    std::atomic<u64> trace_rt_{0};    // ... or into this surface (gpu va) when set
+    // Debug pixel history: draws of frame `pick_frame_` touching (pick_x_, pick_y_) (fractions of the target size).
+    void Pick(float x, float y) { pick_x_ = x; pick_y_ = y; pick_frame_ = frame_counter_ + 2; }
+    void CountSamples() { occl_frame_ = frame_counter_ + 2; }
 
     // Debug: recently sampled textures / render targets (for the overlay's texture viewer).
     struct RecentTexture {
@@ -72,9 +89,15 @@ public:
     u64 draws_ok = 0, draws_skipped = 0, clears = 0;
 
 private:
+    std::atomic<u64> pick_frame_{~0ull}, occl_frame_{~0ull};
+    std::string trace_vb_;
+    std::vector<u8> trace_vb_data_;
+    u32 trace_vb_stride_ = 0;
+    u64 skip_reason_[5]{}; // shader not ready, topology, no indices, index range, input layout
+    float pick_x_ = 0, pick_y_ = 0;
     Surface* GetColorSurface(u32 index);
     Surface* GetDepthSurface();
-    Surface* GetSurface(u64 gpu_va, u32 width, u32 height, u32 format, bool depth);
+    Surface* GetSurface(u64 gpu_va, u32 width, u32 height, u32 format, bool depth, u32 tile_mode = 0);
     void BindRenderTargets(Surface** colors, u32 count, Surface* depth);
 
     ID3D11Device* dev_;
@@ -87,7 +110,6 @@ private:
 
     ComPtr<ID3D11PixelShader> debug_ps_;
     int debug_mode_ = 0;
-    int trace_draws_ = 0;
     bool trace_draw_ = false;
     u64 last_present_cpu_ = 0;
     std::set<u64> presented_cpu_;
