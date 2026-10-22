@@ -1,3 +1,4 @@
+#include <set>
 #include <cstdlib>
 // Maxwell SASS -> HLSL (Shader Model 5.0) translator.
 #include "gpu/shader/translator.h"
@@ -265,6 +266,15 @@ private:
     };
     bool BuildStructuredBlocks();
     bool EmitStructured(std::string& body);
+    std::string sfail_;
+    // Forward jumps out of a region's last block: the condition is kept in a flag and the blocks it skips
+    // are wrapped in if (!flag) by the enclosing sequence.
+    std::set<u32> pending_fwd_, fwd_used_;
+    bool SFail(std::string why) {
+        if (sfail_.empty())
+            sfail_ = std::move(why);
+        return false;
+    }
     bool Seq(u32 first, u32 last, u32 end_target, LoopCtx ctx, u32 skip_header);
     bool Goto(u32 from, u32 target, u32 last, u32 end_target, LoopCtx ctx);
     void SLine(const std::string& l) { sout_.append(size_t(sindent_) * 4, ' ').append(l).append("\n"); }
@@ -294,7 +304,23 @@ private:
     bool cc_used_ = false;
     std::map<u32, u32> tex_slot_of_; // cbuf offset -> slot
     std::set<u32> vs_inputs_, out_attrs_, in_attrs_;
-    bool uses_lmem_ = false, uses_frag_coord_ = false, uses_front_face_ = false;
+    bool uses_lmem_ = false, uses_smem_ = false, uses_gmem_ = false, uses_frag_coord_ = false, uses_front_face_ = false;
+    // Atomic op (Maxwell order: ADD MIN MAX INC DEC AND OR XOR EXCH) on `dst`; `orig` receives the old value.
+    std::string AtomicOp(u32 aop, const std::string& dst, const std::string& v, const std::string& orig) {
+        switch (aop) {
+        case 0: return fmt::format("InterlockedAdd({}, {}, {});", dst, v, orig);
+        case 1: return fmt::format("InterlockedMin({}, {}, {});", dst, v, orig);
+        case 2: return fmt::format("InterlockedMax({}, {}, {});", dst, v, orig);
+        case 5: return fmt::format("InterlockedAnd({}, {}, {});", dst, v, orig);
+        case 6: return fmt::format("InterlockedOr({}, {}, {});", dst, v, orig);
+        case 7: return fmt::format("InterlockedXor({}, {}, {});", dst, v, orig);
+        case 8: return fmt::format("InterlockedExchange({}, {}, {});", dst, v, orig);
+        default:
+            res_.unimplemented.insert(fmt::format("ATOM_op{}", aop));
+            return fmt::format("InterlockedAdd({}, {}, {});", dst, v, orig);
+        }
+    }
+    u32 SmemWords() const { return std::max<u32>(opt_.shared_bytes / 4, 1); }
     bool uses_vertex_id_ = false, uses_instance_id_ = false;
 };
 
@@ -878,7 +904,7 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
     auto form3 = [](Op o, Op reg, Op cbuf) { return o == reg ? 0 : o == cbuf ? 1 : 2; };
 
     switch (op) {
-    case Op::NOP: case Op::DEPBAR: case Op::MEMBAR: case Op::BAR: case Op::SSY: case Op::PBK: case Op::PCNT:
+    case Op::NOP: case Op::DEPBAR: case Op::MEMBAR: case Op::SSY: case Op::PBK: case Op::PCNT:
     case Op::CCTL: case Op::CCTLL: case Op::FCHK_reg: case Op::FCHK_cbuf: case Op::FCHK_imm:
         return;
 
@@ -1185,8 +1211,15 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
         std::string av = R(a);
         if (Bit(insn, 49)) av = "(0u - " + av + ")";
         if (Bit(insn, 48)) b = "(0u - " + b + ")";
+        if (cc) {
+            cc_used_ = true;
+            Line(fmt::format("tmpu.x = {} << {}u; tmpu.y = {}; tmpu.z = tmpu.x + tmpu.y;", av, Bits(insn, 39, 5), b));
+            Line("cc_c = tmpu.z < tmpu.x; cc_z = tmpu.z == 0u; cc_s = int(tmpu.z) < 0;"
+                 " cc_o = ((~(tmpu.x ^ tmpu.y)) & (tmpu.x ^ tmpu.z) & 0x80000000u) != 0u;");
+            SetR(d, "tmpu.z");
+            return;
+        }
         SetR(d, fmt::format("({} << {}u) + {}", av, Bits(insn, 39, 5), b));
-        if (cc) SetCcInt(R(d));
         return;
     }
     case Op::ISCADD32I:
@@ -1503,6 +1536,9 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
         case 0x26: v = "group_id.y"; break;
         case 0x27: v = "group_id.z"; break;
         case 0x50: case 0x51: v = "0u"; break;
+        // Lane masks for a one-lane warp (lane 0): EQ/LE/GE contain it, LT/GT are empty.
+        case 0x38: case 0x3A: case 0x3C: v = "1u"; break;
+        case 0x39: case 0x3B: v = "0u"; break;
         default:
             res_.unimplemented.insert(fmt::format("S2R_{:#x}", sr));
             v = "0u";
@@ -1577,6 +1613,107 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
         }
         return;
     }
+    case Op::BAR:
+        if (stage_ == Stage::Compute)
+            Line("GroupMemoryBarrierWithGroupSync();");
+        return;
+    case Op::LDS: case Op::STS: {
+        // Shared memory: one groupshared array of words. Sizes: 0 U8, 1 S8, 2 U16, 3 S16, 4 32, 5 64, 6 128.
+        uses_smem_ = true;
+        const s32 off = s32(u32(Bits(insn, 20, 24)) << 8) >> 8;
+        const u32 size = u32(Bits(insn, 48, 3));
+        const u32 words = size == 5 ? 2 : size == 6 ? 4 : 1;
+        Line(fmt::format("tmpu.w = {} + {};", R(a), Hex(u32(off))));
+        const std::string w = fmt::format("smem[(tmpu.w >> 2u) % {}u]", SmemWords());
+        if (op == Op::LDS) {
+            if (size < 4) {
+                const u32 bits = size < 2 ? 8 : 16;
+                Line(fmt::format("tmpu.z = ({} >> ((tmpu.w & 3u) * 8u)) & {}u;", w, (1u << bits) - 1));
+                if (size == 1 || size == 3)
+                    Line(fmt::format("tmpu.z = uint(int(tmpu.z << {}u) >> {});", 32 - bits, 32 - bits));
+                SetR(d, "tmpu.z");
+                return;
+            }
+            for (u32 i = 0; i < words; i++)
+                Line(fmt::format("tmpu4_[{}] = smem[((tmpu.w >> 2u) + {}u) % {}u];", i, i, SmemWords()));
+            for (u32 i = 0; i < words; i++)
+                SetR(d == RZ ? RZ : d + i, fmt::format("tmpu4_[{}]", i));
+        } else {
+            if (size < 4) {
+                const u32 mask = size < 2 ? 0xFFu : 0xFFFFu;
+                Line(fmt::format("tmpu.z = (tmpu.w & 3u) * 8u;"));
+                Line(fmt::format("{0} = ({0} & ~({1}u << tmpu.z)) | (({2} & {1}u) << tmpu.z);", w, mask, R(d)));
+                return;
+            }
+            for (u32 i = 0; i < words; i++)
+                Line(fmt::format("smem[((tmpu.w >> 2u) + {}u) % {}u] = {};", i, SmemWords(), R(d == RZ ? RZ : d + i)));
+        }
+        return;
+    }
+    // Warp operations. Each D3D11 thread runs as a one-lane warp: votes see only their own predicate and a
+    // shuffle reads the thread's own value. That keeps the usual warp-aggregated patterns (ballot, elect the
+    // first lane, one atomic per warp, broadcast with SHFL.IDX) exact without cross-thread exchange.
+    case Op::SHFL: {
+        SetR(d, R(a));
+        const u32 pd = u32(Bits(insn, 48, 3));
+        if (pd != PT)
+            Line(fmt::format("{} = true;", P(pd, false)));
+        return;
+    }
+    case Op::ATOMS: {
+        uses_smem_ = true;
+        const u32 aop = u32(Bits(insn, 52, 4));
+        const u32 off = u32(Bits(insn, 30, 22)) << 2;
+        Line(fmt::format("tmpu.w = (({} + {}) >> 2u) % {}u;", R(a), Hex(off), SmemWords()));
+        Line(fmt::format("tmpu.z = {};", R(u32(Bits(insn, 20, 8)))));
+        Line(AtomicOp(aop, "smem[tmpu.w]", "tmpu.z", "tmpu.y"));
+        SetR(d, "tmpu.y");
+        return;
+    }
+    case Op::RED:
+        res_.unimplemented.insert("RED");
+        return;
+    case Op::LDG: case Op::STG: case Op::ATOM: {
+        if (stage_ != Stage::Compute) { // global memory windows are only bound for compute dispatches
+            res_.unimplemented.insert(OpName(op));
+            if (op != Op::STG)
+                SetR(d, "0u");
+            return;
+        }
+        uses_gmem_ = true;
+        const bool wide = op == Op::ATOM ? Bit(insn, 48) : Bit(insn, 45);
+        const s32 off = op == Op::ATOM ? s32(u32(Bits(insn, 28, 20)) << 12) >> 12 : s32(u32(Bits(insn, 20, 24)) << 8) >> 8;
+        // 64-bit guest address in (lo, hi); the address pair may be overwritten by a load, so evaluate it first.
+        const std::string hi = wide && a != RZ ? R(a + 1) : "0u";
+        if (off >= 0)
+            Line(fmt::format("tmpu.x = {0} + {1}; tmpu.y = {2} + ((tmpu.x < {0}) ? 1u : 0u);", R(a), Hex(u32(off)), hi));
+        else
+            Line(fmt::format("tmpu.x = {0} - {1}; tmpu.y = {2} - (({0} < {1}) ? 1u : 0u);", R(a), Hex(u32(-off)), hi));
+        if (op == Op::LDG || op == Op::STG) {
+            const u32 size = u32(Bits(insn, 48, 3));
+            const u32 words = size == 5 ? 2 : size == 6 ? 4 : 1;
+            if (size < 4)
+                res_.unimplemented.insert(fmt::format("{}_subword", OpName(op)));
+            if (op == Op::LDG) {
+                for (u32 i = 0; i < words; i++)
+                    Line(fmt::format("tmpu4_[{}] = GmemLoad(tmpu.x + {}u, tmpu.y);", i, i * 4));
+                for (u32 i = 0; i < words; i++)
+                    SetR(d == RZ ? RZ : d + i, fmt::format("tmpu4_[{}]", i));
+            } else {
+                for (u32 i = 0; i < words; i++)
+                    Line(fmt::format("GmemStore(tmpu.x + {}u, tmpu.y, {});", i * 4, R(d == RZ ? RZ : d + i)));
+            }
+            return;
+        }
+        const u32 aop = u32(Bits(insn, 52, 4));
+        const u32 asize = u32(Bits(insn, 49, 3));
+        if (asize != 0 && asize != 1)
+            res_.unimplemented.insert(fmt::format("{}_size{}", OpName(op), asize));
+        Line(fmt::format("tmpu.z = GmemAtomic({}u, tmpu.x, tmpu.y, {});", aop, R(u32(Bits(insn, 20, 8)))));
+        if (op == Op::ATOM)
+            SetR(d, "tmpu.z");
+        return;
+    }
     case Op::KIL:
         if (stage_ == Stage::Fragment) {
             const u32 t = u32(Bits(insn, 0, 5));
@@ -1586,8 +1723,17 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
                 Line(fmt::format("if ({}) discard;", CcTest(t)));
         }
         return;
+    case Op::VOTE: { // one-lane warp: ALL/ANY are the predicate itself, EQ always holds, the ballot is bit 0
+        const std::string pv = P(u32(Bits(insn, 39, 3)), Bit(insn, 42));
+        const u32 vop = u32(Bits(insn, 48, 2));
+        Line(fmt::format("tmpb = {};", pv));
+        SetR(d, "(tmpb ? 1u : 0u)");
+        const u32 pd = u32(Bits(insn, 45, 3));
+        if (pd != PT)
+            Line(fmt::format("{} = {};", P(pd, false), vop == 2 ? "true" : "tmpb"));
+        return;
+    }
     case Op::FSWZADD:
-    case Op::VOTE:
     case Op::VOTE_vtg:
         res_.unimplemented.insert(OpName(op));
         SetR(d, "0u");
@@ -1776,6 +1922,7 @@ cbuffer Driver : register(b13) {
     uint4 drv_vbuf[16];      // x: stride, y: divisor, z: byte offset in vball (~0 = disabled), w: first element uploaded
     uint4 tex_swizzle[32];   // x: packed swizzle
     uint4 drv_misc;          // x: base instance, y: alpha test func, z: alpha ref (float bits), w: alpha test enable
+    uint4 drv_gmem[8];       // compute global memory windows: x base lo, y base hi, z size
 };
 float2 H2(uint v) { return float2(f16tof32(v & 0xFFFFu), f16tof32(v >> 16)); }
 uint P2(float2 v) { return f32tof16(v.x) | (f32tof16(v.y) << 16); }
@@ -1930,6 +2077,21 @@ bool Translator::Seq(u32 first, u32 last, u32 end_target, LoopCtx ctx, u32 skip_
     const u32 n = u32(sblocks_.size());
     u32 i = first;
     while (i < last) {
+        // A flagged forward jump from an earlier region lands inside this one: skip to its target.
+        if (auto f = std::find_if(pending_fwd_.begin(), pending_fwd_.end(), [&](u32 t) { return t > i && t <= last; });
+            f != pending_fwd_.end()) {
+            const u32 t = *f;
+            pending_fwd_.erase(f);
+            SLine(fmt::format("if (!fwd{}) {{", t));
+            sindent_++;
+            if (!Seq(i, t, t, ctx, ~0u))
+                return false;
+            sindent_--;
+            SLine("}");
+            SLine(fmt::format("fwd{} = false;", t));
+            i = t;
+            continue;
+        }
         // Loop header: the latest back edge into i closes the loop.
         if (i != skip_header) {
             u32 latch = ~0u;
@@ -1941,7 +2103,7 @@ bool Translator::Seq(u32 first, u32 last, u32 end_target, LoopCtx ctx, u32 skip_
             if (latch != ~0u) {
                 const u32 loop_end = latch + 1;
                 if (loop_end > last)
-                    return false;
+                    return SFail(fmt::format("loop {}..{} crosses region end {}", i, latch, last));
                 SLine("[loop] for (uint li_ = 0u; ; li_++) {");
                 sindent_++;
                 SLine("if (li_ >= 4096u) { loop_capped = true; break; }");
@@ -1977,7 +2139,7 @@ bool Translator::Seq(u32 first, u32 last, u32 end_target, LoopCtx ctx, u32 skip_
                 continue;
             }
             if (!Goto(i, t.target, last, end_target, ctx))
-                return false;
+                return SFail(fmt::format("jump {} -> {} (region end {}, join {})", i, t.target, last, end_target));
             i++;
             continue;
         case Term::Cond: {
@@ -1990,12 +2152,19 @@ bool Translator::Seq(u32 first, u32 last, u32 end_target, LoopCtx ctx, u32 skip_
                 SLine("}");
                 // Not taken: fall through to the next block.
                 if (i + 1 >= last && end_target != i + 1 && !Goto(i, i + 1, last, end_target, ctx))
-                    return false;
+                    return SFail(fmt::format("fallthrough out of region at {}", i));
+                i++;
+                continue;
+            }
+            if (tg > last && i + 1 == last && tg != ~0u && (ctx.exit == ~0u || tg < ctx.exit)) {
+                SLine(fmt::format("fwd{} = {};", tg, t.cond));
+                pending_fwd_.insert(tg);
+                fwd_used_.insert(tg);
                 i++;
                 continue;
             }
             if (tg <= i + 1 || tg > last)
-                return false;
+                return SFail(fmt::format("cond {} -> {} (region {}..{})", i, tg, first, last));
             // if-else: the then-part ends with a jump over the else-part to a join point.
             const Term& tl = sblocks_[tg - 1].term;
             if (tl.kind == Term::Jump && tl.target != ~0u && tl.target > tg && tl.target <= last &&
@@ -2036,8 +2205,17 @@ bool Translator::EmitStructured(std::string& body) {
         return false;
     sout_.clear();
     sindent_ = 1;
-    if (!Seq(0, u32(sblocks_.size()), ~0u, LoopCtx{}, ~0u))
+    pending_fwd_.clear();
+    fwd_used_.clear();
+    if (!Seq(0, u32(sblocks_.size()), ~0u, LoopCtx{}, ~0u)) {
+        if (std::getenv("MUA3_STRUCT_DEBUG")) {
+            std::string blocks;
+            for (u32 i = 0; i < sblocks_.size(); i++)
+                blocks += fmt::format(" {}:k{}->{}", i, int(sblocks_[i].term.kind), sblocks_[i].term.target == ~0u ? -1 : int(sblocks_[i].term.target));
+            fmt::print(stderr, "structurize failed: {}\n blocks:{}\n", sfail_, blocks);
+        }
         return false;
+    }
     SLine("return_flag = true;");
     body = std::move(sout_);
     return true;
@@ -2182,6 +2360,8 @@ bool Translator::Run() {
         decls += "static bool cc_z = false, cc_s = false, cc_c = false, cc_o = false;\n";
     if (uses_lmem_)
         decls += "static uint lmem[1024];\n";
+    for (u32 t : fwd_used_)
+        decls += fmt::format("static bool fwd{} = false;\n", t);
     decls += "static uint3 local_id = uint3(0u, 0u, 0u);\nstatic uint3 group_id = uint3(0u, 0u, 0u);\n";
 
     if (stage_ == Stage::Vertex) {
@@ -2254,6 +2434,47 @@ bool Translator::Run() {
         if (sph_[19] & 2)
             src += "    o.depth = out_depth;\n";
         src += "    return o;\n}\n";
+    } else if (stage_ == Stage::Compute) {
+        src += decls;
+        if (uses_gmem_) {
+            res_.uses_gmem = true;
+            // Guest global memory: up to kGmemWindows storage buffers (NVN's c0 table), each a raw UAV whose
+            // guest address range is in drv_gmem[i] (x: base lo, y: base hi, z: size in bytes).
+            for (u32 i = 0; i < kGmemWindows; i++)
+                src += fmt::format("RWByteAddressBuffer gmem{0} : register(u{0});\n", i);
+            src += "uint GmemWindow(uint lo, uint hi, out uint off) {\n";
+            src += fmt::format("    [unroll] for (uint i = 0u; i < {}u; i++) {{\n", kGmemWindows);
+            src += "        uint4 w = drv_gmem[i];\n"
+                   "        if (w.z != 0u && hi == w.y && lo >= w.x && lo - w.x < w.z) { off = lo - w.x; return i; }\n"
+                   "    }\n    off = 0u;\n    return 0xFFFFFFFFu;\n}\n";
+            src += "uint GmemLoad(uint lo, uint hi) {\n    uint off; uint w = GmemWindow(lo, hi, off);\n    switch (w) {\n";
+            for (u32 i = 0; i < kGmemWindows; i++)
+                src += fmt::format("    case {0}u: return gmem{0}.Load(off & ~3u);\n", i);
+            src += "    default: return 0u;\n    }\n}\n";
+            src += "void GmemStore(uint lo, uint hi, uint v) {\n    uint off; uint w = GmemWindow(lo, hi, off);\n    switch (w) {\n";
+            for (u32 i = 0; i < kGmemWindows; i++)
+                src += fmt::format("    case {0}u: gmem{0}.Store(off & ~3u, v); break;\n", i);
+            src += "    default: break;\n    }\n}\n";
+            src += "uint GmemAtomic(uint op, uint lo, uint hi, uint v) {\n    uint off; uint w = GmemWindow(lo, hi, off); uint o = 0u;\n"
+                   "    off &= ~3u;\n    switch (w) {\n";
+            for (u32 i = 0; i < kGmemWindows; i++) {
+                src += fmt::format("    case {}u:\n", i);
+                src += fmt::format("        if (op == 0u) gmem{0}.InterlockedAdd(off, v, o);\n"
+                                   "        else if (op == 1u) gmem{0}.InterlockedMin(off, v, o);\n"
+                                   "        else if (op == 2u) gmem{0}.InterlockedMax(off, v, o);\n"
+                                   "        else if (op == 5u) gmem{0}.InterlockedAnd(off, v, o);\n"
+                                   "        else if (op == 6u) gmem{0}.InterlockedOr(off, v, o);\n"
+                                   "        else if (op == 7u) gmem{0}.InterlockedXor(off, v, o);\n"
+                                   "        else gmem{0}.InterlockedExchange(off, v, o);\n        break;\n", i);
+            }
+            src += "    default: break;\n    }\n    return o;\n}\n";
+        }
+        if (uses_smem_)
+            src += fmt::format("groupshared uint smem[{}];\n", SmemWords());
+        src += "void Run() {\n" + body + "}\n";
+        src += fmt::format("[numthreads({}, {}, {})]\n", opt_.block[0], opt_.block[1], opt_.block[2]);
+        src += "void main(uint3 ltid : SV_GroupThreadID, uint3 gid : SV_GroupID) {\n"
+               "    local_id = ltid; group_id = gid;\n    Run();\n}\n";
     } else {
         res_.error = "unsupported stage";
         return false;

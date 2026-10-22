@@ -25,6 +25,8 @@ struct HostShader {
     shader::TranslateResult info;
     ComPtr<ID3D11VertexShader> vs;
     ComPtr<ID3D11PixelShader> ps;
+    ComPtr<ID3D11ComputeShader> cs;
+    shader::TranslateOptions opt; // compute: workgroup shape and shared memory from the launch
     std::vector<u8> code; // guest program (kept until compiled)
     std::vector<u8> dxbc; // vertex shaders keep their bytecode for input layouts
     bool is_variant = false; // vertex shader re-declared for integer vertex attributes (info.hlsl is final)
@@ -38,7 +40,7 @@ public:
     explicit ShaderCache(ID3D11Device* dev);
     ~ShaderCache();
     // `code` = guest program starting at its SPH, `size` bytes available.
-    HostShader* Get(shader::Stage stage, const u8* code, size_t size);
+    HostShader* Get(shader::Stage stage, const u8* code, size_t size, const shader::TranslateOptions* opt = nullptr);
     // Shader re-declared to match the draw's integer data: integer vertex attributes become uint4/int4 inputs
     // (scaled ones converted to float like Maxwell's USCALED/SSCALED) and integer textures are declared with
     // integer element types. Returns `base` when nothing is an integer type.

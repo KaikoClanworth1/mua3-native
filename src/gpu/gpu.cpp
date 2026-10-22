@@ -553,12 +553,14 @@ void Gpu::CallMethod(u32 subch, u32 method, u32 arg, bool last_in_batch) {
         IncrementSyncpoint(arg & 0xFFFF);
         return;
     }
-    if (cls == 0xB1C0) { // compute: report semaphore (dispatch not yet supported)
+    if (cls == 0xB1C0) { // compute: launches and report semaphores
         if (method == 0xAF) { // LAUNCH: the queue meta data (QMD) lives at LAUNCH_DESC_LOC << 8
             static u32 launches = 0;
-            if (launches++ < 40) {
-                u32 q[0x40]{};
-                ReadGpu(u64(r[0xAD]) << 8, q, sizeof(q));
+            u32 q[0x40]{};
+            ReadGpu(u64(r[0xAD]) << 8, q, sizeof(q));
+            if (renderer_)
+                renderer_->Dispatch(r, q);
+            if (launches++ < 8) {
                 const u64 code = (u64(r[0x582] & 0xFF) << 32) | r[0x583];
                 LOG_INFO("GPU", "compute launch #{}: code {:#x}+{:#x} grid {}x{}x{} block {}x{}x{} shared {:#x} cb mask {:#x} "
                                 "cb0 {:#x}/{:#x}",

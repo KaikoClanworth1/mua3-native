@@ -51,6 +51,7 @@ public:
 
     void Clear(u32 rt, u32 mask) override;
     void Draw() override;
+    void Dispatch(const u32* regs, const u32* qmd) override;
     void Present(const PresentInfo& p) override;
     void InvalidateRegion(u64 gpu_va, u64 size) override;
     bool Blit2D(const u32* regs) override;
@@ -110,6 +111,16 @@ private:
     std::unordered_map<u64, HostShader*> shader_by_addr_; // code address ^ stage -> shader
     u64 code_lo_ = ~0ull, code_hi_ = 0;                   // range of code those addresses cover
     void EmulateCullingGs();
+    // Guest global memory windows for compute (NVN storage buffers): raw UAV buffers mirrored from guest memory.
+    struct GmemWindow {
+        ComPtr<ID3D11Buffer> buf, staging;
+        ComPtr<ID3D11UnorderedAccessView> uav;
+        u32 capacity = 0;
+        std::vector<u8> uploaded; // guest bytes as uploaded, to write back only what the dispatch changed
+    };
+    GmemWindow gmem_[8]; // shader::kGmemWindows
+    std::unordered_map<u64, HostShader*> compute_by_key_; // program address ^ launch shape -> shader
+    u64 dispatches_ = 0;
     float pick_x_ = 0, pick_y_ = 0;
     struct PixelReq {
         u64 va;

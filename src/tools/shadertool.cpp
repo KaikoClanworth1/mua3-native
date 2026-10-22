@@ -71,11 +71,18 @@ int main(int argc, char** argv) {
             Disassemble(data);
             continue;
         }
-        auto r = Translate(vs ? Stage::Vertex : Stage::Fragment, data.data(), data.size());
+        const bool cs = f.filename().string().rfind("compute_", 0) == 0;
+        const Stage stage = cs ? Stage::Compute : vs ? Stage::Vertex : Stage::Fragment;
+        TranslateOptions copt;
+        if (cs) { // shape is not in the program; good enough for inspection
+            copt.block[0] = 64;
+            copt.shared_bytes = 0x400;
+        }
+        auto r = Translate(stage, data.data(), data.size(), copt);
         if (r.uses_loop) { // like the game: loop shaders sample with explicit LOD 0
-            TranslateOptions opt;
+            TranslateOptions opt = copt;
             opt.force_lod0 = true;
-            r = Translate(vs ? Stage::Vertex : Stage::Fragment, data.data(), data.size(), opt);
+            r = Translate(stage, data.data(), data.size(), opt);
         }
         for (auto& u : r.unimplemented)
             unimpl[u]++;
@@ -84,7 +91,7 @@ int main(int argc, char** argv) {
             fmt::print("{}\n", r.hlsl);
             continue;
         }
-        const bool compiled = r.ok && CompileHlsl(r.hlsl, vs ? "vs_5_0" : "ps_5_0", err);
+        const bool compiled = r.ok && CompileHlsl(r.hlsl, cs ? "cs_5_0" : vs ? "vs_5_0" : "ps_5_0", err);
         if (print)
             fmt::print("{}\n", r.hlsl);
         if (compiled)

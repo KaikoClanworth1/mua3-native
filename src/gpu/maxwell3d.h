@@ -43,6 +43,7 @@ constexpr u32 kDrawEnd = 0x585, kDrawBegin = 0x586;
 constexpr u32 kIndexAddrHigh = 0x5F2, kIndexAddrLow = 0x5F3, kIndexLimitHigh = 0x5F4, kIndexLimitLow = 0x5F5;
 constexpr u32 kIndexFormat = 0x5F6, kIndexFirst = 0x5F7, kIndexCount = 0x5F8;
 constexpr u32 kCullEnable = 0x646, kFrontFace = 0x647, kCullFace = 0x648;
+constexpr u32 kPolygonOffsetFillEnable = 0x372, kSlopeScaleDepthBias = 0x55B, kDepthBias = 0x56F, kDepthBiasClamp = 0x61F;
 constexpr u32 kViewportTransformEnable = 0x64B;
 constexpr u32 kClearBuffers = 0x674;
 constexpr u32 kColorMask = 0x680; // [8]

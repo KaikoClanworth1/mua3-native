@@ -200,6 +200,7 @@ struct DriverConstants {
     u32 vbuf[16][4];
     u32 swizzle[32][4];
     u32 misc[4];
+    u32 gmem[8][4]; // compute global memory windows: base lo, base hi, size
 };
 
 } // namespace
@@ -482,6 +483,209 @@ void D3D11Renderer::Clear(u32 rt, u32 mask) {
 // MUA3's culling geometry program: for each visible triangle it atomically reserves three slots in an index list
 // (counter address at GS c0[0x410], list base at c0[0x420]) and stores the vertex ids as v1, v0, v2. Later draws
 // index that list. We keep every triangle (culling is only an optimisation).
+static_assert(shader::kGmemWindows == 8, "D3D11Renderer::gmem_ size");
+
+void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
+    std::lock_guard ctx_lock(ContextMutex());
+    auto& g = G();
+    auto& dc = *g_dc;
+    // ---- program and launch shape
+    const u64 code = (u64(r[0x582] & 0xFF) << 32) | r[0x583];
+    const u64 prog = code + q[8];
+    shader::TranslateOptions opt;
+    opt.block[0] = std::max<u32>(q[0x12] >> 16, 1);
+    opt.block[1] = std::max<u32>(q[0x13] & 0xFFFF, 1);
+    opt.block[2] = std::max<u32>(q[0x13] >> 16, 1);
+    opt.shared_bytes = q[0x11] & 0x3FFFF;
+    const u32 grid[3] = {q[0xC] & 0x7FFFFFFF, q[0xD] & 0xFFFF, q[0xD] >> 16};
+    if (!grid[0] || !grid[1] || !grid[2])
+        return;
+    const u64 key = prog ^ (u64(opt.block[0]) << 40) ^ (u64(opt.block[1]) << 50) ^ (u64(opt.block[2]) << 56) ^
+                    (u64(opt.shared_bytes) << 20);
+    HostShader* cs;
+    if (auto it = compute_by_key_.find(key); it != compute_by_key_.end()) {
+        cs = it->second;
+    } else {
+        // Compute programs have no SPH: put them behind a zeroed one like the graphics stages expect.
+        std::vector<u8> buf(0x50 + 0x10000, 0);
+        const size_t got = g.ReadGpuPartial(prog, buf.data() + 0x50, 0x10000);
+        if (got < 0x10)
+            return;
+        cs = shaders_->Get(shader::Stage::Compute, buf.data(), 0x50 + got, &opt);
+        compute_by_key_[key] = cs;
+        code_lo_ = std::min(code_lo_, prog);
+        code_hi_ = std::max(code_hi_, prog + got);
+    }
+    if (cs->state != HostShader::Ready)
+        return;
+    // ---- constant buffers (QMD slots)
+    const u32 cb_mask = q[0x14] & 0xFF;
+    u64 cb_addr[8]{};
+    u32 cb_size[8]{};
+    for (u32 i = 0; i < 8; i++)
+        if (cb_mask & (1u << i)) {
+            cb_addr[i] = (u64(q[0x1E + i * 2] & 0xFF) << 32) | q[0x1D + i * 2];
+            cb_size[i] = q[0x1E + i * 2] >> 15;
+        }
+    // Integer-typed textures need a shader variant, as for draws.
+    const u64 tic_base = (u64(r[0x55D] & 0xFF) << 32) | r[0x55E];
+    const u64 tsc_base = (u64(r[0x557] & 0xFF) << 32) | r[0x558];
+    const u32 tex_cb = r[0x982] & 7;
+    auto handle_of = [&](const shader::TextureUse& t) {
+        u32 h = 0;
+        g.ReadGpu(cb_addr[tex_cb] + t.cbuf_offset, &h, 4);
+        return h;
+    };
+    {
+        ShaderCache::VariantKey vk;
+        for (auto& t : cs->info.textures) {
+            if (t.slot >= 32)
+                continue;
+            TicEntry tic;
+            g.ReadGpu(tic_base + u64(handle_of(t) & 0xFFFFF) * 32, tic.w.data(), 32);
+            if (FindSurfaceByGpu(tic.Address()))
+                continue;
+            switch (DxgiIntKind(TicFormat(tic.Format(), tic.RType(), tic.Srgb()).dxgi)) {
+            case 1: vk.tex_uint |= 1u << t.slot; break;
+            case 2: vk.tex_sint |= 1u << t.slot; break;
+            default: break;
+            }
+        }
+        cs = shaders_->GetVariant(cs, vk);
+        if (cs->state != HostShader::Ready)
+            return;
+    }
+    static std::unordered_map<u64, int> logged;
+    const int nth = logged[key]++;
+    const bool log = nth < 2 || nth % 600 == 0;
+    if (log)
+        LOG_INFO("Renderer", "dispatch {:#x} cs {:016x} grid {}x{}x{} block {}x{}x{} shared {:#x}", prog, cs->hash, grid[0], grid[1],
+                 grid[2], opt.block[0], opt.block[1], opt.block[2], opt.shared_bytes);
+    ID3D11Buffer* cbs[13]{};
+    ID3D11ShaderResourceView* srvs[48]{};
+    for (u32 i = 0; i < 8; i++) {
+        if (!(cs->info.cbuf_mask & (1u << i)) || !cb_size[i])
+            continue;
+        static thread_local std::vector<u8> tmp;
+        const bool dyn = (cs->info.cbuf_dyn_mask >> i) & 1;
+        const u32 need = dyn ? 65536u : cs->info.cbuf_rows[i] * 16u;
+        const u32 size = u32(common::AlignUp(std::max<u32>(std::min<u32>({cb_size[i], 65536u, need}), 16u), 16));
+        tmp.assign(size, 0);
+        g.ReadGpu(cb_addr[i], tmp.data(), std::min<u32>(size, cb_size[i]));
+        cbs[i] = dc.Constant(5 * 32 + i, tmp.data(), size);
+        if (dyn)
+            srvs[32 + i] = dc.RawBuffer(5 * 32 + i, tmp.data(), size);
+    }
+    // ---- textures
+    DriverConstants drv{};
+    ID3D11SamplerState* smps[16]{};
+    for (auto& t : cs->info.textures) {
+        if (t.slot >= 32)
+            continue;
+        const u32 h = handle_of(t);
+        TicEntry tic;
+        g.ReadGpu(tic_base + u64(h & 0xFFFFF) * 32, tic.w.data(), 32);
+        u32 tsc[8];
+        g.ReadGpu(tsc_base + u64((h >> 20) & 0xFFF) * 32, tsc, 32);
+        u32 swz = 0xB1A;
+        srvs[t.slot] = textures_->Get(tic, t, swz);
+        drv.swizzle[t.slot][0] = swz;
+        if (t.sampler < 16)
+            smps[t.sampler] = textures_->GetSampler(tsc, t.shadow);
+    }
+    // ---- global memory windows: NVN's storage buffer table in c0 at 0x310 ({address lo, hi, size, -} each)
+    ID3D11UnorderedAccessView* uavs[shader::kGmemWindows]{};
+    u64 win_addr[shader::kGmemWindows]{};
+    u32 win_size[shader::kGmemWindows]{};
+    if (cs->info.uses_gmem && cb_size[0] >= 0x310 + 16 * shader::kGmemWindows) {
+        u32 table[shader::kGmemWindows][4];
+        g.ReadGpu(cb_addr[0] + 0x310, table, sizeof(table));
+        for (u32 i = 0; i < shader::kGmemWindows; i++) {
+            const u64 a = (u64(table[i][1]) << 32) | table[i][0];
+            const u32 size = u32(common::AlignUp(table[i][2], 4));
+            if (!a || !size || size > (64u << 20))
+                continue;
+            GmemWindow& w = gmem_[i];
+            if (w.capacity < size) {
+                w = {};
+                w.capacity = u32(common::AlignUp(size, 1u << 16));
+                D3D11_BUFFER_DESC bd{w.capacity, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0,
+                                     D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
+                dev_->CreateBuffer(&bd, nullptr, &w.buf);
+                D3D11_BUFFER_DESC sd{w.capacity, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0};
+                dev_->CreateBuffer(&sd, nullptr, &w.staging);
+                D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+                ud.Format = DXGI_FORMAT_R32_TYPELESS;
+                ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+                ud.Buffer = {0, w.capacity / 4, D3D11_BUFFER_UAV_FLAG_RAW};
+                dev_->CreateUnorderedAccessView(w.buf.Get(), &ud, &w.uav);
+            }
+            w.uploaded.assign(size, 0);
+            g.ReadGpuPartial(a, w.uploaded.data(), size);
+            const D3D11_BOX box{0, 0, 0, size, 1, 1};
+            ctx_->UpdateSubresource(w.buf.Get(), 0, &box, w.uploaded.data(), size, size);
+            uavs[i] = w.uav.Get();
+            win_addr[i] = a;
+            win_size[i] = size;
+            drv.gmem[i][0] = u32(a);
+            drv.gmem[i][1] = u32(a >> 32);
+            drv.gmem[i][2] = size;
+            if (log)
+                LOG_INFO("Renderer", "  gmem window {}: {:#x} size {:#x}", i, a, size);
+        }
+    }
+    ID3D11Buffer* drv_cb = dc.Constant(1001, &drv, sizeof(drv));
+    // Render targets may be sampled by the kernel: unbind them from the output stage.
+    ctx_->OMSetRenderTargets(0, nullptr, nullptr);
+    ctx_->CSSetShader(cs->cs.Get(), nullptr, 0);
+    ctx_->CSSetConstantBuffers(0, 13, cbs);
+    ctx_->CSSetConstantBuffers(13, 1, &drv_cb);
+    ctx_->CSSetShaderResources(0, 48, srvs);
+    ctx_->CSSetSamplers(0, 16, smps);
+    ctx_->CSSetUnorderedAccessViews(0, shader::kGmemWindows, uavs, nullptr);
+    ctx_->Dispatch(grid[0], grid[1], grid[2]);
+    ID3D11UnorderedAccessView* no_uav[shader::kGmemWindows]{};
+    ctx_->CSSetUnorderedAccessViews(0, shader::kGmemWindows, no_uav, nullptr);
+    ID3D11ShaderResourceView* no_srv[48]{};
+    ctx_->CSSetShaderResources(0, 48, no_srv);
+    dispatches_++;
+    // ---- write back what the kernel changed (the guest reads results through texel buffers and the CPU)
+    for (u32 i = 0; i < shader::kGmemWindows; i++) {
+        if (!win_size[i])
+            continue;
+        GmemWindow& w = gmem_[i];
+        const D3D11_BOX box{0, 0, 0, win_size[i], 1, 1};
+        ctx_->CopySubresourceRegion(w.staging.Get(), 0, 0, 0, 0, w.buf.Get(), 0, &box);
+        D3D11_MAPPED_SUBRESOURCE mp;
+        if (FAILED(ctx_->Map(w.staging.Get(), 0, D3D11_MAP_READ, 0, &mp)))
+            continue;
+        const u8* now = static_cast<const u8*>(mp.pData);
+        // Changed runs only, so data the CPU wrote meanwhile elsewhere in the window survives.
+        u32 changed = 0;
+        for (u32 off = 0; off < win_size[i];) {
+            if (std::memcmp(now + off, w.uploaded.data() + off, 4) == 0) {
+                off += 4;
+                continue;
+            }
+            u32 end = off + 4;
+            while (end < win_size[i] && std::memcmp(now + end, w.uploaded.data() + end, 4) != 0)
+                end += 4;
+            g.WriteGpu(win_addr[i] + off, now + off, end - off);
+            if (log && changed < 0x80) {
+                u32 v[4]{};
+                std::memcpy(v, now + off, std::min<u32>(16, end - off));
+                LOG_INFO("Renderer", "    changed +{:#x} len {:#x}: {:08x} {:08x} {:08x} {:08x}", off, end - off, v[0], v[1], v[2], v[3]);
+            }
+            changed += end - off;
+            textures_->Invalidate(win_addr[i] + off, end - off);
+            off = end;
+        }
+        ctx_->Unmap(w.staging.Get(), 0);
+        if (log)
+            LOG_INFO("Renderer", "  gmem window {} changed {:#x} bytes", i, changed);
+    }
+}
+
 void D3D11Renderer::EmulateCullingGs() {
     auto& g = G();
     const auto& m = g.M3D();
@@ -512,8 +716,8 @@ void D3D11Renderer::EmulateCullingGs() {
         return;
     std::vector<u32> out(size_t(tris) * 3);
     for (u32 t = 0; t < tris; t++) {
-        out[t * 3 + 0] = ids[t * 3 + 1];
-        out[t * 3 + 1] = ids[t * 3 + 0];
+        out[t * 3 + 0] = ids[t * 3 + 0];
+        out[t * 3 + 1] = ids[t * 3 + 1];
         out[t * 3 + 2] = ids[t * 3 + 2];
     }
     u32 counter = 0;
@@ -797,6 +1001,12 @@ void D3D11Renderer::Draw() {
         ccw = !ccw;
     rd.FrontCounterClockwise = ccw;
     rd.DepthClipEnable = TRUE;
+    // Polygon offset (shadow casters): units are stored doubled, slope factor and clamp as floats.
+    if (m.Reg(kPolygonOffsetFillEnable) & 1) {
+        rd.DepthBias = INT(std::lround(m.RegF(kDepthBias) * 0.5f));
+        rd.SlopeScaledDepthBias = m.RegF(kSlopeScaleDepthBias);
+        rd.DepthBiasClamp = m.RegF(kDepthBiasClamp);
+    }
     // Debug: MUA3_ZBIAS_PS=<ps hash>:<depth bias units> biases one pixel shader's depth.
     static const std::pair<u64, int> zbias = [] {
         const char* e = std::getenv("MUA3_ZBIAS_PS");
@@ -1425,6 +1635,7 @@ void D3D11Renderer::InvalidateRegion(u64 gpu_va, u64 size) {
     textures_->Invalidate(gpu_va, size);
     if (gpu_va < code_hi_ && code_lo_ < gpu_va + size) {
         shader_by_addr_.clear();
+        compute_by_key_.clear();
         code_lo_ = ~0ull;
         code_hi_ = 0;
     }

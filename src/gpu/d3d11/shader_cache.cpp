@@ -9,6 +9,15 @@
 
 namespace gpu {
 
+namespace {
+const char* StageTag(shader::Stage st) {
+    return st == shader::Stage::Vertex ? "vs" : st == shader::Stage::Compute ? "cs" : "ps";
+}
+const char* StageTarget(shader::Stage st) {
+    return st == shader::Stage::Vertex ? "vs_5_0" : st == shader::Stage::Compute ? "cs_5_0" : "ps_5_0";
+}
+} // namespace
+
 u64 Hash64(const void* data, size_t size) {
     // FNV-1a 64 over 8-byte words (fast enough for shader programs).
     const u8* p = static_cast<const u8*>(data);
@@ -70,18 +79,18 @@ void ShaderCache::Worker(bool slow) {
 }
 
 bool ShaderCache::Build(HostShader& s, bool slow) {
-    const char* tag = s.stage == shader::Stage::Vertex ? "vs" : "ps";
+    const char* tag = StageTag(s.stage);
     if (!s.is_variant && !s.translated) {
-        s.info = shader::Translate(s.stage, s.code.data(), s.code.size());
-        if (s.info.ok && s.info.uses_loop) {
+        s.info = shader::Translate(s.stage, s.code.data(), s.code.size(), s.opt);
+        if (s.info.ok && (s.info.uses_loop || s.stage == shader::Stage::Compute)) {
             // Gradient ops inside loops are rejected by FXC: loop shaders sample with explicit LOD 0.
-            shader::TranslateOptions opt;
+            shader::TranslateOptions opt = s.opt;
             opt.force_lod0 = true;
             s.info = shader::Translate(s.stage, s.code.data(), s.code.size(), opt);
         }
         s.translated = true;
     }
-    const char* target = s.stage == shader::Stage::Vertex ? "vs_5_0" : "ps_5_0";
+    const char* target = StageTarget(s.stage);
     if (!slow && s.info.ok && s.info.uses_loop && !fs::exists(CachePath(s, target))) {
         {
             std::lock_guard lk(mutex_);
@@ -100,7 +109,7 @@ bool ShaderCache::Build(HostShader& s, bool slow) {
     } else {
         err = s.info.error;
     }
-    s.ok = err.empty() && (s.vs || s.ps);
+    s.ok = err.empty() && (s.vs || s.ps || s.cs);
     if (!s.ok) {
         failures++;
         common::WriteFile(dump_dir_ / fmt::format("{:016x}.{}.hlsl", s.hash, tag),
@@ -121,18 +130,18 @@ bool ShaderCache::Build(HostShader& s, bool slow) {
 
 fs::path ShaderCache::CachePath(const HostShader& s, const char* target) const {
     // Bump kTranslatorVersion whenever the translator output changes, to invalidate cached bytecode.
-    constexpr int kTranslatorVersion = 25;
+    constexpr int kTranslatorVersion = 26;
     return cache_dir_ / fmt::format("{:016x}_{}_v{}.dxbc", s.hash, target, kTranslatorVersion);
 }
 
 bool ShaderCache::Compile(HostShader& s, const std::string& hlsl, std::string& err, bool out_of_process) {
-    const char* target = s.stage == shader::Stage::Vertex ? "vs_5_0" : "ps_5_0";
+    const char* target = StageTarget(s.stage);
     fs::path cached = s.no_cache ? fs::path() : CachePath(s, target);
     std::vector<u8> blob = s.no_cache ? std::vector<u8>() : common::ReadFile(cached);
     // Debug aid: shader_override/<hash>.<vs|ps>.hlsl replaces the translated HLSL (never cached).
     std::string source = hlsl;
     const fs::path override_path =
-        fs::path("shader_override") / fmt::format("{:016x}.{}.hlsl", s.hash, s.stage == shader::Stage::Vertex ? "vs" : "ps");
+        fs::path("shader_override") / fmt::format("{:016x}.{}.hlsl", s.hash, StageTag(s.stage));
     if (fs::exists(override_path)) {
         const auto text = common::ReadFile(override_path);
         source.assign(text.begin(), text.end());
@@ -201,6 +210,8 @@ bool ShaderCache::Compile(HostShader& s, const std::string& hlsl, std::string& e
         hr = dev_->CreateVertexShader(blob.data(), blob.size(), nullptr, &s.vs);
         s.dxbc = blob;
     }
+    else if (s.stage == shader::Stage::Compute)
+        hr = dev_->CreateComputeShader(blob.data(), blob.size(), nullptr, &s.cs);
     else
         hr = dev_->CreatePixelShader(blob.data(), blob.size(), nullptr, &s.ps);
     if (FAILED(hr)) {
@@ -210,9 +221,11 @@ bool ShaderCache::Compile(HostShader& s, const std::string& hlsl, std::string& e
     return true;
 }
 
-HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size) {
+HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size, const shader::TranslateOptions* opt) {
     size = shader::ProgramSize(code, size);
-    const u64 hash = Hash64(code, size) ^ (u64(stage) << 60);
+    u64 hash = Hash64(code, size) ^ (u64(stage) << 60);
+    if (opt) // the launch shape is compiled into compute shaders
+        hash ^= Hash64(opt, sizeof(*opt)) * 0x9E3779B97F4A7C15ull;
     auto it = shaders_.find(hash);
     if (it != shaders_.end())
         return it->second.get();
@@ -221,7 +234,9 @@ HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size) {
     s->stage = stage;
     s->hash = hash;
     s->code.assign(code, code + size);
-    const char* tag = stage == shader::Stage::Vertex ? "vs" : "ps";
+    if (opt)
+        s->opt = *opt;
+    const char* tag = StageTag(stage);
     common::WriteFile(dump_dir_ / fmt::format("{:016x}.{}.bin", hash, tag), std::span(code, size));
     auto* raw = s.get();
     shaders_[hash] = std::move(s);

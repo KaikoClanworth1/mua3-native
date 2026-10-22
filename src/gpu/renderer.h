@@ -17,6 +17,9 @@ public:
     virtual void InvalidateRegion(u64 gpu_va, u64 size) {}
     // 2D engine surface copy (Fermi 0x902D); returns false if unsupported.
     virtual bool Blit2D(const u32* regs) { return false; }
+    // Compute launch (Kepler compute LAUNCH): `regs` = compute engine registers, `qmd` = the 0x40-word launch
+    // descriptor it points at.
+    virtual void Dispatch(const u32* regs, const u32* qmd) {}
     // Called at the end of each command submission.
     virtual void FlushCommands() {}
 };
