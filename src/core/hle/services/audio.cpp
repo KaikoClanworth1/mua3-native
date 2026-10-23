@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <map>
+#include <set>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -153,6 +155,19 @@ private:
         // StoreStatus reports 3 (enabled) or 4 (disabled); IsAuxRemovable waits for the latter before the
         // game may tear an effect (and the voice routed through it) down.
         const size_t effects_at = voices_at + voices_in;
+        ParseEffects(in, effects_at, n_effects);
+        if (static const bool dbg = std::getenv("MUA3_AUDIO_DEBUG") != nullptr; dbg) {
+            static std::set<std::string> seen;
+            for (u32 i = 0; i < n_effects; i++) {
+                const size_t fx = effects_at + size_t(i) * 0xC0;
+                if (fx + 0xC0 > in.size() || in[fx] == 0)
+                    continue;
+                const std::string d = fmt::format("effect {} type {} enabled {} mix {} params {}", i, in[fx], in[fx + 2],
+                                                  common::Read<s32>(&in[fx + 4]), common::ToHex(std::span(&in[fx + 0x20], 0x40)));
+                if (seen.insert(d).second && seen.size() < 64)
+                    LOG_INFO("audren", "{}", d);
+            }
+        }
         for (u32 i = 0; i < n_effects; i++) {
             u8 e[0x10]{};
             const size_t fx = effects_at + size_t(i) * 0xC0;
@@ -176,6 +191,28 @@ private:
             LOG_INFO("audren", "{} updates ({} voices, {} queued wave buffers) | mixing: {} playing, formats {:#x}, source peak {:.3f}, "
                      "{} routed / {} unrouted channels, {} mixes, last mix peak {:.3f}", elapsed_frames_, n_voices, queued,
                      stat_playing_, stat_format_mask_, stat_src_peak_, stat_routed_, stat_unrouted_, mix_order_.size(), mix_peak);
+            if (std::getenv("MUA3_AUDIO_DEBUG")) {
+                std::string a;
+                for (auto& [k, v] : aux_stats_)
+                    a += fmt::format(" [mix {} ch {}: send {:.3f} ret {:.3f}]", k / 32, k % 32, v.first, v.second);
+                LOG_INFO("audren", "aux peaks:{}", a);
+                std::string sp;
+                for (size_t m : mix_order_) {
+                    const u32 split = common::Read<u32>(&in[m + 0x928]);
+                    auto it = splitters_.find(split);
+                    if (it == splitters_.end())
+                        continue;
+                    sp += fmt::format(" [mix {} splitter {}:", common::Read<u32>(&in[m + 0x10]), split);
+                    for (u32 d : it->second)
+                        if (auto dd = destinations_.find(d); dd != destinations_.end())
+                            sp += fmt::format(" d{}->mix{}{} vol {:.2f},{:.2f},{:.2f}", d, dd->second.mix_id,
+                                              dd->second.in_use ? "" : "(off)", dd->second.volume[0], dd->second.volume[1],
+                                              dd->second.volume[2]);
+                    sp += "]";
+                }
+                LOG_INFO("audren", "mix splitters:{}", sp);
+                aux_stats_.clear();
+            }
             stat_playing_ = stat_routed_ = stat_unrouted_ = 0;
             stat_format_mask_ = 0;
             stat_src_peak_ = 0;
@@ -309,6 +346,24 @@ private:
         }
         stat_playing_++;
         stat_format_mask_ |= 1u << (format & 31);
+        { // MUA3_AUDIO_DEBUG: describe each distinct kind of playing voice once
+            static const bool dbg = std::getenv("MUA3_AUDIO_DEBUG") != nullptr;
+            static std::set<u64> seen;
+            const u32 mix = common::Read<u32>(p + 0x58), split = common::Read<u32>(p + 0x5C);
+            const u64 sig = u64(format) | u64(channels) << 8 | u64(mix & 0xFFFF) << 16 | u64(split & 0xFFFF) << 32 |
+                            u64(rd32(0x0C) / 1000) << 48;
+            if (dbg && seen.insert(sig).second) {
+                std::string dests;
+                if (auto it = splitters_.find(split); it != splitters_.end())
+                    for (u32 d : it->second)
+                        if (auto dd = destinations_.find(d); dd != destinations_.end())
+                            dests += fmt::format(" d{}->mix{}{}", d, dd->second.mix_id, dd->second.in_use ? "" : "(off)");
+                float vol;
+                std::memcpy(&vol, p + 0x20, 4);
+                LOG_INFO("audren", "voice kind: id {} format {} ch {} rate {} vol {:.2f} mix {} splitter {}{}", common::Read<u32>(p),
+                         format, channels, rd32(0x0C), vol, s32(mix), s32(split), dests);
+            }
+        }
         for (s64 i = 0; i < got * s64(channels); i += 7)
             stat_src_peak_ = std::max(stat_src_peak_, std::abs(src[size_t(i)]));
         MixVoice(vs, p, channels, src.data(), total);
@@ -389,49 +444,171 @@ private:
         const u32 mix_id = common::Read<u32>(p + 0x58), splitter_id = common::Read<u32>(p + 0x5C);
         auto sit = splitter_id != 0xFFFFFFFF ? splitters_.find(splitter_id) : splitters_.end();
         for (u32 c = 0; c < channels; c++) {
-            const float* mv = nullptr;
-            u32 dest_mix = mix_id;
+            // Sends of this channel: its channel resource, or (splitter voices) every splitter destination at
+            // index c, c + channels, c + 2 * channels... (how the DSP walks a splitter for multi-destination sends).
+            struct Send {
+                u32 mix;
+                const float* volume;
+            };
+            Send sends[8];
+            u32 nsend = 0;
             if (sit != splitters_.end()) {
-                if (sit->second.empty())
-                    continue;
-                auto dit = destinations_.find(sit->second[c % sit->second.size()]);
-                if (dit == destinations_.end() || !dit->second.in_use)
-                    continue;
-                dest_mix = dit->second.mix_id;
-                mv = dit->second.volume.data();
-            } else {
-                auto rit = channel_volumes_.find(common::Read<u32>(p + 0x140 + c * 4));
-                if (rit == channel_volumes_.end())
-                    continue;
-                mv = rit->second.data();
+                for (size_t k = c; k < sit->second.size() && nsend < 8; k += channels) {
+                    auto dit = destinations_.find(sit->second[k]);
+                    if (dit != destinations_.end() && dit->second.in_use)
+                        sends[nsend++] = {dit->second.mix_id, dit->second.volume.data()};
+                }
+            } else if (auto rit = channel_volumes_.find(common::Read<u32>(p + 0x140 + c * 4)); rit != channel_volumes_.end()) {
+                sends[nsend++] = {mix_id, rit->second.data()};
             }
-            auto mit = mix_offset_.find(dest_mix);
-            if (mit == mix_offset_.end()) {
-                stat_unrouted_++;
+            if (!nsend)
                 continue;
-            }
-            stat_routed_++;
-            const u32 base = mit->second.first, nbuf = mit->second.second;
             // Linear resampling: output i maps to source position (i + 1) * count / samples_ - 1 (previous
             // update's last frame at -1).
+            std::vector<float>& res = resampled_;
+            res.resize(samples_);
             for (u32 i = 0; i < samples_; i++) {
                 const double pos = double(i + 1) * double(count) / double(samples_) - 1.0;
                 const s64 i0 = s64(std::floor(pos));
                 const float t = float(pos - double(i0));
                 const float a = i0 < 0 ? vs.last[c] : src[size_t(i0) * channels + c];
                 const float bb = i0 + 1 < count ? src[size_t(i0 + 1) * channels + c] : a;
-                const float s = (a + (bb - a) * t) * volume;
-                for (u32 j = 0; j < nbuf && j < 24; j++)
-                    if (mv[j] != 0.0f)
-                        mix_[size_t(base + j) * samples_ + i] += s * mv[j];
+                res[i] = (a + (bb - a) * t) * volume;
+            }
+            for (u32 k = 0; k < nsend; k++) {
+                auto mit = mix_offset_.find(sends[k].mix);
+                if (mit == mix_offset_.end()) {
+                    stat_unrouted_++;
+                    continue;
+                }
+                stat_routed_++;
+                const u32 base = mit->second.first, nbuf = mit->second.second;
+                for (u32 j = 0; j < nbuf && j < 24; j++) {
+                    const float mv = sends[k].volume[j];
+                    if (mv == 0.0f)
+                        continue;
+                    float* dst = &mix_[size_t(base + j) * samples_];
+                    for (u32 i = 0; i < samples_; i++)
+                        dst[i] += res[i] * mv;
+                }
             }
             vs.last[c] = src[size_t(count - 1) * channels + c];
         }
     }
 
     // Splitter data (between effects and mixes) when present: "SNDH" header {magic, info count, data count, pad},
-    // then infos "SNDI" {magic, id, sample rate, destination count, destination data ids...} and destinations
-    // "SNDD" {magic, id, mix id, mix volumes[24], in use, pad} (0x70). Returns its size; fills splitters_.
+    // then infos "SNDI" {magic, id, sample rate, destination count, destination data ids..., padding} and destinations
+    // "SNDD" {magic, id, mix volumes[24], mix id, in use, pad} (0x70). Returns its size; fills splitters_.
+    // Effects. Only Aux (type 2) matters for MUA3: its sound engine mixes music, dialogue and movie audio on the
+    // CPU. Per update the DSP writes each input mix buffer into the "send" ring and reads the "return" ring (which
+    // the game filled) into the output buffer. Rings: AuxBufferInfo {cpu info, dsp info} (0x40 each) followed by
+    // s32 samples, count_max per ring; channel i uses offset i * samples within the frame, and the last channel
+    // advances the dsp write/read offset by channels * samples. Disabled aux copies input to output.
+    struct Effect {
+        u8 type = 0;
+        bool enabled = false;
+        s32 mix = -1, order = 0;
+        s8 inputs[24]{}, outputs[24]{};
+        u32 channels = 0, count_max = 0;
+        u64 send_info = 0, send_data = 0, return_info = 0, return_data = 0;
+    };
+    std::vector<Effect> effects_;
+
+    void ParseEffects(const std::vector<u8>& in, size_t at, u32 n) {
+        effects_.clear();
+        for (u32 i = 0; i < n; i++) {
+            const size_t fx = at + size_t(i) * 0xC0;
+            if (fx + 0xC0 > in.size() || in[fx] != 2)
+                continue;
+            Effect e;
+            e.type = in[fx];
+            e.enabled = in[fx + 2] != 0;
+            e.mix = common::Read<s32>(&in[fx + 4]);
+            e.order = common::Read<s32>(&in[fx + 0x18]);
+            std::memcpy(e.inputs, &in[fx + 0x20], 24);
+            std::memcpy(e.outputs, &in[fx + 0x38], 24);
+            e.channels = std::min<u32>(common::Read<u32>(&in[fx + 0x50]), 24);
+            e.count_max = common::Read<u32>(&in[fx + 0x58]);
+            e.send_info = common::Read<u64>(&in[fx + 0x60]);
+            e.send_data = common::Read<u64>(&in[fx + 0x68]);
+            e.return_info = common::Read<u64>(&in[fx + 0x70]);
+            e.return_data = common::Read<u64>(&in[fx + 0x78]);
+            static int logged = 0;
+            if (logged < 4 && e.send_info) {
+                logged++;
+                LOG_INFO("audren", "aux on mix {}: {} ch, count max {}, send info {:#x} data {:#x}, return info {:#x} data {:#x}",
+                         e.mix, e.channels, e.count_max, e.send_info, e.send_data, e.return_info, e.return_data);
+            }
+            effects_.push_back(e);
+        }
+        std::stable_sort(effects_.begin(), effects_.end(), [](const Effect& a, const Effect& b) { return a.order < b.order; });
+    }
+
+    void ApplyEffects(u32 mix_id) {
+        auto mit = mix_offset_.find(mix_id);
+        if (mit == mix_offset_.end())
+            return;
+        auto& mem = core::Sys().Mem();
+        const u32 base = mit->second.first, nbuf = mit->second.second;
+        std::vector<s32>& tmp = aux_scratch_;
+        tmp.resize(samples_);
+        for (const Effect& e : effects_) {
+            if (s32(mix_id) != e.mix)
+                continue;
+            for (u32 c = 0; c < e.channels; c++) {
+                const s8 si = e.inputs[c], so = e.outputs[c];
+                if (si < 0 || so < 0 || u32(si) >= nbuf || u32(so) >= nbuf)
+                    continue;
+                float* src = &mix_[size_t(base + u32(si)) * samples_];
+                float* dst = &mix_[size_t(base + u32(so)) * samples_];
+                const bool usable = e.enabled && e.send_info && e.return_info && e.send_data && e.return_data &&
+                                    e.count_max >= samples_ && mem.IsValid(e.send_info, 0x80) && mem.IsValid(e.return_info, 0x80) &&
+                                    mem.IsValid(e.send_data, u64(e.count_max) * 4) && mem.IsValid(e.return_data, u64(e.count_max) * 4);
+                if (!usable) {
+                    if (si != so)
+                        std::memcpy(dst, src, samples_ * sizeof(float));
+                    continue;
+                }
+                const bool last = c + 1 == e.channels;
+                const u32 advance = last ? e.channels * samples_ : 0;
+                // Send: this channel's frame at dsp write offset + c * samples.
+                for (u32 i = 0; i < samples_; i++)
+                    tmp[i] = s32(std::lround(std::clamp(src[i], -4.0f, 4.0f) * 32768.0f));
+                RingTransfer(mem, e.send_info + 0x40, e.send_data, e.count_max, c * samples_, advance, true, tmp.data());
+                // Return: what the game wrote for this channel.
+                RingTransfer(mem, e.return_info + 0x40, e.return_data, e.count_max, c * samples_, advance, false, tmp.data());
+                float sp = 0, rp = 0;
+                for (u32 i = 0; i < samples_; i++) {
+                    sp = std::max(sp, std::abs(src[i]));
+                    dst[i] = float(tmp[i]) / 32768.0f;
+                    rp = std::max(rp, std::abs(dst[i]));
+                }
+                auto& st = aux_stats_[u32(e.mix) * 32 + c];
+                st.first = std::max(st.first, sp);
+                st.second = std::max(st.second, rp);
+            }
+        }
+    }
+
+    // Copies samples_ s32 samples to (write) or from (read) a ring at `info`'s dsp offset (+0 read, +4 write) plus
+    // `offset`, wrapping at count_max; then advances that offset by `advance`.
+    void RingTransfer(core::Memory& mem, u64 info, u64 data, u32 count_max, u32 offset, u32 advance, bool write, s32* samples) {
+        const u32 field = write ? 4 : 0;
+        const u32 cur = mem.Read<u32>(info + field);
+        u32 pos = (cur + offset) % count_max;
+        for (u32 done = 0; done < samples_;) {
+            const u32 n = std::min(count_max - pos, samples_ - done);
+            if (write)
+                mem.WriteBlock(data + u64(pos) * 4, samples + done, size_t(n) * 4);
+            else
+                mem.ReadBlock(data + u64(pos) * 4, samples + done, size_t(n) * 4);
+            done += n;
+            pos = (pos + n) % count_max;
+        }
+        if (advance)
+            mem.Write<u32>(info + field, (cur + advance) % count_max);
+    }
+
     // Only changed splitters/destinations are sent, so the tables persist across updates.
     size_t SplitterSize(const std::vector<u8>& in, size_t at) {
         if (at + 0x20 > in.size() || common::Read<u32>(&in[at]) != 0x48444E53)
@@ -439,27 +616,50 @@ private:
         const s32 infos = common::Read<s32>(&in[at + 4]), datas = common::Read<s32>(&in[at + 8]);
         size_t o = at + 0x20;
         for (s32 i = 0; i < infos; i++) {
-            if (o + 0x10 > in.size() || common::Read<u32>(&in[o]) != 0x49444E53)
+            if (o + 0x10 > in.size() || common::Read<u32>(&in[o]) != 0x49444E53) {
+                SplitterParseError("info", i, o - at, in, o);
                 return 0;
+            }
             const s32 id = common::Read<s32>(&in[o + 4]);
             const u32 count = common::Read<u32>(&in[o + 12]);
             auto& dests = splitters_[u32(id)];
             dests.clear();
             for (u32 k = 0; k < count && o + 0x10 + k * 4 + 4 <= in.size(); k++)
                 dests.push_back(common::Read<u32>(&in[o + 0x10 + k * 4]));
+            // Entries carry padding after the destination ids (12 bytes seen with 4 destinations): resume at the next
+            // entry's magic.
             o += 0x10 + size_t(count) * 4;
+            for (u32 k = 0; k < 16 && o + 4 <= in.size(); k++, o += 4) {
+                const u32 magic = common::Read<u32>(&in[o]);
+                if (magic == 0x49444E53 || magic == 0x44444E53)
+                    break;
+            }
         }
         for (s32 i = 0; i < datas; i++) {
-            if (o + 0x70 > in.size() || common::Read<u32>(&in[o]) != 0x44444E53)
+            if (o + 0x70 > in.size() || common::Read<u32>(&in[o]) != 0x44444E53) {
+                SplitterParseError("destination", i, o - at, in, o);
                 return 0;
+            }
             Destination d;
-            d.mix_id = common::Read<u32>(&in[o + 8]);
-            std::memcpy(d.volume.data(), &in[o + 12], 24 * 4);
+            std::memcpy(d.volume.data(), &in[o + 8], 24 * 4);
+            d.mix_id = common::Read<u32>(&in[o + 0x68]);
             d.in_use = in[o + 0x6C] != 0;
+            if (std::getenv("MUA3_AUDIO_DEBUG")) {
+                auto& old = destinations_[common::Read<u32>(&in[o + 4])];
+                if (old.mix_id != d.mix_id || old.in_use != d.in_use)
+                    LOG_INFO("audren", "splitter destination {} -> mix {} in use {} vol {:.2f},{:.2f}", common::Read<u32>(&in[o + 4]),
+                             s32(d.mix_id), d.in_use, d.volume[0], d.volume[1]);
+            }
             destinations_[common::Read<u32>(&in[o + 4])] = d;
             o += 0x70;
         }
         return o - at;
+    }
+    void SplitterParseError(const char* what, s32 index, size_t rel, const std::vector<u8>& in, size_t o) {
+        static int n = 0;
+        if (n++ < 8)
+            LOG_WARN("audren", "splitter {} {} unparsed at +{:#x}: {}", what, index, rel,
+                     common::ToHex(std::span(&in[std::min(o, in.size() - 0x20)], 0x20)));
     }
     struct Destination {
         u32 mix_id = 0;
@@ -536,6 +736,7 @@ private:
                 dst[i] += src[i] * gain;
         };
         for (auto& [d, id] : order) {
+            ApplyEffects(id);
             const size_t m = by_id[id];
             const u32 nbuf = mix_offset_[id].second;
             float vol;
@@ -549,15 +750,17 @@ private:
                         add(id, a, dest, b, mv * vol);
                     }
             } else if (auto it = splitters_.find(split); it != splitters_.end() && !it->second.empty()) {
-                for (u32 a = 0; a < nbuf; a++) {
-                    auto dit = destinations_.find(it->second[a % it->second.size()]);
-                    if (dit == destinations_.end() || !dit->second.in_use)
-                        continue;
-                    for (u32 b = 0; b < 24; b++)
-                        add(id, a, dit->second.mix_id, b, dit->second.volume[b] * vol);
-                }
+                for (u32 a = 0; a < nbuf; a++)
+                    for (size_t k = a; k < it->second.size(); k += nbuf) {
+                        auto dit = destinations_.find(it->second[k]);
+                        if (dit == destinations_.end() || !dit->second.in_use)
+                            continue;
+                        for (u32 b = 0; b < 24; b++)
+                            add(id, a, dit->second.mix_id, b, dit->second.volume[b] * vol);
+                    }
             }
         }
+        ApplyEffects(0);
         // Device sink: input[] picks final mix buffers (FL, FR, FC, LFE, RL, RR); downmix to stereo.
         auto fin = mix_offset_.find(0);
         if (fin == mix_offset_.end() || !g_audio_output || !started_)
@@ -641,7 +844,9 @@ private:
     std::unordered_map<u32, std::pair<u32, u32>> mix_offset_;        // mix id -> {first mix buffer, buffer count}
     std::vector<size_t> mix_order_;                                  // mixes in use (offsets into the update data)
     std::vector<float> mix_;                                         // mix buffers, samples_ each
-    std::vector<float> mix_scratch_;
+    std::vector<float> mix_scratch_, resampled_;
+    std::vector<s32> aux_scratch_;
+    std::map<u32, std::pair<float, float>> aux_stats_; // mix * 32 + channel -> {send peak, return peak}
     u64 stat_playing_ = 0, stat_routed_ = 0, stat_unrouted_ = 0; // mixer diagnostics (periodic log)
     u32 stat_format_mask_ = 0;
     float stat_src_peak_ = 0;

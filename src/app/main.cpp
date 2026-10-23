@@ -521,8 +521,10 @@ int main(int argc, char** argv) {
                 std::this_thread::sleep_for(std::chrono::seconds(3));
             }
         }).detach();
+    // MUA3_HEADLESS=1 (automated test runs): hidden window, physical controllers ignored (only mua3_cmd.txt drives).
+    const bool test_instance = std::getenv("MUA3_HEADLESS") != nullptr;
     while (display.PumpEvents()) {
-        if (autopress_after == 0 && !g_script_active) // the test aids drive player 1 themselves
+        if (autopress_after == 0 && !g_script_active && !test_instance) // the test aids drive player 1 themselves
             input.Update(display.Focused());
         PollCommandFile(&input);
         display.BeginFrame();

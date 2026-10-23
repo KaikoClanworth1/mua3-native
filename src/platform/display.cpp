@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <d3d11.h>
 #include <dxgi1_2.h>
 
@@ -27,6 +28,8 @@ bool Display::Init(const core::Config& cfg, const char* title) {
         return false;
     }
     SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+    if (std::getenv("MUA3_HEADLESS")) // automated test runs: no visible window
+        flags |= SDL_WINDOW_HIDDEN;
     window_ = SDL_CreateWindow(title, cfg.width, cfg.height, flags);
     if (!window_) {
         LOG_ERROR("Display", "SDL_CreateWindow failed: {}", SDL_GetError());
