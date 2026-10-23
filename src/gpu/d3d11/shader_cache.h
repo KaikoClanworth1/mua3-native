@@ -26,6 +26,8 @@ struct HostShader {
     ComPtr<ID3D11VertexShader> vs;
     ComPtr<ID3D11PixelShader> ps;
     ComPtr<ID3D11ComputeShader> cs;
+    ComPtr<ID3D11ComputeShader> cs_ref; // MUA3_DXBC_VERIFY: the same kernel compiled by FXC, for A/B checks
+    bool direct_dxbc = false;           // compiled by the FXC-free backend
     shader::TranslateOptions opt; // compute: workgroup shape and shared memory from the launch
     std::vector<u8> cbuf1;        // compute: constant buffer 1 at first launch (opt.cbuf1 points here)
     std::vector<u8> code; // guest program (kept until compiled)

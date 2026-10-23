@@ -1,4 +1,5 @@
 #include "gpu/d3d11/shader_cache.h"
+#include "gpu/dxbc/dxbc.h"
 
 #include <cctype>
 #include <cstdlib>
@@ -92,7 +93,9 @@ bool ShaderCache::Build(HostShader& s, bool slow) {
         s.translated = true;
     }
     const char* target = StageTarget(s.stage);
-    if (!slow && s.info.ok && s.info.uses_loop && !fs::exists(CachePath(s, target))) {
+    // Compute shaders go through the direct DXBC backend (milliseconds): no slow FXC queue for them.
+    const bool direct = s.stage == shader::Stage::Compute && !std::getenv("MUA3_FXC_COMPUTE");
+    if (!slow && !direct && s.info.ok && s.info.uses_loop && !fs::exists(CachePath(s, target))) {
         {
             std::lock_guard lk(mutex_);
             slow_queue_.push_back(&s);
@@ -137,6 +140,40 @@ fs::path ShaderCache::CachePath(const HostShader& s, const char* target) const {
 
 bool ShaderCache::Compile(HostShader& s, const std::string& hlsl, std::string& err, bool out_of_process) {
     const char* target = StageTarget(s.stage);
+    if (s.stage == shader::Stage::Compute && !std::getenv("MUA3_FXC_COMPUTE") && !s.direct_dxbc) {
+        std::vector<u8> blob;
+        std::string derr;
+        std::string src = hlsl;
+        const fs::path ovr = fs::path("shader_override") / fmt::format("{:016x}.cs.hlsl", s.hash);
+        if (fs::exists(ovr)) {
+            const auto text = common::ReadFile(ovr);
+            src.assign(text.begin(), text.end());
+            LOG_INFO("Shader", "using override {}", ovr.string());
+        }
+        if (dxbc::CompileHlsl(src, dxbc::Stage::Compute, blob, derr)) {
+            const HRESULT hr = dev_->CreateComputeShader(blob.data(), blob.size(), nullptr, &s.cs);
+            if (SUCCEEDED(hr)) {
+                s.direct_dxbc = true;
+                if (std::getenv("MUA3_DXBC_VERIFY")) {
+                    // Reference build through FXC (out of process, bounded) for the renderer's A/B comparison.
+                    ComPtr<ID3D11ComputeShader> mine = s.cs;
+                    s.cs.Reset();
+                    std::string ferr;
+                    s.no_cache = true;
+                    if (Compile(s, hlsl, ferr, true))
+                        s.cs_ref = s.cs;
+                    else
+                        LOG_INFO("Shader", "cs {:016x}: no FXC reference ({})", s.hash, ferr.substr(0, 120));
+                    s.cs = mine;
+                }
+                return true;
+            }
+            LOG_WARN("Shader", "cs {:016x}: driver rejected direct DXBC ({:#x}), using FXC", s.hash, u32(hr));
+        } else {
+            LOG_WARN("Shader", "cs {:016x}: direct DXBC failed ({}), using FXC", s.hash, derr);
+        }
+        s.direct_dxbc = true; // tried; the FXC path below runs once
+    }
     fs::path cached = s.no_cache ? fs::path() : CachePath(s, target);
     std::vector<u8> blob = s.no_cache ? std::vector<u8>() : common::ReadFile(cached);
     // Debug aid: shader_override/<hash>.<vs|ps>.hlsl replaces the translated HLSL (never cached).

@@ -501,6 +501,13 @@ void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
     const u32 grid[3] = {q[0xC] & 0x7FFFFFFF, q[0xD] & 0xFFFF, q[0xD] >> 16};
     if (!grid[0] || !grid[1] || !grid[2])
         return;
+    // Debug: MUA3_SKIP_CS=<offset hex>,... drops those compute programs.
+    static const std::string skip_cs = [] {
+        const char* e = std::getenv("MUA3_SKIP_CS");
+        return std::string(e ? e : "");
+    }();
+    if (!skip_cs.empty() && skip_cs.find(fmt::format("{:x}", q[8])) != std::string::npos)
+        return;
     const u64 key = prog ^ (u64(opt.block[0]) << 40) ^ (u64(opt.block[1]) << 50) ^ (u64(opt.block[2]) << 56) ^
                     (u64(opt.shared_bytes) << 20);
     HostShader* cs;
@@ -704,6 +711,69 @@ void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
         drv.image[k][2] = w | (hgt << 16);
         drv.image[k][3] = dep | (mode << 16) | (bh << 24) | (bd << 28);
     }
+    // Debug: MUA3_CAPTURE=<program offset hex> saves one dispatch's inputs for `shadertool --replay`.
+    static const u32 capture_off = [] {
+        const char* e = std::getenv("MUA3_CAPTURE");
+        return e ? u32(std::strtoul(e, nullptr, 16)) : ~0u;
+    }();
+    static bool captured = false;
+    if (!captured && q[8] == capture_off) {
+        captured = true;
+        std::vector<u32> f;
+        auto put_bytes = [&](const void* p, u32 n) {
+            f.push_back(n);
+            const u32 words = (n + 3) / 4;
+            const size_t at = f.size();
+            f.resize(at + words, 0);
+            std::memcpy(&f[at], p, n);
+        };
+        f.push_back(0x5041434D); // "MCAP"
+        put_bytes(cs->info.hlsl.data(), u32(cs->info.hlsl.size()));
+        f.insert(f.end(), {opt.block[0], opt.block[1], opt.block[2], grid[0], grid[1], grid[2]});
+        std::vector<u32> cbl;
+        for (u32 i = 0; i < 8; i++)
+            if (cb_size[i])
+                cbl.push_back(i);
+        f.push_back(u32(cbl.size()));
+        for (u32 i : cbl) {
+            std::vector<u8> d(std::min<u32>(cb_size[i], 65536u), 0);
+            g.ReadGpuPartial(cb_addr[i], d.data(), d.size());
+            f.push_back(i);
+            put_bytes(d.data(), u32(d.size()));
+        }
+        std::vector<std::pair<u32, std::vector<u8>>> texs;
+        std::vector<u32> tex_fmt;
+        for (auto& t : cs->info.textures) {
+            if (t.dim != shader::TexDim::Buffer)
+                continue;
+            TicEntry tic;
+            g.ReadGpu(tic_base + u64(handle_of(t) & 0xFFFFF) * 32, tic.w.data(), 32);
+            const TexFormatInfo fi = TicFormat(tic.Format(), tic.RType(), tic.Srgb());
+            std::vector<u8> d(size_t(tic.Width()) * fi.bytes_per_block, 0);
+            g.ReadGpuPartial(tic.Address(), d.data(), d.size());
+            texs.push_back({t.slot, std::move(d)});
+            tex_fmt.push_back(u32(fi.dxgi) | (fi.bytes_per_block << 16));
+        }
+        f.push_back(u32(texs.size()));
+        for (size_t k = 0; k < texs.size(); k++) {
+            f.push_back(texs[k].first);
+            f.push_back(tex_fmt[k]);
+            put_bytes(texs[k].second.data(), u32(texs[k].second.size()));
+        }
+        u32 nwin = 0;
+        for (u32 i = 0; i < shader::kGmemWindows; i++)
+            nwin += win_size[i] != 0;
+        f.push_back(nwin);
+        for (u32 i = 0; i < shader::kGmemWindows; i++)
+            if (win_size[i]) {
+                f.push_back(i);
+                put_bytes(gmem_[i].uploaded.data(), win_size[i]);
+            }
+        put_bytes(&drv, sizeof(drv));
+        const fs::path out = fmt::format("shader_dump/capture_{:x}.bin", q[8]);
+        common::WriteFile(out, std::span(reinterpret_cast<const u8*>(f.data()), f.size() * 4));
+        LOG_INFO("Renderer", "captured dispatch {:#x} to {}", prog, out.string());
+    }
     ID3D11Buffer* drv_cb = dc.Constant(1001, &drv, sizeof(drv));
     // Render targets may be sampled by the kernel: unbind them from the output stage.
     ctx_->OMSetRenderTargets(0, nullptr, nullptr);
@@ -713,6 +783,28 @@ void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
     ctx_->CSSetShaderResources(0, 48, srvs);
     ctx_->CSSetSamplers(0, 16, smps);
     ctx_->CSSetUnorderedAccessViews(0, shader::kGmemWindows, uavs, nullptr);
+    // MUA3_DXBC_VERIFY: run the FXC build first on the same inputs, keep its results, restore the inputs, then run
+    // the direct-DXBC build; the write-back below compares the two.
+    std::vector<std::vector<u8>> reference(shader::kGmemWindows);
+    const bool verify = cs->cs_ref != nullptr;
+    if (verify) {
+        ctx_->CSSetShader(cs->cs_ref.Get(), nullptr, 0);
+        ctx_->Dispatch(grid[0], grid[1], grid[2]);
+        for (u32 i = 0; i < shader::kGmemWindows; i++) {
+            if (!win_size[i])
+                continue;
+            GmemWindow& w = gmem_[i];
+            const D3D11_BOX box{0, 0, 0, win_size[i], 1, 1};
+            ctx_->CopySubresourceRegion(w.staging.Get(), 0, 0, 0, 0, w.buf.Get(), 0, &box);
+            D3D11_MAPPED_SUBRESOURCE mp;
+            if (SUCCEEDED(ctx_->Map(w.staging.Get(), 0, D3D11_MAP_READ, 0, &mp))) {
+                reference[i].assign(static_cast<const u8*>(mp.pData), static_cast<const u8*>(mp.pData) + win_size[i]);
+                ctx_->Unmap(w.staging.Get(), 0);
+            }
+            ctx_->UpdateSubresource(w.buf.Get(), 0, &box, w.uploaded.data(), win_size[i], win_size[i]);
+        }
+        ctx_->CSSetShader(cs->cs.Get(), nullptr, 0);
+    }
     ctx_->Dispatch(grid[0], grid[1], grid[2]);
     ID3D11UnorderedAccessView* no_uav[shader::kGmemWindows]{};
     ctx_->CSSetUnorderedAccessViews(0, shader::kGmemWindows, no_uav, nullptr);
@@ -730,6 +822,26 @@ void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
         if (FAILED(ctx_->Map(w.staging.Get(), 0, D3D11_MAP_READ, 0, &mp)))
             continue;
         const u8* now = static_cast<const u8*>(mp.pData);
+        if (verify && reference[i].size() == win_size[i]) {
+            u32 diff = 0, first = ~0u;
+            for (u32 off = 0; off < win_size[i]; off += 4)
+                if (std::memcmp(now + off, &reference[i][off], 4) != 0) {
+                    diff++;
+                    if (first == ~0u)
+                        first = off;
+                }
+            static std::map<u64, u32> reported;
+            if (diff && reported[key ^ i]++ < 3) {
+                u32 a4 = 0, b4 = 0;
+                std::memcpy(&a4, now + first, 4);
+                std::memcpy(&b4, &reference[i][first], 4);
+                LOG_WARN("Renderer", "DXBC verify {:#x} window {}: {} words differ (first +{:#x}: dxbc {:08x} fxc {:08x})", prog, i,
+                         diff, first, a4, b4);
+            } else if (!diff && reported[key ^ i] == 0) {
+                reported[key ^ i] = 100;
+                LOG_INFO("Renderer", "DXBC verify {:#x} window {}: identical", prog, i);
+            }
+        }
         // Changed runs only, so data the CPU wrote meanwhile elsewhere in the window survives.
         u32 changed = 0;
         for (u32 off = 0; off < win_size[i];) {
