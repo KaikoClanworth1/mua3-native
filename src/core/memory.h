@@ -103,9 +103,12 @@ public:
 
     // Write tracking (used to invalidate host copies of guest textures written by the CPU).
     // Pages are write-protected until the first write, which marks them dirty.
-    void TrackWrites(u64 addr, u64 size);
-    // True if any page in the range was written since it was last tracked.
-    bool ConsumeDirty(u64 addr, u64 size);
+    // Each consumer has its own channel of dirty bits (0: texture cache, 1: compute buffers, 2: index/vertex buffers), so one re-tracking
+    // a page does not hide the write from the other.
+    static constexpr u32 kDirtyChannels = 3;
+    void TrackWrites(u64 addr, u64 size, u32 channel = 0);
+    // True if any page in the range was written since it was last tracked on this channel.
+    bool ConsumeDirty(u64 addr, u64 size, u32 channel = 0);
     bool HandleWriteFault(uintptr_t host_addr);
 
 private:
@@ -122,7 +125,7 @@ private:
 
     u8* base_ = nullptr;
     std::vector<std::atomic<u64>> page_bits_; // 1 bit per committed 4 KiB page
-    std::vector<std::atomic<u64>> tracked_bits_, dirty_bits_;
+    std::vector<std::atomic<u64>> tracked_bits_, dirty_bits_[kDirtyChannels];
     std::mutex track_mutex_;
     std::map<u64, Vma> vmas_; // non-free regions only
     u64 heap_size_ = 0;

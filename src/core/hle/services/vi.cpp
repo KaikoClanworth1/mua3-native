@@ -114,7 +114,12 @@ BufferQueue& Queue() {
 }
 
 void PaceFrame(BufferQueue& q, u32 swap_interval) {
-    const int limit = core::Sys().Cfg().fps_limit;
+    // With its frame rate unlocked (fps_target, see game_patches.cpp) the game's own limiter paces it; a second
+    // independent 60 Hz pacer here would drift against it and hold back a frame now and then (judder).
+    const auto& cfg = core::Sys().Cfg();
+    if (cfg.fps_target > 30 && cfg.swap_interval == 0)
+        return;
+    const int limit = cfg.fps_limit;
     if (limit <= 0)
         return;
     using namespace std::chrono;
@@ -175,6 +180,11 @@ void Transact(u32 code, std::vector<u8> in, ParcelWriter& out) {
         const s32 slot = p.Read<s32>();
         auto qbi = p.ReadFlattened();
         u32 swap_interval = qbi.size() >= 0x30 ? common::Read<u32>(&qbi[0x2C]) : 1;
+        // The game asks NVN for interval 2 (30 fps); with its frame rate unlocked (fps_target) present every frame.
+        if (core::Sys().Cfg().fps_target > 30)
+            swap_interval = 1;
+        if (const int forced = core::Sys().Cfg().swap_interval; forced > 0)
+            swap_interval = u32(forced);
         BufferQueue::Slot s;
         {
             std::lock_guard lk(q.mutex);
@@ -193,8 +203,8 @@ void Transact(u32 code, std::vector<u8> in, ParcelWriter& out) {
         if (now - q.fps_t0 > std::chrono::seconds(5)) {
             const double secs = std::chrono::duration<double>(now - q.fps_t0).count();
             auto& g = gpu::G();
-            LOG_INFO("vi", "Presenting: {:.1f} fps (gpu submits {}, methods {}) gpu busy {:.0f}% (draw {:.0f}%)", q.frames / secs,
-                     g.submits.load(), g.methods.load(), g.busy_ns.exchange(0) / (secs * 1e7), g.draw_ns.exchange(0) / (secs * 1e7));
+            LOG_INFO("vi", "Presenting: {:.1f} fps (swap interval {}, gpu submits {}, methods {}) gpu busy {:.0f}% (draw {:.0f}%)",
+                     q.frames / secs, swap_interval, g.submits.load(), g.methods.load(), g.busy_ns.exchange(0) / (secs * 1e7), g.draw_ns.exchange(0) / (secs * 1e7));
             q.frames = 0;
             q.fps_t0 = now;
         }
@@ -287,9 +297,12 @@ public:
 std::shared_ptr<kernel::Event> VsyncEvent() {
     static std::shared_ptr<kernel::Event> e = [] {
         auto ev = MakeEvent("vi:vsync");
-        std::thread([ev] {
+        // MUA3_VSYNC_HZ: experiment with the display refresh the guest sees (default 60).
+        const char* hz_env = std::getenv("MUA3_VSYNC_HZ");
+        const int hz = hz_env ? std::max(1, std::atoi(hz_env)) : 60;
+        std::thread([ev, hz] {
             for (;;) {
-                std::this_thread::sleep_for(std::chrono::microseconds(16667));
+                std::this_thread::sleep_for(std::chrono::microseconds(1000000 / hz));
                 kernel::K().SignalEvent(*ev);
             }
         }).detach();

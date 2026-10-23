@@ -134,7 +134,7 @@ bool ShaderCache::Build(HostShader& s, bool slow) {
 
 fs::path ShaderCache::CachePath(const HostShader& s, const char* target) const {
     // Bump kTranslatorVersion whenever the translator output changes, to invalidate cached bytecode.
-    constexpr int kTranslatorVersion = 28;
+    constexpr int kTranslatorVersion = 29;
     return cache_dir_ / fmt::format("{:016x}_{}_v{}.dxbc", s.hash, target, kTranslatorVersion);
 }
 

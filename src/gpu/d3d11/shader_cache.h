@@ -65,7 +65,7 @@ private:
     fs::path CachePath(const HostShader& s, const char* target) const;
 
     ID3D11Device* dev_;
-    std::unordered_map<u64, std::unique_ptr<HostShader>> shaders_;
+    common::U64Map<std::unique_ptr<HostShader>> shaders_;
     fs::path dump_dir_ = "shader_dump";
     fs::path cache_dir_ = "shader_cache";
 

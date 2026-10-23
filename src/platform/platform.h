@@ -39,6 +39,7 @@ public:
     // Supplies the latest rendered game frame (called with context_mutex held).
     std::function<ID3D11ShaderResourceView*(u32& w, u32& h)> frame_source;
     std::recursive_mutex* context_mutex = nullptr;
+    std::atomic<u64>* context_epoch = nullptr; // bumped whenever the UI used the shared context (state caches)
 
 private:
     void CreateBackbuffer();

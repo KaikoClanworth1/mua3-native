@@ -214,6 +214,8 @@ void Display::EndFrame() {
     ctx_->OMSetRenderTargets(1, &rtv_, nullptr);
     ctx_->ClearRenderTargetView(rtv_, clear);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    if (context_epoch)
+        (*context_epoch)++;
     // Don't hold the context lock while Present waits for vblank: the GPU thread needs the context.
     if (lk.owns_lock())
         lk.unlock();

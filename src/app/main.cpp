@@ -1,6 +1,9 @@
 // MUA3 runtime entry point: window/input/audio on the main thread, the game on its own threads.
 #include <algorithm>
+#include <csignal>
+#include <exception>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <chrono>
 #include <thread>
@@ -8,11 +11,13 @@
 #include <imgui.h>
 #include <windows.h>
 #include <timeapi.h>
+#include <dbghelp.h>
 
 #include "common/profiler.h"
 #include "core/config.h"
 #include "core/kernel/kernel.h"
 #include "core/system.h"
+#include "core/hle/audio_output.h"
 #include "core/hle/hid.h"
 #include "gpu/d3d11/renderer_d3d11.h"
 #include "gpu/d3d11/shader_cache.h"
@@ -103,6 +108,7 @@ u64 ParseButtons(const std::string& btns);
 
 // Test aid: external control channel. Each line of mua3_cmd.txt is executed then the file is deleted:
 //   press <BUTTON>[+BUTTON...] [hold_ms]     tap buttons on player 1
+//   stick <lx> <ly> [hold_ms]                tilt player 1's left stick
 //   shot <path.bmp>                          save the next presented game frame
 void PollCommandFile(platform::Input* input) {
     static auto last = std::chrono::steady_clock::now();
@@ -131,6 +137,19 @@ void PollCommandFile(platform::Input* input) {
                 g_script_active = true;
                 hle::hid::SetPad(0, hle::hid::PadInput{true, ParseButtons(arg)});
                 std::this_thread::sleep_for(std::chrono::milliseconds(hold));
+                hle::hid::SetPad(0, hle::hid::PadInput{true});
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                g_script_active = false;
+            } else if (cmd == "stick") { // stick <lx> <ly> [hold_ms]: tilt the left stick (-32767..32767, +y up)
+                int lx = 0, ly = 0, ms = 1000;
+                std::string c;
+                std::istringstream(line) >> c >> lx >> ly >> ms;
+                g_script_active = true;
+                hle::hid::PadInput in{true};
+                in.lx = lx;
+                in.ly = ly;
+                hle::hid::SetPad(0, in);
+                std::this_thread::sleep_for(std::chrono::milliseconds(ms));
                 hle::hid::SetPad(0, hle::hid::PadInput{true});
                 std::this_thread::sleep_for(std::chrono::milliseconds(250));
                 g_script_active = false;
@@ -260,7 +279,136 @@ void RunInputScript(const fs::path& path) {
 
 } // namespace
 
+// Unhandled host crash: log the exception and a symbolized stack (RelWithDebInfo has PDBs) before dying.
+static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
+    static std::atomic<bool> once{false};
+    if (once.exchange(true))
+        return EXCEPTION_CONTINUE_SEARCH;
+    const auto* er = ep->ExceptionRecord;
+    LOG_ERROR("Crash", "unhandled exception {:#x} at {:p} (info {:#x} {:#x})", u32(er->ExceptionCode), er->ExceptionAddress,
+              er->NumberParameters > 0 ? er->ExceptionInformation[0] : 0, er->NumberParameters > 1 ? er->ExceptionInformation[1] : 0);
+    HANDLE proc = GetCurrentProcess();
+    SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+    SymInitialize(proc, nullptr, TRUE);
+    CONTEXT ctx = *ep->ContextRecord;
+    STACKFRAME64 f{};
+    f.AddrPC = {ctx.Rip, 0, AddrModeFlat};
+    f.AddrFrame = {ctx.Rbp, 0, AddrModeFlat};
+    f.AddrStack = {ctx.Rsp, 0, AddrModeFlat};
+    for (int i = 0; i < 32; i++) {
+        if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, proc, GetCurrentThread(), &f, &ctx, nullptr, SymFunctionTableAccess64,
+                         SymGetModuleBase64, nullptr) || !f.AddrPC.Offset)
+            break;
+        alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256]{};
+        auto* sym = reinterpret_cast<SYMBOL_INFO*>(buf);
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen = 255;
+        DWORD64 disp = 0;
+        IMAGEHLP_LINE64 line{sizeof(line)};
+        DWORD ldisp = 0;
+        const bool has_sym = SymFromAddr(proc, f.AddrPC.Offset, &disp, sym);
+        const bool has_line = SymGetLineFromAddr64(proc, f.AddrPC.Offset, &ldisp, &line);
+        LOG_ERROR("Crash", "  #{} {:#x} {}+{:#x} {}:{}", i, f.AddrPC.Offset, has_sym ? sym->Name : "?", disp,
+                  has_line ? line.FileName : "", has_line ? line.LineNumber : 0);
+    }
+    std::fflush(nullptr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// MUA3_SAMPLE_GPU=1: statistical profiler for the GPU command thread. Samples its instruction pointer at ~2 kHz
+// and logs the hottest functions (leaf, and the first frame inside the renderer) every 10 seconds.
+static void StartGpuSampler() {
+    std::thread([] {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        HANDLE th = static_cast<HANDLE>(gpu::G().NativeThread());
+        HANDLE proc = GetCurrentProcess();
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+        SymInitialize(proc, nullptr, TRUE);
+        auto name_of = [&](DWORD64 pc) -> std::string {
+            alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256]{};
+            auto* sym = reinterpret_cast<SYMBOL_INFO*>(buf);
+            sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+            sym->MaxNameLen = 255;
+            DWORD64 disp = 0;
+            return SymFromAddr(proc, pc, &disp, sym) ? std::string(sym->Name) : fmt::format("{:#x}", pc);
+        };
+        std::map<std::string, u32> leaf, owner;
+        u32 total = 0;
+        auto t0 = std::chrono::steady_clock::now();
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
+            if (SuspendThread(th) == DWORD(-1))
+                continue;
+            // Only capture raw return addresses while the thread is suspended: it may hold the heap or dbghelp
+            // locks, so anything that allocates must wait until it runs again.
+            DWORD64 pcs[12];
+            int npc = 0;
+            CONTEXT ctx{};
+            ctx.ContextFlags = CONTEXT_FULL;
+            if (GetThreadContext(th, &ctx)) {
+                for (; npc < 12 && ctx.Rip; npc++) {
+                    pcs[npc] = ctx.Rip;
+                    DWORD64 image = 0;
+                    RUNTIME_FUNCTION* fn = RtlLookupFunctionEntry(ctx.Rip, &image, nullptr);
+                    if (!fn) { // leaf function: return address on top of the stack
+                        ctx.Rip = *reinterpret_cast<DWORD64*>(ctx.Rsp);
+                        ctx.Rsp += 8;
+                        continue;
+                    }
+                    void* handler_data = nullptr;
+                    DWORD64 frame = 0;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, fn, &ctx, &handler_data, &frame, nullptr);
+                }
+            }
+            ResumeThread(th);
+            if (npc) {
+                std::string first, mine;
+                for (int i = 0; i < npc; i++) {
+                    std::string n = name_of(pcs[i]);
+                    if (first.empty())
+                        first = n;
+                    if (n.rfind("gpu::", 0) == 0 || n.rfind("core::", 0) == 0) {
+                        mine = n;
+                        break;
+                    }
+                }
+                leaf[first]++;
+                owner[mine.empty() ? first : mine]++;
+                total++;
+            }
+            if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(10) && total) {
+                t0 = std::chrono::steady_clock::now();
+                for (auto* m : {&leaf, &owner}) {
+                    std::vector<std::pair<u32, std::string>> v;
+                    for (auto& [k, c] : *m)
+                        v.push_back({c, k});
+                    std::sort(v.rbegin(), v.rend());
+                    std::string line;
+                    for (size_t i = 0; i < v.size() && i < 25; i++)
+                        line += fmt::format("\n    {:5.1f}% {}", 100.0 * v[i].first / total, v[i].second);
+                    LOG_INFO("Sampler", "GPU thread, {} samples, by {}:{}", total, m == &leaf ? "leaf" : "renderer function", line);
+                    m->clear();
+                }
+                total = 0;
+            }
+        }
+    }).detach();
+}
+
 int main(int argc, char** argv) {
+    SetUnhandledExceptionFilter(CrashFilter);
+    std::signal(SIGABRT, [](int) {
+        LOG_ERROR("Crash", "abort()");
+        std::fflush(nullptr);
+    });
+    std::set_terminate([] {
+        LOG_ERROR("Crash", "std::terminate (uncaught C++ exception)");
+        std::fflush(nullptr);
+        std::abort();
+    });
+    // Stack overflows need stack left for the filter to run.
+    ULONG guarantee = 64 * 1024;
+    SetThreadStackGuarantee(&guarantee);
     // Child-process mode used by the shader cache for compiles that may not finish (see ShaderCache).
     if (argc == 5 && std::string(argv[1]) == "--compile-shader")
         return gpu::CompileShaderFile(argv[2], argv[3], argv[4]) ? 0 : 1;
@@ -329,10 +477,15 @@ int main(int argc, char** argv) {
     platform::Input input;
     input.Init(cfg.input);
     platform::Audio().Init(cfg.audio, cfg.volume);
+    hle::SetAudioOutput([](const s16* pcm, size_t frames) { platform::Audio().Push(pcm, frames); },
+                        [] { return platform::Audio().Queued(); });
 
     gpu::D3D11Renderer renderer(display.Device(), display.Context());
+    renderer.SetResolutionScale(u32(std::clamp(cfg.resolution_scale, 1, 4)));
     gpu::G().SetRenderer(&renderer);
     g_renderer = &renderer;
+    if (std::getenv("MUA3_SAMPLE_GPU"))
+        StartGpuSampler();
     // Test aid: MUA3_DUMP_RT=<seconds> dumps all colour render targets once.
     if (const char* t = std::getenv("MUA3_DUMP_RT"))
         std::thread([s = std::atoi(t)] {
@@ -340,6 +493,7 @@ int main(int argc, char** argv) {
             g_renderer->dump_surfaces_ = true;
         }).detach();
     display.context_mutex = &gpu::ContextMutex();
+    display.context_epoch = &gpu::ContextEpoch();
     display.frame_source = [&](u32& w, u32& h) { return renderer.LatestFrame(w, h); };
 
     bool show_overlay = cfg.show_debug_overlay;
@@ -373,7 +527,30 @@ int main(int argc, char** argv) {
         PollCommandFile(&input);
         display.BeginFrame();
         display.EndFrame();
-        display.PaceFrame();
+        // Present when the game has a new frame (in step with its frame rate, no beat against a separate UI
+        // clock); the timeout keeps the UI responsive while the game shows nothing new (loading, paused).
+        const bool new_frame = WaitForSingleObject(static_cast<HANDLE>(renderer.NewFrameEvent()), 50) == WAIT_OBJECT_0;
+        { // frame pacing stats (display side)
+            static auto last = std::chrono::steady_clock::now(), t0 = last;
+            static double worst = 0, sum = 0;
+            static int n = 0, late = 0;
+            const auto now = std::chrono::steady_clock::now();
+            if (new_frame) {
+                const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+                last = now;
+                worst = std::max(worst, ms);
+                sum += ms;
+                n++;
+                late += ms > 20.0;
+            }
+            if (now - t0 > std::chrono::seconds(5)) {
+                if (n)
+                    LOG_INFO("Main", "display: {} frames, avg {:.2f} ms, worst {:.1f} ms, {} over 20 ms", n, sum / n, worst, late);
+                t0 = now;
+                worst = sum = 0;
+                n = late = 0;
+            }
+        }
         if (watch_seconds > 0 && std::chrono::steady_clock::now() >= next_dump) {
             sys.Kern().DumpAllThreads();
             next_dump += std::chrono::seconds(watch_seconds);

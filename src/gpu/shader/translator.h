@@ -36,6 +36,7 @@ struct TranslateResult {
     u32 rt_mask = 0;             // PS: render targets written (bit per RT)
     bool writes_depth = false;
     bool uses_gmem = false; // compute: reads/writes guest global memory through drv_gmem windows
+    bool writes_gmem = false; // compute: stores, atomics or image stores (results need writing back)
     std::vector<u32> images; // compute: bound image (SUST) handle offsets in the texture constant buffer, by slot
     bool structured = false; // emitted as nested if/else and natural loops
     bool uses_loop = false;

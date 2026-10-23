@@ -1,24 +1,60 @@
-// audren:u / audout:u. The renderer protocol is answered so the game's sound library runs;
-// mixing to the host device (XAudio2/SDL) hooks in at RequestUpdate.
+// audren:u / audout:u. The renderer protocol is answered so the game's sound library runs, and each update mixes
+// the voices (PCM / DSP-ADPCM wave buffers) through the game's submixes into the final mix, which goes to the
+// host device (XAudio2/SDL) via SetAudioOutput.
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <thread>
+#include <unordered_map>
+#include <vector>
 
+#include "core/hle/audio_output.h"
 #include "core/hle/service.h"
+#include "core/memory.h"
+#include "core/system.h"
 
 namespace hle {
+
+namespace {
+std::function<void(const s16*, size_t)> g_audio_output;
+std::function<size_t()> g_audio_queued;
+std::atomic<s64> g_last_output_ns{0}; // steady clock time of the last mix sent to the device
+s64 NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+} // namespace
+
+void SetAudioOutput(std::function<void(const s16* stereo, size_t frames)> fn, std::function<size_t()> queued) {
+    g_audio_output = std::move(fn);
+    g_audio_queued = std::move(queued);
+}
 
 namespace {
 
 std::shared_ptr<kernel::Event> AudioTickEvent() {
     static std::shared_ptr<kernel::Event> e = [] {
         auto ev = MakeEvent("audren:system");
+        // The game renders one audio frame (5 ms) per signal. While the mix reaches the device, signal whenever
+        // its queue runs low so production follows the device clock; otherwise tick every 5 ms.
         std::thread([ev] {
             for (;;) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                kernel::K().SignalEvent(*ev);
+                const bool flowing = g_audio_queued && NowNs() - g_last_output_ns.load() < 100'000'000;
+                if (!flowing) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    kernel::K().SignalEvent(*ev);
+                    continue;
+                }
+                if (g_audio_queued() < 48000 * 40 / 1000) {
+                    kernel::K().SignalEvent(*ev);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                } else {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
             }
         }).detach();
         return ev;
@@ -74,8 +110,33 @@ private:
             std::memcpy(e, &state, 4);
             out.insert(out.end(), e, e + 0x10);
         }
+        // Voice channel resources (0x70 each: id, mix volumes[24], in use): per-channel send levels.
+        const size_t res_at = pools_at + mempools_in;
+        channel_volumes_.clear();
+        for (size_t o = res_at; o + 0x70 <= res_at + voice_res_in && o + 0x70 <= in.size(); o += 0x70) {
+            if (!in[o + 0x64])
+                continue;
+            auto& v = channel_volumes_[rd(o)];
+            std::memcpy(v.data(), &in[o + 4], 24 * 4);
+        }
+        // Mixes (0x930 each): give every mix in use its range of mix buffers (final mix first).
+        const size_t effects_end = pools_at + mempools_in + voice_res_in + voices_in + effects_in;
+        const size_t sinks_at = in.size() >= 0x40 ? 0x40 + behavior_in + mempools_in + voice_res_in + voices_in + effects_in +
+                                                        mixes_in + SplitterSize(in, effects_end)
+                                                  : 0;
+        const size_t mixes_at = sinks_at - mixes_in;
+        SetupMixes(in, mixes_at, mixes_in / 0x930);
+        static bool layout_logged = false;
+        if (!layout_logged && n_voices && !mix_order_.empty()) {
+            layout_logged = true;
+            LOG_INFO("audren", "update layout: in {:#x} behavior {:#x} pools {:#x} channel res {:#x} voices {:#x} effects {:#x} "
+                     "mixes {:#x} sinks {:#x} perf {:#x}; {} mixes in use, {} channel resources, {} splitters, {} destinations",
+                     in.size(), behavior_in, mempools_in, voice_res_in, voices_in, effects_in, mixes_in, sinks_in, rd(0x20),
+                     mix_order_.size(), channel_volumes_.size(), splitters_.size(), destinations_.size());
+        }
+
         // Voices: run each voice's wave-buffer queue at its sample rate so the game's buffer
-        // bookkeeping (release, stop and flush waits) behaves like the DSP.
+        // bookkeeping (release, stop and flush waits) behaves like the DSP, mixing what it plays.
         const size_t voices_at = pools_at + mempools_in + voice_res_in;
         for (u32 i = 0; i < n_voices; i++) {
             u8 e[0x10]{};
@@ -99,6 +160,7 @@ private:
                 e[0] = in[fx + 2] ? 3 : 4;
             out.insert(out.end(), e, e + 0x10);
         }
+        FinishMix(in, sinks_at, n_sinks);
         out.insert(out.end(), size_t(n_sinks) * 0x20, 0);
         out.insert(out.end(), 0x10, 0); // performance
         out.insert(out.end(), 0xB0, 0); // behavior
@@ -108,7 +170,15 @@ private:
             for (u32 i = 0; i < std::min(n_voices, kMaxVoices); i++)
                 for (auto& b : voices_[i].buffers)
                     queued += b.queued;
-            LOG_INFO("audren", "{} updates ({} voices, {} queued wave buffers)", elapsed_frames_, n_voices, queued);
+            float mix_peak = 0;
+            for (float v : mix_)
+                mix_peak = std::max(mix_peak, std::abs(v));
+            LOG_INFO("audren", "{} updates ({} voices, {} queued wave buffers) | mixing: {} playing, formats {:#x}, source peak {:.3f}, "
+                     "{} routed / {} unrouted channels, {} mixes, last mix peak {:.3f}", elapsed_frames_, n_voices, queued,
+                     stat_playing_, stat_format_mask_, stat_src_peak_, stat_routed_, stat_unrouted_, mix_order_.size(), mix_peak);
+            stat_playing_ = stat_routed_ = stat_unrouted_ = 0;
+            stat_format_mask_ = 0;
+            stat_src_peak_ = 0;
         }
         std::memcpy(render_info.data(), &elapsed_frames_, 8);
         out.insert(out.end(), render_info.begin(), render_info.end());
@@ -136,9 +206,14 @@ private:
             bool queued = false;
             bool loop = false;
             s64 remaining = 0; // samples left to play
+            s64 length = 0;    // end - start
+            s64 start = 0;     // first sample (frame) in the wave buffer
+            u64 address = 0, context = 0;
         } buffers[4];
         u32 cursor = 0;   // ring slot being played
         u64 played = 0;   // samples played since the last stop
+        s16 hist1 = 0, hist2 = 0; // DSP-ADPCM decoder history
+        float last[6]{};          // last source frame of the previous update (resampler continuity)
         u32 consumed = 0; // total wave buffers released back to the game
         double frac = 0;
         bool stopped = true; // a fresh voice starts out stopped
@@ -175,6 +250,10 @@ private:
             b.queued = true;
             b.loop = wb[0x18] != 0;
             b.remaining = std::max<s64>(end - start, 1);
+            b.length = b.remaining;
+            b.start = start;
+            b.address = common::Read<u64>(wb);
+            b.context = common::Read<u64>(wb + 0x20);
         }
         auto release_front = [&] {
             vs.buffers[vs.cursor] = {};
@@ -204,24 +283,368 @@ private:
         const double want = double(rd32(0x0C) ? rd32(0x0C) : rate_) * samples_ / rate_ * pitch + vs.frac;
         s64 todo = s64(want);
         vs.frac = want - double(todo);
+        const s64 total = todo;
+        const u32 channels = std::clamp<u32>(rd32(0x18), 1, 6);
+        const u8 format = p[0x0B];
+        std::vector<float>& src = mix_scratch_;
+        src.assign(size_t(total) * channels, 0.0f);
+        s64 got = 0;
         for (u32 guard = 0; todo > 0 && guard < 8; guard++) {
             auto& b = vs.buffers[vs.cursor];
             if (!b.queued)
                 break;
             const s64 n = std::min(todo, b.remaining);
+            DecodeSamples(vs, b, p, format, channels, b.length - b.remaining, n, &src[size_t(got) * channels]);
+            got += n;
             b.remaining -= n;
             todo -= n;
             vs.played += u64(n);
             if (b.remaining > 0)
                 break;
             if (b.loop) {
-                b.remaining = 1; // looping buffers are never released; keep them alive
-                break;
+                b.remaining = b.length; // play the buffer again from its start
+                continue;
             }
             release_front();
         }
+        stat_playing_++;
+        stat_format_mask_ |= 1u << (format & 31);
+        for (s64 i = 0; i < got * s64(channels); i += 7)
+            stat_src_peak_ = std::max(stat_src_peak_, std::abs(src[size_t(i)]));
+        MixVoice(vs, p, channels, src.data(), total);
     }
 
+    // Decodes `count` frames starting `pos` frames into wave buffer `b` (interleaved floats, `channels` wide).
+    static void DecodeSamples(VoiceState& vs, const VoiceState::Buffer& b, const u8* p, u8 format, u32 channels, s64 pos,
+                              s64 count, float* out) {
+        auto& mem = core::Sys().Mem();
+        if (!b.address)
+            return;
+        const s64 first = b.start + pos;
+        switch (format) {
+        case 1: // PCM s8
+        case 2: // PCM s16
+        case 5: { // float
+            const u32 bytes = format == 1 ? 1 : format == 2 ? 2 : 4;
+            const u64 a = b.address + u64(first) * channels * bytes;
+            const size_t n = size_t(count) * channels;
+            if (!mem.IsValid(a, n * bytes))
+                return;
+            const u8* src = mem.Ptr<u8>(a);
+            for (size_t i = 0; i < n; i++) {
+                if (format == 1)
+                    out[i] = s8(src[i]) / 128.0f;
+                else if (format == 2)
+                    out[i] = common::Read<s16>(src + i * 2) / 32768.0f;
+                else
+                    out[i] = common::Read<float>(src + i * 4);
+            }
+            break;
+        }
+        case 6: { // Nintendo DSP-ADPCM (mono): 8-byte frames of 14 samples, coefficients at the voice's src data
+            s16 coef[16]{};
+            const u64 ca = common::Read<u64>(p + 0x48);
+            if (ca && mem.IsValid(ca, 32))
+                mem.ReadBlock(ca, coef, 32);
+            if (pos == 0 && b.context && mem.IsValid(b.context, 6)) { // buffer start: history from its context
+                vs.hist1 = mem.Read<s16>(b.context + 2);
+                vs.hist2 = mem.Read<s16>(b.context + 4);
+            }
+            for (s64 i = 0; i < count; i++) {
+                const s64 n = first + i;
+                const u64 fa = b.address + u64(n / 14) * 8;
+                if (!mem.IsValid(fa, 8))
+                    break;
+                const u8 header = mem.Read<u8>(fa);
+                const u32 idx = u32(n % 14);
+                const u8 byte = mem.Read<u8>(fa + 1 + idx / 2);
+                int nib = (idx & 1) ? (byte & 0xF) : (byte >> 4);
+                if (nib >= 8)
+                    nib -= 16;
+                const int ci = (header >> 4) & 7;
+                const s32 v = ((nib * (1 << (header & 0xF))) << 11) + 1024 + coef[ci * 2] * vs.hist1 + coef[ci * 2 + 1] * vs.hist2;
+                const s16 sample = s16(std::clamp(v >> 11, -32768, 32767));
+                vs.hist2 = vs.hist1;
+                vs.hist1 = sample;
+                out[size_t(i) * channels] = sample / 32768.0f;
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    // Resamples a voice's source frames to one output frame of samples_ and adds it to its mix's buffers through
+    // the per-channel mix volumes (voice channel resources).
+    void MixVoice(VoiceState& vs, const u8* p, u32 channels, const float* src, s64 count) {
+        if (mix_.empty() || count <= 0)
+            return;
+        float volume;
+        std::memcpy(&volume, p + 0x20, 4);
+        if (!(volume > 0.0f))
+            return;
+        // Destination of each channel: the voice's mix with its channel resource volumes, or (splitter voices) the
+        // channel's splitter destination with that destination's volumes.
+        const u32 mix_id = common::Read<u32>(p + 0x58), splitter_id = common::Read<u32>(p + 0x5C);
+        auto sit = splitter_id != 0xFFFFFFFF ? splitters_.find(splitter_id) : splitters_.end();
+        for (u32 c = 0; c < channels; c++) {
+            const float* mv = nullptr;
+            u32 dest_mix = mix_id;
+            if (sit != splitters_.end()) {
+                if (sit->second.empty())
+                    continue;
+                auto dit = destinations_.find(sit->second[c % sit->second.size()]);
+                if (dit == destinations_.end() || !dit->second.in_use)
+                    continue;
+                dest_mix = dit->second.mix_id;
+                mv = dit->second.volume.data();
+            } else {
+                auto rit = channel_volumes_.find(common::Read<u32>(p + 0x140 + c * 4));
+                if (rit == channel_volumes_.end())
+                    continue;
+                mv = rit->second.data();
+            }
+            auto mit = mix_offset_.find(dest_mix);
+            if (mit == mix_offset_.end()) {
+                stat_unrouted_++;
+                continue;
+            }
+            stat_routed_++;
+            const u32 base = mit->second.first, nbuf = mit->second.second;
+            // Linear resampling: output i maps to source position (i + 1) * count / samples_ - 1 (previous
+            // update's last frame at -1).
+            for (u32 i = 0; i < samples_; i++) {
+                const double pos = double(i + 1) * double(count) / double(samples_) - 1.0;
+                const s64 i0 = s64(std::floor(pos));
+                const float t = float(pos - double(i0));
+                const float a = i0 < 0 ? vs.last[c] : src[size_t(i0) * channels + c];
+                const float bb = i0 + 1 < count ? src[size_t(i0 + 1) * channels + c] : a;
+                const float s = (a + (bb - a) * t) * volume;
+                for (u32 j = 0; j < nbuf && j < 24; j++)
+                    if (mv[j] != 0.0f)
+                        mix_[size_t(base + j) * samples_ + i] += s * mv[j];
+            }
+            vs.last[c] = src[size_t(count - 1) * channels + c];
+        }
+    }
+
+    // Splitter data (between effects and mixes) when present: "SNDH" header {magic, info count, data count, pad},
+    // then infos "SNDI" {magic, id, sample rate, destination count, destination data ids...} and destinations
+    // "SNDD" {magic, id, mix id, mix volumes[24], in use, pad} (0x70). Returns its size; fills splitters_.
+    // Only changed splitters/destinations are sent, so the tables persist across updates.
+    size_t SplitterSize(const std::vector<u8>& in, size_t at) {
+        if (at + 0x20 > in.size() || common::Read<u32>(&in[at]) != 0x48444E53)
+            return 0;
+        const s32 infos = common::Read<s32>(&in[at + 4]), datas = common::Read<s32>(&in[at + 8]);
+        size_t o = at + 0x20;
+        for (s32 i = 0; i < infos; i++) {
+            if (o + 0x10 > in.size() || common::Read<u32>(&in[o]) != 0x49444E53)
+                return 0;
+            const s32 id = common::Read<s32>(&in[o + 4]);
+            const u32 count = common::Read<u32>(&in[o + 12]);
+            auto& dests = splitters_[u32(id)];
+            dests.clear();
+            for (u32 k = 0; k < count && o + 0x10 + k * 4 + 4 <= in.size(); k++)
+                dests.push_back(common::Read<u32>(&in[o + 0x10 + k * 4]));
+            o += 0x10 + size_t(count) * 4;
+        }
+        for (s32 i = 0; i < datas; i++) {
+            if (o + 0x70 > in.size() || common::Read<u32>(&in[o]) != 0x44444E53)
+                return 0;
+            Destination d;
+            d.mix_id = common::Read<u32>(&in[o + 8]);
+            std::memcpy(d.volume.data(), &in[o + 12], 24 * 4);
+            d.in_use = in[o + 0x6C] != 0;
+            destinations_[common::Read<u32>(&in[o + 4])] = d;
+            o += 0x70;
+        }
+        return o - at;
+    }
+    struct Destination {
+        u32 mix_id = 0;
+        std::array<float, 24> volume{};
+        bool in_use = false;
+    };
+    std::unordered_map<u32, std::vector<u32>> splitters_; // splitter id -> destination data ids
+    std::unordered_map<u32, Destination> destinations_;
+
+    void SetupMixes(const std::vector<u8>& in, size_t at, u32 n) {
+        mix_offset_.clear();
+        mix_order_.clear();
+        u32 next = 0;
+        std::vector<std::pair<s32, size_t>> mixes;
+        for (u32 i = 0; i < n; i++) {
+            const size_t m = at + size_t(i) * 0x930;
+            if (m + 0x930 > in.size() || !in[m + 0x0C])
+                continue;
+            mixes.push_back({common::Read<s32>(&in[m + 0x10]), m});
+        }
+        std::sort(mixes.begin(), mixes.end()); // final mix (id 0) first
+        for (auto& [id, m] : mixes) {
+            const u32 count = std::min<u32>(common::Read<u32>(&in[m + 0x08]), 24);
+            mix_offset_[u32(id)] = {next, count};
+            mix_order_.push_back(m);
+            next += count;
+        }
+        mix_.assign(size_t(next) * samples_, 0.0f);
+    }
+
+    // Submixes into their destinations (deepest first), then the final mix to the device sink. A mix sends either
+    // to dest_mix_id (+0x924) through its volume matrix, or (dest unused) through splitter dest_splitter_id (+0x928):
+    // source buffer a goes to that splitter's destination a (mix id + volumes per destination buffer).
+    void FinishMix(const std::vector<u8>& in, size_t sinks_at, u32 n_sinks) {
+        if (mix_.empty())
+            return;
+        std::unordered_map<u32, size_t> by_id;
+        for (size_t m : mix_order_)
+            by_id[common::Read<u32>(&in[m + 0x10])] = m;
+        auto targets = [&](size_t m) {
+            std::vector<u32> t;
+            const u32 dest = common::Read<u32>(&in[m + 0x924]), split = common::Read<u32>(&in[m + 0x928]);
+            if (by_id.count(dest))
+                t.push_back(dest);
+            else if (auto it = splitters_.find(split); it != splitters_.end())
+                for (u32 d : it->second)
+                    if (auto dit = destinations_.find(d); dit != destinations_.end() && dit->second.in_use)
+                        t.push_back(dit->second.mix_id);
+            return t;
+        };
+        std::unordered_map<u32, u32> depth; // longest path to a sink-side mix
+        std::function<u32(u32, u32)> depth_of = [&](u32 id, u32 guard) -> u32 {
+            if (auto it = depth.find(id); it != depth.end())
+                return it->second;
+            u32 d = 0;
+            if (guard < 16 && id != 0)
+                for (u32 t : targets(by_id[id]))
+                    d = std::max(d, depth_of(t, guard + 1) + 1);
+            depth[id] = d;
+            return d;
+        };
+        std::vector<std::pair<u32, u32>> order;
+        for (auto& [id, m] : by_id)
+            if (id != 0)
+                order.push_back({depth_of(id, 0), id});
+        std::sort(order.rbegin(), order.rend());
+        auto add = [&](u32 src_id, u32 a, u32 dst_id, u32 b, float gain) {
+            auto s = mix_offset_.find(src_id), t = mix_offset_.find(dst_id);
+            if (gain == 0.0f || s == mix_offset_.end() || t == mix_offset_.end() || a >= s->second.second || b >= t->second.second)
+                return;
+            const float* src = &mix_[size_t(s->second.first + a) * samples_];
+            float* dst = &mix_[size_t(t->second.first + b) * samples_];
+            for (u32 i = 0; i < samples_; i++)
+                dst[i] += src[i] * gain;
+        };
+        for (auto& [d, id] : order) {
+            const size_t m = by_id[id];
+            const u32 nbuf = mix_offset_[id].second;
+            float vol;
+            std::memcpy(&vol, &in[m], 4);
+            const u32 dest = common::Read<u32>(&in[m + 0x924]), split = common::Read<u32>(&in[m + 0x928]);
+            if (by_id.count(dest)) {
+                for (u32 a = 0; a < nbuf; a++)
+                    for (u32 b = 0; b < 24; b++) {
+                        float mv;
+                        std::memcpy(&mv, &in[m + 0x24 + (size_t(a) * 24 + b) * 4], 4);
+                        add(id, a, dest, b, mv * vol);
+                    }
+            } else if (auto it = splitters_.find(split); it != splitters_.end() && !it->second.empty()) {
+                for (u32 a = 0; a < nbuf; a++) {
+                    auto dit = destinations_.find(it->second[a % it->second.size()]);
+                    if (dit == destinations_.end() || !dit->second.in_use)
+                        continue;
+                    for (u32 b = 0; b < 24; b++)
+                        add(id, a, dit->second.mix_id, b, dit->second.volume[b] * vol);
+                }
+            }
+        }
+        // Device sink: input[] picks final mix buffers (FL, FR, FC, LFE, RL, RR); downmix to stereo.
+        auto fin = mix_offset_.find(0);
+        if (fin == mix_offset_.end() || !g_audio_output || !started_)
+            return;
+        s8 input[6] = {0, 1, -1, -1, -1, -1};
+        u32 input_count = 2;
+        for (u32 k = 0; k < n_sinks; k++) {
+            const size_t sk = sinks_at + size_t(k) * 0x140;
+            if (sk + 0x140 > in.size() || in[sk] != 1 || !in[sk + 1])
+                continue;
+            // SinkInfo: +0 type (1 device), +1 in use; device parameters at +0x20: name[0x100], input count, inputs[6].
+            const u32 count = std::min<u32>(common::Read<u32>(&in[sk + 0x120]), 6);
+            if (count) {
+                input_count = count;
+                std::memcpy(input, &in[sk + 0x124], 6);
+            }
+            break;
+        }
+        float fvol = 1.0f;
+        for (size_t m : mix_order_)
+            if (common::Read<s32>(&in[m + 0x10]) == 0)
+                std::memcpy(&fvol, &in[m], 4);
+        auto chan = [&](u32 k, u32 i) -> float {
+            if (k >= input_count || input[k] < 0 || u32(input[k]) >= fin->second.second)
+                return 0.0f;
+            return mix_[size_t(fin->second.first + u32(input[k])) * samples_ + i];
+        };
+        static int graph_logged = 0;
+        if (graph_logged < 2) {
+            float peak = 0;
+            for (float v : mix_)
+                peak = std::max(peak, std::abs(v));
+            if (peak > 0.05f) {
+                graph_logged++;
+                std::string g;
+                for (size_t m : mix_order_) {
+                    const u32 id = common::Read<u32>(&in[m + 0x10]);
+                    float vol, pk = 0;
+                    std::memcpy(&vol, &in[m], 4);
+                    auto o = mix_offset_[id];
+                    for (u32 k = 0; k < o.second * samples_; k++)
+                        pk = std::max(pk, std::abs(mix_[size_t(o.first) * samples_ + k]));
+                    g += fmt::format(" [mix {} -> {} vol {:.2f} bufs {}@{} peak {:.3f}]", id, s32(common::Read<u32>(&in[m + 0x924])), vol,
+                                     o.second, o.first, pk);
+                }
+                LOG_INFO("audren", "mix graph:{} | sink inputs {} [{} {} {} {} {} {}] final vol {:.2f}", g, input_count, input[0], input[1],
+                         input[2], input[3], input[4], input[5], fvol);
+            }
+        }
+        std::vector<s16> pcm(size_t(samples_) * 2);
+        for (u32 i = 0; i < samples_; i++) {
+            float l = chan(0, i), r = chan(1, i);
+            if (input_count >= 6) {
+                const float c = chan(2, i) * 0.7071f;
+                l += c + chan(4, i) * 0.7071f;
+                r += c + chan(5, i) * 0.7071f;
+            }
+            pcm[i * 2] = s16(std::clamp(l * fvol * 32767.0f, -32768.0f, 32767.0f));
+            pcm[i * 2 + 1] = s16(std::clamp(r * fvol * 32767.0f, -32768.0f, 32767.0f));
+        }
+        g_audio_output(pcm.data(), samples_);
+        g_last_output_ns = NowNs();
+        // MUA3_AUDIO_DUMP=<file.wav>: record the mix (debugging without listening).
+        static FILE* dump = [] {
+            const char* path = std::getenv("MUA3_AUDIO_DUMP");
+            FILE* f = path ? std::fopen(path, "wb") : nullptr;
+            if (f) {
+                const u8 header[44] = {'R', 'I', 'F', 'F', 0xFF, 0xFF, 0xFF, 0x7F, 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ', 16, 0, 0, 0, 1, 0, 2, 0,
+                                       0x80, 0xBB, 0, 0, 0x00, 0xEE, 0x02, 0, 4, 0, 16, 0, 'd', 'a', 't', 'a', 0xFF, 0xFF, 0xFF, 0x7F};
+                std::fwrite(header, 1, sizeof(header), f);
+            }
+            return f;
+        }();
+        if (dump) {
+            std::fwrite(pcm.data(), 2, pcm.size(), dump);
+            std::fflush(dump);
+        }
+    }
+
+    std::unordered_map<u32, std::array<float, 24>> channel_volumes_; // voice channel resource id -> mix volumes
+    std::unordered_map<u32, std::pair<u32, u32>> mix_offset_;        // mix id -> {first mix buffer, buffer count}
+    std::vector<size_t> mix_order_;                                  // mixes in use (offsets into the update data)
+    std::vector<float> mix_;                                         // mix buffers, samples_ each
+    std::vector<float> mix_scratch_;
+    u64 stat_playing_ = 0, stat_routed_ = 0, stat_unrouted_ = 0; // mixer diagnostics (periodic log)
+    u32 stat_format_mask_ = 0;
+    float stat_src_peak_ = 0;
     u32 rate_ = 48000, samples_ = 240;
     bool started_ = false;
     u64 elapsed_frames_ = 0;

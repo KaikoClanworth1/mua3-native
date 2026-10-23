@@ -1,0 +1,66 @@
+#include "core/game_patches.h"
+
+#include <cstring>
+
+#include "core/config.h"
+#include "core/memory.h"
+
+namespace core {
+
+namespace {
+
+// MUA3 v3.0.0 main NSO (build id e853c44fdf18b88f...), loaded at a module base the patches are relative to.
+constexpr u8 kMainBuildId[8] = {0xe8, 0x53, 0xc4, 0x4f, 0xdf, 0x18, 0xb8, 0x8f};
+
+// Frame rate. KTGL keeps a timing block (pointer at main+0x2188a00) whose +0x60 is the present interval: its
+// constructor and the game set 2 (30 fps), the engine also supports 1 (60 fps). Game systems read the interval and the frame
+// delta (+0x18, clamped below by 1/60 or 1/30 from a table at main+0x19f33d8), so forcing interval 1 gives a
+// correctly timed 60 fps. The frame limiter sleeps to a target rate stored once at startup (30.0f).
+constexpr u64 kInitInterval = 0x8403b0;   // timing block constructor: mov x9, #0x200000002 (+0x60/+0x64 = 2) -> 1
+constexpr u64 kSetInterval2 = 0x41eb48;   // orr w9, wzr, #2  -> #1
+constexpr u64 kLimiterTarget = 0x839eb8;  // movz w8, #0x41f0, lsl #16 (30.0f) -> target fps
+constexpr u64 kMinDeltaTable = 0x19f33d8; // float[2] {1/60, 1/30}: minimum frame delta per interval
+
+bool Patch32(Memory& mem, u64 addr, u32 expect, u32 value, const char* what) {
+    const u32 cur = mem.Read<u32>(addr);
+    if (cur != expect) {
+        LOG_WARN("Patch", "{}: unexpected word {:#010x} at {:#x} (expected {:#010x}); skipped", what, cur, addr, expect);
+        return false;
+    }
+    mem.Write<u32>(addr, value);
+    return true;
+}
+
+u32 FloatBits(float f) {
+    u32 u;
+    std::memcpy(&u, &f, 4);
+    return u;
+}
+
+} // namespace
+
+void ApplyGamePatches(Memory& mem, const std::string& module, u64 base, std::span<const u8> build_id, const Config& cfg) {
+    if (module != "main" || build_id.size() < 8 || std::memcmp(build_id.data(), kMainBuildId, 8) != 0)
+        return;
+    const int fps = cfg.fps_target;
+    if (fps <= 30)
+        return;
+    // movz w8, #hi16(float fps), lsl #16: the float must have zero low bits (true for 60, 120, 144, 240, ...).
+    const u32 bits = FloatBits(float(fps));
+    if (bits & 0xFFFF) {
+        LOG_WARN("Patch", "fps_target {} cannot be encoded; keeping 30", fps);
+        return;
+    }
+    if (!Patch32(mem, base + kInitInterval, 0xB21F03E9, 0xB20003E9, "initial interval") ||
+        !Patch32(mem, base + kSetInterval2, 0x321F03E9, 0x320003E9, "60 fps interval"))
+        return;
+    Patch32(mem, base + kLimiterTarget, 0x52A83E08, 0x52A00008 | ((bits >> 16) << 5), "frame limiter target");
+    if (fps > 60) {
+        // Above 60 the minimum frame delta (1/60) would speed the game up: lower it to one target frame.
+        // Experimental: some systems may still assume 60 updates per second.
+        Patch32(mem, base + kMinDeltaTable, FloatBits(1.0f / 60.0f), FloatBits(1.0f / float(fps)), "minimum frame delta");
+    }
+    LOG_INFO("Patch", "frame rate unlocked: target {} fps", fps);
+}
+
+} // namespace core

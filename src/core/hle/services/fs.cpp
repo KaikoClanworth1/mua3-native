@@ -7,6 +7,7 @@
 #include <windows.h>
 
 #include "core/hle/service.h"
+#include "core/hle/video_output.h"
 #include "core/system.h"
 
 namespace hle {
@@ -61,7 +62,14 @@ bool HostRead(const fs::path& p, u64 off, void* dst, size_t size) {
     ov.Offset = DWORD(off);
     ov.OffsetHigh = DWORD(off >> 32);
     DWORD got = 0;
-    ReadFile(h, dst, DWORD(size), &got, &ov);
+    if (!ReadFile(h, dst, DWORD(size), &got, &ov) && GetLastError() == ERROR_NOACCESS) {
+        // The kernel refuses to write into write-tracked (read-only) guest pages; a host memcpy faults and is
+        // handled by the tracking handler instead.
+        std::vector<u8> tmp(size);
+        got = 0;
+        ReadFile(h, tmp.data(), DWORD(size), &got, &ov);
+        std::memcpy(dst, tmp.data(), got);
+    }
     if (got < size)
         std::memset(static_cast<u8*>(dst) + got, 0, size - got);
     return true;
@@ -239,6 +247,8 @@ public:
                 return;
             }
             const Extent& e = *std::prev(it);
+            if (rel == e.off && e.host.extension() == ".mp4")
+                video::OnMovieRead(e.host, 0);
             if (!e.logged.exchange(true))
                 LOG_INFO("romfs", "open {} ({} bytes)", e.host.lexically_relative(root_).generic_string(), e.size);
             if (rel >= e.off + e.size) { // padding between files

@@ -8,6 +8,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include <fmt/format.h>
@@ -56,6 +57,19 @@ inline T Read(const void* p) {
 }
 
 constexpr u64 AlignUp(u64 v, u64 a) { return (v + a - 1) & ~(a - 1); }
+
+// Hash for integer keys (addresses, precomputed hashes): MSVC's std::hash<u64> runs FNV-1a over the bytes,
+// which shows up in profiles of the renderer's per-draw lookups.
+struct U64Hash {
+    size_t operator()(u64 x) const {
+        x ^= x >> 33;
+        x *= 0xff51afd7ed558ccdull;
+        x ^= x >> 33;
+        return size_t(x);
+    }
+};
+template <typename V>
+using U64Map = std::unordered_map<u64, V, U64Hash>;
 constexpr u64 AlignDown(u64 v, u64 a) { return v & ~(a - 1); }
 
 } // namespace common

@@ -17,6 +17,7 @@ void Init(core::Memory& mem) { g_gpu = new Gpu(mem); }
 // ---------------------------------------------------------------- AddressSpace
 void AddressSpace::Map(u64 gpu_va, u64 cpu_va, u64 size) {
     std::lock_guard lk(mutex_);
+    generation_++;
     auto it = maps_.lower_bound(gpu_va);
     if (it != maps_.begin()) {
         auto p = std::prev(it);
@@ -58,6 +59,19 @@ void AddressSpace::Reserve(u64 gpu_va, u64 size) {
 }
 
 u64 AddressSpace::TranslateRun(u64 gpu_va, u64& run) const {
+    // Small per-thread cache of recently hit mappings (the renderer translates thousands of addresses per frame).
+    struct Hit {
+        const AddressSpace* as;
+        u64 gen, lo, hi, cpu;
+    };
+    thread_local Hit hits[8]{};
+    thread_local u32 next_hit = 0;
+    const u64 gen = generation_.load(std::memory_order_acquire);
+    for (const Hit& h : hits)
+        if (h.as == this && h.gen == gen && gpu_va >= h.lo && gpu_va < h.hi) {
+            run = h.hi - gpu_va;
+            return h.cpu + (gpu_va - h.lo);
+        }
     std::lock_guard lk(mutex_);
     auto it = maps_.upper_bound(gpu_va);
     if (it == maps_.begin())
@@ -66,18 +80,13 @@ u64 AddressSpace::TranslateRun(u64 gpu_va, u64& run) const {
     if (gpu_va >= it->first + it->second.size || !it->second.cpu_va)
         return run = 0;
     run = it->first + it->second.size - gpu_va;
+    hits[next_hit++ & 7] = {this, gen, it->first, it->first + it->second.size, it->second.cpu_va};
     return it->second.cpu_va + (gpu_va - it->first);
 }
 
 u64 AddressSpace::Translate(u64 gpu_va) const {
-    std::lock_guard lk(mutex_);
-    auto it = maps_.upper_bound(gpu_va);
-    if (it == maps_.begin())
-        return 0;
-    --it;
-    if (gpu_va >= it->first + it->second.size || !it->second.cpu_va)
-        return 0;
-    return it->second.cpu_va + (gpu_va - it->first);
+    u64 run = 0;
+    return TranslateRun(gpu_va, run);
 }
 
 // ---------------------------------------------------------------- Gpu
@@ -272,7 +281,8 @@ void Gpu::RunCommands(const std::vector<u64>& entries) {
 }
 
 void Gpu::ProcessPushbuffer(u64 gpu_va, u32 words) {
-    std::vector<u32> w(words);
+    static thread_local std::vector<u32> w;
+    w.resize(words);
     if (!ReadGpu(gpu_va, w.data(), size_t(words) * 4)) {
         LOG_WARN("GPU", "Pushbuffer at unmapped GPU VA {:#x}", gpu_va);
         return;
@@ -322,9 +332,17 @@ void Gpu::FlushMacro() {
         return;
     const u32 idx = u32(macro_index_);
     macro_index_ = -1;
-    auto params = std::move(macro_params_);
+    // Reuse parameter buffers (one per nesting level: a macro's methods can start another macro).
+    static thread_local std::vector<std::vector<u32>> pool;
+    static thread_local size_t depth = 0;
+    if (pool.size() <= depth)
+        pool.resize(depth + 1);
+    std::vector<u32>& params = pool[depth];
+    params.swap(macro_params_);
     macro_params_.clear();
+    depth++;
     m3d_.CallMacro(idx, params);
+    depth--;
 }
 
 namespace {

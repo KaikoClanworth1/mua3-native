@@ -204,6 +204,30 @@ struct DriverConstants {
     u32 image[8][4]; // compute images: base lo, base hi, width | height << 16, depth | mode << 16 | bh << 24 | bd << 28
 };
 
+// MUA3_PROFILE: time spent per Draw() section and bytes uploaded, logged every few seconds at Present.
+static const bool g_profile = std::getenv("MUA3_PROFILE") != nullptr;
+enum ProfSection { kProfShaders, kProfState, kProfIndex, kProfVertex, kProfCbufs, kProfTextures, kProfResources, kProfSubmit, kProfCount };
+static const char* const kProfNames[kProfCount] = {"shaders", "state", "index", "vertex", "cbufs", "textures", "other", "submit"};
+static u64 g_prof_ns[kProfCount], g_prof_vb_bytes, g_prof_cb_bytes, g_prof_ib_count, g_prof_draws;
+static u64 g_prof_tex_get_ns, g_prof_tex_samp_ns, g_prof_tex_calls;
+static u64 g_prof_last = 0;
+static int g_prof_section = -1;
+static u64 ProfNow() {
+    LARGE_INTEGER c, f;
+    QueryPerformanceCounter(&c);
+    static const u64 freq = (QueryPerformanceFrequency(&f), u64(f.QuadPart));
+    return u64(c.QuadPart) * 1000000000ull / freq;
+}
+static void Prof(int section) {
+    if (!g_profile)
+        return;
+    const u64 now = ProfNow();
+    if (g_prof_section >= 0)
+        g_prof_ns[g_prof_section] += now - g_prof_last;
+    g_prof_section = section;
+    g_prof_last = now;
+}
+
 } // namespace
 
 // Per-renderer pooled GPU buffers and state objects.
@@ -258,7 +282,7 @@ public:
         Write(b.buf.Get(), data, size);
         return b.buf.Get();
     }
-    std::unordered_map<u64, ComPtr<ID3D11InputLayout>> layouts;
+    common::U64Map<ComPtr<ID3D11InputLayout>> layouts;
     ComPtr<ID3D11Buffer> default_attrib; // float4(0,0,0,1) for disabled / constant attributes
     ID3D11Buffer* Index(const void* data, u32 size) {
         if (!index_ || index_size_ < size) {
@@ -273,7 +297,7 @@ public:
     void SetContext(ID3D11DeviceContext* c) { ctx_ = c; }
 
     template <typename Desc, typename Obj, typename Create>
-    Obj* Cached(std::unordered_map<u64, ComPtr<Obj>>& map, const Desc& d, Create create) {
+    Obj* Cached(common::U64Map<ComPtr<Obj>>& map, const Desc& d, Create create) {
         const u64 k = Hash64(&d, sizeof(d));
         auto it = map.find(k);
         if (it != map.end())
@@ -283,9 +307,9 @@ public:
         map[k] = o;
         return o.Get();
     }
-    std::unordered_map<u64, ComPtr<ID3D11BlendState>> blend;
-    std::unordered_map<u64, ComPtr<ID3D11DepthStencilState>> depth;
-    std::unordered_map<u64, ComPtr<ID3D11RasterizerState>> raster;
+    common::U64Map<ComPtr<ID3D11BlendState>> blend;
+    common::U64Map<ComPtr<ID3D11DepthStencilState>> depth;
+    common::U64Map<ComPtr<ID3D11RasterizerState>> raster;
 
 private:
     void Write(ID3D11Buffer* b, const void* data, u32 size) {
@@ -315,7 +339,31 @@ std::recursive_mutex& ContextMutex() {
     return m;
 }
 
+std::atomic<u64>& ContextEpoch() {
+    static std::atomic<u64> e{0};
+    return e;
+}
+
+namespace {
+// Sets only the changed span of a binding array (cache `cur` mirrors what the context has).
+template <typename T, typename Set>
+void BindRange(T* cur, const T* want_begin, u32 base, u32 n, Set set) {
+    u32 lo = n, hi = 0;
+    for (u32 i = 0; i < n; i++)
+        if (cur[base + i] != want_begin[i]) {
+            lo = std::min(lo, i);
+            hi = i + 1;
+        }
+    if (lo >= hi)
+        return;
+    set(base + lo, hi - lo, want_begin + lo);
+    for (u32 i = lo; i < hi; i++)
+        cur[base + i] = want_begin[i];
+}
+} // namespace
+
 D3D11Renderer::D3D11Renderer(ID3D11Device* dev, ID3D11DeviceContext* ctx) : dev_(dev), ctx_(ctx) {
+    new_frame_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     shaders_ = std::make_unique<ShaderCache>(dev);
     textures_ = std::make_unique<TextureCache>(dev, ctx, *this);
     g_dc = std::make_unique<DrawContext>(dev);
@@ -331,7 +379,17 @@ D3D11Renderer::D3D11Renderer(ID3D11Device* dev, ID3D11DeviceContext* ctx) : dev_
     }
 }
 
-D3D11Renderer::~D3D11Renderer() = default;
+D3D11Renderer::~D3D11Renderer() {
+    if (new_frame_event_)
+        CloseHandle(static_cast<HANDLE>(new_frame_event_));
+}
+
+u32 D3D11Renderer::TextureScale(u64 gpu_va, bool tex2d) {
+    if (!tex2d)
+        return 1;
+    const Surface* s = FindSurfaceByGpu(gpu_va);
+    return s && s->srv ? s->scale : 1;
+}
 
 Surface* D3D11Renderer::FindSurfaceByGpu(u64 gpu_va) {
     auto it = surfaces_.find(gpu_va);
@@ -370,11 +428,17 @@ Surface* D3D11Renderer::GetSurface(u64 gpu_va, u32 width, u32 height, u32 format
     s->cpu_va = G().As().Translate(gpu_va);
     s->width = width;
     s->height = height;
+    // Resolution scaling applies to screen-shaped targets (the frame and its half/quarter-size passes); shadow
+    // maps, lookup tables and other square or tiny targets keep their size.
+    const bool screen_like = width >= 240 && height >= 135 && width > height &&
+                             std::abs(int(width * 9) - int(height * 16)) <= int(width * 9 / 16);
+    s->scale = screen_like ? res_scale_ : 1;
+    const u32 tw = width * s->scale, th = height * s->scale;
     s->format = format;
     s->depth = depth;
     s->dxgi = fi.dxgi;
     s->last_use = frame_counter_;
-    D3D11_TEXTURE2D_DESC td{width, height, 1, 1, Typeless(fi.dxgi), {1, 0}, D3D11_USAGE_DEFAULT,
+    D3D11_TEXTURE2D_DESC td{tw, th, 1, 1, Typeless(fi.dxgi), {1, 0}, D3D11_USAGE_DEFAULT,
                             UINT(D3D11_BIND_SHADER_RESOURCE | (depth ? D3D11_BIND_DEPTH_STENCIL : D3D11_BIND_RENDER_TARGET)),
                             0, 0};
     // A render target is guest memory on the Switch: start from what the guest left there (e.g. values the CPU
@@ -389,8 +453,16 @@ Surface* D3D11Renderer::GetSurface(u64 gpu_va, u32 width, u32 height, u32 format
         if (G().ReadGpuPartial(gpu_va, raw.data(), raw.size()) == raw.size()) {
             initial.resize(size_t(width) * height * fi.bpp);
             Deswizzle(raw.data(), initial.data(), width, height, 1, fi.bpp, bh, 0, width * fi.bpp);
+            if (s->scale > 1) { // nearest-neighbour upscale of the initial contents
+                std::vector<u8> up(size_t(tw) * th * fi.bpp);
+                for (u32 y = 0; y < th; y++)
+                    for (u32 x = 0; x < tw; x++)
+                        std::memcpy(&up[(size_t(y) * tw + x) * fi.bpp],
+                                    &initial[(size_t(y / s->scale) * width + x / s->scale) * fi.bpp], fi.bpp);
+                initial.swap(up);
+            }
             init.pSysMem = initial.data();
-            init.SysMemPitch = width * fi.bpp;
+            init.SysMemPitch = tw * fi.bpp;
         }
     }
     if (FAILED(dev_->CreateTexture2D(&td, init.pSysMem ? &init : nullptr, &s->tex))) {
@@ -435,9 +507,9 @@ ID3D11ShaderResourceView* D3D11Renderer::HazardSrv(Surface* s) {
             return nullptr;
         }
     }
-    if (s->copy_serial != draw_serial_) {
+    if (s->copy_serial != s->write_serial) { // only when written since the last copy
         ctx_->CopyResource(s->copy_tex.Get(), s->tex.Get());
-        s->copy_serial = draw_serial_;
+        s->copy_serial = s->write_serial;
     }
     return s->copy_srv.Get();
 }
@@ -467,6 +539,7 @@ void D3D11Renderer::Clear(u32 rt, u32 mask) {
             const float c[4] = {m.RegF(kClearColor), m.RegF(kClearColor + 1), m.RegF(kClearColor + 2),
                                 m.RegF(kClearColor + 3)};
             ctx_->ClearRenderTargetView(s->rtv.Get(), c);
+            s->write_serial = ++surface_writes_;
         }
     }
     if (mask & 3) {
@@ -477,14 +550,405 @@ void D3D11Renderer::Clear(u32 rt, u32 mask) {
             if (mask & 2)
                 flags |= D3D11_CLEAR_STENCIL;
             ctx_->ClearDepthStencilView(s->dsv.Get(), flags, m.RegF(kClearDepth), u8(m.Reg(kClearStencil)));
+            s->write_serial = ++surface_writes_;
         }
     }
+}
+
+// Pages of a buffer the CPU wrote since they were last tracked on `channel`, as (buffer offset, size) runs.
+template <class Ranges>
+static void CollectCpuWrites(const Ranges& ranges, std::vector<std::pair<u32, u32>>& out, u32 channel = 1) {
+    auto& mem = G().Mem();
+    for (auto& r : ranges) {
+        if (!mem.ConsumeDirty(r.cpu, r.size, channel))
+            continue;
+        for (u64 p = r.cpu & ~0xFFFull; p < r.cpu + r.size; p += 0x1000) {
+            const u64 lo = std::max(p, r.cpu), hi = std::min(p + 0x1000, r.cpu + r.size);
+            if (mem.ConsumeDirty(lo, hi - lo, channel))
+                out.push_back({r.off + u32(lo - r.cpu), u32(hi - lo)});
+        }
+    }
+}
+
+void D3D11Renderer::Reupload(GpuBuf& b, bool all) {
+    auto& g = G();
+    std::vector<std::pair<u32, u32>> runs;
+    if (all) {
+        b.snapshot.assign(b.size, 0);
+        b.cpu_ranges.clear();
+        for (u64 off = 0; off < b.size;) {
+            u64 run = 0;
+            const u64 cpu = g.As().TranslateRun(b.addr + off, run);
+            if (!cpu || !run)
+                break;
+            const u64 n = std::min<u64>(run, b.size - off);
+            b.cpu_ranges.push_back({u32(off), cpu, n});
+            off += n;
+        }
+        runs.push_back({0, b.size});
+        b.cpu_pages.clear();
+        b.page_serial.assign((b.size + 0xFFF) >> 12, 0);
+    } else {
+        runs = std::move(b.cpu_pages);
+        b.cpu_pages.clear();
+        CollectCpuWrites(b.cpu_ranges, runs);
+        if (runs.empty())
+            return;
+        std::sort(runs.begin(), runs.end());
+        size_t n = 0;
+        for (auto& r : runs) {
+            if (n && runs[n - 1].first + runs[n - 1].second >= r.first)
+                runs[n - 1].second = std::max(runs[n - 1].second, r.first + r.second - runs[n - 1].first);
+            else
+                runs[n++] = r;
+        }
+        runs.resize(n);
+    }
+    // Readbacks issued before this upload must not write their (older) GPU data over these pages.
+    b.serial++;
+    for (auto [off, n] : runs) {
+        n = std::min(n, b.size - off);
+        g.ReadGpuPartial(b.addr + off, b.snapshot.data() + off, n);
+        const D3D11_BOX box{off, 0, 0, off + n, 1, 1};
+        ctx_->UpdateSubresource(b.buf.Get(), 0, &box, b.snapshot.data() + off, n, n);
+        for (u32 p = off >> 12; p <= (off + n - 1) >> 12 && p < b.page_serial.size(); p++)
+            b.page_serial[p] = b.serial;
+    }
+    for (auto& r : b.cpu_ranges)
+        g.Mem().TrackWrites(r.cpu, r.size, 1);
+    b.stale = false;
+}
+
+void D3D11Renderer::FlushGpuBuf(GpuBuf& b) {
+    if (b.gpu_dirty)
+        QueueReadback(b);
+    if (b.in_flight)
+        PollReadbacks(true, &b);
+}
+
+D3D11Renderer::GpuBuf* D3D11Renderer::ComputeBuffer(u64 addr, u32 size) {
+    GpuBuf* e = nullptr;
+    for (auto& b : gbufs_)
+        if (b->addr == addr)
+            e = b.get();
+    // Another resident buffer overlapping this one: land its results and re-upload both from guest memory.
+    for (auto& b : gbufs_) {
+        if (b.get() == e || b->addr >= addr + size || addr >= b->addr + b->size)
+            continue;
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LOG_WARN("Renderer", "compute buffers overlap: {:#x}+{:#x} and {:#x}+{:#x}", addr, size, b->addr, b->size);
+        }
+        FlushGpuBuf(*b);
+        b->stale = true;
+        if (e)
+            e->stale = true;
+    }
+    if (e && size > e->capacity) {
+        FlushGpuBuf(*e);
+        std::erase_if(gbufs_, [&](auto& b) { return b.get() == e; });
+        e = nullptr;
+    }
+    if (!e) {
+        auto nb = std::make_unique<GpuBuf>();
+        nb->addr = addr;
+        nb->capacity = u32(common::AlignUp(size, 1u << 16));
+        D3D11_BUFFER_DESC bd{nb->capacity, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE, 0,
+                             D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
+        if (FAILED(dev_->CreateBuffer(&bd, nullptr, &nb->buf)))
+            return nullptr;
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+        ud.Format = DXGI_FORMAT_R32_TYPELESS;
+        ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        ud.Buffer = {0, nb->capacity / 4, D3D11_BUFFER_UAV_FLAG_RAW};
+        dev_->CreateUnorderedAccessView(nb->buf.Get(), &ud, &nb->uav);
+        nb->stale = true;
+        e = nb.get();
+        gbufs_.push_back(std::move(nb));
+    }
+    e->last_use = frame_counter_;
+    if (size > e->size) {
+        e->size = size;
+        e->stale = true;
+    }
+    if (e->stale) { // full re-upload: the GPU's results have to reach guest memory first
+        FlushGpuBuf(*e);
+        Reupload(*e, true);
+        return e;
+    }
+    // CPU writes: upload just those pages (results for other pages stay on the GPU; see ApplyReadback).
+    bool cpu_wrote = !e->cpu_pages.empty();
+    for (auto& r : e->cpu_ranges)
+        cpu_wrote = cpu_wrote || G().Mem().ConsumeDirty(r.cpu, r.size, 1);
+    if (cpu_wrote)
+        Reupload(*e, false);
+    return e;
+}
+
+void D3D11Renderer::QueueReadback(GpuBuf& b) {
+    Readback rb{&b, nullptr, b.size, b.serial};
+    for (size_t k = 0; k < staging_pool_.size(); k++) {
+        D3D11_BUFFER_DESC d;
+        staging_pool_[k]->GetDesc(&d);
+        if (d.ByteWidth >= b.size) {
+            rb.staging = std::move(staging_pool_[k]);
+            staging_pool_.erase(staging_pool_.begin() + k);
+            break;
+        }
+    }
+    if (!rb.staging) {
+        D3D11_BUFFER_DESC sd{b.capacity, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0};
+        if (FAILED(dev_->CreateBuffer(&sd, nullptr, &rb.staging)))
+            return;
+    }
+    const D3D11_BOX box{0, 0, 0, b.size, 1, 1};
+    ctx_->CopySubresourceRegion(rb.staging.Get(), 0, 0, 0, 0, b.buf.Get(), 0, &box);
+    b.in_flight++;
+    b.gpu_dirty = false;
+    readbacks_.push_back(std::move(rb));
+}
+
+void D3D11Renderer::ApplyReadback(GpuBuf& b, const u8* now, u32 size, u32 serial) {
+    auto& g = G();
+    size = std::min<u32>(size, u32(b.snapshot.size()));
+    // CPU writes made meanwhile survive (only words the kernels changed are written); those pages re-upload later.
+    CollectCpuWrites(b.cpu_ranges, b.cpu_pages);
+    u8* old = b.snapshot.data();
+    u32 lo = ~0u, hi = 0;
+    for (u32 page = 0; page * 0x1000u < size; page++) {
+        const u32 pbeg = page * 0x1000u, pend = std::min(size, pbeg + 0x1000u);
+        if (page < b.page_serial.size() && b.page_serial[page] > serial)
+            continue; // re-uploaded from guest memory after this copy was taken: guest data is newer
+        if (std::memcmp(now + pbeg, old + pbeg, pend - pbeg) == 0)
+            continue;
+        for (u32 off = pbeg; off < pend;) {
+            if (std::memcmp(now + off, old + off, 4) == 0) {
+                off += 4;
+                continue;
+            }
+            u32 end = off + 4;
+            while (end < pend && std::memcmp(now + end, old + end, 4) != 0)
+                end += 4;
+            g.WriteGpu(b.addr + off, now + off, end - off);
+            std::memcpy(old + off, now + off, end - off);
+            lo = std::min(lo, off);
+            hi = std::max(hi, end);
+            off = end;
+        }
+    }
+    if (lo < hi) {
+        textures_->Invalidate(b.addr + lo, hi - lo);
+        for (auto& r : b.cpu_ranges) // our own writes dirtied the pages
+            g.Mem().TrackWrites(r.cpu, r.size, 1);
+    }
+}
+
+void D3D11Renderer::PollReadbacks(bool wait, const GpuBuf* until) {
+    size_t need = wait ? readbacks_.size() : 0;
+    if (until)
+        for (size_t i = 0; i < readbacks_.size(); i++)
+            if (readbacks_[i].b == until)
+                need = std::max(need, i + 1);
+    while (!readbacks_.empty()) {
+        Readback& rb = readbacks_.front();
+        // A newer copy of the same buffer supersedes this one (it contains every change made since).
+        bool superseded = false;
+        for (size_t i = 1; i < readbacks_.size() && !superseded; i++)
+            superseded = readbacks_[i].b == rb.b;
+        if (!superseded) {
+            D3D11_MAPPED_SUBRESOURCE mp;
+            const HRESULT hr = ctx_->Map(rb.staging.Get(), 0, D3D11_MAP_READ, need ? 0 : D3D11_MAP_FLAG_DO_NOT_WAIT, &mp);
+            if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
+                break;
+            if (SUCCEEDED(hr)) {
+                ApplyReadback(*rb.b, static_cast<const u8*>(mp.pData), rb.size, rb.serial);
+                ctx_->Unmap(rb.staging.Get(), 0);
+            }
+        }
+        rb.b->in_flight--;
+        staging_pool_.push_back(std::move(rb.staging));
+        readbacks_.pop_front();
+        if (need)
+            need--;
+    }
+}
+
+void D3D11Renderer::SyncGuest(u64 gpu_va, u64 size) {
+    if (!gpu_dirty_any_ && readbacks_.empty())
+        return;
+    for (auto& b : gbufs_)
+        if ((b->in_flight || b->gpu_dirty) && gpu_va < b->addr + b->size && b->addr < gpu_va + size)
+            FlushGpuBuf(*b);
+}
+
+ID3D11ShaderResourceView* D3D11Renderer::ComputeBufferSrv(u64 gpu_va, u64 size, DXGI_FORMAT fmt, u32 bpb) {
+    if (!bpb || !size || fmt == DXGI_FORMAT_UNKNOWN)
+        return nullptr;
+    for (auto& bp : gbufs_) {
+        GpuBuf& b = *bp;
+        if (!b.gpu_written || gpu_va < b.addr || gpu_va + size > b.addr + b.size)
+            continue;
+        const u64 off = gpu_va - b.addr;
+        if (off % bpb)
+            return nullptr;
+        if (ComputeBuffer(b.addr, b.size) != &b) // picks up CPU writes; never reallocates (size fits)
+            return nullptr;
+        const u64 key = off | (size << 27) | (u64(fmt) << 56);
+        auto& srv = b.srvs[key];
+        if (!srv) {
+            D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+            sv.Format = fmt;
+            sv.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+            sv.Buffer.FirstElement = u32(off / bpb);
+            sv.Buffer.NumElements = u32(size / bpb);
+            if (FAILED(dev_->CreateShaderResourceView(b.buf.Get(), &sv, &srv)))
+                return nullptr;
+        }
+        return srv.Get();
+    }
+    return nullptr;
+}
+
+bool D3D11Renderer::RefreshGeometry(GeomBuf& b, D3D11_BIND_FLAG bind, bool& fill) {
+    auto& g = G();
+    b.last_use = frame_counter_;
+    if (b.streaming)
+        return false;
+    if (!b.buf) { // only cache data drawn again in a later frame (not one-off ring-buffer contents)
+        if (b.first_seen == ~0ull || b.first_seen == frame_counter_) {
+            b.first_seen = frame_counter_;
+            return false;
+        }
+    }
+    SyncGuest(b.addr, b.size);
+    fill = !b.buf;
+    std::vector<std::pair<u32, u32>> runs;
+    if (!fill) {
+        CollectCpuWrites(b.cpu_ranges, runs, 2);
+        if (runs.empty()) {
+            b.dirty_streak = 0;
+            return true;
+        }
+        if (++b.dirty_streak >= 8) { // rewritten every frame: stop tracking it
+            b.streaming = true;
+            b.buf.Reset();
+            return false;
+        }
+        if (bind == D3D11_BIND_INDEX_BUFFER)
+            fill = true; // small, and the vertex range has to be recomputed anyway
+    } else {
+        D3D11_BUFFER_DESC bd{b.size, D3D11_USAGE_DEFAULT, UINT(bind), 0, 0, 0};
+        if (FAILED(dev_->CreateBuffer(&bd, nullptr, &b.buf)))
+            return false;
+        b.cpu_ranges.clear();
+        for (u64 off = 0; off < b.size;) {
+            u64 run = 0;
+            const u64 cpu = g.As().TranslateRun(b.addr + off, run);
+            if (!cpu || !run)
+                break;
+            const u64 n = std::min<u64>(run, b.size - off);
+            b.cpu_ranges.push_back({u32(off), cpu, n});
+            off += n;
+        }
+    }
+    if (!fill) {
+        static thread_local std::vector<u8> tmp;
+        for (auto [off, n] : runs) {
+            n = std::min(n, b.size - off);
+            tmp.resize(n);
+            g.ReadGpu(b.addr + off, tmp.data(), n);
+            const D3D11_BOX box{off, 0, 0, off + n, 1, 1};
+            ctx_->UpdateSubresource(b.buf.Get(), 0, &box, tmp.data(), n, n);
+        }
+    }
+    for (auto& r : b.cpu_ranges)
+        g.Mem().TrackWrites(r.cpu, r.size, 2);
+    return true;
+}
+
+D3D11Renderer::GeomBuf* D3D11Renderer::CachedIndices(u64 addr, u32 count, u32 index_size, bool strip) {
+    if (!count || count > (16u << 20))
+        return nullptr;
+    const u64 key = addr ^ (u64(count) << 34) ^ (u64(index_size) << 61) ^ (strip ? 1ull << 63 : 0);
+    GeomBuf& b = index_cache_[key];
+    const u32 size = u32(common::AlignUp(count * std::max<u32>(index_size, 2), 4));
+    if (b.addr != addr || b.size != size || b.index_size != index_size) { // new, or a key collision
+        b = {};
+        b.addr = addr;
+        b.size = size;
+        b.index_size = index_size;
+    }
+    bool fill = false;
+    if (!RefreshGeometry(b, D3D11_BIND_INDEX_BUFFER, fill))
+        return nullptr;
+    if (fill) {
+        std::vector<u8> raw(size_t(count) * index_size);
+        G().ReadGpu(addr, raw.data(), raw.size());
+        std::vector<u8> data(b.size, 0);
+        u32 lo = ~0u, hi = 0;
+        const u32 restart = index_size == 4 ? ~0u : 0xFFFF;
+        for (u32 i = 0; i < count; i++) {
+            const u32 v = index_size == 1 ? raw[i] : index_size == 2 ? common::Read<u16>(&raw[i * 2]) : common::Read<u32>(&raw[i * 4]);
+            if (index_size == 1)
+                { const u16 v16 = u16(v); std::memcpy(&data[i * 2], &v16, 2); }
+            if (strip && v == restart && index_size != 1)
+                continue; // D3D cuts strips at all-ones indices, like Maxwell's primitive restart
+            lo = std::min(lo, v);
+            hi = std::max(hi, v);
+        }
+        if (index_size != 1)
+            std::memcpy(data.data(), raw.data(), raw.size());
+        b.index_format = index_size == 4 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
+        b.min_v = lo == ~0u ? 0 : lo;
+        b.max_v = lo == ~0u ? 0 : hi;
+        const D3D11_BOX box{0, 0, 0, b.size, 1, 1};
+        ctx_->UpdateSubresource(b.buf.Get(), 0, &box, data.data(), b.size, b.size);
+    }
+    return &b;
+}
+
+D3D11Renderer::GeomBuf* D3D11Renderer::CachedVertices(u64 addr, u32 size) {
+    GeomBuf& b = vertex_cache_[addr];
+    if (b.size < size) { // new or grew: start over
+        const u64 seen = b.first_seen;
+        b = {};
+        b.first_seen = seen;
+        b.addr = addr;
+        b.size = u32(common::AlignUp(size, 16));
+    }
+    bool fill = false;
+    if (!RefreshGeometry(b, D3D11_BIND_VERTEX_BUFFER, fill))
+        return nullptr;
+    if (fill) {
+        std::vector<u8> data(b.size, 0);
+        G().ReadGpuPartial(addr, data.data(), std::min(size, b.size));
+        const D3D11_BOX box{0, 0, 0, b.size, 1, 1};
+        ctx_->UpdateSubresource(b.buf.Get(), 0, &box, data.data(), b.size, b.size);
+    }
+    return &b;
+}
+
+// Synchronous copy of a GPU buffer's first `size` bytes (debug paths only).
+static std::vector<u8> ReadBufferNow(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Buffer* buf, u32 size) {
+    std::vector<u8> out;
+    D3D11_BUFFER_DESC sd{size, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0};
+    ComPtr<ID3D11Buffer> st;
+    if (FAILED(dev->CreateBuffer(&sd, nullptr, &st)))
+        return out;
+    const D3D11_BOX box{0, 0, 0, size, 1, 1};
+    ctx->CopySubresourceRegion(st.Get(), 0, 0, 0, 0, buf, 0, &box);
+    D3D11_MAPPED_SUBRESOURCE mp;
+    if (SUCCEEDED(ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &mp))) {
+        out.assign(static_cast<const u8*>(mp.pData), static_cast<const u8*>(mp.pData) + size);
+        ctx->Unmap(st.Get(), 0);
+    }
+    return out;
 }
 
 // MUA3's culling geometry program: for each visible triangle it atomically reserves three slots in an index list
 // (counter address at GS c0[0x410], list base at c0[0x420]) and stores the vertex ids as v1, v0, v2. Later draws
 // index that list. We keep every triangle (culling is only an optimisation).
-static_assert(shader::kGmemWindows == 8, "D3D11Renderer::gmem_ size");
 
 void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
     std::lock_guard ctx_lock(ContextMutex());
@@ -573,7 +1037,7 @@ void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
         if (cs->state != HostShader::Ready)
             return;
     }
-    static std::unordered_map<u64, int> logged;
+    static common::U64Map<int> logged;
     const int nth = logged[key]++;
     const bool log = nth < 2 || nth % 600 == 0;
     if (log)
@@ -608,12 +1072,14 @@ void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
         u32 swz = 0xB1A;
         srvs[t.slot] = textures_->Get(tic, t, swz);
         drv.swizzle[t.slot][0] = swz;
+        drv.swizzle[t.slot][1] = TextureScale(tic.Address(), t.dim == shader::TexDim::Tex2D && !t.array);
         if (t.sampler < 16)
             smps[t.sampler] = textures_->GetSampler(tsc, t.shadow);
     }
     // ---- global memory windows: NVN's storage buffer table in c0 at 0x310 ({address lo, hi, size, -} each)
+    PollReadbacks(false);
     ID3D11UnorderedAccessView* uavs[shader::kGmemWindows]{};
-    u64 win_addr[shader::kGmemWindows]{};
+    GpuBuf* win[shader::kGmemWindows]{};
     u32 win_size[shader::kGmemWindows]{};
     if (cs->info.uses_gmem && cb_size[0] >= 0x310 + 16 * shader::kGmemWindows) {
         u32 table[shader::kGmemWindows][4];
@@ -623,27 +1089,11 @@ void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
             const u32 size = u32(common::AlignUp(table[i][2], 4));
             if (!a || !size || size > (64u << 20))
                 continue;
-            GmemWindow& w = gmem_[i];
-            if (w.capacity < size) {
-                w = {};
-                w.capacity = u32(common::AlignUp(size, 1u << 16));
-                D3D11_BUFFER_DESC bd{w.capacity, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0,
-                                     D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
-                dev_->CreateBuffer(&bd, nullptr, &w.buf);
-                D3D11_BUFFER_DESC sd{w.capacity, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0};
-                dev_->CreateBuffer(&sd, nullptr, &w.staging);
-                D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
-                ud.Format = DXGI_FORMAT_R32_TYPELESS;
-                ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-                ud.Buffer = {0, w.capacity / 4, D3D11_BUFFER_UAV_FLAG_RAW};
-                dev_->CreateUnorderedAccessView(w.buf.Get(), &ud, &w.uav);
-            }
-            w.uploaded.assign(size, 0);
-            g.ReadGpuPartial(a, w.uploaded.data(), size);
-            const D3D11_BOX box{0, 0, 0, size, 1, 1};
-            ctx_->UpdateSubresource(w.buf.Get(), 0, &box, w.uploaded.data(), size, size);
-            uavs[i] = w.uav.Get();
-            win_addr[i] = a;
+            GpuBuf* w = ComputeBuffer(a, size);
+            if (!w)
+                continue;
+            uavs[i] = w->uav.Get();
+            win[i] = w;
             win_size[i] = size;
             drv.gmem[i][0] = u32(a);
             drv.gmem[i][1] = u32(a >> 32);
@@ -680,28 +1130,12 @@ void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
             continue;
         }
         const u64 a = tic.Address();
+        GpuBuf* gw = ComputeBuffer(a, u32(size));
+        if (!gw)
+            continue;
         const u32 i = next_window++;
-        GmemWindow& gw = gmem_[i];
-        if (gw.capacity < size) {
-            gw = {};
-            gw.capacity = u32(common::AlignUp(size, 1u << 16));
-            D3D11_BUFFER_DESC bd_{gw.capacity, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0,
-                                  D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
-            dev_->CreateBuffer(&bd_, nullptr, &gw.buf);
-            D3D11_BUFFER_DESC sd{gw.capacity, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0};
-            dev_->CreateBuffer(&sd, nullptr, &gw.staging);
-            D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
-            ud.Format = DXGI_FORMAT_R32_TYPELESS;
-            ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-            ud.Buffer = {0, gw.capacity / 4, D3D11_BUFFER_UAV_FLAG_RAW};
-            dev_->CreateUnorderedAccessView(gw.buf.Get(), &ud, &gw.uav);
-        }
-        gw.uploaded.assign(size_t(size), 0);
-        g.ReadGpuPartial(a, gw.uploaded.data(), size_t(size));
-        const D3D11_BOX box{0, 0, 0, u32(size), 1, 1};
-        ctx_->UpdateSubresource(gw.buf.Get(), 0, &box, gw.uploaded.data(), u32(size), u32(size));
-        uavs[i] = gw.uav.Get();
-        win_addr[i] = a;
+        uavs[i] = gw->uav.Get();
+        win[i] = gw;
         win_size[i] = u32(size);
         drv.gmem[i][0] = u32(a);
         drv.gmem[i][1] = u32(a >> 32);
@@ -767,7 +1201,8 @@ void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
         for (u32 i = 0; i < shader::kGmemWindows; i++)
             if (win_size[i]) {
                 f.push_back(i);
-                put_bytes(gmem_[i].uploaded.data(), win_size[i]);
+                const auto d = ReadBufferNow(dev_, ctx_, win[i]->buf.Get(), win_size[i]);
+                put_bytes(d.data(), u32(d.size()));
             }
         put_bytes(&drv, sizeof(drv));
         const fs::path out = fmt::format("shader_dump/capture_{:x}.bin", q[8]);
@@ -777,6 +1212,7 @@ void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
     ID3D11Buffer* drv_cb = dc.Constant(1001, &drv, sizeof(drv));
     // Render targets may be sampled by the kernel: unbind them from the output stage.
     ctx_->OMSetRenderTargets(0, nullptr, nullptr);
+    InvalidateBinds(); // UAVs bound below unbind VS/PS views of the same resources
     ctx_->CSSetShader(cs->cs.Get(), nullptr, 0);
     ctx_->CSSetConstantBuffers(0, 13, cbs);
     ctx_->CSSetConstantBuffers(13, 1, &drv_cb);
@@ -788,20 +1224,18 @@ void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
     std::vector<std::vector<u8>> reference(shader::kGmemWindows);
     const bool verify = cs->cs_ref != nullptr;
     if (verify) {
+        std::vector<std::vector<u8>> before(shader::kGmemWindows);
+        for (u32 i = 0; i < shader::kGmemWindows; i++)
+            if (win[i])
+                before[i] = ReadBufferNow(dev_, ctx_, win[i]->buf.Get(), win_size[i]);
         ctx_->CSSetShader(cs->cs_ref.Get(), nullptr, 0);
         ctx_->Dispatch(grid[0], grid[1], grid[2]);
         for (u32 i = 0; i < shader::kGmemWindows; i++) {
-            if (!win_size[i])
+            if (!win[i] || before[i].size() != win_size[i])
                 continue;
-            GmemWindow& w = gmem_[i];
+            reference[i] = ReadBufferNow(dev_, ctx_, win[i]->buf.Get(), win_size[i]);
             const D3D11_BOX box{0, 0, 0, win_size[i], 1, 1};
-            ctx_->CopySubresourceRegion(w.staging.Get(), 0, 0, 0, 0, w.buf.Get(), 0, &box);
-            D3D11_MAPPED_SUBRESOURCE mp;
-            if (SUCCEEDED(ctx_->Map(w.staging.Get(), 0, D3D11_MAP_READ, 0, &mp))) {
-                reference[i].assign(static_cast<const u8*>(mp.pData), static_cast<const u8*>(mp.pData) + win_size[i]);
-                ctx_->Unmap(w.staging.Get(), 0);
-            }
-            ctx_->UpdateSubresource(w.buf.Get(), 0, &box, w.uploaded.data(), win_size[i], win_size[i]);
+            ctx_->UpdateSubresource(win[i]->buf.Get(), 0, &box, before[i].data(), win_size[i], win_size[i]);
         }
         ctx_->CSSetShader(cs->cs.Get(), nullptr, 0);
     }
@@ -811,21 +1245,16 @@ void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
     ID3D11ShaderResourceView* no_srv[48]{};
     ctx_->CSSetShaderResources(0, 48, no_srv);
     dispatches_++;
-    // ---- write back what the kernel changed (the guest reads results through texel buffers and the CPU)
-    for (u32 i = 0; i < shader::kGmemWindows; i++) {
-        if (!win_size[i])
+    // ---- results stay on the GPU (the CPU and host-side reads see them after the copy-back, see Present/SyncGuest)
+    for (u32 i = 0; i < shader::kGmemWindows && cs->info.writes_gmem; i++) {
+        GpuBuf* w = win[i];
+        if (!w || std::find(win, win + i, w) != win + i)
             continue;
-        GmemWindow& w = gmem_[i];
-        const D3D11_BOX box{0, 0, 0, win_size[i], 1, 1};
-        ctx_->CopySubresourceRegion(w.staging.Get(), 0, 0, 0, 0, w.buf.Get(), 0, &box);
-        D3D11_MAPPED_SUBRESOURCE mp;
-        if (FAILED(ctx_->Map(w.staging.Get(), 0, D3D11_MAP_READ, 0, &mp)))
-            continue;
-        const u8* now = static_cast<const u8*>(mp.pData);
         if (verify && reference[i].size() == win_size[i]) {
+            const auto now = ReadBufferNow(dev_, ctx_, w->buf.Get(), win_size[i]);
             u32 diff = 0, first = ~0u;
-            for (u32 off = 0; off < win_size[i]; off += 4)
-                if (std::memcmp(now + off, &reference[i][off], 4) != 0) {
+            for (u32 off = 0; off + 4 <= now.size(); off += 4)
+                if (std::memcmp(&now[off], &reference[i][off], 4) != 0) {
                     diff++;
                     if (first == ~0u)
                         first = off;
@@ -833,7 +1262,7 @@ void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
             static std::map<u64, u32> reported;
             if (diff && reported[key ^ i]++ < 3) {
                 u32 a4 = 0, b4 = 0;
-                std::memcpy(&a4, now + first, 4);
+                std::memcpy(&a4, &now[first], 4);
                 std::memcpy(&b4, &reference[i][first], 4);
                 LOG_WARN("Renderer", "DXBC verify {:#x} window {}: {} words differ (first +{:#x}: dxbc {:08x} fxc {:08x})", prog, i,
                          diff, first, a4, b4);
@@ -842,29 +1271,10 @@ void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
                 LOG_INFO("Renderer", "DXBC verify {:#x} window {}: identical", prog, i);
             }
         }
-        // Changed runs only, so data the CPU wrote meanwhile elsewhere in the window survives.
-        u32 changed = 0;
-        for (u32 off = 0; off < win_size[i];) {
-            if (std::memcmp(now + off, w.uploaded.data() + off, 4) == 0) {
-                off += 4;
-                continue;
-            }
-            u32 end = off + 4;
-            while (end < win_size[i] && std::memcmp(now + end, w.uploaded.data() + end, 4) != 0)
-                end += 4;
-            g.WriteGpu(win_addr[i] + off, now + off, end - off);
-            if (log && changed < 0x80) {
-                u32 v[4]{};
-                std::memcpy(v, now + off, std::min<u32>(16, end - off));
-                LOG_INFO("Renderer", "    changed +{:#x} len {:#x}: {:08x} {:08x} {:08x} {:08x}", off, end - off, v[0], v[1], v[2], v[3]);
-            }
-            changed += end - off;
-            textures_->Invalidate(win_addr[i] + off, end - off);
-            off = end;
-        }
-        ctx_->Unmap(w.staging.Get(), 0);
-        if (log)
-            LOG_INFO("Renderer", "  gmem window {} changed {:#x} bytes", i, changed);
+        // Results stay on the GPU; Present copies dirty buffers back to guest memory once per frame.
+        w->gpu_written = true;
+        w->gpu_dirty = true;
+        gpu_dirty_any_ = true;
     }
 }
 
@@ -881,32 +1291,44 @@ void D3D11Renderer::EmulateCullingGs() {
     const u64 counter_va = u64(c0[0]) | (u64(c0[1]) << 32), list_va = u64(base[0]) | (u64(base[1]) << 32);
     if (!counter_va || !list_va)
         return;
-    std::vector<u32> ids(dr.count);
-    if (dr.indexed) {
-        const u32 fmt = m.Reg(kIndexFormat);
-        const u32 isz = fmt == 0 ? 1 : fmt == 1 ? 2 : 4;
-        std::vector<u8> raw(size_t(dr.count) * isz);
-        g.ReadGpu(m.Addr(kIndexAddrHigh) + u64(dr.first) * isz, raw.data(), raw.size());
-        for (u32 i = 0; i < dr.count; i++)
-            ids[i] = isz == 1 ? raw[i] : isz == 2 ? common::Read<u16>(&raw[i * 2]) : common::Read<u32>(&raw[i * 4]);
-    } else {
-        for (u32 i = 0; i < dr.count; i++)
-            ids[i] = dr.first + i;
-    }
     const u32 tris = dr.count / 3;
     if (!tris)
         return;
-    std::vector<u32> out(size_t(tris) * 3);
-    for (u32 t = 0; t < tris; t++) {
-        out[t * 3 + 0] = ids[t * 3 + 0];
-        out[t * 3 + 1] = ids[t * 3 + 1];
-        out[t * 3 + 2] = ids[t * 3 + 2];
+    const size_t bytes = size_t(tris) * 12;
+    // The emulated program keeps every triangle, so the list is the draw's own indices (as u32).
+    static thread_local std::vector<u32> out;
+    const u8* src = nullptr;
+    if (dr.indexed) {
+        const u32 fmt = m.Reg(kIndexFormat);
+        const u32 isz = fmt == 0 ? 1 : fmt == 1 ? 2 : 4;
+        const u64 ia = m.Addr(kIndexAddrHigh) + u64(dr.first) * isz;
+        SyncGuest(ia, size_t(tris) * 3 * isz);
+        if (isz == 4)
+            src = g.GpuPtr(ia, bytes);
+        if (!src) {
+            static thread_local std::vector<u8> raw;
+            raw.resize(size_t(tris) * 3 * isz);
+            g.ReadGpu(ia, raw.data(), raw.size());
+            out.resize(size_t(tris) * 3);
+            for (u32 i = 0; i < tris * 3; i++)
+                out[i] = isz == 1 ? raw[i] : isz == 2 ? common::Read<u16>(&raw[i * 2]) : common::Read<u32>(&raw[i * 4]);
+            src = reinterpret_cast<const u8*>(out.data());
+        }
+    } else {
+        out.resize(size_t(tris) * 3);
+        for (u32 i = 0; i < tris * 3; i++)
+            out[i] = dr.first + i;
+        src = reinterpret_cast<const u8*>(out.data());
     }
     u32 counter = 0;
+    SyncGuest(counter_va, 4);
     g.ReadGpu(counter_va, &counter, 4);
     if (trace_draws_ > 0)
         LOG_INFO("Renderer", "TRACE culling-gs: counter {:#x} = {} list {:#x} +{} tris", counter_va, counter, list_va, tris);
-    g.WriteGpu(list_va + u64(counter) * 4, out.data(), out.size() * 4);
+    // Usually the same list as last frame: leave identical data alone so cached index buffers over it stay valid.
+    const u8* cur = g.GpuPtr(list_va + u64(counter) * 4, bytes);
+    if (!cur || std::memcmp(cur, src, bytes) != 0)
+        g.WriteGpu(list_va + u64(counter) * 4, src, bytes);
     counter += tris * 3;
     g.WriteGpu(counter_va, &counter, 4);
 }
@@ -916,6 +1338,24 @@ void D3D11Renderer::Draw() {
     auto& g = G();
     const auto& m = g.M3D();
     auto& dc = *g_dc;
+    // Someone else used the context (UI) or a dispatch rebound resources: forget what is bound.
+    if (const u64 epoch = ContextEpoch().load(); epoch != binds_epoch_) {
+        binds_epoch_ = epoch;
+        for (auto& b : binds_)
+            std::memset(&b, 0xFF, sizeof(b));
+        std::fill(std::begin(last_rtvs_), std::end(last_rtvs_), reinterpret_cast<ID3D11RenderTargetView*>(~uintptr_t(0)));
+        last_dsv_ = reinterpret_cast<ID3D11DepthStencilView*>(~uintptr_t(0));
+    }
+    if (!readbacks_.empty() && ++draws_since_poll_ >= 32) {
+        draws_since_poll_ = 0;
+        PollReadbacks(false);
+    }
+    struct ProfEnd {
+        ~ProfEnd() { Prof(-1); }
+    } prof_end;
+    Prof(kProfShaders);
+    if (g_profile)
+        g_prof_draws++;
 
     // ---- shaders
     const u64 code_base = m.Addr(kCodeAddrHigh);
@@ -1061,6 +1501,7 @@ void D3D11Renderer::Draw() {
     }
 
     // ---- render targets
+    Prof(kProfState);
     Surface* colors[8]{};
     const u32 rtc = m.Reg(kRtControl);
     const u32 count = std::min<u32>(rtc & 0xF, 8);
@@ -1070,7 +1511,15 @@ void D3D11Renderer::Draw() {
     ID3D11RenderTargetView* rtvs[8]{};
     for (u32 i = 0; i < count; i++)
         rtvs[i] = colors[i] ? colors[i]->rtv.Get() : nullptr;
-    ctx_->OMSetRenderTargets(8, rtvs, depth ? depth->dsv.Get() : nullptr);
+    ID3D11DepthStencilView* dsv = depth ? depth->dsv.Get() : nullptr;
+    // Binding outputs makes D3D silently unbind those resources' SRVs: start the SRV cache over then.
+    if (std::memcmp(last_rtvs_, rtvs, sizeof(rtvs)) != 0 || last_dsv_ != dsv) {
+        std::memcpy(last_rtvs_, rtvs, sizeof(rtvs));
+        last_dsv_ = dsv;
+        for (auto& b : binds_)
+            std::fill(std::begin(b.srv), std::end(b.srv), reinterpret_cast<ID3D11ShaderResourceView*>(~uintptr_t(0)));
+    }
+    ctx_->OMSetRenderTargets(8, rtvs, dsv);
     draw_serial_++;
     for (u32 i = 0; i < 8; i++)
         bound_[i] = i < count ? colors[i] : nullptr;
@@ -1080,7 +1529,16 @@ void D3D11Renderer::Draw() {
     const float sx = m.RegF(kViewportTransform + 0), sy = m.RegF(kViewportTransform + 1);
     const float sz = m.RegF(kViewportTransform + 2), tx = m.RegF(kViewportTransform + 3);
     const float ty = m.RegF(kViewportTransform + 4), tz = m.RegF(kViewportTransform + 5);
-    D3D11_VIEWPORT vp{tx - std::abs(sx), ty - std::abs(sy), 2 * std::abs(sx), 2 * std::abs(sy), 0.0f, 1.0f};
+    // Targets stored at a higher resolution scale the viewport and scissor with them.
+    u32 rscale = 1;
+    for (Surface* b : bound_)
+        if (b) {
+            rscale = b->scale;
+            break;
+        }
+    const float fs = float(rscale);
+    D3D11_VIEWPORT vp{(tx - std::abs(sx)) * fs, (ty - std::abs(sy)) * fs, 2 * std::abs(sx) * fs, 2 * std::abs(sy) * fs,
+                      0.0f, 1.0f};
     ctx_->RSSetViewports(1, &vp);
     float flip = sy > 0 ? -1.0f : 1.0f;
     if (m.Reg(kScreenYControl) & 1)
@@ -1091,13 +1549,13 @@ void D3D11Renderer::Draw() {
     D3D11_RECT sr{0, 0, 16384, 16384};
     if (sc_enable & 1) {
         const u32 x = m.Reg(0x381), y = m.Reg(0x382);
-        sr = {LONG(x & 0xFFFF), LONG(y & 0xFFFF), LONG(x >> 16), LONG(y >> 16)};
+        sr = {LONG(x & 0xFFFF) * LONG(rscale), LONG(y & 0xFFFF) * LONG(rscale), LONG(x >> 16) * LONG(rscale), LONG(y >> 16) * LONG(rscale)};
     }
     // Pixel history (debug "pick x y"): restrict every draw of one frame to that pixel and count samples.
     const bool counting = occl_frame_ == frame_counter_; // debug "occl": samples written by every draw
     const bool picking = (pick_frame_ == frame_counter_ && colors[0] && colors[0]->width >= 1280 / 2) || counting;
     if (picking && !counting) {
-        const u32 px = u32(pick_x_ * colors[0]->width), py = u32(pick_y_ * colors[0]->height);
+        const u32 px = u32(pick_x_ * colors[0]->width * rscale), py = u32(pick_y_ * colors[0]->height * rscale);
         sr = {std::max<LONG>(sr.left, LONG(px)), std::max<LONG>(sr.top, LONG(py)), std::min<LONG>(sr.right, LONG(px + 1)),
               std::min<LONG>(sr.bottom, LONG(py + 1))};
     }
@@ -1208,84 +1666,125 @@ void D3D11Renderer::Draw() {
     ctx_->RSSetState(rs);
 
     // ---- topology / indices
+    Prof(kProfIndex);
     const auto& dr = m.draw;
     std::vector<u32> converted;
     u32 index_size = 0;
     u32 min_v = 0, max_v = 0;
     D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     std::vector<u32> indices;
-    if (dr.indexed) {
-        const u32 fmt = m.Reg(kIndexFormat);
-        index_size = fmt == 0 ? 1 : fmt == 1 ? 2 : 4;
-        std::vector<u8> raw(size_t(dr.count) * index_size);
-        g.ReadGpu(m.Addr(kIndexAddrHigh) + u64(dr.first) * index_size, raw.data(), raw.size());
-        indices.resize(dr.count);
-        for (u32 i = 0; i < dr.count; i++)
-            indices[i] = index_size == 1 ? raw[i] : index_size == 2 ? common::Read<u16>(&raw[i * 2])
-                                                                   : common::Read<u32>(&raw[i * 4]);
+    u32 index_count = 0;
+    bool direct = false; // non-indexed list/strip: Draw() straight from the vertex buffers
+    const bool native_topology = dr.topology == 0 || dr.topology == 1 || dr.topology == 3 || dr.topology == 4 || dr.topology == 5;
+    if (native_topology && dr.count && trace_draws_ <= 0 && !trace_draw_) {
+        static const D3D11_PRIMITIVE_TOPOLOGY kTopology[6] = {
+            D3D11_PRIMITIVE_TOPOLOGY_POINTLIST, D3D11_PRIMITIVE_TOPOLOGY_LINELIST, D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED,
+            D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP};
+        topo = kTopology[dr.topology];
+        if (!dr.indexed) {
+            direct = true;
+            index_count = dr.count;
+            min_v = dr.first;
+            max_v = dr.first + dr.count - 1;
+        } else {
+            const u32 fmt = m.Reg(kIndexFormat);
+            index_size = fmt == 0 ? 1 : fmt == 1 ? 2 : 4;
+            const bool strip = dr.topology == 3 || dr.topology == 5;
+            if (GeomBuf* ib = CachedIndices(m.Addr(kIndexAddrHigh) + u64(dr.first) * index_size, dr.count, index_size, strip)) {
+                ctx_->IASetIndexBuffer(ib->buf.Get(), ib->index_format, 0);
+                index_count = dr.count;
+                min_v = ib->min_v;
+                max_v = ib->max_v;
+            }
+        }
+        if (index_count)
+            ctx_->IASetPrimitiveTopology(topo);
+    }
+    if (index_count) {
+        if (max_v - min_v > 4000000) {
+            draws_skipped++, skip_reason_[3]++;
+            return;
+        }
     } else {
-        indices.resize(dr.count);
-        for (u32 i = 0; i < dr.count; i++)
-            indices[i] = dr.first + i;
+        if (dr.indexed) {
+            const u32 fmt = m.Reg(kIndexFormat);
+            index_size = fmt == 0 ? 1 : fmt == 1 ? 2 : 4;
+            std::vector<u8> raw(size_t(dr.count) * index_size);
+            SyncGuest(m.Addr(kIndexAddrHigh) + u64(dr.first) * index_size, raw.size());
+            g.ReadGpu(m.Addr(kIndexAddrHigh) + u64(dr.first) * index_size, raw.data(), raw.size());
+            indices.resize(dr.count);
+            for (u32 i = 0; i < dr.count; i++)
+                indices[i] = index_size == 1 ? raw[i] : index_size == 2 ? common::Read<u16>(&raw[i * 2])
+                                                                       : common::Read<u32>(&raw[i * 4]);
+        } else {
+            indices.resize(dr.count);
+            for (u32 i = 0; i < dr.count; i++)
+                indices[i] = dr.first + i;
+        }
+        switch (dr.topology) {
+        case 0: topo = D3D11_PRIMITIVE_TOPOLOGY_POINTLIST; break;
+        case 1: topo = D3D11_PRIMITIVE_TOPOLOGY_LINELIST; break;
+        case 3: topo = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP; break;
+        case 4: topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST; break;
+        case 5: topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP; break;
+        case 6: case 9: { // fan / polygon -> list
+            std::vector<u32> t;
+            for (u32 i = 2; i < indices.size(); i++)
+                t.insert(t.end(), {indices[0], indices[i - 1], indices[i]});
+            indices.swap(t);
+            break;
+        }
+        case 7: { // quads
+            std::vector<u32> t;
+            for (u32 i = 0; i + 3 < indices.size(); i += 4)
+                t.insert(t.end(), {indices[i], indices[i + 1], indices[i + 2], indices[i], indices[i + 2], indices[i + 3]});
+            indices.swap(t);
+            break;
+        }
+        case 8: { // quad strip
+            std::vector<u32> t;
+            for (u32 i = 0; i + 3 < indices.size(); i += 2)
+                t.insert(t.end(), {indices[i], indices[i + 1], indices[i + 3], indices[i], indices[i + 3], indices[i + 2]});
+            indices.swap(t);
+            break;
+        }
+        case 2: // line loop
+            if (!indices.empty())
+                indices.push_back(indices[0]);
+            topo = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP;
+            break;
+        default:
+            draws_skipped++, skip_reason_[1]++;
+            return;
+        }
+        if (indices.empty()) {
+            draws_skipped++, skip_reason_[2]++;
+            return;
+        }
+        min_v = *std::min_element(indices.begin(), indices.end());
+        max_v = *std::max_element(indices.begin(), indices.end());
+        if (max_v - min_v > 4000000) {
+            draws_skipped++, skip_reason_[3]++;
+            return;
+        }
+        ctx_->IASetPrimitiveTopology(topo);
+        ctx_->IASetIndexBuffer(dc.Index(indices.data(), u32(indices.size() * 4)), DXGI_FORMAT_R32_UINT, 0);
+        index_count = u32(indices.size());
     }
-    switch (dr.topology) {
-    case 0: topo = D3D11_PRIMITIVE_TOPOLOGY_POINTLIST; break;
-    case 1: topo = D3D11_PRIMITIVE_TOPOLOGY_LINELIST; break;
-    case 3: topo = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP; break;
-    case 4: topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST; break;
-    case 5: topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP; break;
-    case 6: case 9: { // fan / polygon -> list
-        std::vector<u32> t;
-        for (u32 i = 2; i < indices.size(); i++)
-            t.insert(t.end(), {indices[0], indices[i - 1], indices[i]});
-        indices.swap(t);
-        break;
-    }
-    case 7: { // quads
-        std::vector<u32> t;
-        for (u32 i = 0; i + 3 < indices.size(); i += 4)
-            t.insert(t.end(), {indices[i], indices[i + 1], indices[i + 2], indices[i], indices[i + 2], indices[i + 3]});
-        indices.swap(t);
-        break;
-    }
-    case 8: { // quad strip
-        std::vector<u32> t;
-        for (u32 i = 0; i + 3 < indices.size(); i += 2)
-            t.insert(t.end(), {indices[i], indices[i + 1], indices[i + 3], indices[i], indices[i + 3], indices[i + 2]});
-        indices.swap(t);
-        break;
-    }
-    case 2: // line loop
-        if (!indices.empty())
-            indices.push_back(indices[0]);
-        topo = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP;
-        break;
-    default:
-        draws_skipped++, skip_reason_[1]++;
-        return;
-    }
-    if (indices.empty()) {
-        draws_skipped++, skip_reason_[2]++;
-        return;
-    }
-    min_v = *std::min_element(indices.begin(), indices.end());
-    max_v = *std::max_element(indices.begin(), indices.end());
-    if (max_v - min_v > 4000000) {
-        draws_skipped++, skip_reason_[3]++;
-        return;
-    }
-    ctx_->IASetPrimitiveTopology(topo);
-    ctx_->IASetIndexBuffer(dc.Index(indices.data(), u32(indices.size() * 4)), DXGI_FORMAT_R32_UINT, 0);
+    g_prof_ib_count += index_count;
 
     // ---- driver constants + vertex buffers
+    Prof(kProfVertex);
     DriverConstants drv{};
     drv.viewport[0] = flip;
     drv.viewport[1] = sz;
     drv.viewport[2] = tz;
+    drv.viewport[3] = fs;
     for (u32 i = 0; i < 32; i++)
         drv.attrib[i][0] = m.Reg(kVertexAttribFormat + i);
     // ---- vertex input: Maxwell attribute formats -> D3D11 input layout
-    std::vector<D3D11_INPUT_ELEMENT_DESC> elems;
+    static thread_local std::vector<D3D11_INPUT_ELEMENT_DESC> elems;
+    elems.clear();
     bool used_buf[16]{};
     bool need_default = false;
     for (u32 i = 0; i < 32; i++) {
@@ -1335,6 +1834,18 @@ void D3D11Renderer::Draw() {
     ID3D11Buffer* vbufs[32]{};
     UINT strides[32]{}, offsets[32]{};
     s32 base_vertex = 0;
+    // Per-vertex buffers come from the geometry cache as whole guest buffers, indexed with absolute vertex numbers;
+    // if any of them is not cached, all are uploaded per draw from the drawn vertex range instead.
+    GeomBuf* cached_vb[16]{};
+    bool cache_vbs = trace_draws_ <= 0;
+    for (u32 b = 0; b < 16 && cache_vbs; b++) {
+        if (!used_buf[b] || m.Reg(kVertexArray + b * 4 + 3))
+            continue;
+        const u64 addr = m.Addr(kVertexArray + b * 4 + 1);
+        const u64 limit = m.Addr(kVertexArrayLimit + b * 2);
+        if (limit < addr || limit + 1 - addr > (32u << 20) || !(cached_vb[b] = CachedVertices(addr, u32(limit + 1 - addr))))
+            cache_vbs = false;
+    }
     for (u32 b = 0; b < 16; b++) {
         if (!used_buf[b])
             continue;
@@ -1343,6 +1854,11 @@ void D3D11Renderer::Draw() {
         const u32 divisor = m.Reg(kVertexArray + b * 4 + 3);
         const u64 addr = m.Addr(kVertexArray + b * 4 + 1);
         const u64 limit = m.Addr(kVertexArrayLimit + b * 2);
+        if (cache_vbs && !divisor) {
+            vbufs[b] = cached_vb[b]->buf.Get();
+            strides[b] = stride;
+            continue;
+        }
         u64 begin, end;
         if (divisor) {
             begin = addr + u64(stride) * (dr.instance / divisor);
@@ -1357,8 +1873,10 @@ void D3D11Renderer::Draw() {
         const u32 size = u32(std::min<u64>(end - begin, 64ull << 20));
         static thread_local std::vector<u8> tmp;
         tmp.assign(size_t(size) + 64, 0);
+        SyncGuest(begin, size);
         g.ReadGpu(begin, tmp.data(), size);
         vbufs[b] = dc.Vertex(b, tmp.data(), u32(tmp.size()));
+        g_prof_vb_bytes += size;
         strides[b] = stride;
         if (trace_draws_ > 0 && b == 0) {
             trace_vb_data_.assign(tmp.begin(), tmp.begin() + size);
@@ -1503,9 +2021,12 @@ void D3D11Renderer::Draw() {
                  m.Reg(kStencilBackOpZFail), m.Reg(kStencilBackOpZPass), m.Reg(0x646), m.Reg(0x648), m.Reg(0x647));
     }
     // ---- per stage resources
+    Prof(kProfResources);
     auto bind_stage = [&](HostShader* s, u32 stage_index, bool is_vs) {
         // constant buffers
+        Prof(kProfCbufs);
         ID3D11Buffer* cbs[13]{};
+        ID3D11ShaderResourceView* raws[13]{}; // dynamically indexed constant buffers as raw views (t32+)
         for (u32 i = 0; i < 13; i++) {
             if (!(s->info.cbuf_mask & (1u << i)))
                 continue;
@@ -1514,25 +2035,41 @@ void D3D11Renderer::Draw() {
                 continue;
             static thread_local std::vector<u8> tmp;
             // Upload only what the shader can read: its highest static row, or everything for dynamic indexing.
-            const u32 need = (s->info.cbuf_dyn_mask & (1u << i)) ? 65536u : s->info.cbuf_rows[i] * 16u;
+            const bool dyn = s->info.cbuf_dyn_mask & (1u << i);
+            const u32 need = dyn ? 65536u : s->info.cbuf_rows[i] * 16u;
             const u32 size = u32(common::AlignUp(std::max<u32>(std::min<u32>({b.size, 65536u, need}), 16u), 16));
+            SyncGuest(b.address, size);
+            // Same bytes as this slot's last upload: keep the buffer (most draws share material/scene constants).
+            CbShadow& sh = cb_shadow_[stage_index * 32 + i];
+            const u8* src = g.GpuPtr(b.address, size);
+            if (src && !trace_draw_ && sh.addr == b.address && sh.data.size() == size && (!dyn || sh.raw) &&
+                std::memcmp(src, sh.data.data(), size) == 0) {
+                cbs[i] = sh.buf;
+                if (dyn)
+                    raws[i] = sh.raw;
+                continue;
+            }
             tmp.resize(size);
             g.ReadGpu(b.address, tmp.data(), size);
             cbs[i] = dc.Constant(stage_index * 32 + i, tmp.data(), size);
+            sh.addr = b.address;
+            sh.data.assign(tmp.begin(), tmp.begin() + size);
+            sh.buf = cbs[i];
+            sh.raw = nullptr;
+            g_prof_cb_bytes += size;
             if (trace_draw_ && !is_vs && size >= 13 * 16) {
                 const float* f = reinterpret_cast<const float*>(tmp.data());
                 LOG_INFO("Renderer", "TRACE upload ps c{} {:#x}@{:#x} size {:#x} dyn {} rows10-12.w {:g} {:g} {:g}", i, b.size, b.address, size,
                          (s->info.cbuf_dyn_mask >> i) & 1, f[10 * 4 + 3], f[11 * 4 + 3], f[12 * 4 + 3]);
             }
-            if (s->info.cbuf_dyn_mask & (1u << i)) {
+            if (dyn) {
                 ID3D11ShaderResourceView* raw = dc.RawBuffer(stage_index * 32 + i, tmp.data(), size);
-                if (is_vs)
-                    ctx_->VSSetShaderResources(32 + i, 1, &raw);
-                else
-                    ctx_->PSSetShaderResources(32 + i, 1, &raw);
+                sh.raw = raw;
+                raws[i] = raw;
             }
         }
         // textures
+        Prof(kProfTextures);
         ID3D11ShaderResourceView* srvs[32]{};
         ID3D11SamplerState* smps[16]{};
         const u32 tex_cb = m.Reg(kTexCbIndex);
@@ -1549,35 +2086,54 @@ void D3D11Renderer::Draw() {
             u32 tsc[8];
             g.ReadGpu(tsc_base + u64(tsc_idx) * 32, tsc, 32);
             u32 swz = 0xB1A;
+            const u64 tg0 = g_profile ? ProfNow() : 0;
             srvs[t.slot] = textures_->Get(tic, t, swz);
-            NoteTexture(srvs[t.slot], tic.Address(), tic.Width(), tic.Height(), tic.Format(),
-                        FindSurfaceByGpu(tic.Address()) != nullptr);
+            if (g_profile)
+                g_prof_tex_get_ns += ProfNow() - tg0, g_prof_tex_calls++;
+            if (frame_counter_ - recent_wanted_ <= 120)
+                NoteTexture(srvs[t.slot], tic.Address(), tic.Width(), tic.Height(), tic.Format(),
+                            FindSurfaceByGpu(tic.Address()) != nullptr);
             if (trace_draw_)
                 LOG_INFO("Renderer", "    {} tex slot {} handle {:#x} tic {} addr {:#x} fmt {:#x} type {} {}x{} w0 {:#x} swz {:#x} srgb {} mips {} {}", is_vs ? "VS" : "PS",
                          t.slot, handle, tic_idx, tic.Address(), tic.Format(), tic.Type(), tic.Width(), tic.Height(), tic.w[0], swz, tic.Srgb(), tic.MaxMip(),
                          FindSurfaceByGpu(tic.Address()) ? "(render target)" : "");
             drv.swizzle[t.slot][0] = swz;
+            drv.swizzle[t.slot][1] = TextureScale(tic.Address(), t.dim == shader::TexDim::Tex2D && !t.array);
+            const u64 ts0 = g_profile ? ProfNow() : 0;
             if (t.sampler < 16)
                 smps[t.sampler] = textures_->GetSampler(tsc, t.shadow);
+            if (g_profile)
+                g_prof_tex_samp_ns += ProfNow() - ts0;
         }
+        StageBinds& sb = binds_[is_vs ? 0 : 1];
         if (is_vs) {
-            ctx_->VSSetConstantBuffers(0, 13, cbs);
-            ctx_->VSSetShaderResources(0, 32, srvs);
-            ctx_->VSSetSamplers(0, 16, smps);
+            BindRange(sb.cb, cbs, 0, 13, [&](u32 s, u32 n, ID3D11Buffer* const* p) { ctx_->VSSetConstantBuffers(s, n, p); });
+            BindRange(sb.srv, srvs, 0, 32, [&](u32 s, u32 n, ID3D11ShaderResourceView* const* p) { ctx_->VSSetShaderResources(s, n, p); });
+            BindRange(sb.srv, raws, 32, 13, [&](u32 s, u32 n, ID3D11ShaderResourceView* const* p) { ctx_->VSSetShaderResources(s, n, p); });
+            BindRange(sb.smp, smps, 0, 16, [&](u32 s, u32 n, ID3D11SamplerState* const* p) { ctx_->VSSetSamplers(s, n, p); });
         } else {
-            ctx_->PSSetConstantBuffers(0, 13, cbs);
-            ctx_->PSSetShaderResources(0, 32, srvs);
-            ctx_->PSSetSamplers(0, 16, smps);
+            BindRange(sb.cb, cbs, 0, 13, [&](u32 s, u32 n, ID3D11Buffer* const* p) { ctx_->PSSetConstantBuffers(s, n, p); });
+            BindRange(sb.srv, srvs, 0, 32, [&](u32 s, u32 n, ID3D11ShaderResourceView* const* p) { ctx_->PSSetShaderResources(s, n, p); });
+            BindRange(sb.srv, raws, 32, 13, [&](u32 s, u32 n, ID3D11ShaderResourceView* const* p) { ctx_->PSSetShaderResources(s, n, p); });
+            BindRange(sb.smp, smps, 0, 16, [&](u32 s, u32 n, ID3D11SamplerState* const* p) { ctx_->PSSetSamplers(s, n, p); });
         }
     };
     // Unbind surfaces that may also be used as textures this draw (D3D forbids read/write hazards).
     bind_stage(vs, 0, true);
     if (ps)
         bind_stage(ps, 4, false);
+    Prof(kProfResources);
 
-    ID3D11Buffer* drv_cb = dc.Constant(1000, &drv, sizeof(drv));
-    ctx_->VSSetConstantBuffers(13, 1, &drv_cb);
-    ctx_->PSSetConstantBuffers(13, 1, &drv_cb);
+    // Driver constants rarely change between consecutive draws: re-upload only when they do.
+    static DriverConstants last_drv;
+    static ID3D11Buffer* last_drv_cb = nullptr;
+    if (!last_drv_cb || std::memcmp(&last_drv, &drv, sizeof(drv)) != 0) {
+        last_drv = drv;
+        last_drv_cb = dc.Constant(1000, &drv, sizeof(drv));
+    }
+    ID3D11Buffer* drv_cb = last_drv_cb;
+    BindRange(binds_[0].cb, &drv_cb, 13, 1, [&](u32 s, u32 n, ID3D11Buffer* const* p) { ctx_->VSSetConstantBuffers(s, n, p); });
+    BindRange(binds_[1].cb, &drv_cb, 13, 1, [&](u32 s, u32 n, ID3D11Buffer* const* p) { ctx_->PSSetConstantBuffers(s, n, p); });
 
     ctx_->VSSetShader(vs->vs.Get(), nullptr, 0);
     ctx_->PSSetShader(ps ? ps->ps.Get() : nullptr, nullptr, 0);
@@ -1607,7 +2163,11 @@ void D3D11Renderer::Draw() {
         dev_->CreateQuery(&qd, &pick_query);
         ctx_->Begin(pick_query.Get());
     }
-    ctx_->DrawIndexedInstanced(u32(indices.size()), 1, 0, base_vertex, 0);
+    Prof(kProfSubmit);
+    if (direct)
+        ctx_->DrawInstanced(index_count, 1, u32(s32(dr.first) + base_vertex), 0);
+    else
+        ctx_->DrawIndexedInstanced(index_count, 1, 0, base_vertex, 0);
     if (pick_query) {
         ctx_->End(pick_query.Get());
         UINT64 samples = 0;
@@ -1619,16 +2179,52 @@ void D3D11Renderer::Draw() {
                      indices.size(), m.Reg(kBlendEnable), m.Reg(kDepthWriteEnable), samples);
     }
     draws_ok++;
+    for (u32 i = 0; i < count; i++)
+        if (colors[i] && ((m.Reg(kColorMask + i) | m.Reg(kColorMask)) & 0x1111))
+            colors[i]->write_serial = ++surface_writes_;
+    if (depth && ((m.Reg(kDepthWriteEnable) & 1) || (m.Reg(kStencilEnable) & 1)))
+        depth->write_serial = ++surface_writes_;
 
-    // Release texture bindings so render targets can be re-bound as outputs.
-    ID3D11ShaderResourceView* null_srv[32]{};
-    ctx_->PSSetShaderResources(0, 32, null_srv);
-    ctx_->VSSetShaderResources(0, 32, null_srv);
+    // Texture bindings stay in place: binding a surface as an output later unbinds it (and resets the cache).
 }
 
 void D3D11Renderer::Present(const PresentInfo& p) {
     std::lock_guard ctx_lock(ContextMutex());
     frame_counter_++;
+    if (g_profile && frame_counter_ % 150 == 0) {
+        std::string line;
+        for (int i = 0; i < kProfCount; i++)
+            line += fmt::format(" {} {:.2f}", kProfNames[i], g_prof_ns[i] / 150e6);
+        static u64 last_reuploads = 0;
+        LOG_INFO("Profile", "per frame (ms):{} | draws {} vb {:.1f} MB cb {:.1f} MB indices {}k | tex reuploads {:.1f} geom {}/{}",
+                 line, g_prof_draws / 150, g_prof_vb_bytes / 150 / 1048576.0, g_prof_cb_bytes / 150 / 1048576.0,
+                 g_prof_ib_count / 150 / 1000, (textures_->reuploads - last_reuploads) / 150.0, index_cache_.size(),
+                 vertex_cache_.size());
+        last_reuploads = textures_->reuploads;
+        static u64 last_uploads = 0;
+        LOG_INFO("Profile", "  textures: {} lookups/frame, Get {:.2f} ms, samplers {:.2f} ms, uploads {:.1f}/frame",
+                 g_prof_tex_calls / 150, g_prof_tex_get_ns / 150e6, g_prof_tex_samp_ns / 150e6,
+                 (textures_->uploads - last_uploads) / 150.0);
+        last_uploads = textures_->uploads;
+        g_prof_tex_get_ns = g_prof_tex_samp_ns = g_prof_tex_calls = 0;
+        std::memset(g_prof_ns, 0, sizeof(g_prof_ns));
+        g_prof_vb_bytes = g_prof_cb_bytes = g_prof_ib_count = g_prof_draws = 0;
+    }
+    // Copy this frame's compute results back (applied to guest memory once the copies land, a frame or so later;
+    // host-side reads of that memory force it earlier via SyncGuest).
+    if (gpu_dirty_any_) {
+        for (auto& b : gbufs_)
+            if (b->gpu_dirty)
+                QueueReadback(*b);
+        gpu_dirty_any_ = false;
+    }
+    PollReadbacks(false);
+    std::erase_if(gbufs_, [&](auto& b) { return !b->in_flight && frame_counter_ - b->last_use > 600; });
+    for (auto* cache : {&index_cache_, &vertex_cache_})
+        std::erase_if(*cache, [&](auto& kv) {
+            const u64 idle = frame_counter_ - kv.second.last_use;
+            return idle > 600 || (!kv.second.buf && !kv.second.streaming && idle > 2);
+        });
     {
         // D3D debug layer messages (only present when MUA3_D3D_DEBUG is set)
         ComPtr<ID3D11InfoQueue> q;
@@ -1680,7 +2276,7 @@ void D3D11Renderer::Present(const PresentInfo& p) {
                 continue;
             if (sf->depth) // depth-stencil copies must be whole-resource; read the full copy instead
                 continue;
-            const D3D11_BOX box{r.x, r.y, 0, r.x + 1, r.y + 1, 1};
+            const D3D11_BOX box{r.x * sf->scale, r.y * sf->scale, 0, r.x * sf->scale + 1, r.y * sf->scale + 1, 1};
             ctx_->CopySubresourceRegion(st.Get(), 0, 0, 0, 0, sf->tex.Get(), 0, &box);
             D3D11_MAPPED_SUBRESOURCE mp;
             if (SUCCEEDED(ctx_->Map(st.Get(), 0, D3D11_MAP_READ, 0, &mp))) {
@@ -1717,7 +2313,7 @@ void D3D11Renderer::Present(const PresentInfo& p) {
     if (s) {
         D3D11_TEXTURE2D_DESC desc;
         s->tex->GetDesc(&desc);
-        if (!frame_tex_ || frame_w_ != s->width || frame_h_ != s->height) {
+        if (!frame_tex_ || frame_w_ != s->width * s->scale || frame_h_ != s->height * s->scale) {
             frame_tex_.Reset();
             frame_srv_.Reset();
             D3D11_TEXTURE2D_DESC td = desc;
@@ -1728,10 +2324,11 @@ void D3D11Renderer::Present(const PresentInfo& p) {
             sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
             sv.Texture2D.MipLevels = 1;
             dev_->CreateShaderResourceView(frame_tex_.Get(), &sv, &frame_srv_);
-            frame_w_ = s->width;
-            frame_h_ = s->height;
+            frame_w_ = s->width * s->scale;
+            frame_h_ = s->height * s->scale;
         }
         ctx_->CopyResource(frame_tex_.Get(), s->tex.Get());
+        SetEvent(static_cast<HANDLE>(new_frame_event_));
     }
     ctx_->Flush();
 }
@@ -1740,6 +2337,7 @@ void D3D11Renderer::Present(const PresentInfo& p) {
 void D3D11Renderer::DumpSurface(Surface* s, const fs::path& path) {
     D3D11_TEXTURE2D_DESC td;
     s->tex->GetDesc(&td);
+    const u32 dump_w = td.Width, dump_h = td.Height; // host size (resolution scaling)
     td.Usage = D3D11_USAGE_STAGING;
     td.BindFlags = 0;
     td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -1750,15 +2348,15 @@ void D3D11Renderer::DumpSurface(Surface* s, const fs::path& path) {
     D3D11_MAPPED_SUBRESOURCE m;
     if (FAILED(ctx_->Map(st.Get(), 0, D3D11_MAP_READ, 0, &m)))
         return;
-    std::vector<u8> bgr(size_t(s->width) * s->height * 3);
+    std::vector<u8> bgr(size_t(dump_w) * dump_h * 3);
     auto f16 = [](u16 h) {
         const u32 e = (h >> 10) & 0x1F, mnt = h & 0x3FF;
         float v = e == 0 ? mnt / 1024.0f / 16384.0f : std::ldexp(1.0f + mnt / 1024.0f, int(e) - 15);
         return (h & 0x8000) ? -v : v;
     };
-    for (u32 y = 0; y < s->height; y++) {
+    for (u32 y = 0; y < dump_h; y++) {
         const u8* row = static_cast<const u8*>(m.pData) + size_t(y) * m.RowPitch;
-        for (u32 x = 0; x < s->width; x++) {
+        for (u32 x = 0; x < dump_w; x++) {
             float r = 0, g = 0, b = 0;
             switch (s->dxgi) {
             case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
@@ -1778,25 +2376,25 @@ void D3D11Renderer::DumpSurface(Surface* s, const fs::path& path) {
             }
             default: r = row[x * 4] / 255.f; break;
             }
-            u8* o = &bgr[(size_t(s->height - 1 - y) * s->width + x) * 3];
+            u8* o = &bgr[(size_t(dump_h - 1 - y) * dump_w + x) * 3];
             o[0] = u8(std::clamp(b, 0.f, 1.f) * 255), o[1] = u8(std::clamp(g, 0.f, 1.f) * 255),
             o[2] = u8(std::clamp(r, 0.f, 1.f) * 255);
         }
     }
     ctx_->Unmap(st.Get(), 0);
-    const u32 row_size = (s->width * 3 + 3) & ~3u;
-    std::vector<u8> file(54 + size_t(row_size) * s->height);
+    const u32 row_size = (dump_w * 3 + 3) & ~3u;
+    std::vector<u8> file(54 + size_t(row_size) * dump_h);
     auto put32 = [&](size_t o, u32 v) { std::memcpy(&file[o], &v, 4); };
     file[0] = 'B', file[1] = 'M';
-    put32(2, u32(file.size())), put32(10, 54), put32(14, 40), put32(18, s->width), put32(22, s->height);
+    put32(2, u32(file.size())), put32(10, 54), put32(14, 40), put32(18, dump_w), put32(22, dump_h);
     file[26] = 1, file[28] = 24;
-    for (u32 y = 0; y < s->height; y++)
-        std::memcpy(&file[54 + size_t(y) * row_size], &bgr[size_t(y) * s->width * 3], size_t(s->width) * 3);
+    for (u32 y = 0; y < dump_h; y++)
+        std::memcpy(&file[54 + size_t(y) * row_size], &bgr[size_t(y) * dump_w * 3], size_t(dump_w) * 3);
     common::WriteFile(path, file);
 }
 
 void D3D11Renderer::NoteTexture(ID3D11ShaderResourceView* srv, u64 addr, u32 w, u32 h, u32 fmt, bool rt) {
-    if (!srv)
+    if (!srv || frame_counter_ - recent_wanted_ > 120) // only while the overlay's texture viewer is reading them
         return;
     std::lock_guard lk(recent_mutex_);
     for (auto& r : recent_)

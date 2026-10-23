@@ -40,6 +40,7 @@ struct CachedTexture {
     ComPtr<ID3D11Resource> res;
     ComPtr<ID3D11ShaderResourceView> srv;
     u64 last_use = 0;
+    bool updatable = false; // DEFAULT usage: rewrites are decoded into it in place
 };
 
 class TextureCache {
@@ -50,18 +51,20 @@ public:
     ID3D11SamplerState* GetSampler(const u32* tsc, bool compare);
     void Invalidate(u64 gpu_va, u64 size);
     void NextFrame() { frame_++; }
-    u64 reuploads = 0;
+    u64 reuploads = 0, uploads = 0;
 
 private:
-    ID3D11ShaderResourceView* Upload(const TicEntry& tic, const shader::TextureUse& use, u64 key);
+    // `reuse`: decode into this existing (updatable) texture; `updatable`: create with DEFAULT usage.
+    ID3D11ShaderResourceView* Upload(const TicEntry& tic, const shader::TextureUse& use, u64 key, CachedTexture* reuse = nullptr,
+                                     bool updatable = false);
     ID3D11Device* dev_;
     ID3D11DeviceContext* ctx_;
     D3D11Renderer& r_;
-    std::unordered_map<u64, std::unique_ptr<CachedTexture>> textures_;
-    std::unordered_map<u64, int> pages_; // 64 KB GPU pages covered by cached textures -> texture count
+    common::U64Map<std::unique_ptr<CachedTexture>> textures_;
+    common::U64Map<int> pages_; // 64 KB GPU pages covered by cached textures -> texture count
     void TrackPages(const CachedTexture& t, int delta);
-    void Erase(std::unordered_map<u64, std::unique_ptr<CachedTexture>>::iterator& it);
-    std::unordered_map<u64, ComPtr<ID3D11SamplerState>> samplers_;
+    void Erase(common::U64Map<std::unique_ptr<CachedTexture>>::iterator& it);
+    common::U64Map<ComPtr<ID3D11SamplerState>> samplers_;
     ID3D11ShaderResourceView* Fallback(const shader::TextureUse& use);
     ComPtr<ID3D11ShaderResourceView> fallback_;
     ComPtr<ID3D11ShaderResourceView> fallbacks_[5]; // 2D, 3D, cube, 2D array, buffer

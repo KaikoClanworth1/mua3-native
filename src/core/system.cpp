@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <map>
 
+#include "core/game_patches.h"
 #include "core/hle/service.h"
 #include "core/kernel/kernel.h"
 #include "core/memory.h"
@@ -132,6 +133,7 @@ bool System::Load(std::string& error) {
             return false;
         }
         memory_->WriteBlock(addr, img->image.data(), size);
+        ApplyGamePatches(*memory_, name, addr, img->module_id, cfg_);
         memory_->SetState(addr + img->text_off, common::AlignUp(img->text_size, 0x1000), MS_Code, MP_RX);
         memory_->SetState(addr + img->ro_off, common::AlignUp(img->ro_size, 0x1000), MS_Code, MP_R);
         memory_->SetState(addr + img->data_off, size - img->data_off, MS_CodeData, MP_RW);

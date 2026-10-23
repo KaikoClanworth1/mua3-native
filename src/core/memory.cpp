@@ -23,7 +23,8 @@ Memory::Memory() {
         PANIC("Failed to reserve {} GB of address space for the guest", layout::kSpaceEnd >> 30);
     page_bits_ = std::vector<std::atomic<u64>>(size_t(layout::kSpaceEnd >> 12 >> 6));
     tracked_bits_ = std::vector<std::atomic<u64>>(page_bits_.size());
-    dirty_bits_ = std::vector<std::atomic<u64>>(page_bits_.size());
+    for (auto& d : dirty_bits_)
+        d = std::vector<std::atomic<u64>>(page_bits_.size());
     g_tracking_memory = this;
     AddVectoredExceptionHandler(1, WriteTrackingHandler);
     LOG_INFO("Memory", "Guest address space reserved at host {:p}", (void*)base_);
@@ -42,14 +43,15 @@ bool Memory::HandleWriteFault(uintptr_t host_addr) {
         VirtualQuery(base_ + (page << 12), &mbi, sizeof(mbi));
         return mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_READWRITE);
     }
-    dirty_bits_[size_t(page >> 6)].fetch_or(bit);
+    for (auto& d : dirty_bits_)
+        d[size_t(page >> 6)].fetch_or(bit);
     DWORD old;
     VirtualProtect(base_ + (page << 12), 0x1000, PAGE_READWRITE, &old);
     tw.fetch_and(~bit);
     return true;
 }
 
-void Memory::TrackWrites(u64 addr, u64 size) {
+void Memory::TrackWrites(u64 addr, u64 size, u32 channel) {
     if (!size || !IsValid(addr, size))
         return;
     std::lock_guard lk(track_mutex_);
@@ -60,7 +62,7 @@ void Memory::TrackWrites(u64 addr, u64 size) {
         bool need = false;
         if (p <= last) {
             const u64 bit = 1ull << (p & 63);
-            dirty_bits_[size_t(p >> 6)].fetch_and(~bit);
+            dirty_bits_[channel][size_t(p >> 6)].fetch_and(~bit);
             need = !(tracked_bits_[size_t(p >> 6)].fetch_or(bit) & bit);
         }
         if (need && !in_run) {
@@ -74,16 +76,21 @@ void Memory::TrackWrites(u64 addr, u64 size) {
     }
 }
 
-bool Memory::ConsumeDirty(u64 addr, u64 size) {
+bool Memory::ConsumeDirty(u64 addr, u64 size, u32 channel) {
     if (!size)
         return false;
-    bool dirty = false;
-    for (u64 p = addr >> 12, e = (addr + size - 1) >> 12; p <= e; p++) {
-        const u64 bit = 1ull << (p & 63);
-        if (dirty_bits_[size_t(p >> 6)].load(std::memory_order_relaxed) & bit)
-            dirty = true;
+    // 64 pages per word: mask the first and last words of the range.
+    const u64 first = addr >> 12, last = (addr + size - 1) >> 12;
+    for (u64 w = first >> 6; w <= last >> 6; w++) {
+        u64 mask = ~0ull;
+        if (w == first >> 6)
+            mask &= ~0ull << (first & 63);
+        if (w == last >> 6)
+            mask &= ~0ull >> (63 - (last & 63));
+        if (dirty_bits_[channel][size_t(w)].load(std::memory_order_relaxed) & mask)
+            return true;
     }
-    return dirty;
+    return false;
 }
 
 void Memory::MarkPages(u64 addr, u64 size, bool committed) {
@@ -169,7 +176,8 @@ bool Memory::Unmap(u64 addr, u64 size) {
     for (u64 p = addr >> 12, e = (addr + size + 0xFFF) >> 12; p < e; p++) {
         const u64 bit = 1ull << (p & 63);
         tracked_bits_[size_t(p >> 6)].fetch_and(~bit);
-        dirty_bits_[size_t(p >> 6)].fetch_and(~bit);
+        for (auto& d : dirty_bits_)
+            d[size_t(p >> 6)].fetch_and(~bit);
     }
     VirtualFree(base_ + addr, size, MEM_DECOMMIT);
     Insert(addr, size, MS_Free, MP_None, 0);

@@ -1,5 +1,8 @@
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <map>
+#include <mutex>
 #include <thread>
 
 #include <windows.h>
@@ -57,6 +60,31 @@ void Kernel::SvcDispatch(Thread* t, u32 id) {
     auto W = [&](int i, u64 v) { c.SetReg(i, v); };
     auto Ret = [&](Result r) { W(0, r); };
     Memory& m = mem_;
+
+    // MUA3_SVC_STATS: which call sites sleep or wait with a timeout, and how long (finding the frame limiter).
+    static const bool svc_stats = std::getenv("MUA3_SVC_STATS") != nullptr;
+    if (svc_stats && (id == 0x0B || id == 0x18 || id == 0x1C || id == 0x34)) {
+        struct Stat {
+            u64 count = 0;
+            s64 last_timeout = 0;
+        };
+        static std::mutex stats_mutex;
+        static std::map<std::pair<u32, u64>, Stat> stats;
+        static auto t0 = std::chrono::steady_clock::now();
+        const s64 timeout = id == 0x0B ? s64(R(0)) : s64(R(3));
+        std::lock_guard sl(stats_mutex);
+        auto& st = stats[{id, R(30)}];
+        st.count++;
+        st.last_timeout = timeout;
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(5)) {
+            t0 = std::chrono::steady_clock::now();
+            for (auto& [k, v] : stats)
+                if (v.count >= 50)
+                    LOG_INFO("SvcStats", "svc {:#x} lr {:#x}: {} calls / 5 s, last timeout {} ns", k.first, k.second, v.count,
+                             v.last_timeout);
+            stats.clear();
+        }
+    }
 
     switch (id) {
     case 0x01: { // SetHeapSize

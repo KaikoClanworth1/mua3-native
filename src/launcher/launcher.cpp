@@ -178,8 +178,8 @@ void PlayTab(LauncherState& st) {
     }
     ImGui::BeginChild("play", ImVec2(0, 150), ImGuiChildFlags_Borders);
     ImGui::Text("Resolution: %d x %d %s", st.cfg.width, st.cfg.height, st.cfg.fullscreen ? "(fullscreen)" : "(windowed)");
-    ImGui::Text("Mode: %s   VSync: %s   FPS limit: %d", st.cfg.docked ? "Docked" : "Handheld",
-                st.cfg.vsync ? "on" : "off", st.cfg.fps_limit);
+    ImGui::Text("Mode: %s   VSync: %s   Frame rate: %d   FPS limit: %d", st.cfg.docked ? "Docked" : "Handheld",
+                st.cfg.vsync ? "on" : "off", st.cfg.fps_target, st.cfg.fps_limit);
     const char* audio[] = {"XAudio2", "SDL", "None"};
     const char* input[] = {"XInput", "SDL"};
     ImGui::Text("Audio: %s   Input: %s", audio[int(st.cfg.audio)], input[int(st.cfg.input)]);
@@ -276,6 +276,16 @@ void SettingsTab(LauncherState& st) {
         ImGui::Checkbox("VSync", &c.vsync);
         ImGui::SliderInt("Internal resolution scale", &c.resolution_scale, 1, 4, "%dx");
         ImGui::SliderInt("FPS limit (0 = off)", &c.fps_limit, 0, 240);
+        {
+            const int rates[] = {30, 60, 120, 144};
+            int cur = 1;
+            for (int i = 0; i < 4; i++)
+                if (c.fps_target == rates[i])
+                    cur = i;
+            const char* names[] = {"30 (original)", "60", "120 (experimental)", "144 (experimental)"};
+            if (ImGui::Combo("Game frame rate", &cur, names, 4))
+                c.fps_target = rates[cur];
+        }
         ImGui::Checkbox("Show FPS", &c.show_fps);
         ImGui::SameLine();
         ImGui::Checkbox("Debug overlay (F1)", &c.show_debug_overlay);

@@ -51,6 +51,8 @@ bool Config::Load(const fs::path& ini) {
     get_b("vsync", vsync);
     get_i("resolution_scale", resolution_scale);
     get_i("fps_limit", fps_limit);
+    get_i("fps_target", fps_target);
+    get_i("swap_interval", swap_interval);
     get_b("show_fps", show_fps);
     get_b("show_debug_overlay", show_debug_overlay);
     int a = int(audio), in = int(input);
@@ -77,7 +79,7 @@ bool Config::Save(const fs::path& ini) const {
       << "[video]\n"
       << "width=" << width << "\nheight=" << height << "\nfullscreen=" << fullscreen
       << "\nborderless=" << borderless << "\nvsync=" << vsync << "\nresolution_scale=" << resolution_scale
-      << "\nfps_limit=" << fps_limit << "\nshow_fps=" << show_fps << "\nshow_debug_overlay=" << show_debug_overlay
+      << "\nfps_limit=" << fps_limit << "\nfps_target=" << fps_target << "\nswap_interval=" << swap_interval << "\nshow_fps=" << show_fps << "\nshow_debug_overlay=" << show_debug_overlay
       << "\n[audio]\naudio_backend=" << int(audio) << "\nvolume=" << volume << "\n[input]\ninput_backend="
       << int(input) << "\n[system]\ndocked=" << docked << "\nlanguage=" << language << "\nlog_level=" << log_level
       << "\n";

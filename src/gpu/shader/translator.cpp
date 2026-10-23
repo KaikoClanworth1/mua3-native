@@ -310,6 +310,7 @@ private:
     std::map<u32, u32> tex_slot_of_; // cbuf offset -> slot
     std::set<u32> vs_inputs_, out_attrs_, in_attrs_;
     bool uses_lmem_ = false, uses_smem_ = false, uses_gmem_ = false, uses_frag_coord_ = false, uses_front_face_ = false;
+    bool gmem_written_ = false;
     // Atomic op (Maxwell order: ADD MIN MAX INC DEC AND OR XOR EXCH) on `dst`; `orig` receives the old value.
     std::string AtomicOp(u32 aop, const std::string& dst, const std::string& v, const std::string& orig) {
         switch (aop) {
@@ -559,17 +560,17 @@ void Translator::TexSample(u64 insn, u32 pc, Op op) {
             load = fmt::format("tex{}.Load(int({}))", slot, R(ra)); break;
         case 2: // 2D, LOD 0, x in ra and y in rb (shaders put them in neighbouring registers)
             slot = TexSlot(cbuf_off, dim, false, false);
-            load = fmt::format("tex{}.Load(int3(int({}), int({}), 0))", slot, R(ra), R(rb)); break;
+            load = fmt::format("tex{0}.Load(int3(RsXY(int2(int({1}), int({2})), {0}u), 0))", slot, R(ra), R(rb)); break;
         case 4: slot = TexSlot(cbuf_off, dim, false, false);
-            load = fmt::format("tex{}.Load(int3(int({}), int({}), 0))", slot, R(ra), R(ra + 1)); break;
+            load = fmt::format("tex{0}.Load(int3(RsXY(int2(int({1}), int({2})), {0}u), 0))", slot, R(ra), R(ra + 1)); break;
         case 8: slot = TexSlot(cbuf_off, dim, false, false);
-            load = fmt::format("tex{}.Load(int3(int({}), int({}), 0))", slot, R(ra), R(ra + 1)); break;
+            load = fmt::format("tex{0}.Load(int3(RsXY(int2(int({1}), int({2})), {0}u), 0))", slot, R(ra), R(ra + 1)); break;
         case 10: dim = TexDim::Tex3D; slot = TexSlot(cbuf_off, dim, false, false);
             load = fmt::format("tex{}.Load(int4(int({}), int({}), int({}), 0))", slot, R(ra), R(ra + 1), R(rb)); break;
         case 12: slot = TexSlot(cbuf_off, dim, false, false);
-            load = fmt::format("tex{}.Load(int3(int({}), int({}), int({})))", slot, R(ra), R(ra + 1), R(rb)); break;
+            load = fmt::format("tex{0}.Load(int3(RsXY(int2(int({1}), int({2})), {0}u), int({3})))", slot, R(ra), R(ra + 1), R(rb)); break;
         case 14: array = true; slot = TexSlot(cbuf_off, dim, true, false);
-            load = fmt::format("tex{}.Load(int4(int({}), int({}), int({}), 0))", slot, R(ra + 1), R(rb), R(ra)); break;
+            load = fmt::format("tex{0}.Load(int4(RsXY(int2(int({1}), int({2})), {0}u), int({3}), 0))", slot, R(ra + 1), R(rb), R(ra)); break;
         default: Unimpl(op, pc, insn); return;
         }
         if (!Bit(insn, 59)) // bit 59 clear: half-precision results packed in pairs
@@ -609,6 +610,11 @@ void Translator::TexSample(u64 insn, u32 pc, Op op) {
         }
         const u32 slot = TexSlot(cbuf_off, dim, array, false);
         const u32 n = ncoord + (array ? 1 : 0) + 1;
+        if (dim == TexDim::Tex2D) { // render targets may be stored at a higher resolution (see RsXY)
+            coords = fmt::format("RsXY(int2(int({}), int({})), {}u)", R(c), R(c + 1), slot);
+            if (array)
+                coords += ", " + aidx;
+        }
         EmitTexWrites(mask, regs, fmt::format("tex{}.Load(int{}({}, {}))", slot, n, coords, lod), slot);
         return;
     }
@@ -686,8 +692,8 @@ void Translator::TexSample(u64 insn, u32 pc, Op op) {
         const u32 mask = u32(Bits(insn, 31, 4));
         const u32 slot = TexSlot(cbuf_off, TexDim::Tex2D, false, false);
         if (query == 1) { // dimensions
-            Line(fmt::format("tex{}.GetDimensions({}, tmpu.x, tmpu.y, tmpu.w); tmpu.z = 1u;", slot,
-                             ra == RZ ? "0u" : R(ra)));
+            Line(fmt::format("tex{0}.GetDimensions({1}, tmpu.x, tmpu.y, tmpu.w); tmpu.z = 1u; tmpu.xy /= max(tex_swizzle[{0}].y, 1u);",
+                             slot, ra == RZ ? "0u" : R(ra)));
             static const char* cs = "xyzw";
             u32 r = d;
             for (u32 i = 0; i < 4; i++)
@@ -1750,6 +1756,7 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
         for (u32 c = 0; c < 4; c++)
             if (mask & (1u << c))
                 v[c] = R(reg == RZ ? RZ : reg++);
+        gmem_written_ = true;
         Line(fmt::format("ImageStore({}u, {}, {}, {}, uint4({}, {}, {}, {}), {}u);", k, x, y, z, v[0], v[1], v[2], v[3], mask));
         return;
     }
@@ -1859,6 +1866,7 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
         const u32 size = u32(Bits(insn, 20, 3));
         if (size != 0 && size != 1)
             res_.unimplemented.insert(fmt::format("RED_size{}", size));
+        gmem_written_ = true;
         Line(fmt::format("GmemAtomic({}u, tmpu.x, tmpu.y, {});", u32(Bits(insn, 23, 3)), R(d)));
         return;
     }
@@ -1889,6 +1897,7 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
                 for (u32 i = 0; i < words; i++)
                     SetR(d == RZ ? RZ : d + i, fmt::format("tmpu4_[{}]", i));
             } else {
+                gmem_written_ = true;
                 for (u32 i = 0; i < words; i++)
                     Line(fmt::format("GmemStore(tmpu.x + {}u, tmpu.y, {});", i * 4, R(d == RZ ? RZ : d + i)));
             }
@@ -1898,6 +1907,7 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
         const u32 asize = u32(Bits(insn, 49, 3));
         if (asize != 0 && asize != 1)
             res_.unimplemented.insert(fmt::format("{}_size{}", OpName(op), asize));
+        gmem_written_ = true;
         Line(fmt::format("tmpu.z = GmemAtomic({}u, tmpu.x, tmpu.y, {});", aop, R(u32(Bits(insn, 20, 8)))));
         if (op == Op::ATOM)
             SetR(d, "tmpu.z");
@@ -2106,14 +2116,21 @@ void Translator::EmitPrologue(std::string& head) {
     head += R"(
 #pragma warning(disable : 3557 3550 4000 3570 4121 3078 3206)
 cbuffer Driver : register(b13) {
-    float4 drv_viewport;     // x: y flip (1/-1), y: depth scale, z: depth bias, w: unused
+    float4 drv_viewport;     // x: y flip (1/-1), y: depth scale, z: depth bias, w: render scale of the bound targets
     uint4 drv_attrib[32];    // x: format register, y: unused
     uint4 drv_vbuf[16];      // x: stride, y: divisor, z: byte offset in vball (~0 = disabled), w: first element uploaded
-    uint4 tex_swizzle[32];   // x: packed swizzle
+    uint4 tex_swizzle[32];   // x: packed swizzle, y: resolution scale of a render-target texture (0/1: none)
     uint4 drv_misc;          // x: base instance, y: alpha test func, z: alpha ref (float bits), w: alpha test enable
     uint4 drv_gmem[8];       // compute global memory windows: x base lo, y base hi, z size
     uint4 drv_image[8];      // compute images (SUST): base, size and layout (see ImageStore)
 };
+// Resolution scaling: render targets may be stored N times larger than the guest sees them. Texel fetches scale
+// their coordinates and keep the pixel's position inside the N x N block (rs_sub, set from SV_Position).
+static int2 rs_sub = int2(0, 0);
+int2 RsXY(int2 c, uint slot) {
+    const uint s = tex_swizzle[slot].y;
+    return s > 1u ? c * int(s) + min(rs_sub, int2(int(s) - 1, int(s) - 1)) : c;
+}
 float2 H2(uint v) { return float2(f16tof32(v & 0xFFFFu), f16tof32(v >> 16)); }
 uint P2(float2 v) { return f32tof16(v.x) | (f32tof16(v.y) << 16); }
 float4 ApplySwizzle(float4 v, uint s) {
@@ -2718,7 +2735,9 @@ bool Translator::Run() {
             src += fmt::format("static float4 in_attr{};\n", i);
         src += "void Run() {\n" + body + "}\n";
         src += "PSOut main(PSIn i) {\n";
-        src += "    frag_coord = i.pos; frag_coord.w = 1.0f / i.pos.w; front_face = i.front;\n";
+        src += "    frag_coord = i.pos; frag_coord.w = 1.0f / i.pos.w; front_face = i.front;\n"
+               "    if (drv_viewport.w > 1.0f) { frag_coord.xy = i.pos.xy / drv_viewport.w;"
+               " rs_sub = int2(i.pos.xy) - int2(frag_coord.xy) * int(drv_viewport.w); }\n";
         for (u32 a : in_attrs_)
             src += fmt::format("    in_attr{0} = i.a{0};\n", a);
         src += "    Run();\n";
@@ -2738,6 +2757,7 @@ bool Translator::Run() {
         src += decls;
         if (uses_gmem_) {
             res_.uses_gmem = true;
+            res_.writes_gmem = gmem_written_;
             // Guest global memory: up to kGmemWindows storage buffers (NVN's c0 table), each a raw UAV whose
             // guest address range is in drv_gmem[i] (x: base lo, y: base hi, z: size in bytes).
             for (u32 i = 0; i < kGmemWindows; i++)

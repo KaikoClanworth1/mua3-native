@@ -1,9 +1,13 @@
 // nvdrv: /dev/nvmap, nvhost-as-gpu, nvhost-gpu, nvhost-ctrl, nvhost-ctrl-gpu.
 #include <map>
+#include <mutex>
 #include <unordered_map>
 
 #include "core/hle/nvmap.h"
 #include "core/hle/service.h"
+#include "core/hle/video_output.h"
+#include "core/memory.h"
+#include "core/system.h"
 #include "gpu/gpu.h"
 
 namespace hle {
@@ -436,11 +440,107 @@ struct CtrlGpuDev final : Device {
 };
 
 // Host1x client engines (nvhost-nvdec, nvhost-vic, nvhost-nvjpg): command submission with syncpoint fences.
-// Work completes immediately; decoded output is not produced yet (video frames stay black).
+// Buffers mapped for the engines get 32-bit device addresses (IOVAs) that their command streams refer to. NVDEC
+// work is not decoded here (video::VideoOutput decodes the movie file on the host instead); VIC executes write the
+// current movie frame into the output surface the command stream describes.
+struct Iommu {
+    std::mutex mutex;
+    std::map<u32, std::pair<u64, u32>> maps; // iova -> {cpu address, size}
+    std::unordered_map<u32, u32> by_handle;  // nvmap handle -> iova
+    u32 next = 0x10000000;
+    u32 MapHandle(u32 handle) {
+        std::lock_guard lk(mutex);
+        if (auto it = by_handle.find(handle); it != by_handle.end())
+            return it->second;
+        auto o = Map().Get(handle);
+        if (!o || !o->addr)
+            return 0;
+        const u32 iova = next;
+        next += u32(common::AlignUp(std::max<u32>(o->size, 0x1000), 0x10000));
+        maps[iova] = {o->addr, o->size};
+        by_handle[handle] = iova;
+        return iova;
+    }
+    u64 Translate(u64 iova) {
+        std::lock_guard lk(mutex);
+        auto it = maps.upper_bound(u32(iova));
+        if (it == maps.begin())
+            return 0;
+        --it;
+        if (iova - it->first >= it->second.second)
+            return 0;
+        return it->second.first + (iova - it->first);
+    }
+};
+Iommu& Mmu() {
+    static Iommu m;
+    return m;
+}
+
 struct Host1xDev final : Device {
     explicit Host1xDev(u32 sp) : syncpt(sp) {}
     u32 syncpt;
     std::shared_ptr<kernel::Event> event = MakeEvent("host1x", true);
+    // THI method interface: METHOD_OFFSET (reg 0x10) selects an engine method, METHOD_DATA (0x11) writes it.
+    u32 method = 0;
+    video::VicState vic;
+
+    void EngineMethod(u32 m, u32 data) {
+        if (name != "/dev/nvhost-vic")
+            return;
+        switch (m) {
+        case 0xC0: // Execute
+            video::VicExecute(vic, [](u64 iova) { return Mmu().Translate(iova); });
+            break;
+        case 0x1C2: vic.config = u64(data) << 8; break;   // SetConfigStructOffset
+        case 0x1C8: vic.luma = u64(data) << 8; break;     // SetOutputSurfaceLumaOffset
+        case 0x1C9: vic.chroma = u64(data) << 8; break;   // SetOutputSurfaceChromaOffset
+        default: break;
+        }
+        static int logged = 0;
+        if (logged < 64) {
+            logged++;
+            LOG_INFO("nvdrv", "{}: method {:#x} = {:#x}", name, m, data);
+        }
+    }
+    void Register(u32 reg, u32 data) {
+        if (reg == 0x10)
+            method = data;
+        else if (reg == 0x11)
+            EngineMethod(method, data);
+    }
+    // Host1x command stream (SETCLASS / INCR / NONINCR / MASK / IMM opcodes).
+    void ProcessCommands(const u32* w, u32 n) {
+        for (u32 i = 0; i < n;) {
+            const u32 word = w[i++];
+            const u32 op = word >> 28, off = (word >> 16) & 0xFFF;
+            switch (op) {
+            case 0: // SETCLASS: offset, class, mask of registers following
+                for (u32 b = 0; b < 6; b++)
+                    if ((word >> b) & 1 && i < n)
+                        Register(off + b, w[i++]);
+                break;
+            case 1: // INCR
+                for (u32 k = 0; k < (word & 0xFFFF) && i < n; k++)
+                    Register(off + k, w[i++]);
+                break;
+            case 2: // NONINCR
+                for (u32 k = 0; k < (word & 0xFFFF) && i < n; k++)
+                    Register(off, w[i++]);
+                break;
+            case 3: // MASK
+                for (u32 b = 0; b < 16; b++)
+                    if ((word >> b) & 1 && i < n)
+                        Register(off + b, w[i++]);
+                break;
+            case 4: // IMM
+                Register(off, word & 0xFFFF);
+                break;
+            default:
+                break;
+            }
+        }
+    }
 
     u32 Ioctl(u32 cmd, std::vector<u8>& in, std::vector<u8>& out) override {
         out = in;
@@ -451,6 +551,17 @@ struct Host1xDev final : Device {
         case 0x01: { // SUBMIT {cmdbuf_count, reloc_count, syncpt_count, fence_count} + arrays
             const u32 ncmd = Arg<u32>(in, 0), nreloc = Arg<u32>(in, 4), nsync = Arg<u32>(in, 8),
                       nfence = Arg<u32>(in, 12);
+            for (u32 c = 0; c < ncmd; c++) { // cmdbufs {nvmap handle, offset, words}
+                const u32 handle = Arg<u32>(in, 16 + c * 12), offset = Arg<u32>(in, 20 + c * 12),
+                          words = Arg<u32>(in, 24 + c * 12);
+                auto o = Map().Get(handle);
+                auto& mem = core::Sys().Mem();
+                if (!o || !o->addr || !words || !mem.IsValid(o->addr + offset, u64(words) * 4))
+                    continue;
+                std::vector<u32> buf(words);
+                mem.ReadBlock(o->addr + offset, buf.data(), buf.size() * 4);
+                ProcessCommands(buf.data(), words);
+            }
             size_t off = 16 + size_t(ncmd) * 12 + size_t(nreloc) * 16 + size_t(nreloc) * 4;
             const size_t sync_off = off;
             off += size_t(nsync) * 20;
@@ -482,10 +593,7 @@ struct Host1xDev final : Device {
             const u32 n = Arg<u32>(in, 0);
             for (u32 i = 0; i < n; i++) {
                 const u32 handle = Arg<u32>(in, 12 + i * 8);
-                u32 addr = 0;
-                if ((cmd & 0xFF) == 0x09)
-                    if (auto o = Map().Get(handle))
-                        addr = u32(o->addr >> 8) | 1; // any stable non-zero device address
+                const u32 addr = (cmd & 0xFF) == 0x09 ? Mmu().MapHandle(handle) : 0;
                 Set<u32>(out, 12 + i * 8 + 4, addr);
             }
             return kSuccess;

@@ -39,6 +39,7 @@ private:
     };
     mutable std::mutex mutex_;
     std::map<u64, Mapping> maps_;
+    std::atomic<u64> generation_{1}; // bumped on every Map/Unmap: invalidates the per-thread lookup caches
     u64 next_ = 0x0400000000ull;
 };
 
@@ -57,6 +58,8 @@ public:
     Maxwell3D& M3D() { return m3d_; }
 
     void SetRenderer(Renderer* r);
+    // Native handle of the GPU command thread (profiling).
+    void* NativeThread() { return thread_.native_handle(); }
     Renderer* GetRenderer() const { return renderer_; }
 
     // ---- syncpoints

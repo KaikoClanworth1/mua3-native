@@ -1,5 +1,6 @@
 #include "gpu/d3d11/texture_cache.h"
 
+#include <map>
 #include <set>
 
 #include "core/memory.h"
@@ -33,7 +34,7 @@ void TextureCache::TrackPages(const CachedTexture& t, int delta) {
     }
 }
 
-void TextureCache::Erase(std::unordered_map<u64, std::unique_ptr<CachedTexture>>::iterator& it) {
+void TextureCache::Erase(common::U64Map<std::unique_ptr<CachedTexture>>::iterator& it) {
     TrackPages(*it->second, -1);
     it = textures_.erase(it);
 }
@@ -101,6 +102,13 @@ ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::T
     // Pack x/y/z/w component sources (3 bits each) for the shader's ApplySwizzle.
     swizzle = tic.Swizzle();
     const u64 addr = tic.Address();
+    if (use.dim == shader::TexDim::Buffer) {
+        // Texel buffer over compute output: read the resident GPU copy.
+        const TexFormatInfo fi = TicFormat(tic.Format(), tic.RType(), tic.Srgb());
+        if (auto* v = r_.ComputeBufferSrv(addr, u64(tic.Width()) * fi.bytes_per_block, fi.dxgi, fi.bytes_per_block))
+            return v;
+    }
+    r_.SyncGuest(addr, 1);
     if (use.dim == shader::TexDim::Tex3D) {
         static int n = 0;
         if (n++ < 4)
@@ -121,8 +129,8 @@ ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::T
         if (s->sub_w != w || s->sub_h != h) {
             D3D11_TEXTURE2D_DESC td;
             s->tex->GetDesc(&td);
-            td.Width = w;
-            td.Height = h;
+            td.Width = w * s->scale;
+            td.Height = h * s->scale;
             td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
             D3D11_SHADER_RESOURCE_VIEW_DESC sv;
             s->srv->GetDesc(&sv);
@@ -133,9 +141,13 @@ ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::T
                 return s->srv.Get();
             s->sub_w = w;
             s->sub_h = h;
+            s->sub_serial = 0;
         }
-        const D3D11_BOX box{0, 0, 0, w, h, 1};
-        ctx_->CopySubresourceRegion(s->sub_tex.Get(), 0, 0, 0, 0, s->tex.Get(), 0, &box);
+        if (s->sub_serial != s->write_serial) { // only when the target was written since the last copy
+            const D3D11_BOX box{0, 0, 0, w * s->scale, h * s->scale, 1};
+            ctx_->CopySubresourceRegion(s->sub_tex.Get(), 0, 0, 0, 0, s->tex.Get(), 0, &box);
+            s->sub_serial = s->write_serial;
+        }
         return s->sub_srv.Get();
     }
     const u64 key = Hash64(tic.w.data(), 32) ^ (u64(use.dim) << 56) ^ (u64(use.array) << 60);
@@ -150,14 +162,43 @@ ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::T
             return it->second->srv.Get();
         }
         reuploads++;
+        CachedTexture& t = *it->second;
+        D3D11_RESOURCE_DIMENSION dim{};
+        t.res->GetType(&dim);
+        if (dim == D3D11_RESOURCE_DIMENSION_BUFFER) { // linear texel buffer: refresh the bytes in place
+            D3D11_BUFFER_DESC bd;
+            static_cast<ID3D11Buffer*>(t.res.Get())->GetDesc(&bd);
+            static thread_local std::vector<u8> tmp;
+            tmp.assign(bd.ByteWidth, 0);
+            G().ReadGpuPartial(addr, tmp.data(), bd.ByteWidth);
+            ctx_->UpdateSubresource(t.res.Get(), 0, nullptr, tmp.data(), 0, 0);
+            for (auto& [a, n] : t.cpu_ranges)
+                G().Mem().TrackWrites(a, n);
+            t.last_use = frame_;
+            return t.srv.Get();
+        }
+        if (t.updatable)
+            if (auto* srv = Upload(tic, use, key, &t))
+                return srv;
+        // Rewritten once: re-create it updatable, so later rewrites update it in place.
         Erase(it);
+        auto* srv = Upload(tic, use, key, nullptr, true);
+        return srv ? srv : Fallback(use);
     }
     auto* srv = Upload(tic, use, key);
     return srv ? srv : Fallback(use);
 }
 
-ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader::TextureUse& use, u64 key) {
+ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader::TextureUse& use, u64 key, CachedTexture* reuse,
+                                               bool updatable) {
     const TexFormatInfo fi = TicFormat(tic.Format(), tic.RType(), tic.Srgb());
+    uploads++;
+    {
+        static std::map<u64, u32> seen;
+        if (seen.size() < 4096 && ++seen[tic.Address()] == 20)
+            LOG_INFO("Texture", "uploaded 20 times: {:#x} fmt {:#x} {}x{}x{} type {} dim {} (frame {})", tic.Address(), tic.Format(),
+                     tic.Width(), tic.Height(), tic.Depth(), tic.Type(), int(use.dim), frame_);
+    }
     if (fi.dxgi == DXGI_FORMAT_UNKNOWN) {
         static std::set<u32> warned;
         if (warned.insert(tic.Format()).second)
@@ -212,38 +253,72 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
         LOG_WARN("Texture", "Texture too large or empty ({} bytes)", total);
         return nullptr;
     }
-    std::vector<u8> guest(static_cast<size_t>(total));
-    G().ReadGpu(tic.Address(), guest.data(), guest.size());
+    // Read guest memory in place when it is contiguous (textures rewritten every frame make this a hot path).
+    const u8* guest = G().GpuPtr(tic.Address(), size_t(total));
+    static thread_local std::vector<u8> guest_copy;
+    if (!guest) {
+        if (guest_copy.size() < total)
+            guest_copy.resize(size_t(total));
+        G().ReadGpu(tic.Address(), guest_copy.data(), size_t(total));
+        guest = guest_copy.data();
+    }
 
-    // Decode every subresource
-    std::vector<std::vector<u8>> sub;
+    // Decode every subresource into reused scratch buffers (no per-upload allocation or zero fill).
+    struct Sub {
+        u8* data;
+        size_t size;
+    };
+    static thread_local std::vector<std::vector<u8>> pool;
+    std::vector<Sub> sub;
+    auto scratch = [&](size_t n) -> u8* {
+        const size_t i = sub.size();
+        if (pool.size() <= i)
+            pool.resize(i + 1);
+        if (pool[i].size() < n)
+            pool[i].resize(n);
+        sub.push_back({pool[i].data(), n});
+        return pool[i].data();
+    };
     std::vector<D3D11_SUBRESOURCE_DATA> init;
     const bool astc = fi.astc;
     for (u32 layer = 0; layer < layers; layer++) {
         for (u32 m = 0; m < mips; m++) {
             const Level& l = levels[m];
-            const u8* src = guest.data() + layer * layer_size + l.offset;
+            const u8* src = guest + layer * layer_size + l.offset;
             const u32 row = l.bw * bpb;
-            std::vector<u8> lin(size_t(row) * l.bh * l.d);
+            const size_t lin_size = size_t(row) * l.bh * l.d;
+            static thread_local std::vector<u8> astc_lin;
+            if (astc && astc_lin.size() < lin_size)
+                astc_lin.resize(lin_size);
+            u8* lin = astc ? astc_lin.data() : scratch(lin_size);
             if (block_linear)
-                Deswizzle(src, lin.data(), l.bw, l.bh, l.d, bpb, l.bhl, l.bdl, row);
+                Deswizzle(src, lin, l.bw, l.bh, l.d, bpb, l.bhl, l.bdl, row);
             else
                 for (u32 y = 0; y < l.bh * l.d; y++)
-                    std::memcpy(&lin[size_t(y) * row], src + size_t(y) * pitch(l), row);
+                    std::memcpy(lin + size_t(y) * row, src + size_t(y) * pitch(l), row);
             if (astc) {
-                std::vector<u8> rgba(size_t(l.w) * l.h * 4);
-                DecodeAstc(lin.data(), rgba.data(), l.w, l.h, fi.block_w, fi.block_h);
-                sub.push_back(std::move(rgba));
-                init.push_back({sub.back().data(), l.w * 4, l.w * l.h * 4});
+                u8* rgba = scratch(size_t(l.w) * l.h * 4);
+                DecodeAstc(lin, rgba, l.w, l.h, fi.block_w, fi.block_h);
+                init.push_back({rgba, l.w * 4, l.w * l.h * 4});
             } else {
-                sub.push_back(std::move(lin));
-                init.push_back({sub.back().data(), row, row * l.bh});
+                init.push_back({lin, row, row * l.bh});
             }
         }
     }
-    // D3D requires the init array pointers to stay valid; `sub` owns the storage.
+    // Rewritten texture we already re-created as updatable: decode straight into it.
+    if (reuse) {
+        for (size_t i = 0; i < init.size(); i++)
+            ctx_->UpdateSubresource(reuse->res.Get(), UINT(i), nullptr, init[i].pSysMem, init[i].SysMemPitch,
+                                    init[i].SysMemSlicePitch);
+        for (auto& [a, n] : reuse->cpu_ranges)
+            G().Mem().TrackWrites(a, n);
+        reuse->last_use = frame_;
+        return reuse->srv.Get();
+    }
+    const D3D11_USAGE usage = updatable ? D3D11_USAGE_DEFAULT : D3D11_USAGE_IMMUTABLE;
+    // The init array points into the thread-local scratch buffers (`sub`), valid until the next upload.
     for (size_t i = 0; i < init.size(); i++)
-        init[i].pSysMem = sub[i].data();
+        init[i].pSysMem = sub[i].data;
 
     auto tex = std::make_unique<CachedTexture>();
     tex->key = key;
@@ -256,8 +331,9 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
     if (use.dim == shader::TexDim::Buffer) {
         // Texel buffer: a typed D3D11 buffer over the first level's texels.
         const u32 elems = levels[0].bw;
-        D3D11_BUFFER_DESC bd{u32(sub[0].size()), D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE, 0, 0, 0};
-        const D3D11_SUBRESOURCE_DATA bdata{sub[0].data(), 0, 0};
+        // DEFAULT usage: texel buffers the CPU rewrites every frame are updated in place (see Get).
+        D3D11_BUFFER_DESC bd{u32(sub[0].size), D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0, 0};
+        const D3D11_SUBRESOURCE_DATA bdata{sub[0].data, 0, 0};
         ComPtr<ID3D11Buffer> b;
         hr = dev_->CreateBuffer(&bd, &bdata, &b);
         tex->res = b;
@@ -265,7 +341,7 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
         sv.Buffer.FirstElement = 0;
         sv.Buffer.NumElements = elems;
     } else if (type == 2 && use.dim == shader::TexDim::Tex3D) {
-        D3D11_TEXTURE3D_DESC td{width, height, depth, mips, fi.dxgi, D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+        D3D11_TEXTURE3D_DESC td{width, height, depth, mips, fi.dxgi, usage, D3D11_BIND_SHADER_RESOURCE, 0, 0};
         ComPtr<ID3D11Texture3D> t;
         hr = dev_->CreateTexture3D(&td, init.data(), &t);
         tex->res = t;
@@ -276,7 +352,7 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
         if (width > D3D11_REQ_TEXTURE1D_U_DIMENSION)
             LOG_WARN("Texture", "1D texture of {} texels exceeds the D3D11 limit; truncated", width);
         D3D11_TEXTURE1D_DESC td{std::min<u32>(width, D3D11_REQ_TEXTURE1D_U_DIMENSION), mips, layers, fi.dxgi,
-                                D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+                                usage, D3D11_BIND_SHADER_RESOURCE, 0, 0};
         ComPtr<ID3D11Texture1D> t;
         hr = dev_->CreateTexture1D(&td, init.data(), &t);
         tex->res = t;
@@ -289,7 +365,7 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
         }
     } else {
         const bool cube = use.dim == shader::TexDim::Cube && layers % 6 == 0;
-        D3D11_TEXTURE2D_DESC td{width, height, mips, layers, fi.dxgi, {1, 0}, D3D11_USAGE_IMMUTABLE,
+        D3D11_TEXTURE2D_DESC td{width, height, mips, layers, fi.dxgi, {1, 0}, usage,
                                 D3D11_BIND_SHADER_RESOURCE, 0, cube ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0u};
         ComPtr<ID3D11Texture2D> t;
         hr = dev_->CreateTexture2D(&td, init.data(), &t);
@@ -331,6 +407,7 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
         off += n;
     }
     auto* srv = tex->srv.Get();
+    tex->updatable = updatable;
     TrackPages(*tex, +1);
     textures_[key] = std::move(tex);
     return srv;
