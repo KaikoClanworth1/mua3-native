@@ -1,5 +1,8 @@
 // Floating-point operations of recompiled code that need exact ARM semantics: delegated to dynarmic's soft-float
 // library with the guest FPCR (cumulative exception bits go to the guest FPSR as they would under the JIT).
+#include <array>
+
+#include <dynarmic/common/crypto/aes.h>
 #include <dynarmic/common/fp/fpcr.h>
 #include <dynarmic/common/fp/fpsr.h>
 #include <dynarmic/common/fp/op/FPConvert.h>
@@ -82,5 +85,21 @@ u64 FPToFixed32(State& s, u32 a, int ibits, u8 fbits, bool uns, u8 r) {
 u64 FPToFixed64(State& s, u64 a, int ibits, u8 fbits, bool uns, u8 r) {
     return WithFp(s, [&](auto c, auto& f) { return FP::FPToFixed<u64>(ibits, a, fbits, uns, c, RM(r), f); });
 }
+
+namespace {
+template <void (*F)(Dynarmic::Common::Crypto::AES::State&, const Dynarmic::Common::Crypto::AES::State&)>
+V128 Aes(V128 a) {
+    Dynarmic::Common::Crypto::AES::State in, out;
+    std::memcpy(in.data(), &a, 16);
+    F(out, in);
+    V128 r;
+    std::memcpy(&r, out.data(), 16);
+    return r;
+}
+} // namespace
+V128 AESEncryptSingleRound(V128 a) { return Aes<Dynarmic::Common::Crypto::AES::EncryptSingleRound>(a); }
+V128 AESDecryptSingleRound(V128 a) { return Aes<Dynarmic::Common::Crypto::AES::DecryptSingleRound>(a); }
+V128 AESMixColumns(V128 a) { return Aes<Dynarmic::Common::Crypto::AES::MixColumns>(a); }
+V128 AESInverseMixColumns(V128 a) { return Aes<Dynarmic::Common::Crypto::AES::InverseMixColumns>(a); }
 
 } // namespace recomp

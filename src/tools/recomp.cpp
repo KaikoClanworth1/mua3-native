@@ -174,6 +174,14 @@ const std::unordered_set<std::string>& GenericOps() {
         "VectorTableLookup128", "VectorLogicalVShift8", "VectorLogicalVShift16", "VectorLogicalVShift32",
         "VectorLogicalVShift64", "VectorArithmeticVShift8", "VectorArithmeticVShift16", "VectorArithmeticVShift32",
         "VectorArithmeticVShift64", "VectorRotateWholeVectorRight",
+        "SHA256Hash", "SHA256MessageSchedule0", "SHA256MessageSchedule1", "VectorMultiplySignedWiden16",
+        "VectorMultiplySignedWiden32", "VectorMultiplySignedWiden8", "VectorPolynomialMultiplyLong64",
+        "VectorPopulationCount", "VectorReduceAdd16", "VectorReduceAdd32", "VectorReduceAdd64", "VectorReduceAdd8",
+        "VectorReverseElementsInHalfGroups8", "VectorReverseElementsInLongGroups16",
+        "VectorReverseElementsInLongGroups32", "VectorReverseElementsInLongGroups8",
+        "VectorReverseElementsInWordGroups16", "VectorReverseElementsInWordGroups8", "VectorTranspose16",
+        "VectorTranspose32", "VectorTranspose64", "VectorTranspose8", "AESEncryptSingleRound",
+        "AESDecryptSingleRound", "AESMixColumns", "AESInverseMixColumns",
     };
     return ops;
 }
@@ -732,6 +740,23 @@ struct Emitter {
     }
 };
 
+// Output file that is only rewritten when its content changes, so a regeneration that touches one shard does not
+// make the build recompile all of them.
+struct ChangedFile : std::ostringstream {
+    std::filesystem::path path;
+    explicit ChangedFile(std::filesystem::path p) : path(std::move(p)) {}
+    ~ChangedFile() {
+        const std::string now = str();
+        {
+            std::ifstream in(path, std::ios::binary);
+            const std::string old{std::istreambuf_iterator<char>(in), {}};
+            if (in && old == now)
+                return;
+        }
+        std::ofstream(path, std::ios::binary) << now;
+    }
+};
+
 u64 Fnv(u64 h, u32 w) {
     for (int i = 0; i < 4; i++) {
         h ^= (w >> (i * 8)) & 0xFF;
@@ -753,6 +778,8 @@ int main(int argc, char** argv) {
     std::vector<std::string> profiles;
     double coverage = 1.0;
     size_t max_funcs = SIZE_MAX;
+    bool stats_only = false, all_funcs = false;
+    std::set<u64> noopt_funcs, skip_funcs;
     int i = 2;
     for (; i + 2 < argc && argv[i][0] != '-'; i += 3) {
         Module m;
@@ -768,6 +795,18 @@ int main(int argc, char** argv) {
             profiles.push_back(argv[i + 1]);
         else if (k == "--coverage")
             coverage = std::atof(argv[i + 1]);
+        else if (k == "--all") // profiles only add entries; emit every function
+            all_funcs = true;
+        else if (k == "--noopt") { // file with function entries (hex) to compile without optimisation
+            std::ifstream in(argv[i + 1]);
+            for (std::string a; in >> a;)
+                noopt_funcs.insert(std::strtoull(a.c_str(), nullptr, 16));
+        } else if (k == "--skip") { // functions MSVC cannot compile at all: left to the JIT
+            std::ifstream in(argv[i + 1]);
+            for (std::string a; in >> a;)
+                skip_funcs.insert(std::strtoull(a.c_str(), nullptr, 16));
+        } else if (k == "--stats")
+            stats_only = true;
         else if (k == "--max-funcs")
             max_funcs = std::strtoull(argv[i + 1], nullptr, 10);
     }
@@ -863,7 +902,31 @@ int main(int argc, char** argv) {
             acc += funcs[keep].weight;
             keep++;
         }
-        funcs.resize(keep);
+        if (!all_funcs)
+            funcs.resize(keep);
+    }
+    if (stats_only) {
+        // Static coverage over every discovered block, weighted by guest instruction count.
+        std::map<std::string, u64> ops;
+        u64 total = 0, bad = 0;
+        for (auto& [pc, bi] : g_blocks) {
+            const u64 n = (std::max(bi.end, pc + 4) - pc) / 4;
+            total += n;
+            if (bi.supported)
+                continue;
+            bad += n;
+            for (auto& op : bi.unsupported_ops)
+                ops[op] += n;
+        }
+        std::printf("static: %llu instructions in %zu blocks, %.2f%% in unsupported blocks\n", total, g_blocks.size(),
+                    100.0 * double(bad) / double(total));
+        std::vector<std::pair<u64, std::string>> v;
+        for (auto& [k, n] : ops)
+            v.emplace_back(n, k);
+        std::sort(v.rbegin(), v.rend());
+        for (size_t i = 0; i < v.size() && i < 60; i++)
+            std::printf("  %8llu %s\n", v[i].first, v[i].second.c_str());
+        return 0;
     }
     if (funcs.size() > max_funcs)
         funcs.resize(max_funcs);
@@ -877,7 +940,7 @@ int main(int argc, char** argv) {
 
     // decls
     {
-        std::ofstream h(out / "recomp_decls.h");
+        ChangedFile h(out / "recomp_decls.h");
         h << "#pragma once\n#include \"core/cpu/recomp/recomp_rt.h\"\nnamespace recomp {\nextern u8 g_ok[];\n";
         for (auto& f : funcs)
             h << "void f_" << std::hex << f.entry << std::dec << "(State& s);\n";
@@ -889,7 +952,7 @@ int main(int argc, char** argv) {
     auto flush = [&] {
         if (cur.tellp() == 0)
             return;
-        std::ofstream f(out / ("recomp_" + std::to_string(shard++) + ".cpp"));
+        ChangedFile f(out / ("recomp_" + std::to_string(shard++) + ".cpp"));
         f << "#include \"recomp_decls.h\"\n#pragma warning(disable : 4102 4189 4100)\nnamespace recomp {\n"
           << cur.str() << "}\n";
         cur.str("");
@@ -913,8 +976,19 @@ int main(int argc, char** argv) {
             if (b != f.entry)
                 em.Block(b, bi);
         }
-        if (!g_blocks[f.entry].supported)
+        // MSVC cannot compile a handful of functions even unoptimised: an empty stub (exits at once, so the JIT runs
+        // it). Keeping the slot keeps every other function's index, so only this shard is rebuilt.
+        const bool skip = skip_funcs.count(f.entry) != 0;
+        if (!g_blocks[f.entry].supported || skip)
             disabled.insert(f.entry);
+        if (skip)
+            cur << "void f_" << std::hex << f.entry << std::dec << "(State& s) {}\n\n";
+        // MSVC's optimizer crashes (internal compiler error) on a few functions: build those unoptimised.
+        const bool noopt = !skip && noopt_funcs.count(f.entry) != 0;
+        if (skip) {
+        } else {
+        if (noopt)
+            cur << "#pragma optimize(\"\", off)\n";
         cur << "void f_" << std::hex << f.entry << std::dec << "(State& s) {\n  if (!g_ok[" << idx
             << "] || reinterpret_cast<u64>(_AddressOfReturnAddress()) < s.stack_limit) return;\n"
                "  bool cbit = false;\n";
@@ -936,6 +1010,9 @@ int main(int argc, char** argv) {
             cur << std::dec << "  default: return;\n  }\n";
         }
         cur << body.str() << "}\n\n";
+        if (noopt)
+            cur << "#pragma optimize(\"\", on)\n";
+        }
         // verification ranges: merged [start, end) of all blocks
         std::vector<std::pair<u64, u64>> r;
         for (u64 b : f.blocks)
@@ -959,7 +1036,7 @@ int main(int argc, char** argv) {
     }
     flush();
     {
-        std::ofstream t(out / "recomp_table.cpp");
+        ChangedFile t(out / "recomp_table.cpp");
         t << "#include \"recomp_decls.h\"\nnamespace recomp {\nu8 g_ok[" << std::max<size_t>(funcs.size(), 1)
           << "];\nstatic const FuncEntry kFuncs[] = {\n";
         for (auto& [e, rf, rc, h] : table)

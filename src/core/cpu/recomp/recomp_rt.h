@@ -747,6 +747,126 @@ RC_INLINE V128 VectorRotateWholeVectorRight(V128 a, u8 bits) {
     return {(a.hi >> b2) | (a.lo << (64 - b2)), (a.lo >> b2) | (a.hi << (64 - b2))};
 }
 
+// ---- byte/element reversal, widening multiplies, reductions, transposes
+template <typename G, typename E>
+RC_INLINE V128 ReverseIn(V128 a) {
+    constexpr int n = sizeof(G) / sizeof(E);
+    V128 r{};
+    for (u8 g = 0; g < 16 / sizeof(G); g++)
+        for (u8 i = 0; i < n; i++)
+            r = SetElem<E>(r, u8(g * n + i), GetElem<E>(a, u8(g * n + n - 1 - i)));
+    return r;
+}
+RC_INLINE V128 VectorReverseElementsInHalfGroups8(V128 a) { return ReverseIn<u16, u8>(a); }
+RC_INLINE V128 VectorReverseElementsInWordGroups8(V128 a) { return ReverseIn<u32, u8>(a); }
+RC_INLINE V128 VectorReverseElementsInWordGroups16(V128 a) { return ReverseIn<u32, u16>(a); }
+RC_INLINE V128 VectorReverseElementsInLongGroups8(V128 a) { return ReverseIn<u64, u8>(a); }
+RC_INLINE V128 VectorReverseElementsInLongGroups16(V128 a) { return ReverseIn<u64, u16>(a); }
+RC_INLINE V128 VectorReverseElementsInLongGroups32(V128 a) { return ReverseIn<u64, u32>(a); }
+// SMULL on the lower halves
+template <typename From, typename To>
+RC_INLINE V128 MulWiden(V128 a, V128 b) {
+    V128 r{};
+    for (u8 i = 0; i < 16 / sizeof(To); i++)
+        r = SetElem<To>(r, i, To(To(GetElem<From>(a, i)) * To(GetElem<From>(b, i))));
+    return r;
+}
+RC_INLINE V128 VectorMultiplySignedWiden8(V128 a, V128 b) { return MulWiden<int8_t, int16_t>(a, b); }
+RC_INLINE V128 VectorMultiplySignedWiden16(V128 a, V128 b) { return MulWiden<int16_t, int32_t>(a, b); }
+RC_INLINE V128 VectorMultiplySignedWiden32(V128 a, V128 b) { return MulWiden<int32_t, int64_t>(a, b); }
+RC_INLINE V128 VectorPolynomialMultiplyLong64(V128 a, V128 b) {
+    return VI(_mm_clmulepi64_si128(PI(a), PI(b), 0x00));
+}
+RC_INLINE V128 VectorPopulationCount(V128 a) {
+    return Map1<u8>(a, [](u8 x) { return u8(std::popcount(x)); });
+}
+template <typename T>
+RC_INLINE V128 ReduceAdd(V128 a) {
+    T sum = 0;
+    for (u8 i = 0; i < 16 / sizeof(T); i++)
+        sum = T(sum + GetElem<T>(a, i));
+    return SetElem<T>(V128{}, 0, sum);
+}
+RC_INLINE V128 VectorReduceAdd8(V128 a) { return ReduceAdd<u8>(a); }
+RC_INLINE V128 VectorReduceAdd16(V128 a) { return ReduceAdd<u16>(a); }
+RC_INLINE V128 VectorReduceAdd32(V128 a) { return ReduceAdd<u32>(a); }
+RC_INLINE V128 VectorReduceAdd64(V128 a) { return ReduceAdd<u64>(a); }
+// TRN1 (part = false) / TRN2 (part = true)
+template <typename T>
+RC_INLINE V128 Transpose(V128 a, V128 b, bool part) {
+    V128 r{};
+    for (u8 i = 0; i < 16 / sizeof(T); i += 2) {
+        r = SetElem<T>(r, i, GetElem<T>(a, u8(i + part)));
+        r = SetElem<T>(r, u8(i + 1), GetElem<T>(b, u8(i + part)));
+    }
+    return r;
+}
+RC_INLINE V128 VectorTranspose8(V128 a, V128 b, bool p) { return Transpose<u8>(a, b, p); }
+RC_INLINE V128 VectorTranspose16(V128 a, V128 b, bool p) { return Transpose<u16>(a, b, p); }
+RC_INLINE V128 VectorTranspose32(V128 a, V128 b, bool p) { return Transpose<u32>(a, b, p); }
+RC_INLINE V128 VectorTranspose64(V128 a, V128 b, bool p) { return Transpose<u64>(a, b, p); }
+
+// ---- SHA256 (ARM pseudocode: SHA256hash / SHA256SU0 / SHA256SU1)
+RC_INLINE u32 Ror32(u32 x, int n) { return std::rotr(x, n); }
+RC_INLINE V128 SHA256Hash(V128 x, V128 y, V128 w, bool part1) {
+    u32 X[4], Y[4], W[4];
+    std::memcpy(X, &x, 16);
+    std::memcpy(Y, &y, 16);
+    std::memcpy(W, &w, 16);
+    for (int e = 0; e < 4; e++) {
+        const u32 chs = ((Y[1] ^ Y[2]) & Y[0]) ^ Y[2];
+        const u32 maj = (X[0] & X[1]) | ((X[0] | X[1]) & X[2]);
+        const u32 t = Y[3] + (Ror32(Y[0], 6) ^ Ror32(Y[0], 11) ^ Ror32(Y[0], 25)) + chs + W[e];
+        X[3] += t;
+        Y[3] = t + (Ror32(X[0], 2) ^ Ror32(X[0], 13) ^ Ror32(X[0], 22)) + maj;
+        // (Y:X) rotated left by one word
+        const u32 y3 = Y[3], x3 = X[3];
+        Y[3] = Y[2], Y[2] = Y[1], Y[1] = Y[0], Y[0] = x3;
+        X[3] = X[2], X[2] = X[1], X[1] = X[0], X[0] = y3;
+    }
+    V128 r;
+    std::memcpy(&r, part1 ? X : Y, 16);
+    return r;
+}
+RC_INLINE V128 SHA256MessageSchedule0(V128 x, V128 y) {
+    u32 X[4], Y[4], T[4], R[4];
+    std::memcpy(X, &x, 16);
+    std::memcpy(Y, &y, 16);
+    T[0] = X[1], T[1] = X[2], T[2] = X[3], T[3] = Y[0];
+    for (int e = 0; e < 4; e++)
+        R[e] = (Ror32(T[e], 7) ^ Ror32(T[e], 18) ^ (T[e] >> 3)) + X[e];
+    V128 r;
+    std::memcpy(&r, R, 16);
+    return r;
+}
+RC_INLINE V128 SHA256MessageSchedule1(V128 x, V128 y, V128 z) {
+    u32 X[4], Y[4], Z[4], T0[4], R[4];
+    std::memcpy(X, &x, 16);
+    std::memcpy(Y, &y, 16);
+    std::memcpy(Z, &z, 16);
+    T0[0] = Y[1], T0[1] = Y[2], T0[2] = Y[3], T0[3] = Z[0];
+    auto s1 = [](u32 v) { return Ror32(v, 17) ^ Ror32(v, 19) ^ (v >> 10); };
+    R[0] = s1(Z[2]) + X[0] + T0[0];
+    R[1] = s1(Z[3]) + X[1] + T0[1];
+    R[2] = s1(R[0]) + X[2] + T0[2];
+    R[3] = s1(R[1]) + X[3] + T0[3];
+    V128 r;
+    std::memcpy(&r, R, 16);
+    return r;
+}
+
+} // namespace op
+
+// AES rounds (dynarmic's table implementation, recomp_fp.cpp)
+V128 AESEncryptSingleRound(V128 a);
+V128 AESDecryptSingleRound(V128 a);
+V128 AESMixColumns(V128 a);
+V128 AESInverseMixColumns(V128 a);
+namespace op {
+using recomp::AESDecryptSingleRound;
+using recomp::AESEncryptSingleRound;
+using recomp::AESInverseMixColumns;
+using recomp::AESMixColumns;
 } // namespace op
 
 // per-lane soft-float vector ops
