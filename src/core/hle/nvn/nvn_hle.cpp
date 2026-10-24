@@ -419,7 +419,7 @@ struct BoundStage {
 };
 struct DrawState {
     BoundStage stage[6];
-    u64 program = 0;
+    u64 program[6]{}; // separable programs: BindProgram(cb, program, stage bits) binds one stage each
     u64 rt[8]{}, depth = 0;
     u32 rt_fmt[8]{}, depth_fmt = 0, num_rt = 0;
 };
@@ -462,8 +462,11 @@ void ResolveFrame(Recording& rec, std::ofstream& f, State& s, const std::vector<
                 st.stage[stage].ubo[idx] = c.x[3];
             else if (n == "nvnCommandBufferBindTexture" && stage < 6 && idx < 32)
                 st.stage[stage].tex[idx] = c.x[3];
-            else if (n == "nvnCommandBufferBindProgram")
-                st.program = c.x[1];
+            else if (n == "nvnCommandBufferBindProgram") {
+                for (u32 b = 0; b < 6; b++)
+                    if (c.x[2] & (1u << b))
+                        st.program[b] = c.x[1];
+            }
             else if (n == "nvnCommandBufferSetRenderTargets") {
                 st.num_rt = u32(c.x[1]);
                 for (u32 i = 0; i < st.num_rt && i < 8; i++) {
@@ -475,12 +478,15 @@ void ResolveFrame(Recording& rec, std::ofstream& f, State& s, const std::vector<
                     st.depth = 0;
             } else if (g_generic[c.fn].draw) {
                 draws++;
-                std::string line = fmt::format("draw {} {} prog {:#x}", draws, n.substr(16), st.program);
-                if (auto sh = rec.shadow.find(st.program); sh != rec.shadow.end())
-                    for (const auto& [slot, cmd] : sh->second)
-                        if (g_generic[slot].shaders)
-                            for (size_t k = 0; k + 1 < cmd.handles.size(); k += 2)
-                                line += fmt::format(" code{} {:#x}", k / 2, cmd.handles[k]);
+                std::string line = fmt::format("draw {} {}", draws, n.substr(16));
+                for (u32 b = 0; b < 5; b++) {
+                    if (!st.program[b])
+                        continue;
+                    if (auto sh = rec.shadow.find(st.program[b]); sh != rec.shadow.end())
+                        for (const auto& [slot, cmd] : sh->second)
+                            if (g_generic[slot].shaders && !cmd.handles.empty())
+                                line += fmt::format(" {} {:#x}", "VFGCE"[b], cmd.handles[0]);
+                }
                 for (u32 i = 0; i < st.num_rt && i < 8; i++) {
                     auto hw = kRtFormat.find(st.rt_fmt[i]);
                     line += fmt::format(" rt{} {:#x}/{:#x}", i, st.rt[i], hw != kRtFormat.end() ? hw->second : 0xFFFFu);
