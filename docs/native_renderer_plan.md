@@ -63,6 +63,42 @@ names in `main`'s strings are *not* in table order.
   pools and handles, vertex stream/attribute state objects, uniform/storage buffers by GPU address, blend/colour/
   depth state objects, render-enable conditionals (predicated draws), barriers and compute dispatch.
 
+## Recorded frame: argument layouts (MUA3_NVN_RECORD=1 MUA3_NVN_DUMP=<seconds>)
+
+Every `nvnCommandBuffer*` call and every state-object setter now goes through a generic recording wrapper
+(`Generic<I>` in `nvn_hle.cpp`, one slot per resolved name, x0-x7 and v0-v3 recorded before the driver runs; state
+setters update a host shadow per object). `MUA3_NVN_DUMP=<seconds>` writes the first large submit after that time,
+with the state objects it binds, to `nvn_frame.txt`. One ST010 frame: 39 command types, ~4,700 commands
+(`nvn_frame_st010_commands.txt`). Layouts confirmed from real values:
+
+| Command | Arguments after the command buffer |
+|---|---|
+| SetRenderTargets | numColors, NVNtexture** colors, NVNtextureView** colorViews, NVNtexture* depth, depthView |
+| ClearColor | index, const float* rgba, channel mask |
+| ClearDepthStencil | depth (v0), depthMask, stencil, stencilMask |
+| SetViewports / SetScissors / SetDepthRanges | first, count, pointer to float[4] / int[4] / float[2] arrays |
+| BindProgram | NVNprogram*, stage bits (0x20 compute; graphics bits below) |
+| BindVertexAttribState / BindVertexStreamState | count, pointer to the state array |
+| BindVertexBuffer | index, GPU address, size |
+| BindUniformBuffer / BindStorageBuffer | stage (0 VS ... 5 CS), index, GPU address, size |
+| BindTexture | stage, index, NVN handle (tex id \| sampler id << 20 \| 1 << 32) |
+| DrawElementsBaseVertex | mode (4 triangles, 5 strip), index type (1 u16, 2 u32), count, index GPU address, base vertex |
+| DrawElementsIndirect | mode, index type, index GPU address, indirect GPU address |
+| DrawArrays | mode, first, count |
+| SetRenderEnable / SetRenderEnableConditional | enable / mode, counter GPU address (predicated draws) |
+| Barrier | barrier bits |
+| DispatchCompute | x, y, z |
+| Bind{Blend,Color,ChannelMask,Polygon,DepthStencil,Multisample}State | state object pointer (shadowed) |
+| SetStencilRef / SetStencilMask / SetStencilValueMask | faces, value |
+| SetPolygonOffsetClamp | factor, units, clamp (v0..v2) |
+| SetTexturePool / SetSamplerPool | pool object |
+
+Conventions still to establish, by comparing with the emulated path on the same frame: which Maxwell constant
+buffer an NVN uniform buffer index lands in (the shaders' `cbuf_mask`), where texture handles sit in the texture
+constant buffer (`TextureUse::cbuf_offset` vs BindTexture index), NVN format enum to hardware render target /
+vertex attribute formats, and the blend, depth and polygon enums. Instrumenting the emulated path (when it creates
+a surface or input layout at a GPU address the NVN model knows, log the pair) learns these tables automatically.
+
 ## Order of work (estimates, in the same units as the recompiler work)
 
 1. ~~Census of the functions used~~ and ~~the hook~~ (done). `recomp::Dispatch` watches the game's three NVN name

@@ -1,12 +1,18 @@
 #include "core/hle/nvn/nvn_hle.h"
 
 #include <array>
+#include <chrono>
+#include <bit>
+#include <set>
+#include <fstream>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 #include "common/common.h"
 
@@ -119,17 +125,6 @@ enum Wrapped {
     kCommandBufferBeginRecording,
     kCommandBufferEndRecording,
     kQueueSubmitCommands,
-    kCommandBufferBindProgram,
-    kCommandBufferBindTexture,
-    kCommandBufferBindUniformBuffer,
-    kCommandBufferBindStorageBuffer,
-    kCommandBufferBindVertexBuffer,
-    kCommandBufferSetRenderTargets,
-    kCommandBufferDrawElementsBaseVertex,
-    kCommandBufferDrawElementsIndirect,
-    kCommandBufferDrawArrays,
-    kCommandBufferDrawArraysIndirect,
-    kCommandBufferDispatchCompute,
     kCommandBufferCallCommands,
     kCommandBufferCopyCommands,
     kWrappedCount
@@ -246,40 +241,101 @@ void SamplerPoolRegisterSampler(State& s) {
 // ---- command recording (step 3, observe mode): host command lists built from the game's command buffer calls,
 // keyed by the command handle EndRecording returns, and summarized when the queue submits them. This is the
 // stream the native D3D11 replay will execute.
+// Every nvnCommandBuffer* command and every state-object setter goes through a generic wrapper (one template
+// instance per resolved name) that records the call's registers before the driver runs.
 struct Command {
-    Wrapped op;
-    u64 args[6];
-    std::vector<u64> handles; // Call/CopyCommands: the nested command handles
+    int fn;                   // generic slot (name), or -1 for Call/CopyCommands
+    u64 x[8];                 // integer/pointer arguments (x0 = the object)
+    u32 v[4];                 // float arguments (low 32 bits of v0..v3)
+    std::vector<u64> handles; // Call/CopyCommands: nested command handles; ProgramSetShaders: stage data pairs
 };
+enum class Kind { Command, Setter };
+struct GenericSlot {
+    std::string name;
+    recomp::Fn driver = nullptr;
+    Kind kind = Kind::Command;
+    bool draw = false, indirect = false, dispatch = false, defaults = false, shaders = false;
+};
+constexpr int kGenericSlots = 320;
+std::array<GenericSlot, kGenericSlots> g_generic;
+std::atomic<int> g_generic_count{0};
 struct Recording {
     std::mutex mutex;
     std::unordered_map<u64, std::vector<Command>> open;    // command buffer -> commands since BeginRecording
     std::unordered_map<u64, std::vector<Command>> handles; // command handle -> finished list
     u64 submits = 0, cmds = 0, draws = 0, indirect = 0, dispatches = 0, unknown = 0;
     u64 recorded = 0, begins = 0, ends = 0, empty_ends = 0; // diagnostics
+    // state objects (blend, colour, depth/stencil, polygon, multisample, channel mask, vertex attrib/stream,
+    // texture views, sampler builders, programs): object -> generic slot -> last call
+    std::unordered_map<u64, std::unordered_map<int, Command>> shadow;
 };
 Recording& Rec() {
     static Recording r;
     return r;
 }
-template <Wrapped W>
-void RecordCommand(State& s) {
-    const u64 cb = s.x[0];
-    Command c{W, {s.x[1], s.x[2], s.x[3], s.x[4], s.x[5], s.x[6]}};
-    u64 obj, r;
-    if (!Through(s, W, obj, r))
-        return;
-    auto& rec = Rec();
-    std::lock_guard lk(rec.mutex);
-    rec.open[cb].push_back(c);
-    rec.recorded++;
+template <int I>
+void Generic(State& s) {
+    const GenericSlot& g = g_generic[I];
+    Command c{I, {}, {}, {}};
+    for (int k = 0; k < 8; k++)
+        c.x[k] = s.x[k];
+    for (int k = 0; k < 4; k++)
+        c.v[k] = u32(s.v[k].lo);
+    if (g.shaders) // nvnProgramSetShaders(program, count, const NVNshaderData*): {code address, control pointer}
+        for (u64 i = 0; i < u32(s.x[1]) && i < 8; i++) {
+            c.handles.push_back(recomp::Rd<u64>(s, s.x[2] + i * 16));
+            c.handles.push_back(recomp::Rd<u64>(s, s.x[2] + i * 16 + 8));
+        }
+    {
+        auto& rec = Rec();
+        std::lock_guard lk(rec.mutex);
+        if (g.kind == Kind::Command) {
+            rec.open[s.x[0]].push_back(std::move(c));
+            rec.recorded++;
+        } else {
+            auto& obj = rec.shadow[s.x[0]];
+            if (g.defaults)
+                obj.clear();
+            obj[I] = std::move(c);
+        }
+    }
+    g.driver(s);
+}
+template <size_t... I>
+constexpr std::array<recomp::Fn, sizeof...(I)> MakeGeneric(std::index_sequence<I...>) {
+    return {Generic<int(I)>...};
+}
+const std::array<recomp::Fn, kGenericSlots> kGenericFns = MakeGeneric(std::make_index_sequence<kGenericSlots>{});
+
+// Which unhandled NVN names get a generic recording wrapper.
+bool GenericKind(std::string_view n, Kind& kind) {
+    auto starts = [&](std::string_view p) { return n.substr(0, p.size()) == p; };
+    if (n.find("Get") != std::string_view::npos)
+        return false;
+    if (starts("nvnCommandBuffer")) {
+        for (std::string_view x : {"Initialize", "Finalize", "BeginRecording", "EndRecording", "CallCommands",
+                                   "CopyCommands", "AddCommandMemory", "AddControlMemory", "SetMemoryCallback",
+                                   "SetDebugLabel"})
+            if (n.find(x) != std::string_view::npos)
+                return false;
+        kind = Kind::Command;
+        return true;
+    }
+    for (std::string_view p : {"nvnBlendState", "nvnColorState", "nvnChannelMaskState", "nvnDepthStencilState",
+                               "nvnPolygonState", "nvnMultisampleState", "nvnVertexAttribState",
+                               "nvnVertexStreamState", "nvnTextureView", "nvnSamplerBuilder", "nvnProgramSetShaders"})
+        if (starts(p) && n.find("Set") != std::string_view::npos) {
+            kind = Kind::Setter;
+            return true;
+        }
+    return false;
 }
 // void nvnCommandBufferCall/CopyCommands(NVNcommandBuffer*, int numCommands, const NVNcommandHandle* handles):
 // a command buffer running (or copying in) other recorded command buffers.
 template <Wrapped W>
 void NestCommands(State& s) {
     const u64 cb = s.x[0], count = u32(s.x[1]), array = s.x[2];
-    Command c{W, {count}};
+    Command c{-1, {cb, count}, {}, {}};
     for (u64 i = 0; i < count && i < 4096; i++)
         c.handles.push_back(recomp::Rd<u64>(s, array + i * 8));
     u64 obj, r;
@@ -327,6 +383,60 @@ void QueueSubmitCommands(State& s) {
     {
     auto& rec = Rec();
     std::lock_guard lk(rec.mutex);
+    // MUA3_NVN_DUMP=<seconds>: write the first large submit after that time's command stream (and the state objects it binds) to nvn_frame.txt
+    static const u64 dump_at = [] {
+        const char* e = std::getenv("MUA3_NVN_DUMP");
+        return e ? std::strtoull(e, nullptr, 10) : 0;
+    }();
+    static const auto t0 = std::chrono::steady_clock::now();
+    static bool dumped = false;
+    size_t top = 0;
+    for (u64 h : handles)
+        if (auto it = rec.handles.find(h); it != rec.handles.end())
+            top += it->second.size();
+    if (dump_at && !dumped && top >= 100 &&
+        std::chrono::steady_clock::now() - t0 > std::chrono::seconds(dump_at)) {
+        dumped = true;
+        std::ofstream f("nvn_frame.txt");
+        std::set<u64> objects;
+        std::vector<std::pair<u64, int>> walk;
+        for (u64 h : handles)
+            walk.emplace_back(h, 0);
+        while (!walk.empty()) {
+            const auto [h, depth] = walk.back();
+            walk.pop_back();
+            auto it = rec.handles.find(h);
+            f << fmt::format("handle {:#x} ({} commands)\n", h, it == rec.handles.end() ? 0 : it->second.size());
+            if (it == rec.handles.end())
+                continue;
+            for (const Command& c : it->second) {
+                const std::string name = c.fn >= 0 ? g_generic[c.fn].name : "CallCommands";
+                f << fmt::format("  {} {:x} {:x} {:x} {:x} {:x} {:x} {:x} | {} {} {} {}\n", name, c.x[1], c.x[2], c.x[3],
+                                 c.x[4], c.x[5], c.x[6], c.x[7], std::bit_cast<float>(c.v[0]),
+                                 std::bit_cast<float>(c.v[1]), std::bit_cast<float>(c.v[2]),
+                                 std::bit_cast<float>(c.v[3]));
+                if (name.find("State") != std::string::npos || name.find("BindProgram") != std::string::npos)
+                    objects.insert(c.x[1]);
+                if (depth < 8)
+                    for (u64 nested : c.handles)
+                        walk.emplace_back(nested, depth + 1);
+            }
+        }
+        for (u64 obj : objects) {
+            auto it = rec.shadow.find(obj);
+            if (it == rec.shadow.end())
+                continue;
+            f << fmt::format("object {:#x}\n", obj);
+            for (const auto& [slot, c] : it->second) {
+                f << fmt::format("  {} {:x} {:x} {:x} {:x} {:x} | {} {}", g_generic[slot].name, c.x[1], c.x[2], c.x[3],
+                                 c.x[4], c.x[5], std::bit_cast<float>(c.v[0]), std::bit_cast<float>(c.v[1]));
+                for (u64 h : c.handles)
+                    f << fmt::format(" {:x}", h);
+                f << "\n";
+            }
+        }
+        LOG_INFO("NVN", "wrote nvn_frame.txt");
+    }
     // walk the submitted command buffers, following nested Call/CopyCommands
     std::vector<std::pair<u64, int>> work;
     for (u64 h : handles)
@@ -341,9 +451,12 @@ void QueueSubmitCommands(State& s) {
         }
         for (const Command& c : it->second) {
             rec.cmds++;
-            rec.draws += c.op >= kCommandBufferDrawElementsBaseVertex && c.op <= kCommandBufferDrawArraysIndirect;
-            rec.indirect += c.op == kCommandBufferDrawElementsIndirect || c.op == kCommandBufferDrawArraysIndirect;
-            rec.dispatches += c.op == kCommandBufferDispatchCompute;
+            if (c.fn >= 0) {
+                const GenericSlot& g = g_generic[c.fn];
+                rec.draws += g.draw;
+                rec.indirect += g.indirect;
+                rec.dispatches += g.dispatch;
+            }
             if (depth < 8)
                 for (u64 nested : c.handles)
                     work.emplace_back(nested, depth + 1);
@@ -379,24 +492,11 @@ const Entry kHostFunctions[] = {
     NVN_ENTRY(TexturePoolRegisterTexture),
     NVN_ENTRY(SamplerPoolRegisterSampler),
 #define NVN_RECORD(NAME) {"nvn" #NAME, NAME, k##NAME, true}
-#define NVN_RECORD_CMD(NAME) {"nvn" #NAME, RecordCommand<k##NAME>, k##NAME, true}
     NVN_RECORD(CommandBufferBeginRecording),
     NVN_RECORD(CommandBufferEndRecording),
     NVN_RECORD(QueueSubmitCommands),
-    NVN_RECORD_CMD(CommandBufferBindProgram),
-    NVN_RECORD_CMD(CommandBufferBindTexture),
-    NVN_RECORD_CMD(CommandBufferBindUniformBuffer),
-    NVN_RECORD_CMD(CommandBufferBindStorageBuffer),
-    NVN_RECORD_CMD(CommandBufferBindVertexBuffer),
-    NVN_RECORD_CMD(CommandBufferSetRenderTargets),
-    NVN_RECORD_CMD(CommandBufferDrawElementsBaseVertex),
-    NVN_RECORD_CMD(CommandBufferDrawElementsIndirect),
-    NVN_RECORD_CMD(CommandBufferDrawArrays),
-    NVN_RECORD_CMD(CommandBufferDrawArraysIndirect),
-    NVN_RECORD_CMD(CommandBufferDispatchCompute),
     {"nvnCommandBufferCallCommands", NestCommands<kCommandBufferCallCommands>, kCommandBufferCallCommands, true},
     {"nvnCommandBufferCopyCommands", NestCommands<kCommandBufferCopyCommands>, kCommandBufferCopyCommands, true},
-#undef NVN_RECORD_CMD
 #undef NVN_RECORD
 };
 #undef NVN_ENTRY
@@ -459,6 +559,27 @@ recomp::Fn Find(std::string_view name, recomp::Fn driver, u64 pc) {
         Driver().emplace(std::string(name), DriverEntry{driver, pc}); // the getters wrappers call
     }
     static const bool record = std::getenv("MUA3_NVN_RECORD") != nullptr;
+    if (!entry && record && driver) {
+        Kind kind;
+        if (!GenericKind(name, kind))
+            return nullptr;
+        for (int i = 0; i < g_generic_count; i++) // resolved again: reuse its slot (never wrap a wrapper)
+            if (g_generic[i].name == name)
+                return driver == kGenericFns[i] || g_generic[i].driver == driver ? kGenericFns[i] : nullptr;
+        const int i = g_generic_count++;
+        if (i >= kGenericSlots)
+            return nullptr;
+        GenericSlot& g = g_generic[i];
+        g.name = std::string(name);
+        g.driver = driver;
+        g.kind = kind;
+        g.draw = name.find("CommandBufferDraw") != std::string_view::npos;
+        g.indirect = g.draw && name.find("Indirect") != std::string_view::npos;
+        g.dispatch = name.find("DispatchCompute") != std::string_view::npos;
+        g.defaults = name.find("SetDefaults") != std::string_view::npos;
+        g.shaders = name == "nvnProgramSetShaders";
+        return kGenericFns[i];
+    }
     if (!entry || (entry->record && !record))
         return nullptr;
     if (entry->wrapped >= 0) {
