@@ -16,6 +16,7 @@
 
 #include "core/cpu/cpu.h"
 #include "core/cpu/recomp/recomp_rt.h"
+#include "core/hle/nvn/nvn_hle.h"
 #include "core/memory.h"
 
 namespace cpu {
@@ -385,9 +386,51 @@ public:
         std::lock_guard lk(census_mutex_);
         census_calls_[pc]++;
     }
-    void CensusName(u64 ptr, const char* name) {
-        std::lock_guard lk(census_mutex_);
-        census_names_.emplace(ptr, name);
+    // nvnDeviceGetProcAddress results (see recomp::Dispatch)
+    std::atomic<bool> capture_names_{true};
+    std::set<u64> proc_addr_pcs_; // lookup functions (nvnDeviceGetProcAddress and friends), once identified
+    size_t names_seen_ = 0;
+    std::unordered_map<u64, std::vector<std::pair<u64, std::string>>> name_candidates_; // per calling target
+    void OnProcAddress(u64 getproc_pc, u64 ptr, const char* name) {
+        std::vector<std::pair<u64, std::string>> apply;
+        {
+            std::lock_guard lk(census_mutex_);
+            if (census_)
+                census_names_.emplace(ptr, name);
+            if (!proc_addr_pcs_.count(getproc_pc)) {
+                // Other calls can pass an "nvn..." string too: a lookup function is one that resolves many names.
+                auto& c = name_candidates_[getproc_pc];
+                c.emplace_back(ptr, name);
+                if (c.size() < 16)
+                    return;
+                proc_addr_pcs_.insert(getproc_pc);
+                apply = std::move(c);
+                name_candidates_.erase(getproc_pc);
+                LOG_INFO("NVN", "NVN name lookup function at {:#x}", getproc_pc);
+            } else {
+                apply.emplace_back(ptr, name);
+            }
+            names_seen_ += apply.size() - (apply.size() ? 1 : 0) + 1;
+            if (names_seen_ >= 519) { // the game resolves 519 names
+                capture_names_ = false;
+                LOG_INFO("NVN", "{} NVN entry points resolved", names_seen_);
+            }
+        }
+        for (const auto& [p, n] : apply)
+            OverrideWithHost(p, n.c_str());
+    }
+    void OverrideWithHost(u64 ptr, const char* name) {
+        if (auto host = hle::nvn::Find(name); host && ptr) {
+            {
+                std::unique_lock lk(native_mutex_);
+                native_[ptr] = host;
+                Publish();
+            }
+            std::lock_guard lk(mutex_);
+            for (auto* c : cores_)
+                c->QueueInvalidate(ptr, 4); // JIT callers trap into the host function too
+            LOG_INFO("NVN", "{} -> host implementation (driver function {:#x})", name, ptr);
+        }
     }
     bool GuestValid(u64 a, u64 n) const { return mem_.IsValid(a, n); }
     void DumpCensus() {
@@ -693,17 +736,21 @@ u32 ExWrite128(State& s, u64 a, V128 v) {
 void ClearExclusive(State& s) { CoreOf(s).Monitor().ClearProcessor(CoreOf(s).slot_); }
 void Dispatch(State& s) {
     auto& f = CoreOf(s).Factory();
-    if (f.census_) [[unlikely]] {
+    if (f.census_) [[unlikely]]
         f.Census(s.pc);
-        // nvnDeviceGetProcAddress(device, "nvnFoo") -> pointer: remember which name each pointer belongs to
-        char name[64]{};
+    // While the game resolves its NVN entry points, nvnDeviceGetProcAddress(device, "nvnFoo") calls arrive here:
+    // remember which driver function each name maps to (host NVN implementations replace them).
+    if (f.capture_names_) [[unlikely]] {
         const u64 str = s.x[1];
-        if (f.GuestValid(str, 64) && Rd<u8>(s, str) == 'n' && Rd<u8>(s, str + 1) == 'v' && Rd<u8>(s, str + 2) == 'n') {
+        if (f.GuestValid(str, 64) && Rd<u8>(s, str) == 'n' &&
+            Rd<u8>(s, str + 1) == 'v' && Rd<u8>(s, str + 2) == 'n') {
+            char name[64]{};
             for (int i = 0; i < 63 && (name[i] = char(Rd<u8>(s, str + i))); i++)
                 ;
             if (auto fn = f.Lookup(s.pc)) {
+                const u64 pc = s.pc;
                 fn(s);
-                f.CensusName(s.x[0], name);
+                f.OnProcAddress(pc, s.x[0], name);
                 return;
             }
         }
