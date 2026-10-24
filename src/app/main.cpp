@@ -21,6 +21,7 @@
 #include "core/hle/hid.h"
 #include "gpu/d3d11/renderer_d3d11.h"
 #include "gpu/d3d11/shader_cache.h"
+#include "gpu/shader/harvest.h"
 #include "gpu/gpu.h"
 #include "platform/platform.h"
 
@@ -55,6 +56,16 @@ void DrawOverlay(const core::Config& cfg, platform::Input& input, bool& show) {
                      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
                          ImGuiWindowFlags_NoNav);
         ImGui::Text("%.1f FPS", g_stats.fps);
+        ImGui::End();
+    }
+    if (g_renderer && g_renderer->Shaders() && g_renderer->Shaders()->pending > 0) {
+        // Like a PC game's first-launch shader compilation: everything the game ships is compiled up front.
+        ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x - 8, 8), 0, ImVec2(1, 0));
+        ImGui::SetNextWindowBgAlpha(0.5f);
+        ImGui::Begin("##shaders", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
+                         ImGuiWindowFlags_NoNav);
+        ImGui::Text("Compiling shaders: %u remaining", g_renderer->Shaders()->pending.load());
         ImGui::End();
     }
     if (!show)
@@ -494,6 +505,17 @@ int main(int argc, char** argv) {
     renderer.SetResolutionScale(u32(scale));
     gpu::G().SetRenderer(&renderer);
     g_renderer = &renderer;
+    // First launch: harvest every shader program the game ships into the prewarm manifest (about 30 s, in the
+    // background); the renderer picks them up and compiles them while the intro and menus run.
+    if (const fs::path shaders = cfg.game_dir / "romfs" / "SHADER", marker = "shader_dump/harvested.txt";
+        fs::exists(shaders) && !fs::exists(marker)) {
+        std::thread([shaders, marker, &renderer] {
+            const size_t n = gpu::shader::HarvestPrograms(shaders, "shader_dump");
+            std::ofstream(marker) << n << "\n";
+            LOG_INFO("Shader", "harvested {} shader programs from the game data", n);
+            renderer.Shaders()->RequestRescan();
+        }).detach();
+    }
     if (std::getenv("MUA3_SAMPLE_GPU"))
         StartGpuSampler();
     // Test aid: MUA3_DUMP_RT=<seconds> dumps all colour render targets once.

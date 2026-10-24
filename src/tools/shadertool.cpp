@@ -9,6 +9,7 @@
 
 #include "gpu/shader/maxwell_isa.h"
 #include "gpu/dxbc/dxbc.h"
+#include "gpu/shader/harvest.h"
 #include "gpu/shader/translator.h"
 
 #pragma comment(lib, "d3dcompiler.lib")
@@ -45,6 +46,11 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         fmt::print("usage: shadertool <file.bin|dir> [--print|--disasm]\n");
         return 1;
+    }
+    // --harvest <romfs dir> <shader_dump dir>: add every program the game ships to the prewarm manifest
+    if (std::string(argv[1]) == "--harvest" && argc >= 4) {
+        fmt::print("{} new programs\n", HarvestPrograms(fs::u8path(argv[2]), fs::u8path(argv[3])));
+        return 0;
     }
     // Replay a captured dispatch (MUA3_CAPTURE): --replay <capture.bin> [override.hlsl] runs the kernel built by FXC and
     // by the direct backend on the captured inputs and compares every global memory window.

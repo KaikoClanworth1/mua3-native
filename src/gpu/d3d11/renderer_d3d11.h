@@ -60,6 +60,7 @@ public:
     void Dispatch(const u32* regs, const u32* qmd) override;
     // Internal resolution multiplier for screen-sized render targets (1 = native).
     void SetResolutionScale(u32 s) { res_scale_ = std::max<u32>(s, 1); }
+    ShaderCache* Shaders() { return shaders_.get(); }
     void Present(const PresentInfo& p) override;
     void InvalidateRegion(u64 gpu_va, u64 size) override;
     bool Blit2D(const u32* regs) override;

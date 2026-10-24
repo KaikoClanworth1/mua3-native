@@ -14,6 +14,10 @@
 
 namespace gpu {
 
+// Bump kTranslatorVersion whenever the translator output changes, to invalidate cached bytecode.
+constexpr int kTranslatorVersion = 29;
+
+
 namespace {
 const char* StageTag(shader::Stage st) {
     return st == shader::Stage::Vertex ? "vs" : st == shader::Stage::Compute ? "cs" : "ps";
@@ -23,24 +27,6 @@ const char* StageTarget(shader::Stage st) {
 }
 } // namespace
 
-u64 Hash64(const void* data, size_t size) {
-    // FNV-1a 64 over 8-byte words (fast enough for shader programs).
-    const u8* p = static_cast<const u8*>(data);
-    u64 h = 0xcbf29ce484222325ull;
-    size_t i = 0;
-    for (; i + 8 <= size; i += 8) {
-        u64 w;
-        std::memcpy(&w, p + i, 8);
-        h ^= w;
-        h *= 0x100000001b3ull;
-        h ^= h >> 29;
-    }
-    for (; i < size; i++) {
-        h ^= p[i];
-        h *= 0x100000001b3ull;
-    }
-    return h;
-}
 
 ShaderCache::ShaderCache(ID3D11Device* dev) : dev_(dev) {
     std::error_code ec;
@@ -120,6 +106,8 @@ bool ShaderCache::Build(HostShader& s, bool slow) {
     s.ok = err.empty() && (s.vs || s.ps || s.cs);
     if (!s.ok) {
         failures++;
+        if (!s.is_variant && !s.no_cache) // don't retry it at every launch's prewarm
+            std::ofstream(cache_dir_ / fmt::format("{:016x}_v{}.fail", s.hash, kTranslatorVersion));
         common::WriteFile(dump_dir_ / fmt::format("{:016x}.{}.hlsl", s.hash, tag),
                           std::span(reinterpret_cast<const u8*>(s.info.hlsl.data()), s.info.hlsl.size()));
         LOG_ERROR("Shader", "{} {:016x} failed: {}", tag, s.hash, err.substr(0, 1500));
@@ -137,8 +125,6 @@ bool ShaderCache::Build(HostShader& s, bool slow) {
 }
 
 fs::path ShaderCache::CachePath(const HostShader& s, const char* target) const {
-    // Bump kTranslatorVersion whenever the translator output changes, to invalidate cached bytecode.
-    constexpr int kTranslatorVersion = 29;
     return cache_dir_ / fmt::format("{:016x}_{}_v{}.dxbc", s.hash, target, kTranslatorVersion);
 }
 
@@ -434,7 +420,8 @@ void ShaderCache::Prewarm() {
         if (tag != "vs" && tag != "ps" && tag != "cs")
             continue;
         const u64 hash = std::strtoull(name.substr(0, 16).c_str(), nullptr, 16);
-        if (shaders_.find(hash) != shaders_.end())
+        if (shaders_.find(hash) != shaders_.end() ||
+            fs::exists(cache_dir_ / fmt::format("{:016x}_v{}.fail", hash, kTranslatorVersion)))
             continue;
         const auto code = common::ReadFile(e.path());
         if (code.empty())
@@ -471,6 +458,8 @@ void ShaderCache::Prewarm() {
 }
 
 void ShaderCache::Tick() {
+    if (rescan_.exchange(false)) // new programs in the manifest (first-launch harvest)
+        Prewarm();
     if (prewarm_reported_)
         return;
     replaying_ = true;

@@ -11,6 +11,7 @@
 #include <d3d11.h>
 #include <wrl/client.h>
 
+#include "gpu/shader/harvest.h"
 #include "gpu/shader/translator.h"
 
 namespace gpu {
@@ -59,6 +60,8 @@ public:
     // GPU thread starts; Tick() (GPU thread, once per frame) creates the variants and reports completion.
     void Prewarm();
     void Tick();
+    void RequestRescan() { rescan_ = true; } // any thread: Tick() re-reads the manifest
+    std::atomic<bool> rescan_{false};
     size_t Count() const { return shaders_.size(); }
     std::atomic<u32> failures{0};
     std::atomic<u32> pending{0};
@@ -89,8 +92,6 @@ private:
     bool prewarm_reported_ = true;
     bool replaying_ = false; // Tick() is recreating manifest variants
 };
-
-u64 Hash64(const void* data, size_t size);
 
 // Compiles the HLSL file `in_path` for `target` (vs_5_0/ps_5_0) into DXBC at `out_path` (process entry point
 // for `mua3 --compile-shader`). Returns false on compile errors (written to `out_path`.err).
