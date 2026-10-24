@@ -15,6 +15,7 @@
 #include <utility>
 
 #include "common/common.h"
+#include "gpu/gpu.h"
 
 namespace hle::nvn {
 namespace {
@@ -105,6 +106,8 @@ struct Objects {
     // texture/sampler pool slots: the IDs packed into texture handles (nvnDeviceGetTextureHandle)
     std::unordered_map<u32, std::pair<u64, u64>> texture_ids; // id -> (texture, texture view or 0)
     std::unordered_map<u32, u64> sampler_ids;                 // id -> sampler
+    std::unordered_map<u64, u64> texture_pools;               // NVNtexturePool -> descriptor GPU address
+    std::unordered_map<u32, u64> learned_formats;             // NVN format -> TIC word 0 (MUA3_NVN_LEARN)
     u64 pool_bytes = 0, texture_inits = 0;
 };
 Objects& Obj() {
@@ -121,6 +124,7 @@ enum Wrapped {
     kTextureFinalize,
     kTexturePoolRegisterTexture,
     kSamplerPoolRegisterSampler,
+    kTexturePoolInitialize,
     // command recording (MUA3_NVN_RECORD=1)
     kCommandBufferBeginRecording,
     kCommandBufferEndRecording,
@@ -214,6 +218,20 @@ void TextureFinalize(State& s) {
     o.textures.erase(tex);
 }
 
+// NVNboolean nvnTexturePoolInitialize(NVNtexturePool*, const NVNmemoryPool*, ptrdiff_t offset, int numDescriptors)
+void TexturePoolInitialize(State& s) {
+    const u64 mem_pool = s.x[1], offset = s.x[2];
+    u64 pool, ok;
+    if (!Through(s, kTexturePoolInitialize, pool, ok) || !(ok & 1))
+        return;
+    auto& o = Obj();
+    std::lock_guard lk(o.mutex);
+    if (auto p = o.pools.find(mem_pool); p != o.pools.end()) {
+        o.texture_pools[pool] = p->second.gpu + offset;
+        LOG_INFO("NVN", "texture pool {:#x}: descriptors at {:#x}", pool, p->second.gpu + offset);
+    }
+}
+
 // void nvnTexturePoolRegisterTexture(const NVNtexturePool*, int id, const NVNtexture*, const NVNtextureView*):
 // KTGL re-registers the textures it binds every frame (~3,200 calls per frame in ST010).
 void TexturePoolRegisterTexture(State& s) {
@@ -225,6 +243,20 @@ void TexturePoolRegisterTexture(State& s) {
     auto& o = Obj();
     std::lock_guard lk(o.mutex);
     o.texture_ids[id] = {tex, view};
+    // MUA3_NVN_LEARN: the hardware descriptor the driver just wrote, per NVN format (the renderer maps TIC formats)
+    static const bool learn = std::getenv("MUA3_NVN_LEARN") != nullptr;
+    if (learn) { // (KTGL always passes a view; it rarely changes the format)
+        auto t = o.textures.find(tex);
+        auto p = o.texture_pools.find(pool);
+        if (t != o.textures.end() && p != o.texture_pools.end() && !o.learned_formats.count(t->second.format)) {
+            u32 tic[8]{};
+            if (gpu::G().ReadGpu(p->second + u64(id) * 32, tic, sizeof(tic))) {
+                o.learned_formats[t->second.format] = tic[0];
+                LOG_INFO("Learn", "nvn format {:#x} -> tic {:08x} {:08x} ({}x{})", t->second.format, tic[0], tic[1],
+                         t->second.width, t->second.height);
+            }
+        }
+    }
 }
 // void nvnSamplerPoolRegisterSampler(const NVNsamplerPool*, int id, const NVNsampler*)
 void SamplerPoolRegisterSampler(State& s) {
@@ -507,6 +539,7 @@ const Entry kHostFunctions[] = {
     NVN_ENTRY(TextureFinalize),
     NVN_ENTRY(TexturePoolRegisterTexture),
     NVN_ENTRY(SamplerPoolRegisterSampler),
+    NVN_ENTRY(TexturePoolInitialize),
 #define NVN_RECORD(NAME) {"nvn" #NAME, NAME, k##NAME, true}
     NVN_RECORD(CommandBufferBeginRecording),
     NVN_RECORD(CommandBufferEndRecording),
