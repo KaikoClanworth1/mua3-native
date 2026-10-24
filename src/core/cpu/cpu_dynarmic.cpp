@@ -374,6 +374,50 @@ public:
     // ---- coverage: fraction of guest instructions executed by recompiled code
     std::atomic<u64> native_instr_{0}, jit_instr_{0};
     std::atomic<s64> last_report_{0};
+    // MUA3_NVN_CENSUS=1: count indirect calls made by recompiled code per target (the game calls every NVN
+    // function through a pointer) and write them, with the game's NVN pointer table, to nvn_census.txt every 10 s.
+    const bool census_ = std::getenv("MUA3_NVN_CENSUS") != nullptr;
+    std::mutex census_mutex_;
+    std::unordered_map<u64, u64> census_calls_;
+    std::chrono::steady_clock::time_point census_start_ = std::chrono::steady_clock::now();
+    std::unordered_map<u64, std::string> census_names_;
+    void Census(u64 pc) {
+        std::lock_guard lk(census_mutex_);
+        census_calls_[pc]++;
+    }
+    void CensusName(u64 ptr, const char* name) {
+        std::lock_guard lk(census_mutex_);
+        census_names_.emplace(ptr, name);
+    }
+    bool GuestValid(u64 a, u64 n) const { return mem_.IsValid(a, n); }
+    void DumpCensus() {
+        // The NVN entry points main resolves by name land in one array of function pointers into the sdk module
+        // (the NVN driver). This build's layout: main data/bss 0xa05c000..0xcfc5000, sdk text 0xdf54000+0x51c600.
+        constexpr u64 kScanBegin = 0x8004000 + 0x2058000, kScanEnd = 0x8004000 + 0x4fc1000;
+        constexpr u64 kSdkBegin = 0xdf54000, kSdkEnd = 0xdf54000 + 0x51c600;
+        u64 best = 0, best_len = 0, run = 0, len = 0;
+        for (u64 a = kScanBegin; a + 8 <= kScanEnd; a += 8) {
+            const u64 v = mem_.IsValid(a, 8) ? mem_.Read<u64>(a) : 0;
+            if (v >= kSdkBegin && v < kSdkEnd) {
+                if (!len)
+                    run = a;
+                if (++len > best_len)
+                    best = run, best_len = len;
+            } else {
+                len = 0;
+            }
+        }
+        std::ofstream f("nvn_census.txt", std::ios::trunc);
+        f << "seconds " << std::chrono::duration<double>(std::chrono::steady_clock::now() - census_start_).count()
+          << "\ntable " << std::hex << best << " " << std::dec << best_len << "\n";
+        for (u64 i = 0; i < best_len; i++)
+            f << "slot " << i << " " << std::hex << mem_.Read<u64>(best + i * 8) << std::dec << "\n";
+        std::lock_guard lk(census_mutex_);
+        for (const auto& [ptr, name] : census_names_)
+            f << "name " << std::hex << ptr << std::dec << " " << name << "\n";
+        for (auto [pc, n] : census_calls_)
+            f << "call " << std::hex << pc << " " << std::dec << n << "\n";
+    }
     void MaybeReport() {
         const s64 now = std::chrono::duration_cast<std::chrono::seconds>(
                             std::chrono::steady_clock::now().time_since_epoch())
@@ -381,6 +425,8 @@ public:
         s64 last = last_report_.load(std::memory_order_relaxed);
         if (now - last < 10 || !last_report_.compare_exchange_strong(last, now))
             return;
+        if (census_)
+            DumpCensus();
         const u64 n = native_instr_.exchange(0), j = jit_instr_.exchange(0), tr = transitions_.exchange(0);
         if (n + j)
             g_native_percent = float(100.0 * double(n) / double(n + j));
@@ -646,7 +692,23 @@ u32 ExWrite128(State& s, u64 a, V128 v) {
 }
 void ClearExclusive(State& s) { CoreOf(s).Monitor().ClearProcessor(CoreOf(s).slot_); }
 void Dispatch(State& s) {
-    if (auto fn = CoreOf(s).Factory().Lookup(s.pc))
+    auto& f = CoreOf(s).Factory();
+    if (f.census_) [[unlikely]] {
+        f.Census(s.pc);
+        // nvnDeviceGetProcAddress(device, "nvnFoo") -> pointer: remember which name each pointer belongs to
+        char name[64]{};
+        const u64 str = s.x[1];
+        if (f.GuestValid(str, 64) && Rd<u8>(s, str) == 'n' && Rd<u8>(s, str + 1) == 'v' && Rd<u8>(s, str + 2) == 'n') {
+            for (int i = 0; i < 63 && (name[i] = char(Rd<u8>(s, str + i))); i++)
+                ;
+            if (auto fn = f.Lookup(s.pc)) {
+                fn(s);
+                f.CensusName(s.x[0], name);
+                return;
+            }
+        }
+    }
+    if (auto fn = f.Lookup(s.pc))
         fn(s);
 }
 } // namespace recomp

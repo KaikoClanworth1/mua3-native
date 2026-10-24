@@ -46,10 +46,28 @@ translator stays; it just runs ahead of time.
 8. **Rollout**: keep the current GPU emulation behind a switch (`MUA3_NVN_HLE=0`). Bring the HLE path up family by
    family, comparing frames against the emulated path (the RT dump tools exist).
 
+## Census (step 1, done 2026-10-24)
+
+`MUA3_NVN_CENSUS=1` counts every indirect call made by recompiled code and records the pointer each
+`nvnDeviceGetProcAddress(device, "name")` call returns. Results go to `nvn_census.txt` (raw, every 10 s); the
+ST010 analysis is in `nvn_census_st010.txt`. The pointer table is at main `0xcfc3d38` (512 slots). Note that the
+names in `main`'s strings are *not* in table order.
+
+- 519 names resolved, **176 functions used at all, 124 called every frame in gameplay**, 52 only at
+  boot/menus/loading, 343 never.
+- Per frame in ST010: texture handle/bind ~3,200 (`nvnTexturePoolRegisterTexture`, `nvnDeviceGetTextureHandle`,
+  `nvnCommandBufferBindTexture`), vertex stream state ~2,900, `nvnBufferGetAddress` ~2,700, uniform buffer binds
+  ~1,300, storage buffer binds ~790, `nvnCommandBufferDrawElementsBaseVertex` ~640, `DrawElementsIndirect` ~360,
+  program binds ~370, barriers ~190, blend/colour/channel-mask state ~80, compute dispatches ~50.
+- So the native path must handle: indexed and indirect draws, ~3k texture binds per frame through texture/sampler
+  pools and handles, vertex stream/attribute state objects, uniform/storage buffers by GPU address, blend/colour/
+  depth state objects, render-enable conditionals (predicated draws), barriers and compute dispatch.
+
 ## Order of work (estimates, in the same units as the recompiler work)
 
-1. Hook and a logging-only shim: forward every call to the real sdk driver (keep the guest pointer it returned),
-   and count calls per function per frame. This finds the ~100-150 functions actually used per frame. *Small.*
+1. ~~Census of the functions used~~ (done; see above). Next: the hook itself, a forwarding shim through
+   `recomp::Dispatch` and the BRK trap that calls host code first and falls through to the sdk driver per function,
+   so families can be switched over one at a time. *Small.*
 2. Device, queue, memory pool, buffer, texture, sampler objects; texture/buffer data paths. *Large.*
 3. Command buffer recording and replay: state objects, draws, clears, copies, compute dispatch. *Large.*
 4. Programs and resource binding (texture/sampler handles: NVN uses 64-bit texture handles from texture/sampler
