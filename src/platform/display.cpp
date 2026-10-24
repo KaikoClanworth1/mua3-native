@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdlib>
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -116,6 +117,14 @@ void Display::Shutdown() {
         SDL_DestroyWindow(window_);
     window_ = nullptr;
     SDL_Quit();
+}
+
+u32 Display::PixelHeight() const {
+    int w = 0, h = 0;
+    SDL_GetWindowSizeInPixels(window_, &w, &h);
+    if (const SDL_DisplayMode* m = SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(window_)); m && fullscreen_)
+        h = std::max(h, int(m->h * m->pixel_density));
+    return u32(std::max(h, 0));
 }
 
 void Display::ToggleFullscreen() {

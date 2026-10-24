@@ -6,6 +6,7 @@
 // the IR opcodes), so the semantics here must match dynarmic's x64 backend exactly.
 #include <atomic>
 #include <bit>
+#include <limits>
 #include <type_traits>
 #include <cmath>
 #include <immintrin.h>
@@ -898,4 +899,168 @@ RC_INLINE V128 FPVectorToSignedFixed32(State& s, V128 a, u8 f, u8 r, bool) { ret
 RC_INLINE V128 FPVectorToUnsignedFixed32(State& s, V128 a, u8 f, u8 r, bool) { return Lanes<u32>(a, [&](u32 x) { return FPToFixed32(s, x, 32, f, true, r); }); }
 RC_INLINE V128 FPVectorToSignedFixed64(State& s, V128 a, u8 f, u8 r, bool) { return Lanes<u64>(a, [&](u64 x) { return FPToFixed64(s, x, 64, f, false, r); }); }
 RC_INLINE V128 FPVectorToUnsignedFixed64(State& s, V128 a, u8 f, u8 r, bool) { return Lanes<u64>(a, [&](u64 x) { return FPToFixed64(s, x, 64, f, true, r); }); }
+// ---- saturating SIMD: lanes that saturate set FPSR.QC (bit 27), as the JIT does
+constexpr u32 kQC = 1u << 27;
+template <typename T>
+RC_INLINE T SatClamp(s64 v, bool& q) {
+    constexpr s64 lo = s64(std::numeric_limits<T>::min()), hi = s64(std::numeric_limits<T>::max());
+    if (v < lo || v > hi) {
+        q = true;
+        return T(v < lo ? lo : hi);
+    }
+    return T(v);
+}
+template <typename T, typename F>
+RC_INLINE V128 SatLanes2(State& s, V128 a, V128 b, F f) {
+    using U = std::make_unsigned_t<T>;
+    V128 r{};
+    bool q = false;
+    for (u8 i = 0; i < 16 / sizeof(T); i++)
+        r = op::SetElem<U>(r, i, U(f(T(op::GetElem<U>(a, i)), T(op::GetElem<U>(b, i)), q)));
+    if (q)
+        s.fpsr |= kQC;
+    return r;
+}
+template <typename T, typename F>
+RC_INLINE V128 SatLanes1(State& s, V128 a, F f) {
+    return SatLanes2<T>(s, a, a, [&](T x, T, bool& q) { return f(x, q); });
+}
+// 64-bit lanes: compute in 128 bits
+template <typename T>
+RC_INLINE T SatAddS(T x, T y, bool& q) {
+    if constexpr (sizeof(T) == 8) {
+        const T r = T(u64(x) + u64(y));
+        if (((x ^ r) & (y ^ r)) < 0) {
+            q = true;
+            return x < 0 ? std::numeric_limits<T>::min() : std::numeric_limits<T>::max();
+        }
+        return r;
+    } else {
+        return SatClamp<T>(s64(x) + s64(y), q);
+    }
+}
+template <typename T>
+RC_INLINE T SatSubS(T x, T y, bool& q) {
+    if constexpr (sizeof(T) == 8) {
+        const T r = T(u64(x) - u64(y));
+        if (((x ^ y) & (x ^ r)) < 0) {
+            q = true;
+            return x < 0 ? std::numeric_limits<T>::min() : std::numeric_limits<T>::max();
+        }
+        return r;
+    } else {
+        return SatClamp<T>(s64(x) - s64(y), q);
+    }
+}
+template <typename T>
+RC_INLINE T SatAddU(T x, T y, bool& q) {
+    const T r = T(x + y);
+    if (r < x) {
+        q = true;
+        return std::numeric_limits<T>::max();
+    }
+    return r;
+}
+template <typename T>
+RC_INLINE T SatSubU(T x, T y, bool& q) {
+    if (y > x) {
+        q = true;
+        return 0;
+    }
+    return T(x - y);
+}
+#define RC_SAT_BIN(NAME, FN, T)                                                                                       \
+    RC_INLINE V128 NAME(State& s, V128 a, V128 b) { return SatLanes2<T>(s, a, b, FN<T>); }
+RC_SAT_BIN(VectorSignedSaturatedAdd8, SatAddS, int8_t)
+RC_SAT_BIN(VectorSignedSaturatedAdd16, SatAddS, int16_t)
+RC_SAT_BIN(VectorSignedSaturatedAdd32, SatAddS, int32_t)
+RC_SAT_BIN(VectorSignedSaturatedAdd64, SatAddS, int64_t)
+RC_SAT_BIN(VectorSignedSaturatedSub8, SatSubS, int8_t)
+RC_SAT_BIN(VectorSignedSaturatedSub16, SatSubS, int16_t)
+RC_SAT_BIN(VectorSignedSaturatedSub32, SatSubS, int32_t)
+RC_SAT_BIN(VectorSignedSaturatedSub64, SatSubS, int64_t)
+RC_SAT_BIN(VectorUnsignedSaturatedAdd8, SatAddU, u8)
+RC_SAT_BIN(VectorUnsignedSaturatedAdd16, SatAddU, u16)
+RC_SAT_BIN(VectorUnsignedSaturatedAdd32, SatAddU, u32)
+RC_SAT_BIN(VectorUnsignedSaturatedAdd64, SatAddU, u64)
+RC_SAT_BIN(VectorUnsignedSaturatedSub8, SatSubU, u8)
+RC_SAT_BIN(VectorUnsignedSaturatedSub16, SatSubU, u16)
+RC_SAT_BIN(VectorUnsignedSaturatedSub32, SatSubU, u32)
+RC_SAT_BIN(VectorUnsignedSaturatedSub64, SatSubU, u64)
+#undef RC_SAT_BIN
+template <typename T>
+RC_INLINE V128 SatAbsNeg(State& s, V128 a, bool neg) {
+    return SatLanes1<T>(s, a, [neg](T x, bool& q) {
+        if (x == std::numeric_limits<T>::min()) {
+            q = true;
+            return std::numeric_limits<T>::max();
+        }
+        return T(neg ? -x : (x < 0 ? -x : x));
+    });
+}
+RC_INLINE V128 VectorSignedSaturatedAbs8(State& s, V128 a) { return SatAbsNeg<int8_t>(s, a, false); }
+RC_INLINE V128 VectorSignedSaturatedAbs16(State& s, V128 a) { return SatAbsNeg<int16_t>(s, a, false); }
+RC_INLINE V128 VectorSignedSaturatedAbs32(State& s, V128 a) { return SatAbsNeg<int32_t>(s, a, false); }
+RC_INLINE V128 VectorSignedSaturatedAbs64(State& s, V128 a) { return SatAbsNeg<int64_t>(s, a, false); }
+RC_INLINE V128 VectorSignedSaturatedNeg8(State& s, V128 a) { return SatAbsNeg<int8_t>(s, a, true); }
+RC_INLINE V128 VectorSignedSaturatedNeg16(State& s, V128 a) { return SatAbsNeg<int16_t>(s, a, true); }
+RC_INLINE V128 VectorSignedSaturatedNeg32(State& s, V128 a) { return SatAbsNeg<int32_t>(s, a, true); }
+RC_INLINE V128 VectorSignedSaturatedNeg64(State& s, V128 a) { return SatAbsNeg<int64_t>(s, a, true); }
+// SQXTN / SQXTUN / UQXTN: narrow every lane into the lower half
+template <typename From, typename To>
+RC_INLINE V128 SatNarrow(State& s, V128 a) {
+    using UF = std::make_unsigned_t<From>;
+    using UT = std::make_unsigned_t<To>;
+    V128 r{};
+    bool q = false;
+    for (u8 i = 0; i < 16 / sizeof(From); i++) {
+        const From x = From(op::GetElem<UF>(a, i));
+        To v;
+        if (x < From(std::numeric_limits<To>::min()) && std::is_signed_v<From>) {
+            q = true;
+            v = std::numeric_limits<To>::min();
+        } else if (std::is_signed_v<From> && std::is_unsigned_v<To> && x < 0) {
+            q = true;
+            v = 0;
+        } else if (UF(x) > UF(std::numeric_limits<To>::max()) && (!std::is_signed_v<From> || x >= 0)) {
+            q = true;
+            v = std::numeric_limits<To>::max();
+        } else {
+            v = To(x);
+        }
+        r = op::SetElem<UT>(r, i, UT(v));
+    }
+    if (q)
+        s.fpsr |= kQC;
+    return r;
+}
+RC_INLINE V128 VectorSignedSaturatedNarrowToSigned16(State& s, V128 a) { return SatNarrow<int16_t, int8_t>(s, a); }
+RC_INLINE V128 VectorSignedSaturatedNarrowToSigned32(State& s, V128 a) { return SatNarrow<int32_t, int16_t>(s, a); }
+RC_INLINE V128 VectorSignedSaturatedNarrowToSigned64(State& s, V128 a) { return SatNarrow<int64_t, int32_t>(s, a); }
+RC_INLINE V128 VectorSignedSaturatedNarrowToUnsigned16(State& s, V128 a) { return SatNarrow<int16_t, u8>(s, a); }
+RC_INLINE V128 VectorSignedSaturatedNarrowToUnsigned32(State& s, V128 a) { return SatNarrow<int32_t, u16>(s, a); }
+RC_INLINE V128 VectorSignedSaturatedNarrowToUnsigned64(State& s, V128 a) { return SatNarrow<int64_t, u32>(s, a); }
+RC_INLINE V128 VectorUnsignedSaturatedNarrow16(State& s, V128 a) { return SatNarrow<u16, u8>(s, a); }
+RC_INLINE V128 VectorUnsignedSaturatedNarrow32(State& s, V128 a) { return SatNarrow<u32, u16>(s, a); }
+RC_INLINE V128 VectorUnsignedSaturatedNarrow64(State& s, V128 a) { return SatNarrow<u64, u32>(s, a); }
+// SQDMULH / SQRDMULH: (2*a*b [+ rounding]) >> esize, saturating only for min*min
+template <typename T, bool kRound>
+RC_INLINE V128 SatDMulH(State& s, V128 a, V128 b) {
+    return SatLanes2<T>(s, a, b, [](T x, T y, bool& q) {
+        constexpr int kBits = sizeof(T) * 8;
+        if (x == std::numeric_limits<T>::min() && y == x) {
+            q = true;
+            return std::numeric_limits<T>::max();
+        }
+        s64 p = 2 * s64(x) * s64(y);
+        if (kRound)
+            p += s64(1) << (kBits - 1);
+        return SatClamp<T>(p >> kBits, q);
+    });
+}
+RC_INLINE V128 VectorSignedSaturatedDoublingMultiplyHigh16(State& s, V128 a, V128 b) { return SatDMulH<int16_t, false>(s, a, b); }
+RC_INLINE V128 VectorSignedSaturatedDoublingMultiplyHigh32(State& s, V128 a, V128 b) { return SatDMulH<int32_t, false>(s, a, b); }
+RC_INLINE V128 VectorSignedSaturatedDoublingMultiplyHighRounding16(State& s, V128 a, V128 b) { return SatDMulH<int16_t, true>(s, a, b); }
+RC_INLINE V128 VectorSignedSaturatedDoublingMultiplyHighRounding32(State& s, V128 a, V128 b) { return SatDMulH<int32_t, true>(s, a, b); }
+
 } // namespace recomp

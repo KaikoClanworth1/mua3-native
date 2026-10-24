@@ -481,7 +481,17 @@ int main(int argc, char** argv) {
                         [] { return platform::Audio().Queued(); });
 
     gpu::D3D11Renderer renderer(display.Device(), display.Context());
-    renderer.SetResolutionScale(u32(std::clamp(cfg.resolution_scale, 1, 4)));
+    // resolution_scale 0 = auto: render the game's screen-sized targets (1080p docked, 720p handheld) at the
+    // smallest multiple that covers the output, so a 1440p/4K window is not an upscaled 1080p frame.
+    int scale = cfg.resolution_scale;
+    if (scale <= 0) {
+        const u32 base = cfg.docked ? 1080 : 720;
+        scale = int((display.PixelHeight() + base - 1) / base);
+    }
+    scale = std::clamp(scale, 1, 4);
+    LOG_INFO("Display", "output {} px high, internal render scale {}x{}", display.PixelHeight(), scale,
+             cfg.resolution_scale <= 0 ? " (auto)" : "");
+    renderer.SetResolutionScale(u32(scale));
     gpu::G().SetRenderer(&renderer);
     g_renderer = &renderer;
     if (std::getenv("MUA3_SAMPLE_GPU"))

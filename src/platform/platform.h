@@ -25,6 +25,8 @@ public:
     void BeginFrame();
     void EndFrame(); // draws the overlay and presents
     void PaceFrame(); // sleeps until the next UI frame (60 Hz)
+    // Height of the output in physical pixels (the desktop in fullscreen), for automatic render scaling.
+    u32 PixelHeight() const;
 
     // Latest guest frame as RGBA8 (linear layout) if available.
     void UploadFrame(const u8* rgba, u32 width, u32 height, u32 pitch);

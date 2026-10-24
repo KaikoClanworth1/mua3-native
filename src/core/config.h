@@ -18,7 +18,7 @@ struct Config {
     bool fullscreen = false;
     bool borderless = true;
     bool vsync = true;
-    int resolution_scale = 1; // internal render scale
+    int resolution_scale = 0; // internal render scale; 0 = auto from the output size
     int fps_limit = 60;
     int fps_target = 60; // game frame rate: 30 (original) or 60; higher values are experimental (patched timing)
     int swap_interval = 0; // 0: the game's own (MUA3 asks for 2 = 30 fps); 1 presents every vblank

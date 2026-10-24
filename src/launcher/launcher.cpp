@@ -274,7 +274,8 @@ void SettingsTab(LauncherState& st) {
         ImGui::Checkbox("Fullscreen", &c.fullscreen);
         ImGui::SameLine();
         ImGui::Checkbox("VSync", &c.vsync);
-        ImGui::SliderInt("Internal resolution scale", &c.resolution_scale, 1, 4, "%dx");
+        ImGui::SliderInt("Internal resolution scale", &c.resolution_scale, 0, 4,
+                         c.resolution_scale <= 0 ? "Auto (match the window)" : "%dx");
         ImGui::SliderInt("FPS limit (0 = off)", &c.fps_limit, 0, 240);
         {
             const int rates[] = {30, 60, 120, 144};
