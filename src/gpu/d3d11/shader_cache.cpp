@@ -1,3 +1,7 @@
+#include <cstring>
+#include <chrono>
+#include <unordered_set>
+#include <fstream>
 #include "gpu/d3d11/shader_cache.h"
 #include "gpu/dxbc/dxbc.h"
 
@@ -269,7 +273,20 @@ HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size, c
     auto it = shaders_.find(hash);
     if (it != shaders_.end())
         return it->second.get();
+    common::WriteFile(dump_dir_ / fmt::format("{:016x}.{}.bin", hash, StageTag(stage)), std::span(code, size));
+    if (opt) { // compute launch shape and constant buffer 1, so Prewarm can rebuild the kernel exactly
+        std::vector<u8> o(16 + opt->cbuf1_size);
+        const u32 shape[4] = {opt->block[0], opt->block[1], opt->block[2], opt->shared_bytes};
+        std::memcpy(o.data(), shape, 16);
+        if (opt->cbuf1_size)
+            std::memcpy(o.data() + 16, opt->cbuf1, opt->cbuf1_size);
+        common::WriteFile(dump_dir_ / fmt::format("{:016x}.cs.opt", hash), std::span(o.data(), o.size()));
+    }
+    return Queue(stage, hash, code, size, opt);
+}
 
+HostShader* ShaderCache::Queue(shader::Stage stage, u64 hash, const u8* code, size_t size,
+                               const shader::TranslateOptions* opt) {
     auto s = std::make_unique<HostShader>();
     s->stage = stage;
     s->hash = hash;
@@ -281,8 +298,6 @@ HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size, c
         s->opt.cbuf1 = s->cbuf1.empty() ? nullptr : s->cbuf1.data();
         s->opt.cbuf1_size = u32(s->cbuf1.size());
     }
-    const char* tag = StageTag(stage);
-    common::WriteFile(dump_dir_ / fmt::format("{:016x}.{}.bin", hash, tag), std::span(code, size));
     auto* raw = s.get();
     shaders_[hash] = std::move(s);
     pending++;
@@ -306,6 +321,11 @@ HostShader* ShaderCache::GetVariant(HostShader* base, const VariantKey& v) {
     s->hash = key;
     s->is_variant = true;
     LOG_INFO("Shader", "variant {:016x} of {:016x} (tex uint {:#x} sint {:#x})", key, base->hash, v.tex_uint, v.tex_sint);
+    if (!replaying_) { // newly seen (not replayed from the manifest): remember it for the next prewarm
+        std::ofstream(dump_dir_ / "variants.txt", std::ios::app)
+            << fmt::format("{:016x} {:x} {:x} {:x} {:x} {:x} {:x}\n", base->hash, v.attr_uint, v.attr_sint,
+                           v.attr_scaled, v.attr_snorm10, v.tex_uint, v.tex_sint);
+    }
     s->info = base->info;
     std::string& src = s->info.hlsl;
     // Debug overrides of the base shader apply to its variants too.
@@ -400,6 +420,78 @@ bool CompileShaderFile(const char* in_path, const char* out_path, const char* ta
     common::WriteFile(fs::u8path(out_path),
                       std::span(static_cast<const u8*>(code->GetBufferPointer()), code->GetBufferSize()));
     return true;
+}
+
+void ShaderCache::Prewarm() {
+    prewarm_start_ = std::chrono::steady_clock::now();
+    size_t n = 0;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(dump_dir_, ec)) {
+        const std::string name = e.path().filename().string(); // <16 hex>.<vs|ps>.bin
+        if (name.size() != 23 || !name.ends_with(".bin"))
+            continue;
+        const std::string tag = name.substr(17, 2);
+        if (tag != "vs" && tag != "ps" && tag != "cs")
+            continue;
+        const u64 hash = std::strtoull(name.substr(0, 16).c_str(), nullptr, 16);
+        if (shaders_.find(hash) != shaders_.end())
+            continue;
+        const auto code = common::ReadFile(e.path());
+        if (code.empty())
+            continue;
+        if (tag == "cs") { // needs the launch options recorded next to it
+            const auto o = common::ReadFile(dump_dir_ / (name.substr(0, 16) + ".cs.opt"));
+            if (o.size() < 16)
+                continue;
+            shader::TranslateOptions opt;
+            u32 shape[4];
+            std::memcpy(shape, o.data(), 16);
+            opt.block[0] = shape[0], opt.block[1] = shape[1], opt.block[2] = shape[2], opt.shared_bytes = shape[3];
+            opt.cbuf1 = o.size() > 16 ? o.data() + 16 : nullptr; // copied by Queue
+            opt.cbuf1_size = u32(o.size() - 16);
+            Queue(shader::Stage::Compute, hash, code.data(), code.size(), &opt);
+        } else {
+            Queue(tag == "vs" ? shader::Stage::Vertex : shader::Stage::Fragment, hash, code.data(), code.size(), nullptr);
+        }
+        n++;
+    }
+    std::ifstream in(dump_dir_ / "variants.txt");
+    std::unordered_set<std::string> seen;
+    for (std::string line; std::getline(in, line);) {
+        VariantKey v;
+        unsigned long long base = 0;
+        if (seen.insert(line).second &&
+            std::sscanf(line.c_str(), "%llx %x %x %x %x %x %x", &base, &v.attr_uint, &v.attr_sint, &v.attr_scaled,
+                        &v.attr_snorm10, &v.tex_uint, &v.tex_sint) == 7)
+            prewarm_variants_.emplace_back(base, v);
+    }
+    prewarm_reported_ = false;
+    LOG_INFO("Shader", "prewarm: compiling {} programs and {} variants seen in earlier runs", n,
+             prewarm_variants_.size());
+}
+
+void ShaderCache::Tick() {
+    if (prewarm_reported_)
+        return;
+    replaying_ = true;
+    std::erase_if(prewarm_variants_, [&](const std::pair<u64, VariantKey>& pv) {
+        auto it = shaders_.find(pv.first);
+        if (it == shaders_.end())
+            return true;
+        HostShader* base = it->second.get();
+        if (base->state == HostShader::Pending)
+            return false;
+        GetVariant(base, pv.second); // no-op for failed bases
+        return true;
+    });
+    replaying_ = false;
+    if (prewarm_variants_.empty() && pending == 0) {
+        prewarm_reported_ = true;
+        const double s =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - prewarm_start_).count();
+        LOG_INFO("Shader", "prewarm complete: {} shaders ready after {:.1f} s ({} failed)", shaders_.size(), s,
+                 failures.load());
+    }
 }
 
 } // namespace gpu

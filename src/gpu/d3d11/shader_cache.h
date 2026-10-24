@@ -1,5 +1,6 @@
 #pragma once
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <memory>
@@ -53,6 +54,11 @@ public:
         u32 tex_uint = 0, tex_sint = 0;                     // texture slots with integer formats
     };
     HostShader* GetVariant(HostShader* base, const VariantKey& v);
+    // Queues every vertex/pixel program seen in earlier runs (shader_dump/*.bin) and, once their bases are built,
+    // the integer variants recorded in shader_dump/variants.txt, so gameplay finds them compiled. Call before the
+    // GPU thread starts; Tick() (GPU thread, once per frame) creates the variants and reports completion.
+    void Prewarm();
+    void Tick();
     size_t Count() const { return shaders_.size(); }
     std::atomic<u32> failures{0};
     std::atomic<u32> pending{0};
@@ -76,6 +82,12 @@ private:
     std::deque<HostShader*> slow_queue_;
     std::vector<std::thread> workers_;
     bool stop_ = false;
+
+    HostShader* Queue(shader::Stage stage, u64 hash, const u8* code, size_t size, const shader::TranslateOptions* opt);
+    std::vector<std::pair<u64, VariantKey>> prewarm_variants_; // waiting for their base shader
+    std::chrono::steady_clock::time_point prewarm_start_;
+    bool prewarm_reported_ = true;
+    bool replaying_ = false; // Tick() is recreating manifest variants
 };
 
 u64 Hash64(const void* data, size_t size);

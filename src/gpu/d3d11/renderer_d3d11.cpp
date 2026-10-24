@@ -365,6 +365,7 @@ void BindRange(T* cur, const T* want_begin, u32 base, u32 n, Set set) {
 D3D11Renderer::D3D11Renderer(ID3D11Device* dev, ID3D11DeviceContext* ctx) : dev_(dev), ctx_(ctx) {
     new_frame_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     shaders_ = std::make_unique<ShaderCache>(dev);
+    shaders_->Prewarm();
     textures_ = std::make_unique<TextureCache>(dev, ctx, *this);
     g_dc = std::make_unique<DrawContext>(dev);
     g_dc->SetContext(ctx);
@@ -2191,6 +2192,7 @@ void D3D11Renderer::Draw() {
 void D3D11Renderer::Present(const PresentInfo& p) {
     std::lock_guard ctx_lock(ContextMutex());
     frame_counter_++;
+    shaders_->Tick();
     if (g_profile && frame_counter_ % 150 == 0) {
         std::string line;
         for (int i = 0; i < kProfCount; i++)
