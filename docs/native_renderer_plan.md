@@ -80,6 +80,16 @@ names in `main`'s strings are *not* in table order.
    objects (pool memory -> buffers/textures, reusing the format and swizzle code in `src/gpu`), still
    alongside the emulated path, and compare them with the emulated path's textures.
 3. Command buffer recording and replay: state objects, draws, clears, copies, compute dispatch. *Large.*
+   **Started:** `MUA3_NVN_RECORD=1` wraps Begin/EndRecording, `nvnQueueSubmitCommands` and the hot draw, bind and
+   dispatch calls, building host command lists keyed by command handle (counters are logged every 600 submits).
+   Finding (2026-10-24): about 3.6M commands are recorded and ~49k recordings ended, but the handles submitted
+   through `nvnQueueSubmitCommands` (1.6 per frame) come from recordings with no observed commands. KTGL must
+   hand its command buffers to the GPU another way. Next: find it, e.g. command memory linked by the driver
+   (`AddCommandMemory`/`AddControlMemory` callbacks), or submission from a thread or path the hooks miss. Trace
+   `QueueSubmitCommands` callers and the queue's control memory.
+   Name capture also has to tolerate other functions that take "nvn..." strings: only results pointing at
+   recompiled code count, a lookup function is trusted after 4 names, and host-implemented names the game never
+   asks for in observed code are resolved with `ResolveMissing`.
 4. Programs and resource binding (texture/sampler handles: NVN uses 64-bit texture handles from texture/sampler
    pools: `nvnTexturePoolRegisterTexture` and friends). *Medium.*
 5. Window, sync, present; delete the nvdrv/GPU-emulation path once parity holds. *Medium.*

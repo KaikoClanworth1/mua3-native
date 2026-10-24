@@ -3,6 +3,7 @@
 // nvnDeviceGetProcAddress and calls it through a pointer; the CPU runtime records which driver function each name
 // resolves to and, when a host implementation exists, runs that instead of the sdk's NVN driver.
 // See docs/native_renderer_plan.md.
+#include <functional>
 #include <string_view>
 
 #include "core/cpu/recomp/recomp_rt.h"
@@ -14,5 +15,10 @@ namespace hle::nvn {
 // guest calling convention: arguments in s.x / s.v, result in s.x[0], and they return with s.pc = s.x[30] like a
 // recompiled function.
 recomp::Fn Find(std::string_view name, recomp::Fn driver, recomp::u64 pc);
+
+// Asks the driver's name lookup function (guest `lookup_pc`) for every host-implemented entry point not seen yet
+// (some are resolved by code the runtime does not observe) and reports each through `found`.
+void ResolveMissing(recomp::State& s, recomp::Fn lookup, recomp::u64 lookup_pc, recomp::u64 device,
+                    const std::function<void(const char*, recomp::u64)>& found);
 
 } // namespace hle::nvn

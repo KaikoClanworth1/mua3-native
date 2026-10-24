@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -114,6 +115,21 @@ enum Wrapped {
     kTextureFinalize,
     kTexturePoolRegisterTexture,
     kSamplerPoolRegisterSampler,
+    // command recording (MUA3_NVN_RECORD=1)
+    kCommandBufferBeginRecording,
+    kCommandBufferEndRecording,
+    kQueueSubmitCommands,
+    kCommandBufferBindProgram,
+    kCommandBufferBindTexture,
+    kCommandBufferBindUniformBuffer,
+    kCommandBufferBindStorageBuffer,
+    kCommandBufferBindVertexBuffer,
+    kCommandBufferSetRenderTargets,
+    kCommandBufferDrawElementsBaseVertex,
+    kCommandBufferDrawElementsIndirect,
+    kCommandBufferDrawArrays,
+    kCommandBufferDrawArraysIndirect,
+    kCommandBufferDispatchCompute,
     kWrappedCount
 };
 std::array<recomp::Fn, kWrappedCount> g_driver{}; // the sdk driver's implementation of each wrapped function
@@ -225,10 +241,100 @@ void SamplerPoolRegisterSampler(State& s) {
     o.sampler_ids[id] = sampler;
 }
 
+// ---- command recording (step 3, observe mode): host command lists built from the game's command buffer calls,
+// keyed by the command handle EndRecording returns, and summarized when the queue submits them. This is the
+// stream the native D3D11 replay will execute.
+struct Command {
+    Wrapped op;
+    u64 args[6];
+};
+struct Recording {
+    std::mutex mutex;
+    std::unordered_map<u64, std::vector<Command>> open;    // command buffer -> commands since BeginRecording
+    std::unordered_map<u64, std::vector<Command>> handles; // command handle -> finished list
+    u64 submits = 0, cmds = 0, draws = 0, indirect = 0, dispatches = 0, unknown = 0;
+    u64 recorded = 0, begins = 0, ends = 0, empty_ends = 0; // diagnostics
+};
+Recording& Rec() {
+    static Recording r;
+    return r;
+}
+template <Wrapped W>
+void RecordCommand(State& s) {
+    const u64 cb = s.x[0];
+    Command c{W, {s.x[1], s.x[2], s.x[3], s.x[4], s.x[5], s.x[6]}};
+    u64 obj, r;
+    if (!Through(s, W, obj, r))
+        return;
+    auto& rec = Rec();
+    std::lock_guard lk(rec.mutex);
+    rec.open[cb].push_back(c);
+    rec.recorded++;
+}
+void CommandBufferBeginRecording(State& s) {
+    u64 cb, r;
+    if (!Through(s, kCommandBufferBeginRecording, cb, r))
+        return;
+    auto& rec = Rec();
+    std::lock_guard lk(rec.mutex);
+    rec.open[cb].clear();
+    rec.begins++;
+}
+void CommandBufferEndRecording(State& s) {
+    u64 cb, handle;
+    if (!Through(s, kCommandBufferEndRecording, cb, handle))
+        return;
+    auto& rec = Rec();
+    std::lock_guard lk(rec.mutex);
+    if (rec.handles.size() > 4096) // handles are submitted soon after recording; drop stale ones
+        rec.handles.clear();
+    rec.ends++;
+    rec.empty_ends += rec.open[cb].empty();
+    // Handles identify command memory, which the game reuses: an empty recording must not hide a real one that
+    // is still waiting to be submitted.
+    auto& slot = rec.handles[handle];
+    if (!rec.open[cb].empty() || slot.empty())
+        slot = std::move(rec.open[cb]);
+    rec.open[cb].clear();
+}
+// void nvnQueueSubmitCommands(NVNqueue*, int numCommands, const NVNcommandHandle* handles)
+void QueueSubmitCommands(State& s) {
+    const u64 count = u32(s.x[1]), array = s.x[2];
+    std::vector<u64> handles;
+    for (u64 i = 0; i < count && i < 256; i++)
+        handles.push_back(recomp::Rd<u64>(s, array + i * 8));
+    u64 queue, r;
+    if (!Through(s, kQueueSubmitCommands, queue, r))
+        return;
+    auto& rec = Rec();
+    std::lock_guard lk(rec.mutex);
+    for (u64 h : handles) {
+        auto it = rec.handles.find(h);
+        if (it == rec.handles.end()) {
+            rec.unknown++;
+            continue;
+        }
+        for (const Command& c : it->second) {
+            rec.cmds++;
+            rec.draws += c.op >= kCommandBufferDrawElementsBaseVertex && c.op <= kCommandBufferDrawArraysIndirect;
+            rec.indirect += c.op == kCommandBufferDrawElementsIndirect || c.op == kCommandBufferDrawArraysIndirect;
+            rec.dispatches += c.op == kCommandBufferDispatchCompute;
+        }
+    }
+    if (++rec.submits % 600 == 0) {
+        LOG_INFO("NVN", "recorded stream, per submit: {:.0f} commands, {:.0f} draws ({:.0f} indirect), {:.1f} "
+                        "dispatches; {} unrecorded handles (recorded {}, begins {}, ends {}, empty {})",
+                 double(rec.cmds) / 600, double(rec.draws) / 600, double(rec.indirect) / 600,
+                 double(rec.dispatches) / 600, rec.unknown, rec.recorded, rec.begins, rec.ends, rec.empty_ends);
+        rec.cmds = rec.draws = rec.indirect = rec.dispatches = rec.unknown = 0;
+    }
+}
+
 struct Entry {
     std::string_view name;
     recomp::Fn fn;
-    int wrapped = -1; // index into g_driver for pass-through wrappers
+    int wrapped = -1;    // index into g_driver for pass-through wrappers
+    bool record = false; // only with MUA3_NVN_RECORD=1
 };
 #define NVN_ENTRY(NAME) {"nvn" #NAME, NAME, k##NAME}
 const Entry kHostFunctions[] = {
@@ -241,16 +347,74 @@ const Entry kHostFunctions[] = {
     NVN_ENTRY(TextureFinalize),
     NVN_ENTRY(TexturePoolRegisterTexture),
     NVN_ENTRY(SamplerPoolRegisterSampler),
+#define NVN_RECORD(NAME) {"nvn" #NAME, NAME, k##NAME, true}
+#define NVN_RECORD_CMD(NAME) {"nvn" #NAME, RecordCommand<k##NAME>, k##NAME, true}
+    NVN_RECORD(CommandBufferBeginRecording),
+    NVN_RECORD(CommandBufferEndRecording),
+    NVN_RECORD(QueueSubmitCommands),
+    NVN_RECORD_CMD(CommandBufferBindProgram),
+    NVN_RECORD_CMD(CommandBufferBindTexture),
+    NVN_RECORD_CMD(CommandBufferBindUniformBuffer),
+    NVN_RECORD_CMD(CommandBufferBindStorageBuffer),
+    NVN_RECORD_CMD(CommandBufferBindVertexBuffer),
+    NVN_RECORD_CMD(CommandBufferSetRenderTargets),
+    NVN_RECORD_CMD(CommandBufferDrawElementsBaseVertex),
+    NVN_RECORD_CMD(CommandBufferDrawElementsIndirect),
+    NVN_RECORD_CMD(CommandBufferDrawArrays),
+    NVN_RECORD_CMD(CommandBufferDrawArraysIndirect),
+    NVN_RECORD_CMD(CommandBufferDispatchCompute),
+#undef NVN_RECORD_CMD
+#undef NVN_RECORD
 };
 #undef NVN_ENTRY
 
 } // namespace
+
+std::mutex g_resolved_mutex;
+std::unordered_map<std::string, u64>& Resolved() { // every name seen, -> driver address
+    static std::unordered_map<std::string, u64> m;
+    return m;
+}
+
+void ResolveMissing(State& s, recomp::Fn lookup, u64 lookup_pc, u64 device,
+                    const std::function<void(const char*, u64)>& found) {
+    for (const auto& e : kHostFunctions) {
+        const std::string name(e.name);
+        {
+            std::lock_guard lk(g_resolved_mutex);
+            if (Resolved().count(name))
+                continue;
+        }
+        // the name goes on the guest stack below sp (free space at a call boundary)
+        const u64 str = (s.sp - 0x400) & ~u64(15);
+        for (size_t i = 0; i <= name.size(); i++)
+            recomp::Wr<recomp::u8>(s, str + i, i < name.size() ? recomp::u8(name[i]) : 0);
+        State saved;
+        std::memcpy(&saved, &s, sizeof(State));
+        s.x[0] = device;
+        s.x[1] = str;
+        s.x[30] = kHostReturn;
+        s.sp = str - 0x100;
+        s.pc = lookup_pc;
+        lookup(s);
+        const u64 ptr = s.pc == kHostReturn ? s.x[0] : 0;
+        const u64 icount = s.icount;
+        std::memcpy(&s, &saved, sizeof(State));
+        s.icount = icount;
+        if (ptr)
+            found(name.c_str(), ptr);
+    }
+}
 
 recomp::Fn Find(std::string_view name, recomp::Fn driver, u64 pc) {
     static const bool enabled = [] {
         const char* e = std::getenv("MUA3_NVN_HLE");
         return !(e && e[0] == '0');
     }();
+    {
+        std::lock_guard lk(g_resolved_mutex);
+        Resolved().emplace(std::string(name), pc);
+    }
     if (!enabled)
         return nullptr;
     const Entry* entry = nullptr;
@@ -261,7 +425,8 @@ recomp::Fn Find(std::string_view name, recomp::Fn driver, u64 pc) {
         std::lock_guard lk(g_names_mutex);
         Driver().emplace(std::string(name), DriverEntry{driver, pc}); // the getters wrappers call
     }
-    if (!entry)
+    static const bool record = std::getenv("MUA3_NVN_RECORD") != nullptr;
+    if (!entry || (entry->record && !record))
         return nullptr;
     if (entry->wrapped >= 0) {
         if (driver == entry->fn) // resolved again after the swap

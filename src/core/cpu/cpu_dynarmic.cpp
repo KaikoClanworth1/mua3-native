@@ -390,19 +390,26 @@ public:
     std::atomic<bool> capture_names_{true};
     std::set<u64> proc_addr_pcs_; // lookup functions (nvnDeviceGetProcAddress and friends), once identified
     size_t names_seen_ = 0;
+    std::set<std::string> unique_names_;
     std::unordered_map<u64, std::vector<std::pair<u64, std::string>>> name_candidates_; // per calling target
-    void OnProcAddress(u64 getproc_pc, u64 ptr, const char* name) {
+    // Returns true once, when the last NVN name has been resolved.
+    bool OnProcAddress(u64 getproc_pc, u64 ptr, const char* name) {
+        bool done = false;
+        // Other functions also take "nvn..." strings (string compares and the like): only results that point at
+        // recompiled game code are entry points.
+        if (!Lookup(ptr))
+            return false;
         std::vector<std::pair<u64, std::string>> apply;
         {
             std::lock_guard lk(census_mutex_);
             if (census_)
                 census_names_.emplace(ptr, name);
             if (!proc_addr_pcs_.count(getproc_pc)) {
-                // Other calls can pass an "nvn..." string too: a lookup function is one that resolves many names.
+                // Other calls can pass an "nvn..." string too: a lookup function is one that resolves several names.
                 auto& c = name_candidates_[getproc_pc];
                 c.emplace_back(ptr, name);
-                if (c.size() < 16)
-                    return;
+                if (c.size() < 4)
+                    return false;
                 proc_addr_pcs_.insert(getproc_pc);
                 apply = std::move(c);
                 name_candidates_.erase(getproc_pc);
@@ -410,14 +417,18 @@ public:
             } else {
                 apply.emplace_back(ptr, name);
             }
-            names_seen_ += apply.size() - (apply.size() ? 1 : 0) + 1;
-            if (names_seen_ >= 519) { // the game resolves 519 names
+            for (const auto& a : apply)
+                unique_names_.insert(a.second);
+            names_seen_ = unique_names_.size();
+            if (names_seen_ >= 519 && capture_names_) { // the game resolves 519 names (some of them twice)
                 capture_names_ = false;
+                done = true;
                 LOG_INFO("NVN", "{} NVN entry points resolved", names_seen_);
             }
         }
         for (const auto& [p, n] : apply)
             OverrideWithHost(p, n.c_str());
+        return done;
     }
     void OverrideWithHost(u64 ptr, const char* name) {
         if (auto host = hle::nvn::Find(name, Lookup(ptr), ptr); host && ptr && host != Lookup(ptr)) {
@@ -748,9 +759,11 @@ void Dispatch(State& s) {
             for (int i = 0; i < 63 && (name[i] = char(Rd<u8>(s, str + i))); i++)
                 ;
             if (auto fn = f.Lookup(s.pc)) {
-                const u64 pc = s.pc;
+                const u64 pc = s.pc, device = s.x[0];
                 fn(s);
-                f.OnProcAddress(pc, s.x[0], name);
+                if (f.OnProcAddress(pc, s.x[0], name)) // all names seen: resolve the host ones never asked for
+                    hle::nvn::ResolveMissing(s, fn, pc, device,
+                                             [&](const char* n, u64 ptr) { f.OverrideWithHost(ptr, n); });
                 return;
             }
         }
