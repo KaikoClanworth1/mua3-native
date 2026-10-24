@@ -103,7 +103,19 @@ resolves surfaces, texture handles and constant buffers during that frame; all s
 - Shader programs: KTGL binds separable single-stage programs (BindProgram stage bits 1 vertex, 2 fragment, ...,
   0x20 compute). ProgramSetShaders' code address points at an NVN blob (magic 0x12345678); the Maxwell program
   header (SPH) is always at **code + 0x30**, so the existing shader cache (and prewarm) applies as is.
-- Render target formats (NVN -> hardware RT format): 0x25 -> 0xD5 (RGBA8), 0x38 -> 0xD6 (RGBA8 sRGB),
+- NVN format enum (GL ordering; every learned texture format and the vertex formats seen fit it):
+  0x01 R8, 0x02 R8SN, 0x03 R8UI, 0x04 R8I, 0x05 R16F, 0x06 R16, 0x07 R16SN, 0x08 R16UI, 0x09 R16I, 0x0A R32F,
+  0x0B R32UI, 0x0C R32I, 0x0D RG8, 0x0E RG8SN, 0x0F RG8UI, 0x10 RG8I, 0x11 RG16F, 0x12 RG16, 0x13 RG16SN,
+  0x14 RG16UI, 0x15 RG16I, 0x16 RG32F, 0x17 RG32UI, 0x18 RG32I, 0x19 RGB8, 0x1A RGB8SN, 0x1B RGB8UI, 0x1C RGB8I,
+  0x1D RGB16F, 0x1E RGB16, 0x1F RGB16SN, 0x20 RGB16UI, 0x21 RGB16I, 0x22 RGB32F, 0x23 RGB32UI, 0x24 RGB32I,
+  0x25 RGBA8, 0x26 RGBA8SN, 0x27 RGBA8UI, 0x28 RGBA8I, 0x29 RGBA16F, 0x2A RGBA16, 0x2B RGBA16SN, 0x2C RGBA16UI,
+  0x2D RGBA16I, 0x2E RGBA32F, 0x2F RGBA32UI, 0x30 RGBA32I, 0x31 STENCIL8, 0x32 DEPTH16, 0x33 DEPTH24,
+  0x34 DEPTH32F, 0x35 DEPTH24_STENCIL8, 0x36 DEPTH32F_STENCIL8, 0x37 RGBX8_SRGB, 0x38 RGBA8_SRGB, 0x39 RGBA4,
+  0x3A RGB5, 0x3B RGB5A1, 0x3C RGB565, 0x3D RGB10A2, 0x3E RGB10A2UI, 0x3F R11G11B10F, 0x40 RGB9E5F,
+  0x41 RGB_DXT1, 0x42 RGBA_DXT1, 0x43 RGBA_DXT3, 0x44 RGBA_DXT5, ... 0x50 BPTC (BC7, learned).
+- Vertex input: NVNvertexAttribState objects are 4 bytes each (BindVertexAttribState(cb, count, array)), set with
+  SetFormat(format, offset) and SetStreamIndex(stream); NVNvertexStreamState: SetStride, SetDivisor. A typical
+  mesh: RGB32F position at 0, RG32F at 0xC, RGBA8 at 0x24; stream stride 0x1C.- Render target formats (NVN -> hardware RT format): 0x25 -> 0xD5 (RGBA8), 0x38 -> 0xD6 (RGBA8 sRGB),
   0x3D -> 0xD1 (RGB10A2), 0x3F -> 0xE0 (R11G11B10F), 0x0A -> 0xE5 (R32F), 0x29 -> 0xCA (RGBA16F),
   depth 0x34 -> 0x0A.
 

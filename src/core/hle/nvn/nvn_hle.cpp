@@ -559,6 +559,12 @@ void QueueSubmitCommands(State& s) {
                                  std::bit_cast<float>(c.v[3]));
                 if (name.find("State") != std::string::npos || name.find("BindProgram") != std::string::npos)
                     objects.insert(c.x[1]);
+                if (name.find("BindVertexAttribState") != std::string::npos ||
+                    name.find("BindVertexStreamState") != std::string::npos)
+                    for (u64 k = 0; k < c.x[1] && k < 32; k++) // arrays of state objects: probe 4/8/16-byte strides
+                        for (u64 stride : {4ull, 8ull, 16ull})
+                            if (rec.shadow.count(c.x[2] + k * stride))
+                                objects.insert(c.x[2] + k * stride);
                 if (depth < 8)
                     for (u64 nested : c.handles)
                         walk.emplace_back(nested, depth + 1);
