@@ -65,9 +65,13 @@ names in `main`'s strings are *not* in table order.
 
 ## Order of work (estimates, in the same units as the recompiler work)
 
-1. ~~Census of the functions used~~ (done; see above). Next: the hook itself, a forwarding shim through
-   `recomp::Dispatch` and the BRK trap that calls host code first and falls through to the sdk driver per function,
-   so families can be switched over one at a time. *Small.*
+1. ~~Census of the functions used~~ and ~~the hook~~ (done). `recomp::Dispatch` watches the game's three NVN name
+   lookup functions while entry points are resolved. `hle::nvn::Find(name)` (`src/core/hle/nvn/nvn_hle.cpp`)
+   supplies host implementations, which replace the driver function in the native table, so recompiled and JIT
+   callers both reach them. `MUA3_NVN_HLE=0` turns it off. The first host function is `nvnDeviceGetTextureHandle`
+   (pure packing, ~3,200 calls/frame), verified in ST010.
+   Single getters/setters swapped one by one give no speed-up on their own: the frame cost is in command-buffer
+   encoding (sdk) plus decoding (`src/gpu`). The gain comes when a whole family (step 3) runs on host objects.
 2. Device, queue, memory pool, buffer, texture, sampler objects; texture/buffer data paths. *Large.*
 3. Command buffer recording and replay: state objects, draws, clears, copies, compute dispatch. *Large.*
 4. Programs and resource binding (texture/sampler handles: NVN uses 64-bit texture handles from texture/sampler
