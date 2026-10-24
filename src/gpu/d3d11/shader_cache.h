@@ -23,6 +23,8 @@ struct HostShader {
     shader::Stage stage{};
     u64 hash = 0;
     std::atomic<int> state{Pending};
+    std::atomic<bool> claimed{false}; // a worker took it (urgent shaders can be queued twice)
+    bool prewarm = false;             // queued by Prewarm (back of the queue) and not yet asked for by the game
     bool ok = false; // valid once state != Pending
     shader::TranslateResult info;
     ComPtr<ID3D11VertexShader> vs;
@@ -86,7 +88,8 @@ private:
     std::vector<std::thread> workers_;
     bool stop_ = false;
 
-    HostShader* Queue(shader::Stage stage, u64 hash, const u8* code, size_t size, const shader::TranslateOptions* opt);
+    HostShader* Queue(shader::Stage stage, u64 hash, const u8* code, size_t size, const shader::TranslateOptions* opt,
+                      bool prewarm);
     std::vector<std::pair<u64, VariantKey>> prewarm_variants_; // waiting for their base shader
     std::chrono::steady_clock::time_point prewarm_start_;
     bool prewarm_reported_ = true;

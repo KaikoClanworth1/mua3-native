@@ -64,6 +64,8 @@ void ShaderCache::Worker(bool slow) {
             s = q.front();
             q.pop_front();
         }
+        if (s->claimed.exchange(true))
+            continue;
         if (Build(*s, slow))
             pending--;
     }
@@ -86,9 +88,13 @@ bool ShaderCache::Build(HostShader& s, bool slow) {
     // Compute shaders go through the direct DXBC backend (milliseconds): no slow FXC queue for them.
     const bool direct = s.stage == shader::Stage::Compute && !std::getenv("MUA3_FXC_COMPUTE");
     if (!slow && !direct && s.info.ok && s.info.uses_loop && !fs::exists(CachePath(s, target))) {
+        s.claimed = false;
         {
             std::lock_guard lk(mutex_);
-            slow_queue_.push_back(&s);
+            if (s.prewarm)
+                slow_queue_.push_back(&s);
+            else
+                slow_queue_.push_front(&s);
         }
         cv_.notify_all();
         return false;
@@ -257,8 +263,17 @@ HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size, c
         hash ^= Hash64(shape, sizeof(shape)) * 0x9E3779B97F4A7C15ull;
     }
     auto it = shaders_.find(hash);
-    if (it != shaders_.end())
-        return it->second.get();
+    if (it != shaders_.end()) {
+        HostShader* found = it->second.get();
+        if (found->prewarm && found->state == HostShader::Pending) { // still waiting in the prewarm backlog
+            found->prewarm = false;
+            std::lock_guard lk(mutex_);
+            // already translated and handed to the slow (loop shader) queue, or still in the normal one
+            (found->translated && found->info.uses_loop ? slow_queue_ : queue_).push_front(found);
+            cv_.notify_all();
+        }
+        return found;
+    }
     common::WriteFile(dump_dir_ / fmt::format("{:016x}.{}.bin", hash, StageTag(stage)), std::span(code, size));
     if (opt) { // compute launch shape and constant buffer 1, so Prewarm can rebuild the kernel exactly
         std::vector<u8> o(16 + opt->cbuf1_size);
@@ -268,12 +283,13 @@ HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size, c
             std::memcpy(o.data() + 16, opt->cbuf1, opt->cbuf1_size);
         common::WriteFile(dump_dir_ / fmt::format("{:016x}.cs.opt", hash), std::span(o.data(), o.size()));
     }
-    return Queue(stage, hash, code, size, opt);
+    return Queue(stage, hash, code, size, opt, false);
 }
 
 HostShader* ShaderCache::Queue(shader::Stage stage, u64 hash, const u8* code, size_t size,
-                               const shader::TranslateOptions* opt) {
+                               const shader::TranslateOptions* opt, bool prewarm) {
     auto s = std::make_unique<HostShader>();
+    s->prewarm = prewarm;
     s->stage = stage;
     s->hash = hash;
     s->code.assign(code, code + size);
@@ -289,7 +305,10 @@ HostShader* ShaderCache::Queue(shader::Stage stage, u64 hash, const u8* code, si
     pending++;
     {
         std::lock_guard lk(mutex_);
-        queue_.push_back(raw);
+        if (prewarm)
+            queue_.push_back(raw);
+        else
+            queue_.push_front(raw); // the game is waiting for this one
     }
     cv_.notify_one();
     return raw;
@@ -386,7 +405,10 @@ HostShader* ShaderCache::GetVariant(HostShader* base, const VariantKey& v) {
     pending++;
     {
         std::lock_guard lk(mutex_);
-        queue_.push_back(raw);
+        if (replaying_)
+            queue_.push_back(raw);
+        else
+            queue_.push_front(raw);
     }
     cv_.notify_one();
     return raw;
@@ -436,9 +458,10 @@ void ShaderCache::Prewarm() {
             opt.block[0] = shape[0], opt.block[1] = shape[1], opt.block[2] = shape[2], opt.shared_bytes = shape[3];
             opt.cbuf1 = o.size() > 16 ? o.data() + 16 : nullptr; // copied by Queue
             opt.cbuf1_size = u32(o.size() - 16);
-            Queue(shader::Stage::Compute, hash, code.data(), code.size(), &opt);
+            Queue(shader::Stage::Compute, hash, code.data(), code.size(), &opt, true);
         } else {
-            Queue(tag == "vs" ? shader::Stage::Vertex : shader::Stage::Fragment, hash, code.data(), code.size(), nullptr);
+            Queue(tag == "vs" ? shader::Stage::Vertex : shader::Stage::Fragment, hash, code.data(), code.size(), nullptr,
+                  true);
         }
         n++;
     }

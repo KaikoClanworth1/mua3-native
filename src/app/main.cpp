@@ -21,6 +21,7 @@
 #include "core/hle/hid.h"
 #include "gpu/d3d11/renderer_d3d11.h"
 #include "gpu/d3d11/shader_cache.h"
+#include "core/cpu/cpu.h"
 #include "gpu/shader/harvest.h"
 #include "gpu/gpu.h"
 #include "platform/platform.h"
@@ -80,7 +81,13 @@ void DrawOverlay(const core::Config& cfg, platform::Input& input, bool& show) {
                 (unsigned long long)g.methods.load(), (unsigned long long)g.draws.load());
     ImGui::Text("Input: %s   Audio: %s", input.DeviceName().c_str(), platform::Audio().BackendName().c_str());
     ImGui::Separator();
-    ImGui::TextWrapped("CPU: dynarmic JIT (interim)   GPU: command stream accepted, D3D11 renderer pending");
+    if (const float pct = cpu::g_native_percent; pct >= 0)
+        ImGui::Text("CPU: %.1f%% of guest code native (AOT recompiled), rest on the dynarmic JIT", pct);
+    else
+        ImGui::Text("CPU: AOT recompiled code + dynarmic JIT fallback");
+    if (g_renderer && g_renderer->Shaders())
+        ImGui::Text("GPU: Maxwell commands -> D3D11, %zu shaders (%u compiling)", g_renderer->Shaders()->Count(),
+                    g_renderer->Shaders()->pending.load());
     if (ImGui::Button("Dump guest threads to log"))
         core::Sys().Kern().DumpAllThreads();
     ImGui::SameLine();

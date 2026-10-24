@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <functional>
 #include <memory>
 #include "common/common.h"
@@ -60,5 +61,8 @@ public:
 };
 
 std::unique_ptr<CoreFactory> CreateDynarmicFactory(core::Memory& memory, size_t max_cores);
+
+// Share of guest instructions run by recompiled code over the last 10 s (percent; < 0 until measured).
+extern std::atomic<float> g_native_percent;
 
 } // namespace cpu

@@ -383,6 +383,8 @@ public:
             return;
         const u64 n = native_instr_.exchange(0), j = jit_instr_.exchange(0), tr = transitions_.exchange(0);
         if (n + j)
+            g_native_percent = float(100.0 * double(n) / double(n + j));
+        if (n + j)
             LOG_INFO("Recomp", "native {:.1f}% of {} M guest instructions, {} k JIT->native entries (last 10 s)",
                      100.0 * double(n) / double(n + j), (n + j) / 1000000, tr / 1000);
     }
@@ -580,6 +582,8 @@ void DynarmicCore::AddTicks(u64 ticks) {
 }
 
 } // namespace
+
+std::atomic<float> g_native_percent{-1.0f};
 
 std::unique_ptr<CoreFactory> CreateDynarmicFactory(core::Memory& memory, size_t max_cores) {
     return std::make_unique<DynarmicFactory>(memory, max_cores);
