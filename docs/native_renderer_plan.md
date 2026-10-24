@@ -130,6 +130,24 @@ constant buffer (`TextureUse::cbuf_offset` vs BindTexture index), NVN format enu
 vertex attribute formats, and the blend, depth and polygon enums. Instrumenting the emulated path (when it creates
 a surface or input layout at a GPU address the NVN model knows, log the pair) learns these tables automatically.
 
+## Replay architecture (next)
+
+The bridge is in place (`hle::nvn::SetReplaySink`, `QueryTexture/QueryState/QueryProgramCode/QueryTexturePool`):
+each submitted frame arrives flattened in execution order. Do not write a second renderer. Translated shaders
+expect the renderer's driver constants (viewport transform/flip, attribute formats for conversion) at b13, and
+`D3D11Renderer::Draw` also carries the variant selection, quad/strip handling, culling-GS emulation, hazard copies
+and caches. Split `Draw` instead:
+1. `GatherFromMaxwell(DrawInputs&)`: today's register reads (shaders, vertex streams/attribs, index buffer,
+   topology, render targets, viewports/scissors, blend/depth/raster/stencil state, constant buffers by address,
+   texture handles -> TIC/TSC).
+2. `Issue(const DrawInputs&)`: everything after, unchanged.
+3. `GatherFromNvn(const ReplayCommand& draw, NvnState&, DrawInputs&)`: the same structure from the replay state,
+   with the learned conventions above (SPH at code + 0x30, cbuf i + 3, handles in cbuf 2 at 0x20 + i * 8, format
+   enum, render target addresses from `QueryTexture`).
+Milestone: `MUA3_NVN_REPLAY=1` replays one recorded frame's draws into replay-owned targets at Present and dumps
+them next to the emulated RT dumps for comparison. Then `MUA3_NVN_NATIVE=1`: replay at submit, host
+FenceSync/SyncWait/Flush/Finish and window present, and the driver's GPU submission suppressed.
+
 ## Order of work (estimates, in the same units as the recompiler work)
 
 1. ~~Census of the functions used~~ and ~~the hook~~ (done). `recomp::Dispatch` watches the game's three NVN name
