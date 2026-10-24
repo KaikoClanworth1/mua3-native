@@ -9,9 +9,10 @@
 
 namespace hle::nvn {
 
-// Host implementation for an NVN entry point name, or nullptr if the guest driver still handles it. Host functions
-// follow the guest calling convention: arguments in s.x / s.v, result in s.x[0], and they return with
-// s.pc = s.x[30] like a recompiled function.
-recomp::Fn Find(std::string_view name);
+// Host implementation for an NVN entry point name, or nullptr if the guest driver still handles it. `driver` is the
+// driver's own (recompiled) implementation at guest address `pc`, which observing wrappers call through to. Host functions follow the
+// guest calling convention: arguments in s.x / s.v, result in s.x[0], and they return with s.pc = s.x[30] like a
+// recompiled function.
+recomp::Fn Find(std::string_view name, recomp::Fn driver, recomp::u64 pc);
 
 } // namespace hle::nvn

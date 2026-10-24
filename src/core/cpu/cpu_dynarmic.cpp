@@ -420,7 +420,7 @@ public:
             OverrideWithHost(p, n.c_str());
     }
     void OverrideWithHost(u64 ptr, const char* name) {
-        if (auto host = hle::nvn::Find(name); host && ptr) {
+        if (auto host = hle::nvn::Find(name, Lookup(ptr), ptr); host && ptr && host != Lookup(ptr)) {
             {
                 std::unique_lock lk(native_mutex_);
                 native_[ptr] = host;
