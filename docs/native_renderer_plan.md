@@ -100,6 +100,9 @@ resolves surfaces, texture handles and constant buffers during that frame; all s
 - Stages: NVN stage 0 (vertex) is hardware stage 0 (vertex B), NVN stage 1 (fragment) is hardware stage 4.
 - Texture GPU addresses: the pool's buffer address (`nvnMemoryPoolGetBufferAddress`) + offset + **0xC3C00000**
   for the main pool (textures use a separate mapping; derive this per pool).
+- Shader programs: KTGL binds separable single-stage programs (BindProgram stage bits 1 vertex, 2 fragment, ...,
+  0x20 compute). ProgramSetShaders' code address points at an NVN blob (magic 0x12345678); the Maxwell program
+  header (SPH) is always at **code + 0x30**, so the existing shader cache (and prewarm) applies as is.
 - Render target formats (NVN -> hardware RT format): 0x25 -> 0xD5 (RGBA8), 0x38 -> 0xD6 (RGBA8 sRGB),
   0x3D -> 0xD1 (RGB10A2), 0x3F -> 0xE0 (R11G11B10F), 0x0A -> 0xE5 (R32F), 0x29 -> 0xCA (RGBA16F),
   depth 0x34 -> 0x0A.

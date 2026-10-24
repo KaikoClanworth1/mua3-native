@@ -484,8 +484,15 @@ void ResolveFrame(Recording& rec, std::ofstream& f, State& s, const std::vector<
                         continue;
                     if (auto sh = rec.shadow.find(st.program[b]); sh != rec.shadow.end())
                         for (const auto& [slot, cmd] : sh->second)
-                            if (g_generic[slot].shaders && !cmd.handles.empty())
-                                line += fmt::format(" {} {:#x}", "VFGCE"[b], cmd.handles[0]);
+                            if (g_generic[slot].shaders && !cmd.handles.empty()) {
+                                u32 w[64]{}; // where the Maxwell SPH (type 1/2, version 3) starts in the blob
+                                gpu::G().ReadGpu(cmd.handles[0], w, sizeof(w));
+                                int sph = -1;
+                                for (int k = 0; k < 64 && sph < 0; k++)
+                                    if (((w[k] & 0x1F) == 1 || (w[k] & 0x1F) == 2) && ((w[k] >> 5) & 0x1F) == 3)
+                                        sph = k * 4;
+                                line += fmt::format(" {} {:#x}[sph+{:#x}]", "VFGCE"[b], cmd.handles[0], sph);
+                            }
                 }
                 for (u32 i = 0; i < st.num_rt && i < 8; i++) {
                     auto hw = kRtFormat.find(st.rt_fmt[i]);
