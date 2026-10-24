@@ -322,9 +322,9 @@ void QueueSubmitCommands(State& s) {
     std::vector<u64> handles;
     for (u64 i = 0; i < count && i < 256; i++)
         handles.push_back(recomp::Rd<u64>(s, array + i * 8));
-    u64 queue, r;
-    if (!Through(s, kQueueSubmitCommands, queue, r))
-        return;
+    // Observed before the driver runs: the submit makes a GPU syscall that can hand the rest of the call to the JIT.
+    const u64 queue = s.x[0];
+    {
     auto& rec = Rec();
     std::lock_guard lk(rec.mutex);
     // walk the submitted command buffers, following nested Call/CopyCommands
@@ -356,6 +356,9 @@ void QueueSubmitCommands(State& s) {
                  double(rec.dispatches) / 600, rec.unknown, rec.recorded, rec.begins, rec.ends, rec.empty_ends);
         rec.cmds = rec.draws = rec.indirect = rec.dispatches = rec.unknown = 0;
     }
+    }
+    u64 q, r;
+    Through(s, kQueueSubmitCommands, q, r);
 }
 
 struct Entry {

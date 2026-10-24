@@ -93,6 +93,11 @@ names in `main`'s strings are *not* in table order.
    So KTGL submits one persistent command buffer per frame and reaches the per-frame command memory indirectly.
    Next: decode the handle bits (control vs command memory) and follow what the persistent buffer's control
    memory points at (it is in guest memory; dump it and look for the 0x2002... handles or their GPU addresses).
+   **Solved:** gameplay submits make a GPU syscall that hands the rest of the call to the JIT, so the submit is now
+   observed before the driver runs. With that, the host captures the full stream: per frame (one submit) about
+   4,680 commands, ~668 draws (~231 indirect) and ~31 compute dispatches, with every handle accounted for. (The
+   constant empty handle is a separate submit loop at boot.) Next: replay these lists on D3D11 next to the
+   emulated path, translating each command with the existing renderer's state code, and compare the frames.
    Name capture also has to tolerate other functions that take "nvn..." strings: only results pointing at
    recompiled code count, a lookup function is trusted after 4 names, and host-implemented names the game never
    asks for in observed code are resolved with `ResolveMissing`.
