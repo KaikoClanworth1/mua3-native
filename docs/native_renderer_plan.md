@@ -87,6 +87,12 @@ names in `main`'s strings are *not* in table order.
    hand its command buffers to the GPU another way. Next: find it, e.g. command memory linked by the driver
    (`AddCommandMemory`/`AddControlMemory` callbacks), or submission from a thread or path the hooks miss. Trace
    `QueueSubmitCommands` callers and the queue's control memory.
+   More (same day): `nvnCommandBufferCallCommands` and `CopyCommands` are resolved by the game but never called.
+   The handle submitted every frame is one constant value (0x1_0020_7716_51f9, high bits 0x1002) whose recording
+   is empty. The recordings that hold the ~600 draws per frame have handles with different high bits (0x2002...).
+   So KTGL submits one persistent command buffer per frame and reaches the per-frame command memory indirectly.
+   Next: decode the handle bits (control vs command memory) and follow what the persistent buffer's control
+   memory points at (it is in guest memory; dump it and look for the 0x2002... handles or their GPU addresses).
    Name capture also has to tolerate other functions that take "nvn..." strings: only results pointing at
    recompiled code count, a lookup function is trusted after 4 names, and host-implemented names the game never
    asks for in observed code are resolved with `ResolveMissing`.

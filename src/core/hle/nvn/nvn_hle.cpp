@@ -130,6 +130,8 @@ enum Wrapped {
     kCommandBufferDrawArrays,
     kCommandBufferDrawArraysIndirect,
     kCommandBufferDispatchCompute,
+    kCommandBufferCallCommands,
+    kCommandBufferCopyCommands,
     kWrappedCount
 };
 std::array<recomp::Fn, kWrappedCount> g_driver{}; // the sdk driver's implementation of each wrapped function
@@ -247,6 +249,7 @@ void SamplerPoolRegisterSampler(State& s) {
 struct Command {
     Wrapped op;
     u64 args[6];
+    std::vector<u64> handles; // Call/CopyCommands: the nested command handles
 };
 struct Recording {
     std::mutex mutex;
@@ -269,6 +272,22 @@ void RecordCommand(State& s) {
     auto& rec = Rec();
     std::lock_guard lk(rec.mutex);
     rec.open[cb].push_back(c);
+    rec.recorded++;
+}
+// void nvnCommandBufferCall/CopyCommands(NVNcommandBuffer*, int numCommands, const NVNcommandHandle* handles):
+// a command buffer running (or copying in) other recorded command buffers.
+template <Wrapped W>
+void NestCommands(State& s) {
+    const u64 cb = s.x[0], count = u32(s.x[1]), array = s.x[2];
+    Command c{W, {count}};
+    for (u64 i = 0; i < count && i < 4096; i++)
+        c.handles.push_back(recomp::Rd<u64>(s, array + i * 8));
+    u64 obj, r;
+    if (!Through(s, W, obj, r))
+        return;
+    auto& rec = Rec();
+    std::lock_guard lk(rec.mutex);
+    rec.open[cb].push_back(std::move(c));
     rec.recorded++;
 }
 void CommandBufferBeginRecording(State& s) {
@@ -308,7 +327,13 @@ void QueueSubmitCommands(State& s) {
         return;
     auto& rec = Rec();
     std::lock_guard lk(rec.mutex);
-    for (u64 h : handles) {
+    // walk the submitted command buffers, following nested Call/CopyCommands
+    std::vector<std::pair<u64, int>> work;
+    for (u64 h : handles)
+        work.emplace_back(h, 0);
+    while (!work.empty()) {
+        const auto [h, depth] = work.back();
+        work.pop_back();
         auto it = rec.handles.find(h);
         if (it == rec.handles.end()) {
             rec.unknown++;
@@ -319,6 +344,9 @@ void QueueSubmitCommands(State& s) {
             rec.draws += c.op >= kCommandBufferDrawElementsBaseVertex && c.op <= kCommandBufferDrawArraysIndirect;
             rec.indirect += c.op == kCommandBufferDrawElementsIndirect || c.op == kCommandBufferDrawArraysIndirect;
             rec.dispatches += c.op == kCommandBufferDispatchCompute;
+            if (depth < 8)
+                for (u64 nested : c.handles)
+                    work.emplace_back(nested, depth + 1);
         }
     }
     if (++rec.submits % 600 == 0) {
@@ -363,6 +391,8 @@ const Entry kHostFunctions[] = {
     NVN_RECORD_CMD(CommandBufferDrawArrays),
     NVN_RECORD_CMD(CommandBufferDrawArraysIndirect),
     NVN_RECORD_CMD(CommandBufferDispatchCompute),
+    {"nvnCommandBufferCallCommands", NestCommands<kCommandBufferCallCommands>, kCommandBufferCallCommands, true},
+    {"nvnCommandBufferCopyCommands", NestCommands<kCommandBufferCopyCommands>, kCommandBufferCopyCommands, true},
 #undef NVN_RECORD_CMD
 #undef NVN_RECORD
 };
