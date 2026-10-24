@@ -73,6 +73,12 @@ names in `main`'s strings are *not* in table order.
    Single getters/setters swapped one by one give no speed-up on their own: the frame cost is in command-buffer
    encoding (sdk) plus decoding (`src/gpu`). The gain comes when a whole family (step 3) runs on host objects.
 2. Device, queue, memory pool, buffer, texture, sampler objects; texture/buffer data paths. *Large.*
+   **In progress (observe mode):** wrappers around Initialize/Finalize of pools, buffers and textures run the driver,
+   then read each object's real properties back through the driver's getters (`CallDriver` in `nvn_hle.cpp`).
+   Texture/sampler pool registrations map handle IDs to objects. ST010: 3 pools (232 MB, 1.5 GB, 40 MB),
+   ~5,100 textures, ~2,100 buffers, ~28,700 texture IDs, 8 sampler IDs. Next: create the D3D11 resources for these
+   objects (pool memory -> buffers/textures, reusing the format and swizzle code in `src/gpu`), still
+   alongside the emulated path, and compare them with the emulated path's textures.
 3. Command buffer recording and replay: state objects, draws, clears, copies, compute dispatch. *Large.*
 4. Programs and resource binding (texture/sampler handles: NVN uses 64-bit texture handles from texture/sampler
    pools: `nvnTexturePoolRegisterTexture` and friends). *Medium.*

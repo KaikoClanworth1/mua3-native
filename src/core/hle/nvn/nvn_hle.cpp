@@ -95,6 +95,9 @@ struct Objects {
     std::unordered_map<u64, PoolDesc> pools;
     std::unordered_map<u64, BufferDesc> buffers;
     std::unordered_map<u64, TextureDesc> textures;
+    // texture/sampler pool slots: the IDs packed into texture handles (nvnDeviceGetTextureHandle)
+    std::unordered_map<u32, std::pair<u64, u64>> texture_ids; // id -> (texture, texture view or 0)
+    std::unordered_map<u32, u64> sampler_ids;                 // id -> sampler
     u64 pool_bytes = 0, texture_inits = 0;
 };
 Objects& Obj() {
@@ -109,6 +112,8 @@ enum Wrapped {
     kBufferFinalize,
     kTextureInitialize,
     kTextureFinalize,
+    kTexturePoolRegisterTexture,
+    kSamplerPoolRegisterSampler,
     kWrappedCount
 };
 std::array<recomp::Fn, kWrappedCount> g_driver{}; // the sdk driver's implementation of each wrapped function
@@ -183,9 +188,9 @@ void TextureInitialize(State& s) {
     o.textures[tex] = d;
     if (++o.texture_inits % 500 == 1)
         LOG_INFO("NVN", "texture {}x{}x{} levels {} format {:#x} target {} storage {:#x} in pool {:#x}+{:#x} "
-                        "({} live textures, {} buffers, {} pools)",
+                        "({} live textures, {} buffers, {} pools, {} texture ids, {} sampler ids)",
                  d.width, d.height, d.depth, d.levels, d.format, d.target, d.storage, d.pool, d.offset,
-                 o.textures.size(), o.buffers.size(), o.pools.size());
+                 o.textures.size(), o.buffers.size(), o.pools.size(), o.texture_ids.size(), o.sampler_ids.size());
 }
 void TextureFinalize(State& s) {
     u64 tex, r;
@@ -194,6 +199,30 @@ void TextureFinalize(State& s) {
     auto& o = Obj();
     std::lock_guard lk(o.mutex);
     o.textures.erase(tex);
+}
+
+// void nvnTexturePoolRegisterTexture(const NVNtexturePool*, int id, const NVNtexture*, const NVNtextureView*):
+// KTGL re-registers the textures it binds every frame (~3,200 calls per frame in ST010).
+void TexturePoolRegisterTexture(State& s) {
+    const u32 id = u32(s.x[1]);
+    const u64 tex = s.x[2], view = s.x[3];
+    u64 pool, r;
+    if (!Through(s, kTexturePoolRegisterTexture, pool, r))
+        return;
+    auto& o = Obj();
+    std::lock_guard lk(o.mutex);
+    o.texture_ids[id] = {tex, view};
+}
+// void nvnSamplerPoolRegisterSampler(const NVNsamplerPool*, int id, const NVNsampler*)
+void SamplerPoolRegisterSampler(State& s) {
+    const u32 id = u32(s.x[1]);
+    const u64 sampler = s.x[2];
+    u64 pool, r;
+    if (!Through(s, kSamplerPoolRegisterSampler, pool, r))
+        return;
+    auto& o = Obj();
+    std::lock_guard lk(o.mutex);
+    o.sampler_ids[id] = sampler;
 }
 
 struct Entry {
@@ -210,6 +239,8 @@ const Entry kHostFunctions[] = {
     NVN_ENTRY(BufferFinalize),
     NVN_ENTRY(TextureInitialize),
     NVN_ENTRY(TextureFinalize),
+    NVN_ENTRY(TexturePoolRegisterTexture),
+    NVN_ENTRY(SamplerPoolRegisterSampler),
 };
 #undef NVN_ENTRY
 
