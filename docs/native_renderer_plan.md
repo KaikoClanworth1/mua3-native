@@ -115,7 +115,12 @@ resolves surfaces, texture handles and constant buffers during that frame; all s
   0x41 RGB_DXT1, 0x42 RGBA_DXT1, 0x43 RGBA_DXT3, 0x44 RGBA_DXT5, ... 0x50 BPTC (BC7, learned).
 - Vertex input: NVNvertexAttribState objects are 4 bytes each (BindVertexAttribState(cb, count, array)), set with
   SetFormat(format, offset) and SetStreamIndex(stream); NVNvertexStreamState: SetStride, SetDivisor. A typical
-  mesh: RGB32F position at 0, RG32F at 0xC, RGBA8 at 0x24; stream stride 0x1C.- Render target formats (NVN -> hardware RT format): 0x25 -> 0xD5 (RGBA8), 0x38 -> 0xD6 (RGBA8 sRGB),
+  mesh: RGB32F position at 0, RG32F at 0xC, RGBA8 at 0x24; stream stride 0x1C.- State enums are GL-like and 1-based, from the shadowed setters: BlendFunc(state, srcRGB, dstRGB, srcA, dstA)
+  with ZERO 1, ONE 2, SRC_COLOR 3, ONE_MINUS_SRC_COLOR 4, SRC_ALPHA 5, ONE_MINUS_SRC_ALPHA 6, DST_ALPHA 7, ...
+  (seen: 5/6 alpha blend, 5/2 additive); BlendEquation(state, rgb, alpha) ADD 1; BlendTarget(state, index);
+  ColorState SetBlendEnable(state, index, enable); ChannelMask(state, index, r, g, b, a). Depth/stencil compare
+  functions and polygon cull/front-face are bound earlier in the frame than the dump; expect the same GL order
+  (NEVER 1 .. ALWAYS 8).- Render target formats (NVN -> hardware RT format): 0x25 -> 0xD5 (RGBA8), 0x38 -> 0xD6 (RGBA8 sRGB),
   0x3D -> 0xD1 (RGB10A2), 0x3F -> 0xE0 (R11G11B10F), 0x0A -> 0xE5 (R32F), 0x29 -> 0xCA (RGBA16F),
   depth 0x34 -> 0x0A.
 
