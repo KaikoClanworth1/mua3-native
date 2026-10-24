@@ -3,6 +3,7 @@
 // nvnDeviceGetProcAddress and calls it through a pointer; the CPU runtime records which driver function each name
 // resolves to and, when a host implementation exists, runs that instead of the sdk's NVN driver.
 // See docs/native_renderer_plan.md.
+#include <atomic>
 #include <functional>
 #include <string_view>
 
@@ -20,5 +21,9 @@ recomp::Fn Find(std::string_view name, recomp::Fn driver, recomp::u64 pc);
 // (some are resolved by code the runtime does not observe) and reports each through `found`.
 void ResolveMissing(recomp::State& s, recomp::Fn lookup, recomp::u64 lookup_pc, recomp::u64 device,
                     const std::function<void(const char*, recomp::u64)>& found);
+
+// MUA3_NVN_LEARN: end of the current learning window (steady_clock ms), opened when MUA3_NVN_DUMP writes a frame,
+// so the emulated path's resolutions can be joined with that same frame's NVN commands.
+extern std::atomic<long long> g_learn_until_ms;
 
 } // namespace hle::nvn

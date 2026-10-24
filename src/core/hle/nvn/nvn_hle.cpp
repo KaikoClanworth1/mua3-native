@@ -435,6 +435,22 @@ void QueueSubmitCommands(State& s) {
                 f << "\n";
             }
         }
+        // texture model with GPU addresses, for learning NVN -> hardware formats (MUA3_NVN_LEARN)
+        {
+            auto& o = Obj();
+            std::lock_guard olk(o.mutex);
+            std::ofstream m("nvn_textures.txt");
+            for (const auto& [tex, d] : o.textures) {
+                auto p = o.pools.find(d.pool);
+                if (p != o.pools.end())
+                    m << fmt::format("{:#x} {} {} {} levels {} format {:#x} target {}\n", p->second.gpu + d.offset, d.width,
+                                     d.height, d.depth, d.levels, d.format, d.target);
+            }
+        }
+        g_learn_until_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count() +
+                           60;
         LOG_INFO("NVN", "wrote nvn_frame.txt");
     }
     // walk the submitted command buffers, following nested Call/CopyCommands
@@ -538,6 +554,8 @@ void ResolveMissing(State& s, recomp::Fn lookup, u64 lookup_pc, u64 device,
             found(name.c_str(), ptr);
     }
 }
+
+std::atomic<long long> g_learn_until_ms{0};
 
 recomp::Fn Find(std::string_view name, recomp::Fn driver, u64 pc) {
     static const bool enabled = [] {

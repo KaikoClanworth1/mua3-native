@@ -93,7 +93,18 @@ with the state objects it binds, to `nvn_frame.txt`. One ST010 frame: 39 command
 | SetPolygonOffsetClamp | factor, units, clamp (v0..v2) |
 | SetTexturePool / SetSamplerPool | pool object |
 
-Conventions still to establish, by comparing with the emulated path on the same frame: which Maxwell constant
+**Learned conventions** (`MUA3_NVN_RECORD=1 MUA3_NVN_DUMP=150 MUA3_NVN_LEARN=1`: the emulated path logs how it
+resolves surfaces, texture handles and constant buffers during that frame; all samples agree):
+- Uniform buffers: NVN `BindUniformBuffer(stage, i, ...)` is hardware constant buffer **i + 3**.
+- Texture handles: hardware constant buffer **2**, offset **0x20 + i * 8** for NVN `BindTexture(stage, i, ...)`.
+- Stages: NVN stage 0 (vertex) is hardware stage 0 (vertex B), NVN stage 1 (fragment) is hardware stage 4.
+- Texture GPU addresses: the pool's buffer address (`nvnMemoryPoolGetBufferAddress`) + offset + **0xC3C00000**
+  for the main pool (textures use a separate mapping; derive this per pool).
+- Render target formats (NVN -> hardware RT format): 0x25 -> 0xD5 (RGBA8), 0x38 -> 0xD6 (RGBA8 sRGB),
+  0x3D -> 0xD1 (RGB10A2), 0x3F -> 0xE0 (R11G11B10F), 0x0A -> 0xE5 (R32F), 0x29 -> 0xCA (RGBA16F),
+  depth 0x34 -> 0x0A.
+
+Still to establish: which Maxwell constant
 buffer an NVN uniform buffer index lands in (the shaders' `cbuf_mask`), where texture handles sit in the texture
 constant buffer (`TextureUse::cbuf_offset` vs BindTexture index), NVN format enum to hardware render target /
 vertex attribute formats, and the blend, depth and polygon enums. Instrumenting the emulated path (when it creates

@@ -1,6 +1,8 @@
 #include "gpu/d3d11/renderer_d3d11.h"
+#include "core/hle/nvn/nvn_hle.h"
 #include "gpu/shader/maxwell_isa.h"
 
+#include <unordered_set>
 #include <set>
 
 #include <algorithm>
@@ -405,9 +407,29 @@ Surface* D3D11Renderer::FindSurfaceByCpu(u64 cpu_va) {
     return best;
 }
 
+
+namespace {
+// MUA3_NVN_LEARN=1: log how the emulated path resolves surfaces, texture handles and constant buffers by GPU
+// address, so the NVN driver's conventions can be learned by joining with the NVN model (docs/native_renderer_plan.md).
+bool LearnEnabled() { // MUA3_NVN_LEARN=1: the ~60 ms after MUA3_NVN_DUMP wrote a frame (that frame's GPU work)
+    static const bool on = std::getenv("MUA3_NVN_LEARN") != nullptr;
+    return on && std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now().time_since_epoch())
+                         .count() < hle::nvn::g_learn_until_ms;
+}
+bool LearnOnce(u64 key) {
+    static std::mutex m;
+    static std::unordered_set<u64> seen;
+    std::lock_guard lk(m);
+    return seen.size() < 4000 && seen.insert(key).second;
+}
+} // namespace
+
 Surface* D3D11Renderer::GetSurface(u64 gpu_va, u32 width, u32 height, u32 format, bool depth, u32 tile_mode) {
     if (!gpu_va || !width || !height || width > 16384 || height > 16384)
         return nullptr;
+    if (LearnEnabled() && LearnOnce(gpu_va ^ (u64(format) << 48)))
+        LOG_INFO("Learn", "surface {:#x} {}x{} format {:#x} depth {}", gpu_va, width, height, format, depth);
     auto it = surfaces_.find(gpu_va);
     if (it != surfaces_.end()) {
         Surface* s = it->second.get();
@@ -2034,6 +2056,8 @@ void D3D11Renderer::Draw() {
             const auto& b = m.CBuf(stage_index, i);
             if (!b.enabled || !b.size)
                 continue;
+            if (LearnEnabled() && LearnOnce(b.address ^ (u64(stage_index * 32 + i) << 56) ^ 0x5A5A))
+                LOG_INFO("Learn", "cbuf stage {} slot {} address {:#x} size {:#x}", stage_index, i, b.address, b.size);
             static thread_local std::vector<u8> tmp;
             // Upload only what the shader can read: its highest static row, or everything for dynamic indexing.
             const bool dyn = s->info.cbuf_dyn_mask & (1u << i);
@@ -2081,6 +2105,9 @@ void D3D11Renderer::Draw() {
                 continue;
             u32 handle = 0;
             g.ReadGpu(tcb.address + t.cbuf_offset, &handle, 4);
+            if (LearnEnabled() && LearnOnce((u64(handle) << 16) ^ (u64(stage_index) << 8) ^ t.cbuf_offset ^ (1ull << 63)))
+                LOG_INFO("Learn", "texture stage {} cbuf {} offset {:#x} handle {:#x}", stage_index, tex_cb,
+                         t.cbuf_offset, handle);
             const u32 tic_idx = handle & 0xFFFFF, tsc_idx = (handle >> 20) & 0xFFF;
             TicEntry tic;
             g.ReadGpu(tic_base + u64(tic_idx) * 32, tic.w.data(), 32);
