@@ -125,6 +125,7 @@ enum Wrapped {
     kTexturePoolRegisterTexture,
     kSamplerPoolRegisterSampler,
     kTexturePoolInitialize,
+    kSamplerPoolInitialize,
     // command recording (MUA3_NVN_RECORD=1)
     kCommandBufferBeginRecording,
     kCommandBufferEndRecording,
@@ -232,6 +233,20 @@ void TexturePoolInitialize(State& s) {
     }
 }
 
+// NVNboolean nvnSamplerPoolInitialize(NVNsamplerPool*, const NVNmemoryPool*, ptrdiff_t offset, int numDescriptors)
+void SamplerPoolInitialize(State& s) {
+    const u64 mem_pool = s.x[1], offset = s.x[2];
+    u64 pool, ok;
+    if (!Through(s, kSamplerPoolInitialize, pool, ok) || !(ok & 1))
+        return;
+    auto& o = Obj();
+    std::lock_guard lk(o.mutex);
+    if (auto p = o.pools.find(mem_pool); p != o.pools.end()) {
+        o.texture_pools[pool] = p->second.gpu + offset;
+        LOG_INFO("NVN", "sampler pool {:#x}: descriptors at {:#x}", pool, p->second.gpu + offset);
+    }
+}
+
 // void nvnTexturePoolRegisterTexture(const NVNtexturePool*, int id, const NVNtexture*, const NVNtextureView*):
 // KTGL re-registers the textures it binds every frame (~3,200 calls per frame in ST010).
 void TexturePoolRegisterTexture(State& s) {
@@ -297,6 +312,7 @@ struct Recording {
     std::unordered_map<u64, std::vector<Command>> handles; // command handle -> finished list
     u64 submits = 0, cmds = 0, draws = 0, indirect = 0, dispatches = 0, unknown = 0;
     u64 recorded = 0, begins = 0, ends = 0, empty_ends = 0; // diagnostics
+    u64 synthetic = 0; // keys for split command lists (replay flattening)
     // state objects (blend, colour, depth/stencil, polygon, multisample, channel mask, vertex attrib/stream,
     // texture views, sampler builders, programs): object -> generic slot -> last call
     std::unordered_map<u64, std::unordered_map<int, Command>> shadow;
@@ -305,6 +321,7 @@ Recording& Rec() {
     static Recording r;
     return r;
 }
+std::atomic<std::function<void(std::vector<ReplayCommand>&&)>*> g_sink{nullptr};
 template <int I>
 void Generic(State& s) {
     const GenericSlot& g = g_generic[I];
@@ -605,6 +622,43 @@ void QueueSubmitCommands(State& s) {
         }
         LOG_INFO("NVN", "wrote nvn_frame.txt");
     }
+    // native replay: hand this frame's commands, in execution order, to the renderer
+    if (auto sink = g_sink.load(); sink && *sink) {
+        std::vector<ReplayCommand> flat;
+        std::vector<std::pair<u64, int>> order;
+        for (auto h = handles.rbegin(); h != handles.rend(); ++h)
+            order.emplace_back(*h, 0);
+        while (!order.empty()) {
+            const auto [h, depth] = order.back();
+            order.pop_back();
+            auto it = rec.handles.find(h);
+            if (it == rec.handles.end())
+                continue;
+            // nested buffers run at their call site: push the rest of this list back behind them
+            const auto& list = it->second;
+            for (size_t k = 0; k < list.size(); k++) {
+                const Command& c = list[k];
+                if (c.fn < 0) {
+                    // remaining commands of this list after the nested ones: re-queue as a synthetic tail
+                    std::vector<Command> tail(list.begin() + k + 1, list.end());
+                    if (!tail.empty()) {
+                        const u64 key = 0xFFFF000000000000ull | (rec.synthetic++ & 0xFFFFFFFFFFFFull);
+                        rec.handles[key] = std::move(tail);
+                        order.emplace_back(key, depth);
+                    }
+                    for (auto n = c.handles.rbegin(); n != c.handles.rend(); ++n)
+                        if (depth < 8)
+                            order.emplace_back(*n, depth + 1);
+                    break;
+                }
+                ReplayCommand r{g_generic[c.fn].name, {}, {}, c.handles};
+                std::memcpy(r.x, c.x, sizeof(r.x));
+                std::memcpy(r.v, c.v, sizeof(r.v));
+                flat.push_back(std::move(r));
+            }
+        }
+        (*sink)(std::move(flat));
+    }
     // walk the submitted command buffers, following nested Call/CopyCommands
     std::vector<std::pair<u64, int>> work;
     for (u64 h : handles)
@@ -660,6 +714,7 @@ const Entry kHostFunctions[] = {
     NVN_ENTRY(TexturePoolRegisterTexture),
     NVN_ENTRY(SamplerPoolRegisterSampler),
     NVN_ENTRY(TexturePoolInitialize),
+    NVN_ENTRY(SamplerPoolInitialize),
 #define NVN_RECORD(NAME) {"nvn" #NAME, NAME, k##NAME, true}
     NVN_RECORD(CommandBufferBeginRecording),
     NVN_RECORD(CommandBufferEndRecording),
@@ -709,6 +764,58 @@ void ResolveMissing(State& s, recomp::Fn lookup, u64 lookup_pc, u64 device,
 }
 
 std::atomic<long long> g_learn_until_ms{0};
+
+void SetReplaySink(std::function<void(std::vector<ReplayCommand>&&)> sink) {
+    g_sink = new std::function<void(std::vector<ReplayCommand>&&)>(std::move(sink)); // lives for the process
+}
+
+bool QueryTexture(u64 texture, TextureInfo& out) {
+    auto& o = Obj();
+    std::lock_guard lk(o.mutex);
+    auto t = o.textures.find(texture);
+    if (t == o.textures.end())
+        return false;
+    auto p = o.pools.find(t->second.pool);
+    if (p == o.pools.end())
+        return false;
+    const TextureDesc& d = t->second;
+    out = {p->second.gpu + d.offset + kTextureVaDelta, d.width, d.height, d.depth, d.levels, d.format, d.target};
+    return true;
+}
+
+bool QueryState(u64 object, std::string_view setter, u64 x[8], u32 v[4]) {
+    auto& rec = Rec();
+    std::lock_guard lk(rec.mutex);
+    auto it = rec.shadow.find(object);
+    if (it == rec.shadow.end())
+        return false;
+    for (const auto& [slot, c] : it->second)
+        if (g_generic[slot].name == setter) {
+            std::memcpy(x, c.x, sizeof(c.x));
+            std::memcpy(v, c.v, sizeof(c.v));
+            return true;
+        }
+    return false;
+}
+
+u64 QueryProgramCode(u64 program) {
+    auto& rec = Rec();
+    std::lock_guard lk(rec.mutex);
+    auto it = rec.shadow.find(program);
+    if (it == rec.shadow.end())
+        return 0;
+    for (const auto& [slot, c] : it->second)
+        if (g_generic[slot].shaders && !c.handles.empty())
+            return c.handles[0];
+    return 0;
+}
+
+u64 QueryTexturePool(u64 pool) {
+    auto& o = Obj();
+    std::lock_guard lk(o.mutex);
+    auto it = o.texture_pools.find(pool);
+    return it == o.texture_pools.end() ? 0 : it->second;
+}
 
 recomp::Fn Find(std::string_view name, recomp::Fn driver, u64 pc) {
     static const bool enabled = [] {

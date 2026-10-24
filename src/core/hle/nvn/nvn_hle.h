@@ -6,6 +6,7 @@
 #include <atomic>
 #include <functional>
 #include <string_view>
+#include <vector>
 
 #include "core/cpu/recomp/recomp_rt.h"
 
@@ -25,5 +26,27 @@ void ResolveMissing(recomp::State& s, recomp::Fn lookup, recomp::u64 lookup_pc, 
 // MUA3_NVN_LEARN: end of the current learning window (steady_clock ms), opened when MUA3_NVN_DUMP writes a frame,
 // so the emulated path's resolutions can be joined with that same frame's NVN commands.
 extern std::atomic<long long> g_learn_until_ms;
+
+// ---- native replay interface (MUA3_NVN_REPLAY): each submitted frame's commands, flattened in execution order
+// (nested Call/CopyCommands expanded), handed to the renderer's sink; queries resolve the objects they reference.
+struct ReplayCommand {
+    std::string_view name;          // NVN entry point, e.g. "nvnCommandBufferDrawElementsBaseVertex"
+    recomp::u64 x[8];               // integer/pointer arguments (x[0] = command buffer)
+    recomp::u32 v[4];               // float arguments
+    std::vector<recomp::u64> extra; // captured arrays (SetRenderTargets colour textures, ...)
+};
+void SetReplaySink(std::function<void(std::vector<ReplayCommand>&&)> sink);
+
+struct TextureInfo {
+    recomp::u64 gpu = 0; // texture GPU address (texture mapping)
+    recomp::u32 width = 0, height = 0, depth = 0, levels = 0, format = 0, target = 0;
+};
+bool QueryTexture(recomp::u64 texture, TextureInfo& out);
+// Last recorded call of `setter` (e.g. "nvnBlendStateSetBlendFunc") on a state object; false if never set.
+bool QueryState(recomp::u64 object, std::string_view setter, recomp::u64 x[8], recomp::u32 v[4]);
+// Shader code GPU address of a single-stage program (the SPH is at +0x30), or 0.
+recomp::u64 QueryProgramCode(recomp::u64 program);
+// Texture / sampler pool descriptor base GPU addresses (TIC / TSC tables), or 0.
+recomp::u64 QueryTexturePool(recomp::u64 pool);
 
 } // namespace hle::nvn
