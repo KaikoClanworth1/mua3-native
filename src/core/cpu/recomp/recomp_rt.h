@@ -118,7 +118,7 @@ struct Table {
     u32 num_funcs;
     const CodeRange* ranges;
     u32 num_ranges;
-    u8* ok; // per function: 1 = verified and enabled (written by the runtime)
+    u8* const* ok; // per function: flag in its shard, 1 = verified and enabled (written by the runtime)
     const ResumeEntry* resumes;
     u32 num_resumes;
 };

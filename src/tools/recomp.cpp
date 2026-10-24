@@ -465,8 +465,13 @@ struct Emitter {
     u64 cur = 0;
     BlockShape sh;
     bool is_call = false;
+    std::set<u64>* called = nullptr; // generated functions this shard calls directly (for its declarations)
 
-    std::string Fn(u64 pc) const { return fmt("f_%llx", pc); }
+    std::string Fn(u64 pc) const {
+        if (called)
+            called->insert(pc);
+        return fmt("f_%llx", pc);
+    }
     static std::string fmt(const char* f, unsigned long long v) {
         char buf[64];
         std::snprintf(buf, sizeof(buf), f, v);
@@ -938,25 +943,29 @@ int main(int argc, char** argv) {
     for (u32 i = 0; i < funcs.size(); i++)
         gen_index[funcs[i].entry] = i;
 
-    // decls
-    {
-        ChangedFile h(out / "recomp_decls.h");
-        h << "#pragma once\n#include \"core/cpu/recomp/recomp_rt.h\"\nnamespace recomp {\nextern u8 g_ok[];\n";
-        for (auto& f : funcs)
-            h << "void f_" << std::hex << f.entry << std::dec << "(State& s);\n";
-        h << "}\n";
-    }
-    // shards
+    // Shards hold the functions of one 256 KB guest code window, named after it: adding or changing a function
+    // only rewrites its own shard (and the table).
+    std::filesystem::remove(out / "recomp_decls.h");
     size_t shard = 0, emitted_blocks = 0, unsupported_blocks = 0;
     std::ostringstream cur;
+    std::set<u64> called, defined;
+    std::set<std::string> written;
+    u64 cur_bucket = ~0ull;
     auto flush = [&] {
         if (cur.tellp() == 0)
             return;
-        ChangedFile f(out / ("recomp_" + std::to_string(shard++) + ".cpp"));
-        f << "#include \"recomp_decls.h\"\n#pragma warning(disable : 4102 4189 4100)\nnamespace recomp {\n"
-          << cur.str() << "}\n";
+        const std::string name = Emitter::fmt("recomp_%llx.cpp", cur_bucket);
+        written.insert(name);
+        shard++;
+        ChangedFile f(out / name);
+        f << "#include \"core/cpu/recomp/recomp_rt.h\"\n#pragma warning(disable : 4102 4189 4100)\nnamespace recomp {\n";
+        for (u64 c : called) // including functions defined further down this shard
+            f << "void f_" << std::hex << c << std::dec << "(State& s);\n";
+        f << cur.str() << "}\n";
         cur.str("");
         cur.clear();
+        called.clear();
+        defined.clear();
     };
     std::vector<std::pair<u64, u64>> all_ranges;
     std::vector<std::tuple<u64, u32, u32, u64>> table; // entry, range_first, range_count, hash
@@ -964,10 +973,17 @@ int main(int argc, char** argv) {
     std::set<u64> disabled;                             // entry block failed to emit: not registered
     for (u32 idx = 0; idx < funcs.size(); idx++) {
         const Function& f = funcs[idx];
+        if ((f.entry >> 18) != cur_bucket) {
+            flush();
+            cur_bucket = f.entry >> 18;
+        }
+        defined.insert(f.entry);
+        cur << "u8 ok_" << std::hex << f.entry << std::dec << ";\n";
         std::unordered_set<u64> blockset(f.blocks.begin(), f.blocks.end());
         // Blocks first: a block that fails to emit becomes an exit stub, and must not be the entry or a resume point.
         std::ostringstream body;
         Emitter em{body, f, blockset, gen_index};
+        em.called = &called;
         em.Block(f.entry, g_blocks[f.entry]);
         for (u64 b : f.blocks) {
             const BlockInfo& bi = g_blocks[b];
@@ -989,8 +1005,8 @@ int main(int argc, char** argv) {
         } else {
         if (noopt)
             cur << "#pragma optimize(\"\", off)\n";
-        cur << "void f_" << std::hex << f.entry << std::dec << "(State& s) {\n  if (!g_ok[" << idx
-            << "] || reinterpret_cast<u64>(_AddressOfReturnAddress()) < s.stack_limit) return;\n"
+        cur << "void f_" << std::hex << f.entry << std::dec << "(State& s) {\n  if (!ok_" << std::hex << f.entry << std::dec
+            << " || reinterpret_cast<u64>(_AddressOfReturnAddress()) < s.stack_limit) return;\n"
                "  bool cbit = false;\n";
         // Resume points: call-return blocks, so the JIT can come back into this function after a callee it ran.
         std::vector<u64> resume;
@@ -1031,14 +1047,24 @@ int main(int argc, char** argv) {
                 h = Fnv(h, Word(a));
         table.emplace_back(f.entry, u32(all_ranges.size()), u32(m.size()), h);
         all_ranges.insert(all_ranges.end(), m.begin(), m.end());
-        if (cur.tellp() > (4 << 20))
-            flush();
     }
     flush();
+    for (const auto& e : std::filesystem::directory_iterator(out)) {
+        const std::string n = e.path().filename().string();
+        if (n.rfind("recomp_", 0) == 0 && n.ends_with(".cpp") && n != "recomp_table.cpp" && !written.count(n))
+            std::filesystem::remove(e.path());
+    }
     {
         ChangedFile t(out / "recomp_table.cpp");
-        t << "#include \"recomp_decls.h\"\nnamespace recomp {\nu8 g_ok[" << std::max<size_t>(funcs.size(), 1)
-          << "];\nstatic const FuncEntry kFuncs[] = {\n";
+        t << "#include \"core/cpu/recomp/recomp_rt.h\"\nnamespace recomp {\n";
+        for (auto& f : funcs)
+            t << "void f_" << std::hex << f.entry << "(State& s);\nextern u8 ok_" << f.entry << ";\n" << std::dec;
+        t << "static u8* const kOk[] = {\n";
+        for (auto& f : funcs)
+            t << "&ok_" << std::hex << f.entry << ",\n" << std::dec;
+        if (funcs.empty())
+            t << "nullptr,\n";
+        t << "};\nstatic const FuncEntry kFuncs[] = {\n";
         for (auto& [e, rf, rc, h] : table)
             t << "{0x" << std::hex << e << "ull, " << (disabled.count(e) ? std::string("nullptr") : "f_" + Emitter::fmt("%llx", e))
               << ", " << std::dec << rf << ", " << rc << ", 0x" << std::hex
@@ -1057,7 +1083,7 @@ int main(int argc, char** argv) {
         if (resumes.empty())
             t << "{0, 0},\n";
         t << "};\nstatic const Table kTable{kFuncs, " << table.size() << ", kRanges, " << all_ranges.size()
-          << ", g_ok, kResumes, " << resumes.size() << "};\nconst Table& GetTable() { return kTable; }\n}\n";
+          << ", kOk, kResumes, " << resumes.size() << "};\nconst Table& GetTable() { return kTable; }\n}\n";
     }
     std::printf("%zu blocks failed to emit\n", g_emit_failures);
     std::printf("%zu resume points\n", resumes.size());

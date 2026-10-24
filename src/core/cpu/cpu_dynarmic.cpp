@@ -265,16 +265,16 @@ public:
             for (u32 i = 0; i < t.num_funcs; i++) {
                 if (!t.funcs[i].fn)
                     continue;
-                t.ok[i] = native_enabled_ && Verify(t, i);
-                ok += t.ok[i];
+                *t.ok[i] = native_enabled_ && Verify(t, i);
+                ok += *t.ok[i];
             }
             std::unique_lock lk(native_mutex_);
             for (u32 i = 0; i < t.num_funcs; i++)
-                if (t.ok[i])
+                if (*t.ok[i])
                     native_.emplace(t.funcs[i].entry, t.funcs[i].fn);
             size_t resumes = 0;
             for (u32 i = 0; i < t.num_resumes; i++)
-                if (t.ok[t.resumes[i].func])
+                if (*t.ok[t.resumes[i].func])
                     resumes += native_.emplace(t.resumes[i].pc, t.funcs[t.resumes[i].func].fn).second;
             LOG_INFO("Recomp", "{} of {} recompiled functions enabled, {} resume points{}", ok, t.num_funcs, resumes,
                      native_enabled_ ? "" : " (MUA3_RECOMP=0)");
@@ -303,13 +303,13 @@ public:
         std::unique_lock lk(native_mutex_);
         bool changed = false;
         for (u32 i = 0; i < t.num_funcs; i++) {
-            if (!t.ok[i])
+            if (!*t.ok[i])
                 continue;
             const auto& f = t.funcs[i];
             for (u32 r = f.range_first; r < f.range_first + f.range_count; r++) {
                 if (t.ranges[r].start < addr + size && addr < t.ranges[r].end) {
                     if (!Verify(t, i)) {
-                        t.ok[i] = 0;
+                        *t.ok[i] = 0;
                         native_.erase(f.entry);
                         for (u32 k = 0; k < t.num_resumes; k++)
                             if (t.resumes[k].func == i)

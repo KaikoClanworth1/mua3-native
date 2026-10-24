@@ -30,7 +30,8 @@ def generate():
     cmd = [os.path.join(P, r'build\bin\RelWithDebInfo\recomp.exe'), GEN,
            os.path.join(NSO, 'main.bin'), '8004000', '159d340', os.path.join(NSO, 'sdk.bin'), 'df54000', '51c600',
            os.path.join(NSO, 'subsdk0.bin'), 'cfc5000', '377110', os.path.join(NSO, 'subsdk1.bin'), 'd6e5000', '4ce300',
-           '--profile', os.path.join(S, 'prof1.txt'), '--profile', os.path.join(S, 'prof2.txt'), '--all', '1',
+           *[a for p in sorted(n for n in os.listdir(S) if re.fullmatch(r'prof\d+\.txt', n))
+             for a in ('--profile', os.path.join(S, p))], '--all', '1',
            '--noopt', NOOPT, '--skip', SKIP]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, check=True)
 
@@ -70,7 +71,7 @@ def bisect(name):
 os.makedirs(OBJ, exist_ok=True)
 generate()
 for attempt in range(10):
-    srcs = sorted(n for n in os.listdir(GEN) if re.fullmatch(r'recomp_(\d+|table)\.cpp', n))
+    srcs = sorted(n for n in os.listdir(GEN) if re.fullmatch(r'recomp_([0-9a-f]+|table)\.cpp', n))
     todo = [n for n in srcs if not os.path.exists(os.path.join(OBJ, n[:-4] + '.obj')) or
             os.path.getsize(os.path.join(OBJ, n[:-4] + '.obj')) == 0 or
             os.path.getmtime(os.path.join(OBJ, n[:-4] + '.obj')) < os.path.getmtime(os.path.join(GEN, n))]
