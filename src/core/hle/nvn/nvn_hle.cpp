@@ -286,7 +286,7 @@ struct GenericSlot {
     std::string name;
     recomp::Fn driver = nullptr;
     Kind kind = Kind::Command;
-    bool draw = false, indirect = false, dispatch = false, defaults = false, shaders = false;
+    bool draw = false, indirect = false, dispatch = false, defaults = false, shaders = false, rts = false;
 };
 constexpr int kGenericSlots = 320;
 std::array<GenericSlot, kGenericSlots> g_generic;
@@ -313,6 +313,9 @@ void Generic(State& s) {
         c.x[k] = s.x[k];
     for (int k = 0; k < 4; k++)
         c.v[k] = u32(s.v[k].lo);
+    if (g.rts) // SetRenderTargets(cb, n, NVNtexture** colors, views, depth, depthView): the arrays are temporaries
+        for (u64 i = 0; i < u32(s.x[1]) && i < 8; i++)
+            c.handles.push_back(recomp::Rd<u64>(s, s.x[2] + i * 8));
     if (g.shaders) // nvnProgramSetShaders(program, count, const NVNshaderData*): {code address, control pointer}
         for (u64 i = 0; i < u32(s.x[1]) && i < 8; i++) {
             c.handles.push_back(recomp::Rd<u64>(s, s.x[2] + i * 16));
@@ -404,6 +407,100 @@ void CommandBufferEndRecording(State& s) {
         slot = std::move(rec.open[cb]);
     rec.open[cb].clear();
 }
+
+// ---- draw resolution (front half of the native replay): walks one submitted frame in order, tracking bound state,
+// and resolves each draw's resources with the learned driver conventions (docs/native_renderer_plan.md).
+constexpr u64 kTextureVaDelta = 0xC3C00000ull; // texture mapping of the main pool vs its buffer address
+const std::unordered_map<u32, u32> kRtFormat = {{0x25, 0xD5}, {0x38, 0xD6}, {0x3D, 0xD1}, {0x3F, 0xE0},
+                                                {0x0A, 0xE5}, {0x29, 0xCA}, {0x34, 0x0A}};
+struct BoundStage {
+    u64 ubo[16]{};      // NVN uniform buffer i (hardware cbuf i + 3)
+    u64 tex[32]{};      // NVN texture handles (hardware cbuf 2, 0x20 + i * 8)
+};
+struct DrawState {
+    BoundStage stage[6];
+    u64 program = 0;
+    u64 rt[8]{}, depth = 0;
+    u32 rt_fmt[8]{}, depth_fmt = 0, num_rt = 0;
+};
+// NVNtexture* -> (texture GPU address, NVN format), from the object model
+bool TextureVa(Objects& o, u64 tex, u64& va, u32& fmt) {
+    auto t = o.textures.find(tex);
+    if (t == o.textures.end())
+        return false;
+    auto p = o.pools.find(t->second.pool);
+    if (p == o.pools.end())
+        return false;
+    va = p->second.gpu + t->second.offset + kTextureVaDelta;
+    fmt = t->second.format;
+    return true;
+}
+void ResolveFrame(Recording& rec, std::ofstream& f, State& s, const std::vector<u64>& roots) {
+    auto& o = Obj();
+    std::lock_guard olk(o.mutex);
+    DrawState st;
+    size_t draws = 0, unresolved_rt = 0;
+    std::vector<std::pair<u64, int>> walk;
+    for (auto it = roots.rbegin(); it != roots.rend(); ++it)
+        walk.emplace_back(*it, 0);
+    while (!walk.empty()) {
+        const auto [h, depth] = walk.back();
+        walk.pop_back();
+        auto it = rec.handles.find(h);
+        if (it == rec.handles.end())
+            continue;
+        for (const Command& c : it->second) {
+            if (c.fn < 0) {
+                for (auto n = c.handles.rbegin(); n != c.handles.rend(); ++n)
+                    if (depth < 8)
+                        walk.emplace_back(*n, depth + 1);
+                continue;
+            }
+            const std::string& n = g_generic[c.fn].name;
+            const u32 stage = u32(c.x[1]), idx = u32(c.x[2]);
+            if (n == "nvnCommandBufferBindUniformBuffer" && stage < 6 && idx < 16)
+                st.stage[stage].ubo[idx] = c.x[3];
+            else if (n == "nvnCommandBufferBindTexture" && stage < 6 && idx < 32)
+                st.stage[stage].tex[idx] = c.x[3];
+            else if (n == "nvnCommandBufferBindProgram")
+                st.program = c.x[1];
+            else if (n == "nvnCommandBufferSetRenderTargets") {
+                st.num_rt = u32(c.x[1]);
+                for (u32 i = 0; i < st.num_rt && i < 8; i++) {
+                    const u64 tex = i < c.handles.size() ? c.handles[i] : 0;
+                    if (!TextureVa(o, tex, st.rt[i], st.rt_fmt[i]))
+                        st.rt[i] = 0, unresolved_rt++;
+                }
+                if (!c.x[4] || !TextureVa(o, c.x[4], st.depth, st.depth_fmt))
+                    st.depth = 0;
+            } else if (g_generic[c.fn].draw) {
+                draws++;
+                std::string line = fmt::format("draw {} {} prog {:#x}", draws, n.substr(16), st.program);
+                if (auto sh = rec.shadow.find(st.program); sh != rec.shadow.end())
+                    for (const auto& [slot, cmd] : sh->second)
+                        if (g_generic[slot].shaders)
+                            for (size_t k = 0; k + 1 < cmd.handles.size(); k += 2)
+                                line += fmt::format(" code{} {:#x}", k / 2, cmd.handles[k]);
+                for (u32 i = 0; i < st.num_rt && i < 8; i++) {
+                    auto hw = kRtFormat.find(st.rt_fmt[i]);
+                    line += fmt::format(" rt{} {:#x}/{:#x}", i, st.rt[i], hw != kRtFormat.end() ? hw->second : 0xFFFFu);
+                }
+                if (st.depth)
+                    line += fmt::format(" depth {:#x}", st.depth);
+                for (u32 sg : {0u, 1u})
+                    for (u32 i = 0; i < 16; i++)
+                        if (st.stage[sg].ubo[i])
+                            line += fmt::format(" s{}c{}={:#x}", sg == 1 ? 4 : 0, i + 3, st.stage[sg].ubo[i]);
+                for (u32 i = 0; i < 32; i++)
+                    if (st.stage[1].tex[i])
+                        line += fmt::format(" t{}=tic{:#x}/tsc{:#x}", i, st.stage[1].tex[i] & 0xFFFFF,
+                                            (st.stage[1].tex[i] >> 20) & 0xFFF);
+                f << line << "\n";
+            }
+        }
+    }
+    f << fmt::format("# {} draws resolved, {} render targets not in the texture model\n", draws, unresolved_rt);
+}
 // void nvnQueueSubmitCommands(NVNqueue*, int numCommands, const NVNcommandHandle* handles)
 void QueueSubmitCommands(State& s) {
     const u64 count = u32(s.x[1]), array = s.x[2];
@@ -483,6 +580,10 @@ void QueueSubmitCommands(State& s) {
                                std::chrono::steady_clock::now().time_since_epoch())
                                .count() +
                            60;
+        {
+            std::ofstream r("nvn_draws.txt");
+            ResolveFrame(rec, r, s, handles);
+        }
         LOG_INFO("NVN", "wrote nvn_frame.txt");
     }
     // walk the submitted command buffers, following nested Call/CopyCommands
@@ -629,6 +730,7 @@ recomp::Fn Find(std::string_view name, recomp::Fn driver, u64 pc) {
         g.dispatch = name.find("DispatchCompute") != std::string_view::npos;
         g.defaults = name.find("SetDefaults") != std::string_view::npos;
         g.shaders = name == "nvnProgramSetShaders";
+        g.rts = name == "nvnCommandBufferSetRenderTargets";
         return kGenericFns[i];
     }
     if (!entry || (entry->record && !record))
