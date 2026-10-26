@@ -4,6 +4,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <thread>
 
@@ -55,7 +56,20 @@ public:
 
     core::Memory& Mem() { return mem_; }
     AddressSpace& As() { return as_; }
-    Maxwell3D& M3D() { return m3d_; }
+    // The 3D engine the renderer reads: the command stream's, or the native NVN replay's (gpu/nvn_encoder.cpp).
+    Maxwell3D& M3D() { return *active_m3d_; }
+    Maxwell3D& StreamM3D() { return m3d_; }
+    void SetActiveM3D(Maxwell3D* m) { active_m3d_ = m ? m : &m3d_; }
+
+    // Host-backed GPU memory at [kHostBase, kHostBase + kHostSize): constant buffers the native replay builds itself
+    // (driver constants, texture handles). Reads and writes through the helpers below reach it like mapped memory.
+    static constexpr u64 kHostBase = 0xFF00000000ull, kHostSize = 0x4000000;
+    u8* HostMem() { return host_mem_.get(); }
+
+    // Verification (MUA3_NVN_VERIFY): the next Submit() after tag_next_submit is set runs with on_tagged_job called
+    // first, on the GPU thread.
+    std::atomic<bool> tag_next_submit{false};
+    std::function<void()> on_tagged_job;
 
     void SetRenderer(Renderer* r);
     // Native handle of the GPU command thread (profiling).
@@ -95,6 +109,7 @@ public:
 private:
     struct Job {
         enum Kind { Commands, Present, Fence } kind;
+        bool tagged = false;
         std::vector<u64> entries;
         u32 syncpt_id = 0, syncpt_incr = 0;
         PresentInfo present;
@@ -110,6 +125,8 @@ private:
     core::Memory& mem_;
     AddressSpace as_;
     Maxwell3D m3d_;
+    Maxwell3D* active_m3d_ = &m3d_;
+    std::unique_ptr<u8[]> host_mem_{new u8[kHostSize]{}};
     Renderer* renderer_ = nullptr;
 
     std::atomic<u32> syncpoints_[kNumSyncpoints]{};

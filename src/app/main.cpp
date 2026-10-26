@@ -24,6 +24,7 @@
 #include "core/cpu/cpu.h"
 #include "gpu/shader/harvest.h"
 #include "gpu/gpu.h"
+#include "gpu/nvn_encoder.h"
 #include "platform/platform.h"
 
 namespace {
@@ -511,6 +512,7 @@ int main(int argc, char** argv) {
              cfg.resolution_scale <= 0 ? " (auto)" : "");
     renderer.SetResolutionScale(u32(scale));
     gpu::G().SetRenderer(&renderer);
+    gpu::InstallNvnEncoder(gpu::G());
     g_renderer = &renderer;
     // First launch: harvest every shader program the game ships into the prewarm manifest (about 30 s, in the
     // background); the renderer picks them up and compiles them while the intro and menus run.

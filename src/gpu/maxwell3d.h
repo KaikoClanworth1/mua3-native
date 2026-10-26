@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include <functional>
 #include <vector>
 
 #include "common/common.h"
@@ -83,6 +84,16 @@ public:
 
     // Bound constant buffers per graphics stage (0..4).
     const ConstBufferBinding& CBuf(u32 stage, u32 index) const { return cbufs_[stage][index]; }
+
+    // Host NVN encoder (src/gpu/nvn_encoder.cpp). `intercept` sees every draw before it is rendered and returns true
+    // if it took care of it (the native replay draws it from its own register file); `suppress_clears` drops
+    // CLEAR_BUFFERS (the replay clears instead). With `capture` set, draws only report their state, and clears and
+    // constant buffer uploads are ignored (a register file filled by the encoder, compared against the driver's).
+    std::function<bool(const Maxwell3D&)> intercept;
+    std::function<void(const Maxwell3D&)> capture;
+    bool suppress_clears = false;
+    const std::array<u32, 0x1000>& Regs() const { return regs_; }
+    const ConstBufferBinding (&CBufs() const)[5][18] { return cbufs_; }
 
     // State of the current draw, for the renderer.
     struct DrawState {

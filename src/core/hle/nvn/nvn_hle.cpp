@@ -1,5 +1,6 @@
 #include "core/hle/nvn/nvn_hle.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <bit>
@@ -15,6 +16,7 @@
 #include <utility>
 
 #include "common/common.h"
+#include "common/profiler.h"
 #include "gpu/gpu.h"
 
 namespace hle::nvn {
@@ -187,10 +189,7 @@ void BufferFinalize(State& s) {
     std::lock_guard lk(o.mutex);
     o.buffers.erase(buffer);
 }
-void TextureInitialize(State& s) {
-    u64 tex, ok;
-    if (!Through(s, kTextureInitialize, tex, ok) || !(ok & 1))
-        return;
+TextureDesc DescribeTexture(State& s, u64 tex) {
     TextureDesc d;
     d.pool = Get(s, "nvnTextureGetMemoryPool", tex);
     d.offset = Get(s, "nvnTextureGetMemoryOffset", tex);
@@ -201,6 +200,33 @@ void TextureInitialize(State& s) {
     d.levels = u32(Get(s, "nvnTextureGetLevels", tex));
     d.format = u32(Get(s, "nvnTextureGetFormat", tex));
     d.target = u32(Get(s, "nvnTextureGetTarget", tex));
+    return d;
+}
+// Textures the Initialize wrapper did not see (render targets made before the hooks, or by unobserved code) are
+// described when first bound.
+void EnsureTexture(State& s, u64 tex) {
+    if (!tex)
+        return;
+    {
+        auto& o = Obj();
+        std::lock_guard lk(o.mutex);
+        if (o.textures.count(tex))
+            return;
+    }
+    const TextureDesc d = DescribeTexture(s, tex);
+    if (!d.width)
+        return;
+    auto& o = Obj();
+    std::lock_guard lk(o.mutex);
+    o.textures[tex] = d;
+    LOG_INFO("NVN", "texture {:#x} described at bind: {}x{} format {:#x} pool {:#x}+{:#x}", tex, d.width, d.height,
+             d.format, d.pool, d.offset);
+}
+void TextureInitialize(State& s) {
+    u64 tex, ok;
+    if (!Through(s, kTextureInitialize, tex, ok) || !(ok & 1))
+        return;
+    const TextureDesc d = DescribeTexture(s, tex);
     auto& o = Obj();
     std::lock_guard lk(o.mutex);
     o.textures[tex] = d;
@@ -295,6 +321,8 @@ struct Command {
     u64 x[8];                 // integer/pointer arguments (x0 = the object)
     u32 v[4];                 // float arguments (low 32 bits of v0..v3)
     std::vector<u64> handles; // Call/CopyCommands: nested command handles; ProgramSetShaders: stage data pairs
+    std::vector<u64> raw;     // memory the command points at, read at record time (state objects, viewport arrays...)
+    std::vector<std::vector<StateCall>> objects; // bound state objects' setter calls as of record time
 };
 enum class Kind { Command, Setter };
 struct GenericSlot {
@@ -302,6 +330,12 @@ struct GenericSlot {
     recomp::Fn driver = nullptr;
     Kind kind = Kind::Command;
     bool draw = false, indirect = false, dispatch = false, defaults = false, shaders = false, rts = false;
+    // replay capture: x[raw_ptr] points at raw_count ? x[raw_count] : 1 elements of raw_elem bytes; `objects`: they
+    // are state objects whose shadows are copied too
+    int raw_ptr = -1, raw_count = -1;
+    u32 raw_elem = 0;
+    bool objects = false;
+    bool indexed = false; // setter whose first argument selects what it sets (render target, face)
 };
 constexpr int kGenericSlots = 320;
 std::array<GenericSlot, kGenericSlots> g_generic;
@@ -311,44 +345,123 @@ struct Recording {
     std::unordered_map<u64, std::vector<Command>> open;    // command buffer -> commands since BeginRecording
     std::unordered_map<u64, std::vector<Command>> handles; // command handle -> finished list
     u64 submits = 0, cmds = 0, draws = 0, indirect = 0, dispatches = 0, unknown = 0;
-    u64 recorded = 0, begins = 0, ends = 0, empty_ends = 0; // diagnostics
+    std::atomic<u64> recorded{0};
+    u64 begins = 0, ends = 0, empty_ends = 0; // diagnostics
     u64 synthetic = 0; // keys for split command lists (replay flattening)
     // state objects (blend, colour, depth/stencil, polygon, multisample, channel mask, vertex attrib/stream,
-    // texture views, sampler builders, programs): object -> generic slot -> last call
-    std::unordered_map<u64, std::unordered_map<int, Command>> shadow;
+    // texture views, sampler builders, programs): object -> setter calls since SetDefaults, in order (a repeated call
+    // with the same first argument replaces the earlier one)
+    std::unordered_map<u64, std::vector<Command>> shadow;
 };
 Recording& Rec() {
     static Recording r;
     return r;
 }
 std::atomic<std::function<void(std::vector<ReplayCommand>&&)>*> g_sink{nullptr};
+extern "C" __declspec(dllimport) void* __stdcall GetCurrentThread();
+std::atomic<u64> g_submit_ns{0}; // recorder cost diagnostics
+inline u64 NowNs() {
+    return u64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+int ProfileAt() {
+    static const int at = [] {
+        const char* e = std::getenv("MUA3_PROFILE_NVN");
+        return e ? std::atoi(e) : -1;
+    }();
+    return at;
+}
+// MUA3_PROFILE_NVN=<seconds>: after that long, samples the first threads that record commands (10 s each).
+void MaybeProfileRecorder() {
+    static const auto start = std::chrono::steady_clock::now();
+    static std::atomic<int> started{0};
+    thread_local bool mine = false;
+    if (mine || started.load() >= 3 || std::chrono::steady_clock::now() - start < std::chrono::seconds(ProfileAt()))
+        return;
+    mine = true;
+    const int n = started++;
+    if (n < 3)
+        common::StartSamplingProfiler(GetCurrentThread(), n == 0 ? "NVN recorder 0" : n == 1 ? "NVN recorder 1" : "NVN recorder 2", 10, 0);
+}
 template <int I>
 void Generic(State& s) {
+    // Test aid: MUA3_NVN_RECORD=2 installs the wrappers but records nothing (measures the wrapping alone).
+    static const bool passthrough = [] {
+        const char* e = std::getenv("MUA3_NVN_RECORD");
+        return e && e[0] == '2';
+    }();
+    if (passthrough)
+        return g_generic[I].driver(s);
+    if (ProfileAt() >= 0)
+        MaybeProfileRecorder();
     const GenericSlot& g = g_generic[I];
     Command c{I, {}, {}, {}};
     for (int k = 0; k < 8; k++)
         c.x[k] = s.x[k];
     for (int k = 0; k < 4; k++)
         c.v[k] = u32(s.v[k].lo);
-    if (g.rts) // SetRenderTargets(cb, n, NVNtexture** colors, views, depth, depthView): the arrays are temporaries
+    if (g.rts) { // SetRenderTargets(cb, n, NVNtexture** colors, views, depth, depthView): the arrays are temporaries
         for (u64 i = 0; i < u32(s.x[1]) && i < 8; i++)
             c.handles.push_back(recomp::Rd<u64>(s, s.x[2] + i * 8));
+        if (g_sink.load()) {
+            for (u64 t : c.handles)
+                EnsureTexture(s, t);
+            EnsureTexture(s, s.x[4]);
+        }
+    }
     if (g.shaders) // nvnProgramSetShaders(program, count, const NVNshaderData*): {code address, control pointer}
         for (u64 i = 0; i < u32(s.x[1]) && i < 8; i++) {
             c.handles.push_back(recomp::Rd<u64>(s, s.x[2] + i * 16));
             c.handles.push_back(recomp::Rd<u64>(s, s.x[2] + i * 16 + 8));
         }
-    {
+    const bool replay = g_sink.load() != nullptr;
+    u32 raw_n = 0;
+    if (replay && g.raw_ptr >= 0 && s.x[g.raw_ptr]) {
+        raw_n = g.raw_count >= 0 ? std::min<u32>(u32(s.x[g.raw_count]), 32) : 1;
+        for (u32 o = 0; o < raw_n * g.raw_elem; o += 8)
+            c.raw.push_back(recomp::Rd<u64>(s, s.x[g.raw_ptr] + o));
+    }
+    // Commands append to the calling thread's current command buffer without the lock (each command buffer is
+    // recorded by one thread; map nodes are stable, so the cached list stays valid).
+    thread_local u64 tls_cb = 0;
+    thread_local std::vector<Command>* tls_list = nullptr;
+    if (g.kind == Kind::Command && !g.objects) {
+        if (tls_cb != s.x[0] || !tls_list) {
+            auto& rec = Rec();
+            std::lock_guard lk(rec.mutex);
+            tls_list = &rec.open[s.x[0]];
+            tls_cb = s.x[0];
+        }
+        tls_list->push_back(std::move(c));
+        Rec().recorded.fetch_add(1, std::memory_order_relaxed);
+    } else {
         auto& rec = Rec();
         std::lock_guard lk(rec.mutex);
         if (g.kind == Kind::Command) {
+            if (g.objects)
+                for (u32 i = 0; i < raw_n; i++) {
+                    auto& calls = c.objects.emplace_back();
+                    if (auto it = rec.shadow.find(s.x[g.raw_ptr] + u64(i) * g.raw_elem); it != rec.shadow.end())
+                        for (const Command& sc : it->second) {
+                            StateCall& k = calls.emplace_back();
+                            k.name = g_generic[sc.fn].name;
+                            std::memcpy(k.x, sc.x, sizeof(k.x));
+                            std::memcpy(k.v, sc.v, sizeof(k.v));
+                            k.handles = sc.handles;
+                        }
+                }
             rec.open[s.x[0]].push_back(std::move(c));
             rec.recorded++;
         } else {
             auto& obj = rec.shadow[s.x[0]];
             if (g.defaults)
                 obj.clear();
-            obj[I] = std::move(c);
+            auto same = std::find_if(obj.begin(), obj.end(),
+                                     [&](const Command& o) { return o.fn == I && (!g.indexed || o.x[1] == c.x[1]); });
+            if (same != obj.end())
+                obj.erase(same);
+            else if (obj.size() >= 64)
+                obj.erase(obj.begin());
+            obj.push_back(std::move(c));
         }
     }
     g.driver(s);
@@ -419,10 +532,14 @@ void CommandBufferEndRecording(State& s) {
     rec.empty_ends += rec.open[cb].empty();
     // Handles identify command memory, which the game reuses: an empty recording must not hide a real one that
     // is still waiting to be submitted.
+    // (swapped rather than moved: the command buffer keeps an allocation for its next recording)
     auto& slot = rec.handles[handle];
-    if (!rec.open[cb].empty() || slot.empty())
-        slot = std::move(rec.open[cb]);
-    rec.open[cb].clear();
+    auto& open = rec.open[cb];
+    if (!open.empty() || slot.empty())
+        slot.swap(open);
+    open.clear();
+    if (open.capacity() < 256)
+        open.reserve(256);
 }
 
 // ---- draw resolution (front half of the native replay): walks one submitted frame in order, tracking bound state,
@@ -500,8 +617,8 @@ void ResolveFrame(Recording& rec, std::ofstream& f, State& s, const std::vector<
                     if (!st.program[b])
                         continue;
                     if (auto sh = rec.shadow.find(st.program[b]); sh != rec.shadow.end())
-                        for (const auto& [slot, cmd] : sh->second)
-                            if (g_generic[slot].shaders && !cmd.handles.empty()) {
+                        for (const Command& cmd : sh->second)
+                            if (g_generic[cmd.fn].shaders && !cmd.handles.empty()) {
                                 u32 w[64]{}; // where the Maxwell SPH (type 1/2, version 3) starts in the blob
                                 gpu::G().ReadGpu(cmd.handles[0], w, sizeof(w));
                                 int sph = -1;
@@ -539,6 +656,10 @@ void QueueSubmitCommands(State& s) {
         handles.push_back(recomp::Rd<u64>(s, array + i * 8));
     // Observed before the driver runs: the submit makes a GPU syscall that can hand the rest of the call to the JIT.
     const u64 queue = s.x[0];
+    const u64 submit_t0 = NowNs();
+
+    std::vector<ReplayCommand> flat;
+    auto* sink = g_sink.load();
     {
     auto& rec = Rec();
     std::lock_guard lk(rec.mutex);
@@ -592,8 +713,8 @@ void QueueSubmitCommands(State& s) {
             if (it == rec.shadow.end())
                 continue;
             f << fmt::format("object {:#x}\n", obj);
-            for (const auto& [slot, c] : it->second) {
-                f << fmt::format("  {} {:x} {:x} {:x} {:x} {:x} | {} {}", g_generic[slot].name, c.x[1], c.x[2], c.x[3],
+            for (const Command& c : it->second) {
+                f << fmt::format("  {} {:x} {:x} {:x} {:x} {:x} | {} {}", g_generic[c.fn].name, c.x[1], c.x[2], c.x[3],
                                  c.x[4], c.x[5], std::bit_cast<float>(c.v[0]), std::bit_cast<float>(c.v[1]));
                 for (u64 h : c.handles)
                     f << fmt::format(" {:x}", h);
@@ -623,8 +744,7 @@ void QueueSubmitCommands(State& s) {
         LOG_INFO("NVN", "wrote nvn_frame.txt");
     }
     // native replay: hand this frame's commands, in execution order, to the renderer
-    if (auto sink = g_sink.load(); sink && *sink) {
-        std::vector<ReplayCommand> flat;
+    if (sink && *sink) {
         std::vector<std::pair<u64, int>> order;
         for (auto h = handles.rbegin(); h != handles.rend(); ++h)
             order.emplace_back(*h, 0);
@@ -651,13 +771,12 @@ void QueueSubmitCommands(State& s) {
                             order.emplace_back(*n, depth + 1);
                     break;
                 }
-                ReplayCommand r{g_generic[c.fn].name, {}, {}, c.handles};
+                ReplayCommand r{g_generic[c.fn].name, {}, {}, c.handles, c.raw, c.objects};
                 std::memcpy(r.x, c.x, sizeof(r.x));
                 std::memcpy(r.v, c.v, sizeof(r.v));
                 flat.push_back(std::move(r));
             }
         }
-        (*sink)(std::move(flat));
     }
     // walk the submitted command buffers, following nested Call/CopyCommands
     std::vector<std::pair<u64, int>> work;
@@ -686,12 +805,16 @@ void QueueSubmitCommands(State& s) {
     }
     if (++rec.submits % 600 == 0) {
         LOG_INFO("NVN", "recorded stream, per submit: {:.0f} commands, {:.0f} draws ({:.0f} indirect), {:.1f} "
-                        "dispatches; {} unrecorded handles (recorded {}, begins {}, ends {}, empty {})",
+                        "dispatches; {} unrecorded handles (recorded {}, begins {}, ends {}, empty {}); submit {:.2f} ms",
                  double(rec.cmds) / 600, double(rec.draws) / 600, double(rec.indirect) / 600,
-                 double(rec.dispatches) / 600, rec.unknown, rec.recorded, rec.begins, rec.ends, rec.empty_ends);
+                 double(rec.dispatches) / 600, rec.unknown, rec.recorded.load(), rec.begins, rec.ends, rec.empty_ends,
+                 g_submit_ns.exchange(0) / 600e6);
         rec.cmds = rec.draws = rec.indirect = rec.dispatches = rec.unknown = 0;
     }
     }
+    if (sink && *sink)
+        (*sink)(std::move(flat));
+    g_submit_ns.fetch_add(NowNs() - submit_t0, std::memory_order_relaxed);
     u64 q, r;
     Through(s, kQueueSubmitCommands, q, r);
 }
@@ -789,10 +912,10 @@ bool QueryState(u64 object, std::string_view setter, u64 x[8], u32 v[4]) {
     auto it = rec.shadow.find(object);
     if (it == rec.shadow.end())
         return false;
-    for (const auto& [slot, c] : it->second)
-        if (g_generic[slot].name == setter) {
-            std::memcpy(x, c.x, sizeof(c.x));
-            std::memcpy(v, c.v, sizeof(c.v));
+    for (auto c = it->second.rbegin(); c != it->second.rend(); ++c)
+        if (g_generic[c->fn].name == setter) {
+            std::memcpy(x, c->x, sizeof(c->x));
+            std::memcpy(v, c->v, sizeof(c->v));
             return true;
         }
     return false;
@@ -804,8 +927,8 @@ u64 QueryProgramCode(u64 program) {
     auto it = rec.shadow.find(program);
     if (it == rec.shadow.end())
         return 0;
-    for (const auto& [slot, c] : it->second)
-        if (g_generic[slot].shaders && !c.handles.empty())
+    for (const Command& c : it->second)
+        if (g_generic[c.fn].shaders && !c.handles.empty())
             return c.handles[0];
     return 0;
 }
@@ -857,6 +980,26 @@ recomp::Fn Find(std::string_view name, recomp::Fn driver, u64 pc) {
         g.defaults = name.find("SetDefaults") != std::string_view::npos;
         g.shaders = name == "nvnProgramSetShaders";
         g.rts = name == "nvnCommandBufferSetRenderTargets";
+        for (std::string_view k : {"SetBlendEnable", "SetChannelMask", "SetStencilFunc", "SetStencilOp", "SetStencilMask",
+                                   "SetStencilValueMask", "SetStencilRef"})
+            g.indexed |= kind == Kind::Setter && name.find(k) != std::string_view::npos;
+        auto raw = [&](int ptr, int count, u32 elem, bool objects) {
+            g.raw_ptr = ptr, g.raw_count = count, g.raw_elem = elem, g.objects = objects;
+        };
+        if (name == "nvnCommandBufferSetViewports" || name == "nvnCommandBufferSetScissors")
+            raw(3, 2, 16, false); // (cb, first, count, float/int[4] array)
+        else if (name == "nvnCommandBufferSetDepthRanges")
+            raw(3, 2, 8, false);
+        else if (name == "nvnCommandBufferBindVertexAttribState")
+            raw(2, 1, 4, true); // (cb, count, NVNvertexAttribState array)
+        else if (name == "nvnCommandBufferBindVertexStreamState")
+            raw(2, 1, 8, true);
+        else if (name == "nvnCommandBufferClearColor")
+            raw(2, -1, 16, false); // (cb, index, const float rgba[4], mask)
+        else if (name == "nvnCommandBufferBindProgram")
+            raw(1, -1, 8, true);
+        else if (name.substr(0, 20) == "nvnCommandBufferBind" && name.ends_with("State"))
+            raw(1, -1, 32, true); // Bind{Blend,Color,ChannelMask,DepthStencil,Polygon,Multisample}State(cb, state)
         return kGenericFns[i];
     }
     if (!entry || (entry->record && !record))

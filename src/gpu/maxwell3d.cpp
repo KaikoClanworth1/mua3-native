@@ -90,6 +90,12 @@ void Maxwell3D::ProcessDrawEnd() {
     }
     draw.instance = instance_counter_;
     index_count_written_ = false;
+    if (capture) {
+        capture(*this);
+        return;
+    }
+    if (intercept && intercept(*this))
+        return;
     gpu_.draws++;
     if (auto* r = gpu_.GetRenderer(); r && draw.count) {
         const u64 t0 = gpu_.NowNs();
@@ -99,11 +105,15 @@ void Maxwell3D::ProcessDrawEnd() {
 }
 
 void Maxwell3D::ProcessClear(u32 arg) {
+    if (capture || suppress_clears)
+        return;
     if (auto* r = gpu_.GetRenderer())
         r->Clear((arg >> 6) & 0xF, arg & 0x3F);
 }
 
 void Maxwell3D::ProcessCbData(u32 arg) {
+    if (capture)
+        return;
     const u64 addr = Addr(kCbAddrHigh) + regs_[kCbPos];
     gpu_.WriteGpu(addr, &arg, 4);
     regs_[kCbPos] += 4;

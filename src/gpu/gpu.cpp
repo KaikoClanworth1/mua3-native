@@ -116,6 +116,12 @@ u64 Gpu::NowNs() const {
 
 bool Gpu::ReadGpu(u64 gpu_va, void* dst, size_t size) {
     u8* d = static_cast<u8*>(dst);
+    if (gpu_va >= kHostBase) {
+        if (gpu_va + size > kHostBase + kHostSize)
+            return std::memset(d, 0, size), false;
+        std::memcpy(d, &host_mem_[gpu_va - kHostBase], size);
+        return true;
+    }
     while (size) {
         u64 run = 0;
         const u64 cpu = as_.TranslateRun(gpu_va, run);
@@ -131,6 +137,8 @@ bool Gpu::ReadGpu(u64 gpu_va, void* dst, size_t size) {
 }
 
 u8* Gpu::GpuPtr(u64 gpu_va, size_t size) {
+    if (gpu_va >= kHostBase)
+        return gpu_va + size <= kHostBase + kHostSize ? &host_mem_[gpu_va - kHostBase] : nullptr;
     u64 run = 0;
     const u64 cpu = as_.TranslateRun(gpu_va, run);
     if (!cpu || run < size || !mem_.IsValid(cpu, size))
@@ -140,6 +148,11 @@ u8* Gpu::GpuPtr(u64 gpu_va, size_t size) {
 
 size_t Gpu::ReadGpuPartial(u64 gpu_va, void* dst, size_t size) {
     u8* d = static_cast<u8*>(dst);
+    if (gpu_va >= kHostBase) {
+        const size_t n = gpu_va < kHostBase + kHostSize ? std::min<size_t>(size, kHostBase + kHostSize - gpu_va) : 0;
+        std::memcpy(d, &host_mem_[gpu_va - kHostBase], n);
+        return n;
+    }
     size_t done = 0;
     while (done < size) {
         const u64 cpu = as_.Translate(gpu_va);
@@ -154,6 +167,12 @@ size_t Gpu::ReadGpuPartial(u64 gpu_va, void* dst, size_t size) {
 
 bool Gpu::WriteGpu(u64 gpu_va, const void* src, size_t size) {
     const u8* s = static_cast<const u8*>(src);
+    if (gpu_va >= kHostBase) {
+        if (gpu_va + size > kHostBase + kHostSize)
+            return false;
+        std::memcpy(&host_mem_[gpu_va - kHostBase], s, size);
+        return true;
+    }
     while (size) {
         u64 run = 0;
         const u64 cpu = as_.TranslateRun(gpu_va, run);
@@ -207,6 +226,7 @@ void Gpu::Submit(std::vector<u64> entries, u32 syncpt_id, u32 syncpt_incr) {
         j.entries = std::move(entries);
         j.syncpt_id = syncpt_id;
         j.syncpt_incr = syncpt_incr;
+        j.tagged = tag_next_submit.exchange(false);
         queue_.push_back(std::move(j));
     }
     queue_cv_.notify_one();
@@ -248,6 +268,8 @@ void Gpu::ThreadMain() {
         }
         switch (job.kind) {
         case Job::Commands: {
+            if (job.tagged && on_tagged_job)
+                on_tagged_job();
             const u64 t0 = NowNs();
             RunCommands(job.entries);
             busy_ns += NowNs() - t0;
