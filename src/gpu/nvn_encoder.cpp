@@ -19,8 +19,10 @@
 
 #include "common/common.h"
 #include "core/hle/nvn/nvn_hle.h"
+#include "core/memory.h"
 #include "gpu/gpu.h"
 #include "gpu/maxwell3d.h"
+#include "gpu/renderer.h"
 #include "gpu/shader/translator.h"
 
 namespace gpu {
@@ -136,6 +138,8 @@ public:
             for (u32 i = 1; i < 8; i++)
                 DrvWrite(hw, 2, i * 4, i);
         }
+        for (u32 i = 1; i < 8; i++)
+            DrvWrite(5, 2, i * 4, i);
         W(kTexCbIndex, 2);
         W(kScreenYControl, 0x10);
         W(kViewportTransformEnable, 1);
@@ -186,13 +190,17 @@ public:
                 continue;
             }
             const ReplayCommand& c = frame_[pos_];
-            if (c.name.find("CommandBufferDraw") != std::string_view::npos)
+            if (c.name.find("CommandBufferDraw") != std::string_view::npos || c.name.ends_with("DispatchCompute"))
                 return true;
             Encode(c);
             pos_++;
         }
     }
     // Programs of the pending draw (vertex, fragment Maxwell program header addresses).
+    bool PendingDispatch() const { return frame_[pos_].name.ends_with("DispatchCompute"); }
+    // Program and grid of the pending dispatch.
+    u64 DispatchProgram() const { return cs_code_; }
+    u32 DispatchGrid(u32 i) const { return u32(frame_[pos_].x[1 + i]); }
     u64 DrawVs() const { return prog_[0]; }
     u64 DrawFs() const { return prog_[1]; }
     // Encodes the pending draw command; returns the hardware draws (instances) it issued.
@@ -204,6 +212,8 @@ public:
     // The pending draw command issues no hardware draw (indirect with zero instances).
     bool PendingIssuesNothing() {
         const ReplayCommand& c = frame_[pos_];
+        if (c.name.ends_with("DispatchCompute"))
+            return c.x[1] == 0 || c.x[2] == 0 || c.x[3] == 0;
         u32 a[2]{};
         if (c.name.ends_with("DrawElementsIndirect"))
             g_.ReadGpu(c.x[4], a, sizeof(a));
@@ -247,6 +257,21 @@ private:
         else if (n == "BindUniformBuffer") {
             if (x[1] < 5)
                 Bind(kHwStage[x[1]], u32(x[2]) + 3, x[3], u32(x[4]));
+            else if (x[1] == 5 && x[2] < 5) {
+                cs_ubo_[x[2]] = {x[3], u32(x[4])};
+                // compute's c0 also lists them: {address lo, hi, size, 0} at 0x210
+                const u32 off = 0x210 + u32(x[2]) * 16;
+                DrvWrite(5, 0, off, u32(x[3]));
+                DrvWrite(5, 0, off + 4, u32(x[3] >> 32));
+                DrvWrite(5, 0, off + 8, u32(x[4]));
+            }
+        } else if (n == "BindStorageBuffer" && x[1] == 5) {
+            if (x[2] < 16) { // compute's own c0: the storage buffer table at 0x310
+                const u32 off = 0x310 + u32(x[2]) * 16;
+                DrvWrite(5, 0, off, u32(x[3]));
+                DrvWrite(5, 0, off + 4, u32(x[3] >> 32));
+                DrvWrite(5, 0, off + 8, u32(x[4]));
+            }
         } else if (n == "BindStorageBuffer") {
             // the driver's table in the shared c0: {address lo, hi, size, 0} at 0x110 + hardware stage * 0x100
             if (x[1] < 5 && x[2] < 16) {
@@ -255,9 +280,11 @@ private:
                 DrvWrite(0, 0, off + 4, u32(x[3] >> 32));
                 DrvWrite(0, 0, off + 8, u32(x[4]));
             }
-        } else if (n == "BindTexture") {
+        } else if (n == "BindTexture" || n == "BindImage") {
             if (x[1] < 5 && x[2] < 128)
-                DrvWrite(kHwStage[x[1]], 2, 0x20 + u32(x[2]) * 8, u32(x[3]));
+                DrvWrite(kHwStage[x[1]], 2, (n == "BindImage" ? 0x120 : 0x20) + u32(x[2]) * 8, u32(x[3]));
+            else if (x[1] == 5 && x[2] < 128) // compute keeps the whole 64-bit handle
+                DrvWrite(5, 2, (n == "BindImage" ? 0x120 : 0x20) + u32(x[2]) * 8, x[3]);
         } else if (n == "BindVertexBuffer") {
             if (x[1] < 16)
                 streams_[x[1]].addr = x[2], streams_[x[1]].size = x[3];
@@ -325,7 +352,9 @@ private:
             W(kClearDepth, c.v[0]);
             W(kClearStencil, u32(x[2]));
             W(kClearBuffers, (x[1] ? 1u : 0u) | (x[3] ? 2u : 0u));
-        } else if (n == "DrawElementsBaseVertex")
+        } else if (n == "DispatchCompute")
+            Dispatch(u32(x[1]), u32(x[2]), u32(x[3]));
+        else if (n == "DrawElementsBaseVertex")
             Draw(u32(x[1]), true, 0, u32(x[3]), u32(x[2]), x[4], s32(x[5]), 1, 0);
         else if (n == "DrawElements")
             Draw(u32(x[1]), true, 0, u32(x[3]), u32(x[2]), x[4], 0, 1, 0);
@@ -348,18 +377,72 @@ private:
     }
 
     void BindProgram(const ReplayCommand& c) {
-        u64 code = 0;
+        u64 code = 0, control = 0;
         if (c.x[1]) {
             if (!c.objects.empty())
                 for (const StateCall& k : c.objects[0])
-                    if (Is(k.name, "SetShaders") && !k.handles.empty())
-                        code = k.handles[0];
+                    if (Is(k.name, "SetShaders") && k.handles.size() >= 2)
+                        code = k.handles[0], control = k.handles[1];
             if (!code)
                 code = hle::nvn::QueryProgramCode(c.x[1]), no_shadow++;
         }
         for (u32 s = 0; s < 6; s++)
             if (c.x[2] & (1u << s))
                 prog_[s] = code ? code + 0x30 : 0; // the Maxwell program header follows NVN's 0x30-byte blob header
+        if (c.x[2] & 0x20)
+            cs_code_ = code, cs_control_ = control;
+    }
+
+  public:
+    // Compute launch as the renderer takes it: compute engine registers and launch descriptor (QMD).
+    struct Launch {
+        std::array<u32, 0x1000> r{};
+        std::array<u32, 0x40> q{};
+        u64 code = 0, control = 0; // NVN shader data of the program
+    };
+    std::function<void(const Launch&)> on_dispatch; // verification
+    bool render_compute = false;                    // replay: launch on the renderer
+  private:
+    void Dispatch(u32 gx, u32 gy, u32 gz) {
+        static thread_local Launch l;
+        l.r.fill(0);
+        l.q.fill(0);
+        l.code = cs_code_, l.control = cs_control_;
+        // Compute code has no blob header; the launch shape and constants come from NVN's control section.
+        const ComputeInfo& ci = Compute(cs_code_, cs_control_);
+        const u64 prog = cs_code_;
+        const u64 base = prog & ~0xFFFFull;
+        l.r[0x582] = u32(base >> 32), l.r[0x583] = u32(base);
+        l.r[0x55D] = m_.Reg(kTicAddrHigh), l.r[0x55E] = m_.Reg(kTicAddrLow), l.r[0x55F] = m_.Reg(kTicLimit);
+        l.r[0x557] = m_.Reg(kTscAddrHigh), l.r[0x558] = m_.Reg(kTscAddrLow), l.r[0x559] = m_.Reg(kTscLimit);
+        l.r[0x982] = 2;
+        l.q[8] = u32(prog - base);
+        l.q[0xC] = gx;
+        l.q[0xD] = gy | (gz << 16);
+        l.q[0x11] = ci.shared;
+        l.q[0x12] = ci.block[0] << 16;
+        l.q[0x13] = ci.block[1] | (ci.block[2] << 16);
+        DrvWrite(5, 0, 0x200, gx);
+        DrvWrite(5, 0, 0x204, gy);
+        DrvWrite(5, 0, 0x208, gz);
+        u32 mask = 0;
+        auto slot = [&](u32 i, u64 addr, u32 size) {
+            if (!addr || !size)
+                return;
+            mask |= 1u << i;
+            l.q[0x1D + i * 2] = u32(addr);
+            l.q[0x1E + i * 2] = (u32(addr >> 32) & 0xFF) | (std::min<u32>(size, 0x10000) << 15);
+        };
+        slot(0, DrvCb(5, 0), 0x1000);
+        slot(1, ci.constants_size ? cs_code_ + ci.constants : 0, ci.constants_size);
+        slot(2, DrvCb(5, 2), 0x600);
+        for (u32 i = 0; i < 5; i++)
+            slot(3 + i, cs_ubo_[i].addr, cs_ubo_[i].size);
+        l.q[0x14] = mask | 0x60000000;
+        if (on_dispatch)
+            on_dispatch(l);
+        else if (render_compute && g_.GetRenderer())
+            g_.GetRenderer()->Dispatch(l.r.data(), l.q.data());
     }
 
     void ResetAttribs() {
@@ -646,6 +729,36 @@ private:
     }
 
     std::unordered_map<u64, u64> constants_;
+    // From a compute program's NVN control section (offsets learned against the driver's launches).
+    struct ComputeInfo {
+        u32 block[3] = {1, 1, 1};
+        u32 shared = 0;
+        u32 constants = 0, constants_size = 0; // constant buffer 1, relative to the code
+    };
+    std::unordered_map<u64, ComputeInfo> compute_;
+    const ComputeInfo& Compute(u64 code, u64 control) {
+        auto it = compute_.find(code);
+        if (it != compute_.end())
+            return it->second;
+        ComputeInfo ci;
+        u32 w[0x60]{};
+        if (control && g_.Mem().IsValid(control + 0x6F0, sizeof(w))) {
+            g_.Mem().ReadBlock(control + 0x6F0, w, sizeof(w));
+            auto at = [&](u32 off) { return w[(off - 0x6F0) / 4]; };
+            ci.block[0] = std::max<u32>(at(0x748), 1), ci.block[1] = std::max<u32>(at(0x74C), 1);
+            ci.block[2] = std::max<u32>(at(0x750), 1);
+            ci.shared = u32(common::AlignUp(at(0x754), 0x100));
+            ci.constants = at(0x700);
+            ci.constants_size = u32(common::AlignUp(at(0x6FC), 0x100));
+        } else
+            unhandled["compute program without control section"]++;
+        return compute_.emplace(code, ci).first->second;
+    }
+    struct Ubo {
+        u64 addr = 0;
+        u32 size = 0;
+    } cs_ubo_[5];
+    u64 cs_code_ = 0, cs_control_ = 0;
     std::mutex queue_mutex_;
     std::deque<std::vector<ReplayCommand>> queue_;
     std::vector<ReplayCommand> frame_;
@@ -672,6 +785,15 @@ struct Verify {
     std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
     std::atomic<int> phase{0}; // 0 waiting, 1 encoded (waiting for the driver's draws), 2 collecting, 3 done
     std::vector<std::unique_ptr<Snap>> enc_snaps, drv_snaps;
+    struct CSnap {
+        u32 r[8]; // code base hi/lo, TIC hi/lo, TSC hi/lo, texture cbuf
+        u32 q[0x40];
+        std::vector<u32> cb[3];
+        u64 code = 0, control = 0;
+        std::vector<u32> control_words;
+        int cmd = -1;
+    };
+    std::vector<CSnap> enc_cs, drv_cs;
     std::vector<std::string> cmd_names, cmd_lines;
     std::map<std::string, u64> unhandled; // encoder diagnostics as of the captured frame
     u64 no_shadow = 0;
@@ -696,6 +818,88 @@ std::string RegName(u32 r) {
         if (r >= n.first && r < n.first + n.count * n.stride)
             return fmt::format("{}{}+{}({:#x})", n.name, (r - n.first) / n.stride, (r - n.first) % n.stride, r);
     return fmt::format("reg{:#x}", r);
+}
+
+Verify::CSnap TakeCSnap(Gpu& g, const u32* r, const u32* q, int cmd) {
+    Verify::CSnap c;
+    const u32 rr[8] = {r[0x582], r[0x583], r[0x55D], r[0x55E], r[0x557], r[0x558], r[0x982], 0};
+    std::memcpy(c.r, rr, sizeof(rr));
+    std::memcpy(c.q, q, sizeof(c.q));
+    c.cmd = cmd;
+    for (u32 i = 0; i < 3; i++)
+        if (q[0x14] & (1u << i)) {
+            const u64 a = (u64(q[0x1E + i * 2] & 0xFF) << 32) | q[0x1D + i * 2];
+            c.cb[i].resize(std::min<u32>(q[0x1E + i * 2] >> 15, i == 0 ? 0x1000u : 0x400u) / 4);
+            g.ReadGpu(a, c.cb[i].data(), c.cb[i].size() * 4);
+        }
+    return c;
+}
+
+void ReportCompute(std::ofstream& f) {
+    auto& v = V();
+    const auto& E = v.enc_cs;
+    const auto& D = v.drv_cs;
+    std::ofstream log("nvn_verify_compute.txt");
+    std::map<std::string, std::pair<u64, std::vector<std::string>>> diffs;
+    auto add = [&](const std::string& k, size_t i, u64 a, u64 b) {
+        auto& d = diffs[k];
+        d.first++;
+        if (d.second.size() < 4)
+            d.second.push_back(fmt::format("c{} drv {:#x} enc {:#x}", i, a, b));
+    };
+    auto abs_prog = [](const Verify::CSnap& c) { return ((u64(c.r[0] & 0xFF) << 32) | c.r[1]) + c.q[8]; };
+    size_t cursor = 0, matched = 0;
+    for (size_t i = 0; i < E.size(); i++) {
+        const auto& e = E[i];
+        size_t j = cursor;
+        for (; j < D.size() && j < cursor + 32; j++)
+            if (D[j].q[0xC] == e.q[0xC] && D[j].q[0xD] == e.q[0xD] &&
+                (abs_prog(D[j]) == abs_prog(e) || abs_prog(D[j]) - e.code < 0x100))
+                break;
+        if (j >= D.size() || j >= cursor + 32) {
+            log << fmt::format("enc cs {} (cmd {}) code {:#x} grid {}x{}: no driver match\n", i, e.cmd, e.code, e.q[0xC], e.q[0xD]);
+            continue;
+        }
+        cursor = j + 1, matched++;
+        const auto& d = D[j];
+        log << fmt::format("enc cs {} = drv {} (cmd {}) code {:#x} drv prog {:#x} (code+{:#x}) block {}x{}x{} shared {:#x} mask {:#x}",
+                           i, j, e.cmd, e.code, abs_prog(d), abs_prog(d) - e.code, d.q[0x12] >> 16, d.q[0x13] & 0xFFFF,
+                           d.q[0x13] >> 16, d.q[0x11] & 0x3FFFF, d.q[0x14]);
+        for (u32 k = 0; k < 8; k++)
+            if (d.q[0x14] & (1u << k))
+                log << fmt::format(" c{}={:#x}/{:#x}", k, (u64(d.q[0x1E + k * 2] & 0xFF) << 32) | d.q[0x1D + k * 2], d.q[0x1E + k * 2] >> 15);
+        log << " control";
+        for (size_t w = 0; w < e.control_words.size(); w++)
+            if (e.control_words[w])
+                log << fmt::format(" [{:x}]={:x}", w * 4, e.control_words[w]);
+        log << "\n";
+        if (abs_prog(d) != abs_prog(e))
+            add("program", i, abs_prog(d), abs_prog(e));
+        for (u32 k = 2; k < 7; k++)
+            if (d.r[k] != e.r[k])
+                add(fmt::format("reg{}", k), i, d.r[k], e.r[k]);
+        for (u32 w = 0; w < 0x40; w++) {
+            if (w == 8 || (w >= 0x1D && w < 0x2D && !((d.q[0x14] >> ((w - 0x1D) / 2)) & 1) && !((e.q[0x14] >> ((w - 0x1D) / 2)) & 1)))
+                continue;
+            if (w >= 0x1D && w < 0x23) // driver constant buffers: compared by content
+                continue;
+            if (d.q[w] != e.q[w])
+                add(fmt::format("qmd[{:#x}]", w), i, d.q[w], e.q[w]);
+        }
+        for (u32 k = 0; k < 3; k++)
+            for (size_t w = 0; w < std::max(d.cb[k].size(), e.cb[k].size()); w++) {
+                const u32 a = w < d.cb[k].size() ? d.cb[k][w] : 0, b = w < e.cb[k].size() ? e.cb[k][w] : 0;
+                if (a != b)
+                    add(fmt::format("cs c{}[{:#05x}]", k, w * 4), i, a, b);
+            }
+    }
+    f << fmt::format("# compute: encoder {} driver {} matched {}\n", E.size(), D.size(), matched);
+    for (const auto& [k, d] : diffs) {
+        f << fmt::format("{:<28} {:>6}  ", k, d.first);
+        for (const auto& ex : d.second)
+            f << ex << "; ";
+        f << "\n";
+    }
 }
 
 void Report() {
@@ -854,6 +1058,7 @@ void Report() {
             f << ex << "; ";
         f << "\n";
     }
+    ReportCompute(f);
     LOG_INFO("NVN", "verify: {} of {} encoder draws matched, {} differing items; wrote nvn_verify.txt", matched, E.size(),
              diffs.size());
 }
@@ -869,7 +1074,7 @@ struct Replay {
     u32 skip = 0; // remaining instances of the last matched draw
     u64 skip_vs = 0, skip_fs = 0;
     u32 misses_in_row = 0;
-    u64 matched = 0, own = 0, lost = 0, frames_logged = 0;
+    u64 matched = 0, own = 0, lost = 0, frames_logged = 0, cs_matched = 0, cs_own = 0;
 };
 
 void InstallReplay(Gpu& gpu) {
@@ -893,7 +1098,7 @@ void InstallReplay(Gpu& gpu) {
             ~Active() { g.SetActiveM3D(nullptr); }
         } active(*r.gpu, e.M());
         for (int tries = 0; tries < 64 && e.ToDraw(); tries++) {
-            if (e.DrawVs() != vs || e.DrawFs() != fs) {
+            if (e.PendingDispatch() || e.DrawVs() != vs || e.DrawFs() != fs) {
                 // an encoder draw without instances has no stream counterpart: pass it; otherwise this is the
                 // stream's own draw, and the encoder waits
                 if (!e.PendingIssuesNothing())
@@ -906,8 +1111,9 @@ void InstallReplay(Gpu& gpu) {
             r.matched++;
             r.skip = n ? n - 1 : 0, r.skip_vs = vs, r.skip_fs = fs;
             if (++r.frames_logged % 20000 == 0)
-                LOG_INFO("NVN", "replay: {} draws from the encoder, {} from the stream, {} resyncs, {} dropped submits",
-                         r.matched, r.own, r.lost, e.dropped);
+                LOG_INFO("NVN", "replay: {} draws from the encoder, {} from the stream, {} resyncs, {} dropped submits; "
+                                "{} dispatches from the encoder, {} from the stream",
+                         r.matched, r.own, r.lost, e.dropped, r.cs_matched, r.cs_own);
             return n > 0;
         }
         if (++r.misses_in_row >= 64) {
@@ -918,6 +1124,34 @@ void InstallReplay(Gpu& gpu) {
         r.own++;
         return false;
     };
+    if (!std::getenv("MUA3_NVN_REPLAY_NO_COMPUTE")) {
+        r.enc->render_compute = true;
+        gpu.intercept_dispatch = [](const u32* regs, const u32* q) -> bool {
+            const u64 prog = ((u64(regs[0x582] & 0xFF) << 32) | regs[0x583]) + q[8];
+            const u32 grid[3] = {q[0xC] & 0x7FFFFFFF, q[0xD] & 0xFFFF, q[0xD] >> 16};
+            Encoder& e = *r.enc;
+            struct Active {
+                Gpu& g;
+                explicit Active(Gpu& gg, Maxwell3D& mm) : g(gg) { g.SetActiveM3D(&mm); }
+                ~Active() { g.SetActiveM3D(nullptr); }
+            } active(*r.gpu, e.M());
+            for (int tries = 0; tries < 64 && e.ToDraw(); tries++) {
+                const bool same = e.PendingDispatch() && e.DispatchProgram() == prog && e.DispatchGrid(0) == grid[0] &&
+                                  e.DispatchGrid(1) == grid[1] && e.DispatchGrid(2) == grid[2];
+                if (!same) {
+                    if (!e.PendingIssuesNothing())
+                        break;
+                    e.RunDraw();
+                    continue;
+                }
+                e.RunDraw();
+                r.cs_matched++;
+                return true;
+            }
+            r.cs_own++;
+            return false;
+        };
+    }
     hle::nvn::SetReplaySink([](std::vector<ReplayCommand>&& cmds) { r.enc->Queue(std::move(cmds)); });
     LOG_INFO("NVN", "native replay: draws come from the host NVN encoder");
 }
@@ -945,6 +1179,11 @@ void InstallNvnEncoder(Gpu& gpu) {
         }
         return false;
     };
+    gpu.intercept_dispatch = [&v](const u32* r, const u32* q) {
+        if (v.phase.load() == 2)
+            v.drv_cs.push_back(TakeCSnap(*v.gpu, r, q, -1));
+        return false;
+    };
     gpu.on_tagged_job = [&v] {
         if (v.phase.load() == 1)
             v.phase = 2;
@@ -958,6 +1197,14 @@ void InstallNvnEncoder(Gpu& gpu) {
         Maxwell3D& m = v.enc->M();
         if (capture) {
             m.capture = [&v](const Maxwell3D& mm) { v.enc_snaps.push_back(TakeSnap(*v.gpu, mm, v.enc->current)); };
+            v.enc->on_dispatch = [&v](const Encoder::Launch& l) {
+                auto c = TakeCSnap(*v.gpu, l.r.data(), l.q.data(), v.enc->current);
+                c.code = l.code, c.control = l.control;
+                c.control_words.resize(0x900 / 4);
+                if (l.control && v.gpu->Mem().IsValid(l.control, 0x900))
+                    v.gpu->Mem().ReadBlock(l.control, c.control_words.data(), 0x900);
+                v.enc_cs.push_back(std::move(c));
+            };
             for (const auto& c : cmds)
             {
                 v.cmd_names.emplace_back(c.name.substr(16));
@@ -993,6 +1240,7 @@ void InstallNvnEncoder(Gpu& gpu) {
             }
         } else {
             m.capture = [](const Maxwell3D&) {};
+            v.enc->on_dispatch = nullptr;
         }
         v.enc->Run(cmds);
         if (capture) {

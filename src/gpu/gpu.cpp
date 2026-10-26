@@ -599,7 +599,7 @@ void Gpu::CallMethod(u32 subch, u32 method, u32 arg, bool last_in_batch) {
             static u32 launches = 0;
             u32 q[0x40]{};
             ReadGpu(u64(r[0xAD]) << 8, q, sizeof(q));
-            if (renderer_)
+            if (renderer_ && !(intercept_dispatch && intercept_dispatch(r, q)))
                 renderer_->Dispatch(r, q);
             const u64 code = (u64(r[0x582] & 0xFF) << 32) | r[0x583];
             if (launches++ < 8)

@@ -70,6 +70,8 @@ public:
     // first, on the GPU thread.
     std::atomic<bool> tag_next_submit{false};
     std::function<void()> on_tagged_job;
+    // Sees every compute launch before the renderer; returns true if it took care of it (native replay).
+    std::function<bool(const u32* regs, const u32* qmd)> intercept_dispatch;
 
     void SetRenderer(Renderer* r);
     // Native handle of the GPU command thread (profiling).
