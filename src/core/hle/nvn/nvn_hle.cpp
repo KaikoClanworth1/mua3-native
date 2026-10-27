@@ -1068,7 +1068,7 @@ recomp::Fn Find(std::string_view name, recomp::Fn driver, u64 pc) {
         else if (name == "nvnCommandBufferCopyTextureToTexture") // (cb, src, srcView, srcRegion, dst, dstView, dstRegion, flags)
             g.copy_view[0] = 2, g.copy_region[0] = 3, g.copy_view[1] = 5, g.copy_region[1] = 6;
         if (kind == Kind::Command && Native()) {
-            // exactly what the host encoder implements; everything else (fences, counters, copies, ...) still goes
+            // exactly what the host encoder implements; everything else (fences, counters, ...) still goes
             // to the driver, whose submissions run after the host's work of the same submit
             static const std::set<std::string_view> host = {
                 "BindProgram", "BindUniformBuffer", "BindStorageBuffer", "BindTexture", "BindImage", "BindVertexBuffer",
@@ -1078,7 +1078,9 @@ recomp::Fn Find(std::string_view name, recomp::Fn driver, u64 pc) {
                 "SetPatchSize", "SetShaderScratchMemory", "SetRenderEnable", "SetRenderEnableConditional",
                 "SetStencilRef", "SetStencilValueMask", "SetStencilMask", "SetPolygonOffsetClamp", "SetPrimitiveRestart",
                 "SetTexturePool", "SetSamplerPool", "ClearColor", "ClearDepthStencil", "DrawArrays", "DrawElements",
-                "DrawElementsBaseVertex", "DrawElementsIndirect", "DrawArraysIndirect", "DispatchCompute"};
+                "DrawElementsBaseVertex", "DrawElementsIndirect", "DrawArraysIndirect", "DispatchCompute",
+                "CopyBufferToBuffer", "CopyBufferToTexture", "CopyTextureToBuffer", "SetCopyRowStride",
+                "SetCopyImageStride"};
             g.host = host.count(name.substr(16)) != 0;
         }
         for (std::string_view k : {"SetBlendEnable", "SetChannelMask", "SetStencilFunc", "SetStencilOp", "SetStencilMask",
