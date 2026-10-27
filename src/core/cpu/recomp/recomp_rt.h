@@ -96,6 +96,17 @@ RC_INLINE u64 FPDoubleToFixedS64(State& s, u64 a, u8 f, u8 r) { return u64(FPToF
 RC_INLINE u16 FPDoubleToFixedU16(State& s, u64 a, u8 f, u8 r) { return u16(FPToFixed64(s, a, 16, f, true, r)); }
 RC_INLINE u32 FPDoubleToFixedU32(State& s, u64 a, u8 f, u8 r) { return u32(FPToFixed64(s, a, 32, f, true, r)); }
 RC_INLINE u64 FPDoubleToFixedU64(State& s, u64 a, u8 f, u8 r) { return u64(FPToFixed64(s, a, 64, f, true, r)); }
+// C library routines run by the host (generated for the SDK's memcpy, memset...): AAPCS64 arguments in x0..x2,
+// result in x0.
+void Libc_memcpy(State& s);
+void Libc_memmove(State& s);
+void Libc_memset(State& s);
+void Libc_memcmp(State& s);
+void Libc_strlen(State& s);
+void Libc_strcmp(State& s);
+void Libc_strncmp(State& s);
+void Libc_memchr(State& s);
+void Libc_strchr(State& s);
 // Runs the native function at s.pc if there is one (indirect call / tail jump); otherwise returns with s.pc unchanged.
 void Dispatch(State& s);
 

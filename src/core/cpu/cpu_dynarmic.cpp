@@ -763,6 +763,45 @@ u32 ExWrite128(State& s, u64 a, V128 v) {
                : 1;
 }
 void ClearExclusive(State& s) { CoreOf(s).Monitor().ClearProcessor(CoreOf(s).slot_); }
+namespace {
+u8* GuestPtr(State& s, u64 a) { return s.mem + a; }
+const char* GuestStr(State& s, u64 a) { return reinterpret_cast<const char*>(s.mem + a); }
+} // namespace
+// Overlapping memcpy is undefined; memmove also covers callers that rely on the guest's forward copy.
+void Libc_memcpy(State& s) { std::memmove(GuestPtr(s, s.x[0]), GuestPtr(s, s.x[1]), s.x[2]); }
+void Libc_memmove(State& s) { std::memmove(GuestPtr(s, s.x[0]), GuestPtr(s, s.x[1]), s.x[2]); }
+void Libc_memset(State& s) { std::memset(GuestPtr(s, s.x[0]), int(u8(s.x[1])), s.x[2]); }
+void Libc_memcmp(State& s) {
+    const u8 *a = GuestPtr(s, s.x[0]), *b = GuestPtr(s, s.x[1]);
+    s.x[0] = 0;
+    for (u64 i = 0, n = s.x[2]; i < n; i++)
+        if (a[i] != b[i]) {
+            s.x[0] = u64(s64(int(a[i]) - int(b[i])));
+            return;
+        }
+}
+void Libc_strlen(State& s) { s.x[0] = std::strlen(GuestStr(s, s.x[0])); }
+void Libc_strcmp(State& s) {
+    const u8 *a = GuestPtr(s, s.x[0]), *b = GuestPtr(s, s.x[1]);
+    while (*a && *a == *b)
+        a++, b++;
+    s.x[0] = u64(s64(int(*a) - int(*b)));
+}
+void Libc_strncmp(State& s) {
+    const u8 *a = GuestPtr(s, s.x[0]), *b = GuestPtr(s, s.x[1]);
+    u64 n = s.x[2];
+    while (n && *a && *a == *b)
+        a++, b++, n--;
+    s.x[0] = n ? u64(s64(int(*a) - int(*b))) : 0;
+}
+void Libc_memchr(State& s) {
+    const void* p = std::memchr(GuestPtr(s, s.x[0]), int(u8(s.x[1])), s.x[2]);
+    s.x[0] = p ? s.x[0] + u64(static_cast<const u8*>(p) - GuestPtr(s, s.x[0])) : 0;
+}
+void Libc_strchr(State& s) {
+    const char* p = std::strchr(GuestStr(s, s.x[0]), char(s.x[1]));
+    s.x[0] = p ? s.x[0] + u64(p - GuestStr(s, s.x[0])) : 0;
+}
 void Dispatch(State& s) {
     auto& f = CoreOf(s).Factory();
     if (f.census_) [[unlikely]]

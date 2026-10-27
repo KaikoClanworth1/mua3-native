@@ -415,6 +415,14 @@ struct Function {
 };
 
 std::set<u64> g_entries;
+// C library routines (by symbol) whose generated function is a call into the host's version: the guest's are
+// hand-unrolled NEON loops that cost dozens of emitted ops per 16 bytes.
+std::map<u64, std::string> g_intrinsics;
+const std::set<std::string>& IntrinsicNames() {
+    static const std::set<std::string> n = {"memcpy", "memmove", "memset", "memcmp", "strlen",
+                                            "strcmp", "strncmp", "memchr", "strchr"};
+    return n;
+}
 constexpr size_t kMaxBlocks = 20000;
 
 Function Discover(u64 entry) {
@@ -456,7 +464,7 @@ void FindEntries(u64 text_size) {
         return;
     }
     const u64 dyn = mod0 + int32_t(ImgRead<u32>(mod0 + 4));
-    u64 rela = 0, relasz = 0, symtab = 0, hash = 0;
+    u64 rela = 0, relasz = 0, symtab = 0, strtab = 0, hash = 0;
     for (u64 p = dyn; p < g_image.size(); p += 16) {
         const u64 tag = ImgRead<u64>(p), val = ImgRead<u64>(p + 8);
         if (tag == 0)
@@ -469,6 +477,8 @@ void FindEntries(u64 text_size) {
             symtab = val;
         else if (tag == 4)
             hash = val;
+        else if (tag == 5)
+            strtab = val;
     }
     size_t from_rel = 0, from_sym = 0;
     for (u64 p = rela; p + 24 <= rela + relasz; p += 24) {
@@ -486,6 +496,13 @@ void FindEntries(u64 text_size) {
             const u64 value = ImgRead<u64>(s + 8);
             if ((info & 0xF) == 2 && value && InText(g_base + value) && g_entries.insert(g_base + value).second)
                 from_sym++;
+            if ((info & 0xF) == 2 && value && strtab) {
+                std::string name;
+                for (u64 p = strtab + ImgRead<u32>(s); p < g_image.size() && ImgRead<u8>(p); p++)
+                    name += char(ImgRead<u8>(p));
+                if (IntrinsicNames().count(name))
+                    g_intrinsics[g_base + value] = name;
+            }
         }
     }
     std::printf("entries: %zu from BL, %zu from relocations, %zu from symbols\n", from_bl, from_rel, from_sym);
@@ -1040,6 +1057,9 @@ int main(int argc, char** argv) {
         // MSVC's optimizer crashes (internal compiler error) on a few functions: build those unoptimised.
         const bool noopt = !skip && noopt_funcs.count(f.entry) != 0;
         if (skip) {
+        } else if (auto in = g_intrinsics.find(f.entry); in != g_intrinsics.end()) {
+            cur << "void f_" << std::hex << f.entry << std::dec << "(State& s) {\n  if (!ok_" << std::hex << f.entry
+                << std::dec << ") return;\n  Libc_" << in->second << "(s);\n  s.pc = s.x[30];\n}\n\n";
         } else {
         if (noopt)
             cur << "#pragma optimize(\"\", off)\n";
@@ -1124,6 +1144,7 @@ int main(int argc, char** argv) {
           << ", kOk, kResumes, " << resumes.size() << "};\nconst Table& GetTable() { return kTable; }\n}\n";
     }
     std::printf("%zu blocks failed to emit\n", g_emit_failures);
+    std::printf("%zu C library routines run on the host\n", g_intrinsics.size());
     std::printf("%zu resume points\n", resumes.size());
     std::printf("emitted %zu functions, %zu blocks (%zu exit to the JIT) in %zu shards\n", funcs.size(),
                 emitted_blocks, unsupported_blocks, shard);
