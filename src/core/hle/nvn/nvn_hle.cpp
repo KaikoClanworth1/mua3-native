@@ -501,10 +501,12 @@ void Generic(State& s) {
                             std::memcpy(kc.v, sc.v, sizeof(kc.v));
                         }
                 }
-            if (g.objects)
+            if (g.objects) {
+                c.objects.reserve(raw_n);
                 for (u32 i = 0; i < raw_n; i++) {
                     auto& calls = c.objects.emplace_back();
-                    if (auto it = rec.shadow.find(s.x[g.raw_ptr] + u64(i) * g.raw_elem); it != rec.shadow.end())
+                    if (auto it = rec.shadow.find(s.x[g.raw_ptr] + u64(i) * g.raw_elem); it != rec.shadow.end()) {
+                        calls.reserve(it->second.size());
                         for (const Command& sc : it->second) {
                             StateCall& k = calls.emplace_back();
                             k.name = g_generic[sc.fn].name;
@@ -512,7 +514,9 @@ void Generic(State& s) {
                             std::memcpy(k.v, sc.v, sizeof(k.v));
                             k.handles = sc.extra;
                         }
+                    }
                 }
+            }
             rec.open[s.x[0]].push_back(std::move(c));
             rec.recorded++;
         } else {
@@ -606,7 +610,7 @@ void CommandBufferEndRecording(State& s) {
         const size_t n = open.size();
         slot = std::make_shared<std::vector<Command>>(std::move(open));
         open = {};
-        open.reserve(std::max<size_t>(n, 64));
+        open.reserve(std::max<size_t>(n * 2, 256));
     } else
         open.clear();
 }
