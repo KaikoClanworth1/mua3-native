@@ -138,7 +138,7 @@ void Maxwell3D::ProcessQuery(u32 arg) {
     if (arg & (1u << 28)) {
         gpu_.WriteGpu(addr, &value, 4);
     } else {
-        const u64 v[2] = {value, gpu_.NowNs()};
+        const u64 v[2] = {value, gpu_.GpuTimestamp()};
         gpu_.WriteGpu(addr, v, 16);
     }
 }

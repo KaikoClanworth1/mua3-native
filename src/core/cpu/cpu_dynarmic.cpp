@@ -215,6 +215,9 @@ public:
     u32 pstate_rest_ = 0;
     std::atomic<bool> sample_pending_{false};
     u64 exit_count_ = 0;
+  public:
+    std::atomic<u64> instr_window_{0}; // native guest instructions since the last report (per-thread table)
+    u32 host_tid_ = 0;
 
     // Host code runs with the default MXCSR; native guest code with one mirroring FPCR (see RunNative).
     void Svc(u32 imm) {
@@ -487,6 +490,18 @@ public:
         if (n + j)
             LOG_INFO("Recomp", "native {:.1f}% of {} M guest instructions, {} k JIT->native entries (last 10 s)",
                      100.0 * double(n) / double(n + j), (n + j) / 1000000, tr / 1000);
+        // the busiest guest threads (host thread ids), for comparing per-thread work between runs
+        std::vector<std::pair<u64, u32>> per;
+        {
+            std::lock_guard lk(mutex_);
+            for (auto* c : cores_)
+                per.emplace_back(c->instr_window_.exchange(0), c->host_tid_);
+        }
+        std::sort(per.rbegin(), per.rend());
+        std::string top;
+        for (size_t i = 0; i < per.size() && i < 5; i++)
+            top += fmt::format(" {}:{}M", per[i].second, per[i].first / 1000000);
+        LOG_INFO("Recomp", "guest instructions by thread (last 10 s):{}", top);
     }
 
     // ---- PC sampling profile for the recompiler (MUA3_RECOMP_PROFILE=<file>)
@@ -663,6 +678,9 @@ void DynarmicCore::RunNative(recomp::Fn fn, u64 pc) {
         factory_.RecordSample(s.pc, 64);
     native_ = false;
     factory_.native_instr_.fetch_add(s.icount - icount0, std::memory_order_relaxed);
+    instr_window_.fetch_add(s.icount - icount0, std::memory_order_relaxed);
+    if (!host_tid_)
+        host_tid_ = GetCurrentThreadId();
 
     std::memcpy(regs.data(), s.x, sizeof(s.x));
     jit_->SetRegisters(regs);

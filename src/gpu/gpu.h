@@ -110,6 +110,13 @@ public:
     // Host pointer for a GPU range if it is mapped contiguously to valid guest memory, else null.
     u8* GpuPtr(u64 gpu_va, size_t size);
     u64 NowNs() const;
+    // GPU timestamps the game reads back (counter reports). The game times its GPU frame with them and lowers its
+    // render resolution when that looks slow; the host renders a frame far faster than the Switch, so it reports a
+    // clock that advances 1 us per report (dynamic resolution then stays at full size).
+    u64 GpuTimestamp() {
+        static std::atomic<u64> ts{0};
+        return ts.fetch_add(1000) + 1000;
+    }
 
     std::atomic<u64> submits{0}, methods{0}, draws{0}, presents{0};
     std::atomic<u64> busy_ns{0}, draw_ns{0}; // time the GPU thread spent executing commands / in Renderer::Draw
@@ -118,6 +125,7 @@ private:
     struct Job {
         enum Kind { Commands, Present, Fence, Host } kind;
         bool tagged = false;
+        u64 queued_ns = 0; // MUA3_GPU_TIMELINE
         std::function<void()> host;
         std::vector<u64> entries;
         u32 syncpt_id = 0, syncpt_incr = 0;

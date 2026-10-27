@@ -459,9 +459,14 @@ private:
         else if (n == "BindPolygonState")
             ApplyPolygon(c);
         else if (n == "BindMultisampleState" || n == "Barrier" || n == "SetDepthBounds" || n == "SetPatchSize" ||
-                 n == "SetShaderScratchMemory" || n == "ReportCounter" || n == "SetRenderEnable" ||
+                 n == "SetShaderScratchMemory" || n == "SetRenderEnable" ||
                  n == "SetRenderEnableConditional") {
             // no renderer state (render enables: the emulated path draws unconditionally too)
+        } else if (n == "ReportCounter") { // (cb, counter type, address) -> {value, GPU timestamp}
+            if (render_compute) {
+                const u64 v[2] = {0, g_.GpuTimestamp()};
+                g_.WriteGpu(x[2], v, sizeof(v));
+            }
         } else if (n == "SetStencilRef" || n == "SetStencilValueMask" || n == "SetStencilMask") {
             const u32 front = n == "SetStencilRef" ? kStencilFrontRef : n == "SetStencilMask" ? kStencilFrontMask : kStencilFrontFuncMask;
             const u32 back = n == "SetStencilRef" ? 0x3D5u : n == "SetStencilMask" ? 0x3D6u : 0x3D7u;

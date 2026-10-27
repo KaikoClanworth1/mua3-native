@@ -652,7 +652,7 @@ void Gpu::CallMethod(u32 subch, u32 method, u32 arg, bool last_in_batch) {
                 if (arg & (1u << 28)) {
                     WriteGpu(addr, &r[0x6C2], 4);
                 } else {
-                    const u64 v[2] = {r[0x6C2], NowNs()};
+                    const u64 v[2] = {r[0x6C2], GpuTimestamp()};
                     WriteGpu(addr, v, 16);
                 }
             }

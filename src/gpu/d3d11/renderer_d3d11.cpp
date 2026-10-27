@@ -456,6 +456,11 @@ Surface* D3D11Renderer::GetSurface(u64 gpu_va, u32 width, u32 height, u32 format
     const bool screen_like = width >= 240 && height >= 135 && width > height &&
                              std::abs(int(width * 9) - int(height * 16)) <= int(width * 9 / 16);
     s->scale = screen_like ? res_scale_ : 1;
+    if (screen_like) { // (the game's dynamic resolution shows up as new frame-sized targets)
+        static std::set<u64> sizes;
+        if (sizes.insert((u64(width) << 32) | height).second)
+            LOG_INFO("Renderer", "screen-sized target {}x{} (format {:#x}{}) first seen", width, height, format, depth ? ", depth" : "");
+    }
     const u32 tw = width * s->scale, th = height * s->scale;
     s->format = format;
     s->depth = depth;

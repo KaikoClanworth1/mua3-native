@@ -4,6 +4,7 @@
 #include <intrin.h>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <bit>
 #include <set>
 #include <tuple>
@@ -140,6 +141,16 @@ enum Wrapped {
     kQueueSubmitCommands,
     kCommandBufferCallCommands,
     kCommandBufferCopyCommands,
+    // queue, sync and window (host in MUA3_NVN_NATIVE: no driver submission at all)
+    kQueueFenceSync,
+    kSyncWait,
+    kQueueWaitSync,
+    kQueueFlush,
+    kQueueFinish,
+    kWindowBuilderSetTextures,
+    kWindowInitialize,
+    kWindowAcquireTexture,
+    kQueuePresentTexture,
     kWrappedCount
 };
 std::array<recomp::Fn, kWrappedCount> g_driver{}; // the sdk driver's implementation of each wrapped function
@@ -396,6 +407,7 @@ Recording& Rec() {
 std::atomic<std::function<void(std::vector<ReplaySpan>&&)>*> g_sink{nullptr};
 extern "C" __declspec(dllimport) void* __stdcall GetCurrentThread();
 std::atomic<u64> g_submit_ns{0}, g_record_cycles{0}; // recorder cost diagnostics
+std::atomic<u64> g_grow[4]{}; // list reallocations: fast path, locked commands, shadows, nested
 inline u64 NowNs() {
     return u64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 }
@@ -406,17 +418,16 @@ int ProfileAt() {
     }();
     return at;
 }
-// MUA3_PROFILE_NVN=<seconds>: after that long, samples the first threads that record commands (10 s each).
+// MUA3_PROFILE_NVN=<seconds>: after that long, samples the thread that makes the most NVN calls (the first to make
+// 20,000) for 10 s.
 void MaybeProfileRecorder() {
     static const auto start = std::chrono::steady_clock::now();
-    static std::atomic<int> started{0};
-    thread_local bool mine = false;
-    if (mine || started.load() >= 3 || std::chrono::steady_clock::now() - start < std::chrono::seconds(ProfileAt()))
+    static std::atomic<bool> started{false};
+    thread_local u32 calls = 0;
+    if (started.load(std::memory_order_relaxed) || std::chrono::steady_clock::now() - start < std::chrono::seconds(ProfileAt()))
         return;
-    mine = true;
-    const int n = started++;
-    if (n < 3)
-        common::StartSamplingProfiler(GetCurrentThread(), n == 0 ? "NVN recorder 0" : n == 1 ? "NVN recorder 1" : "NVN recorder 2", 10, 0);
+    if (++calls == 20000 && !started.exchange(true))
+        common::StartSamplingProfiler(GetCurrentThread(), "NVN recorder 0", 10, 0);
 }
 template <int I>
 void Generic(State& s) {
@@ -425,10 +436,10 @@ void Generic(State& s) {
         const char* e = std::getenv("MUA3_NVN_RECORD");
         return e && e[0] == '2';
     }();
-    if (passthrough)
-        return g_generic[I].driver(s);
     if (ProfileAt() >= 0)
         MaybeProfileRecorder();
+    if (passthrough)
+        return g_generic[I].driver(s);
     const u64 cycles0 = __rdtsc();
     const GenericSlot& g = g_generic[I];
     Command c;
@@ -486,6 +497,7 @@ void Generic(State& s) {
             tls_list = &rec.open[s.x[0]];
             tls_cb = s.x[0];
         }
+        g_grow[0] += tls_list->size() == tls_list->capacity();
         tls_list->push_back(std::move(c));
         Rec().recorded.fetch_add(1, std::memory_order_relaxed);
     } else {
@@ -519,7 +531,9 @@ void Generic(State& s) {
                     }
                 }
             }
-            rec.open[s.x[0]].push_back(std::move(c));
+            auto& list = rec.open[s.x[0]];
+            g_grow[1] += list.size() == list.capacity();
+            list.push_back(std::move(c));
             rec.recorded++;
         } else {
             auto& obj = rec.shadow[s.x[0]];
@@ -533,6 +547,7 @@ void Generic(State& s) {
                 obj.erase(same);
             else if (obj.size() >= 64)
                 obj.erase(obj.begin());
+            g_grow[2] += obj.size() == obj.capacity();
             obj.push_back(std::move(c));
         }
     }
@@ -892,18 +907,205 @@ void QueueSubmitCommands(State& s) {
     if (++rec.submits % 600 == 0) {
         LOG_INFO("NVN", "recorded stream, per submit: {:.0f} commands, {:.0f} draws ({:.0f} indirect), {:.1f} "
                         "dispatches; {} unrecorded handles (recorded {}, begins {}, ends {}, empty {}); submit {:.2f} ms, "
-                        "recording {:.0f} Mcycles",
+                        "recording {:.0f} Mcycles, list growth {} {} {}",
                  double(rec.cmds) / 600, double(rec.draws) / 600, double(rec.indirect) / 600,
                  double(rec.dispatches) / 600, rec.unknown, rec.recorded.load(), rec.begins, rec.ends, rec.empty_ends,
-                 g_submit_ns.exchange(0) / 600e6, g_record_cycles.exchange(0) / 600e6);
+                 g_submit_ns.exchange(0) / 600e6, g_record_cycles.exchange(0) / 600e6, g_grow[0].exchange(0) / 600,
+                 g_grow[1].exchange(0) / 600, g_grow[2].exchange(0) / 600);
         rec.cmds = rec.draws = rec.indirect = rec.dispatches = rec.unknown = 0;
     }
     }
     if (sink && *sink)
         (*sink)(std::move(flat));
     g_submit_ns.fetch_add(NowNs() - submit_t0, std::memory_order_relaxed);
+    if (Native()) // the host renders it; the driver's queue never runs
+        return Return(s, 0);
     u64 q, r;
     Through(s, kQueueSubmitCommands, q, r);
+}
+
+// ---- queue, sync and window on the host (MUA3_NVN_NATIVE). Fences complete in submission order on the GPU thread
+// (host jobs run in order), so a fence is just a sequence number; window textures rotate on the host and present
+// straight to the renderer.
+struct HostQueue {
+    std::mutex mutex;
+    std::condition_variable cv;
+    u64 submitted = 0, completed = 0;
+    std::unordered_map<u64, u64> syncs;                   // NVNsync -> fence sequence
+    std::unordered_map<u64, std::vector<u64>> builders;   // NVNwindowBuilder -> textures
+    struct Window {
+        std::vector<u64> textures;
+        u32 next = 0;
+    };
+    std::unordered_map<u64, Window> windows;
+    u64 presents = 0;
+    std::chrono::steady_clock::time_point fps_t0 = std::chrono::steady_clock::now();
+};
+HostQueue& HQ() {
+    static HostQueue q;
+    return q;
+}
+// Signals `sync` once everything submitted so far has run.
+void HostFence(u64 sync) {
+    auto& q = HQ();
+    u64 seq;
+    {
+        std::lock_guard lk(q.mutex);
+        seq = ++q.submitted;
+        if (sync)
+            q.syncs[sync] = seq;
+    }
+    gpu::G().SubmitHost([seq] {
+        auto& hq = HQ();
+        {
+            std::lock_guard lk(hq.mutex);
+            hq.completed = std::max(hq.completed, seq);
+        }
+        hq.cv.notify_all();
+    });
+}
+// void nvnQueueFenceSync(NVNqueue*, NVNsync*, NVNsyncCondition, int flags)
+void QueueFenceSync(State& s) {
+    if (!Native()) {
+        u64 o, r;
+        Through(s, kQueueFenceSync, o, r);
+        return;
+    }
+    HostFence(s.x[1]);
+    Return(s, 0);
+}
+// NVNsyncWaitResult nvnSyncWait(const NVNsync*, uint64_t timeoutNs): 0 already signaled, 1 satisfied, 2 timeout
+void SyncWait(State& s) {
+    if (!Native()) {
+        u64 o, r;
+        Through(s, kSyncWait, o, r);
+        return;
+    }
+    auto& q = HQ();
+    std::unique_lock lk(q.mutex);
+    auto it = q.syncs.find(s.x[0]);
+    if (it == q.syncs.end() || q.completed >= it->second)
+        return lk.unlock(), Return(s, 0);
+    const u64 seq = it->second, timeout = s.x[1];
+    auto done = [&] { return q.completed >= seq; };
+    bool ok;
+    if (timeout >= (1ull << 62))
+        q.cv.wait(lk, done), ok = true;
+    else
+        ok = q.cv.wait_for(lk, std::chrono::nanoseconds(timeout), done);
+    lk.unlock();
+    Return(s, ok ? 1 : 2);
+}
+// void nvnQueueWaitSync(NVNqueue*, const NVNsync*): one queue runs in order, nothing to wait for
+void QueueWaitSync(State& s) {
+    if (!Native()) {
+        u64 o, r;
+        Through(s, kQueueWaitSync, o, r);
+        return;
+    }
+    Return(s, 1);
+}
+void QueueFlush(State& s) {
+    if (!Native()) {
+        u64 o, r;
+        Through(s, kQueueFlush, o, r);
+        return;
+    }
+    Return(s, 0);
+}
+void QueueFinish(State& s) {
+    if (!Native()) {
+        u64 o, r;
+        Through(s, kQueueFinish, o, r);
+        return;
+    }
+    HostFence(0);
+    auto& q = HQ();
+    std::unique_lock lk(q.mutex);
+    const u64 seq = q.submitted;
+    q.cv.wait(lk, [&] { return q.completed >= seq; });
+    lk.unlock();
+    Return(s, 0);
+}
+// void nvnWindowBuilderSetTextures(NVNwindowBuilder*, int numTextures, NVNtexture* const* textures)
+void WindowBuilderSetTextures(State& s) {
+    std::vector<u64> textures;
+    for (u64 i = 0; i < u32(s.x[1]) && i < 8; i++)
+        textures.push_back(recomp::Rd<u64>(s, s.x[2] + i * 8));
+    {
+        auto& q = HQ();
+        std::lock_guard lk(q.mutex);
+        q.builders[s.x[0]] = std::move(textures);
+    }
+    u64 o, r;
+    Through(s, kWindowBuilderSetTextures, o, r);
+}
+// NVNboolean nvnWindowInitialize(NVNwindow*, const NVNwindowBuilder*)
+void WindowInitialize(State& s) {
+    const u64 window = s.x[0], builder = s.x[1];
+    { // (before the driver: initialization talks to vi and may finish outside recompiled code)
+        auto& q = HQ();
+        std::lock_guard lk(q.mutex);
+        q.windows[window].textures = q.builders[builder];
+        LOG_INFO("NVN", "window {:#x}: {} textures", window, q.windows[window].textures.size());
+    }
+    u64 o, r;
+    Through(s, kWindowInitialize, o, r);
+}
+// NVNwindowAcquireTextureResult nvnWindowAcquireTexture(NVNwindow*, NVNsync* available, int* textureIndex)
+void WindowAcquireTexture(State& s) {
+    if (!Native()) {
+        u64 o, r;
+        Through(s, kWindowAcquireTexture, o, r);
+        return;
+    }
+    const u64 window = s.x[0], sync = s.x[1], index_ptr = s.x[2];
+    u32 index = 0;
+    {
+        auto& q = HQ();
+        std::lock_guard lk(q.mutex);
+        auto& w = q.windows[window];
+        if (!w.textures.empty())
+            index = w.next++ % u32(w.textures.size());
+    }
+    recomp::Wr<u32>(s, index_ptr, index);
+    HostFence(sync); // available once the work queued so far (that texture's last present) has run
+    Return(s, 0);
+}
+// void nvnQueuePresentTexture(NVNqueue*, NVNwindow*, int textureIndex)
+void QueuePresentTexture(State& s) {
+    if (!Native()) {
+        u64 o, r;
+        Through(s, kQueuePresentTexture, o, r);
+        return;
+    }
+    const u64 window = s.x[1];
+    const u32 index = u32(s.x[2]);
+    u64 tex = 0;
+    auto& q = HQ();
+    {
+        std::lock_guard lk(q.mutex);
+        auto& w = q.windows[window];
+        if (index < w.textures.size())
+            tex = w.textures[index];
+    }
+    TextureInfo t;
+    if (tex && QueryTexture(tex, t)) {
+        auto& g = gpu::G();
+        g.QueuePresent({g.As().Translate(t.gpu), t.width, t.height, t.width * 4, 1});
+    }
+    std::lock_guard lk(q.mutex);
+    q.presents++;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - q.fps_t0 > std::chrono::seconds(5)) {
+        const double secs = std::chrono::duration<double>(now - q.fps_t0).count();
+        auto& g = gpu::G();
+        LOG_INFO("NVN", "Presenting: {:.1f} fps (native) gpu busy {:.0f}% (draw {:.0f}%)", q.presents / secs,
+                 g.busy_ns.exchange(0) / (secs * 1e7), g.draw_ns.exchange(0) / (secs * 1e7));
+        q.presents = 0;
+        q.fps_t0 = now;
+    }
+    Return(s, 0);
 }
 
 struct Entry {
@@ -931,6 +1133,15 @@ const Entry kHostFunctions[] = {
     NVN_RECORD(QueueSubmitCommands),
     {"nvnCommandBufferCallCommands", NestCommands<kCommandBufferCallCommands>, kCommandBufferCallCommands, true},
     {"nvnCommandBufferCopyCommands", NestCommands<kCommandBufferCopyCommands>, kCommandBufferCopyCommands, true},
+    NVN_RECORD(QueueFenceSync),
+    NVN_RECORD(SyncWait),
+    NVN_RECORD(QueueWaitSync),
+    NVN_RECORD(QueueFlush),
+    NVN_RECORD(QueueFinish),
+    NVN_RECORD(WindowBuilderSetTextures),
+    NVN_RECORD(WindowInitialize),
+    NVN_RECORD(WindowAcquireTexture),
+    NVN_RECORD(QueuePresentTexture),
 #undef NVN_RECORD
 };
 #undef NVN_ENTRY
@@ -1091,7 +1302,7 @@ recomp::Fn Find(std::string_view name, recomp::Fn driver, u64 pc) {
                 "SetTexturePool", "SetSamplerPool", "ClearColor", "ClearDepthStencil", "DrawArrays", "DrawElements",
                 "DrawElementsBaseVertex", "DrawElementsIndirect", "DrawArraysIndirect", "DispatchCompute",
                 "CopyBufferToBuffer", "CopyBufferToTexture", "CopyTextureToBuffer", "SetCopyRowStride",
-                "SetCopyImageStride"};
+                "SetCopyImageStride", "ReportCounter"};
             g.host = host.count(name.substr(16)) != 0;
         }
         for (std::string_view k : {"SetBlendEnable", "SetChannelMask", "SetStencilFunc", "SetStencilOp", "SetStencilMask",
