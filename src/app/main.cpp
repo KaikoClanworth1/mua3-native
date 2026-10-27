@@ -8,6 +8,7 @@
 #include <chrono>
 #include <thread>
 
+#include <SDL3/SDL.h>
 #include <imgui.h>
 #include <windows.h>
 #include <timeapi.h>
@@ -40,6 +41,10 @@ struct Stats {
     std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
 } g_stats;
 
+// Overlay scale on high-DPI monitors (4K at 150-225%): set from the window's display at startup.
+float g_ui = 1.0f;
+ImVec2 UiVec(float x, float y) { return ImVec2(x * g_ui, y * g_ui); }
+
 void DrawOverlay(const core::Config& cfg, platform::Input& input, bool& show) {
     if (ImGui::IsKeyPressed(ImGuiKey_F1))
         show = !show;
@@ -52,7 +57,7 @@ void DrawOverlay(const core::Config& cfg, platform::Input& input, bool& show) {
         g_stats.t0 = now;
     }
     if (cfg.show_fps) {
-        ImGui::SetNextWindowPos(ImVec2(8, 8));
+        ImGui::SetNextWindowPos(UiVec(8, 8));
         ImGui::SetNextWindowBgAlpha(0.35f);
         ImGui::Begin("##fps", nullptr,
                      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
@@ -62,7 +67,7 @@ void DrawOverlay(const core::Config& cfg, platform::Input& input, bool& show) {
     }
     if (g_renderer && g_renderer->Shaders() && g_renderer->Shaders()->pending > 0) {
         // Like a PC game's first-launch shader compilation: everything the game ships is compiled up front.
-        ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x - 8, 8), 0, ImVec2(1, 0));
+        ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x - 8 * g_ui, 8 * g_ui), 0, ImVec2(1, 0));
         ImGui::SetNextWindowBgAlpha(0.5f);
         ImGui::Begin("##shaders", nullptr,
                      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
@@ -72,8 +77,8 @@ void DrawOverlay(const core::Config& cfg, platform::Input& input, bool& show) {
     }
     if (!show)
         return;
-    ImGui::SetNextWindowPos(ImVec2(8, 48), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(460, 0), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(UiVec(8, 48), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(UiVec(460, 0), ImGuiCond_FirstUseEver);
     ImGui::Begin("MUA3 Native (F1)");
     auto& g = gpu::G();
     ImGui::Text("Game frames presented: %llu (%.1f fps)", (unsigned long long)g_stats.presents.load(), g_stats.fps);
@@ -99,8 +104,8 @@ void DrawOverlay(const core::Config& cfg, platform::Input& input, bool& show) {
     if (g_renderer) {
         static bool show_tex = std::getenv("MUA3_TEXVIEW") != nullptr;
         if (show_tex) {
-            ImGui::SetNextWindowPos(ImVec2(500, 48), ImGuiCond_FirstUseEver);
-            ImGui::SetNextWindowSize(ImVec2(760, 640), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowPos(UiVec(500, 48), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize(UiVec(760, 640), ImGuiCond_FirstUseEver);
             ImGui::Begin("Textures", &show_tex);
             int n = 0;
             static const u32 min_size = [] {
@@ -499,6 +504,17 @@ int main(int argc, char** argv) {
     if (!display.Init(cfg, "Marvel Ultimate Alliance 3: The Black Order")) {
         MessageBoxA(nullptr, "Failed to create the D3D11 window.", "MUA3 Native", MB_ICONERROR);
         return 1;
+    }
+    // High-DPI monitors: rasterise the overlay font and size its widgets at the display's scale (sharp, readable
+    // text on 4K instead of tiny 13 px text).
+    g_ui = std::clamp(SDL_GetDisplayContentScale(SDL_GetDisplayForWindow(display.Window())), 1.0f, 3.0f);
+    if (g_ui > 1.0f) {
+        ImGui::GetStyle().ScaleAllSizes(g_ui);
+        ImGuiIO& io = ImGui::GetIO();
+        io.Fonts->Clear();
+        ImFontConfig fc;
+        fc.SizePixels = 13.0f * g_ui;
+        io.Fonts->AddFontDefault(&fc);
     }
     platform::Input input;
     input.Init(cfg.input);
