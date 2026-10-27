@@ -1321,8 +1321,12 @@ void TimelineEvent(const char* what, u64 arg) {
     }
 }
 
-bool Native() {
-    static const bool native = std::getenv("MUA3_NVN_NATIVE") != nullptr;
+bool Native() { // the default; MUA3_NVN_NATIVE=0 keeps the NVN driver + GPU command stream path (for comparison)
+    static const bool native = [] {
+        const char* e = std::getenv("MUA3_NVN_NATIVE");
+        const char* hle = std::getenv("MUA3_NVN_HLE");
+        return !(e && e[0] == '0') && !(hle && hle[0] == '0');
+    }();
     return native;
 }
 

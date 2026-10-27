@@ -32,7 +32,7 @@ extern std::atomic<long long> g_learn_until_ms;
 // with thread ids and times to nvn_timeline.txt.
 void TimelineEvent(const char* what, recomp::u64 arg = 0);
 
-// MUA3_NVN_NATIVE: command buffer commands the host encoder handles are recorded but never reach the driver; each
+// Native rendering (default; MUA3_NVN_NATIVE=0 turns it off): command buffer commands the host encoder handles are recorded but never reach the driver; each
 // submit's commands run on the host (gpu/nvn_encoder.cpp).
 bool Native();
 
