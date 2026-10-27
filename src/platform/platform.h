@@ -42,9 +42,11 @@ public:
     std::function<ID3D11ShaderResourceView*(u32& w, u32& h)> frame_source;
     std::recursive_mutex* context_mutex = nullptr;
     std::atomic<u64>* context_epoch = nullptr; // bumped whenever the UI used the shared context (state caches)
+    fs::path capture_path; // when set, the next presented frame is saved there as a BMP (then cleared)
 
 private:
     void CreateBackbuffer();
+    void SaveBackbuffer(const fs::path& path);
     void DrawFrameTexture();
 
     SDL_Window* window_ = nullptr;

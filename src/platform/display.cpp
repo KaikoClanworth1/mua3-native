@@ -217,6 +217,46 @@ void Display::DrawFrameTexture() {
     ImGui::GetBackgroundDrawList()->AddImage((ImTextureID)srv, p0, ImVec2(p0.x + w, p0.y + h));
 }
 
+// Writes the current backbuffer to a 24-bit BMP (automation: screenshots of hidden windows).
+void Display::SaveBackbuffer(const fs::path& path) {
+    ID3D11Texture2D* bb = nullptr;
+    if (FAILED(swapchain_->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb)))
+        return;
+    D3D11_TEXTURE2D_DESC td;
+    bb->GetDesc(&td);
+    td.Usage = D3D11_USAGE_STAGING;
+    td.BindFlags = 0;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    td.MiscFlags = 0;
+    ID3D11Texture2D* st = nullptr;
+    if (SUCCEEDED(device_->CreateTexture2D(&td, nullptr, &st))) {
+        ctx_->CopyResource(st, bb);
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (SUCCEEDED(ctx_->Map(st, 0, D3D11_MAP_READ, 0, &m))) {
+            const u32 w = td.Width, h = td.Height, row = (w * 3 + 3) & ~3u;
+            std::vector<u8> file(54 + size_t(row) * h, 0);
+            auto put32 = [&](size_t o, u32 v) { std::memcpy(&file[o], &v, 4); };
+            file[0] = 'B', file[1] = 'M';
+            put32(2, u32(file.size())), put32(10, 54), put32(14, 40), put32(18, w), put32(22, h);
+            file[26] = 1, file[28] = 24;
+            const bool bgra = td.Format == DXGI_FORMAT_B8G8R8A8_UNORM || td.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+            for (u32 y = 0; y < h; y++) {
+                const u8* src = static_cast<const u8*>(m.pData) + size_t(y) * m.RowPitch;
+                u8* dst = &file[54 + size_t(h - 1 - y) * row];
+                for (u32 x = 0; x < w; x++) {
+                    dst[x * 3 + 0] = src[x * 4 + (bgra ? 0 : 2)];
+                    dst[x * 3 + 1] = src[x * 4 + 1];
+                    dst[x * 3 + 2] = src[x * 4 + (bgra ? 2 : 0)];
+                }
+            }
+            ctx_->Unmap(st, 0);
+            common::WriteFile(path, file);
+        }
+        st->Release();
+    }
+    bb->Release();
+}
+
 void Display::EndFrame() {
     std::unique_lock<std::recursive_mutex> lk;
     if (context_mutex)
@@ -226,6 +266,10 @@ void Display::EndFrame() {
     ctx_->OMSetRenderTargets(1, &rtv_, nullptr);
     ctx_->ClearRenderTargetView(rtv_, clear);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    if (!capture_path.empty()) {
+        SaveBackbuffer(capture_path);
+        capture_path.clear();
+    }
     if (context_epoch)
         (*context_epoch)++;
     // Don't hold the context lock while Present waits for vblank: the GPU thread needs the context.
