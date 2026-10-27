@@ -65,9 +65,14 @@ public:
     void InvalidateRegion(u64 gpu_va, u64 size) override;
     bool Blit2D(const u32* regs) override;
     void FlushCommands() override;
+    u32 CullListCount(u64 index_addr) override {
+        auto it = cull_lists_.find(index_addr);
+        return it == cull_lists_.end() ? 0 : it->second;
+    }
+    std::unordered_map<u64, u32> cull_lists_; // culling list start -> indices written there (EmulateCullingGs)
     void SyncRegion(u64 gpu_va, u64 size) override {
         std::lock_guard ctx_lock(ContextMutex());
-        SyncGuest(gpu_va, size);
+        SyncGuest(gpu_va, size, 11);
     }
 
     // Latest presented frame for the window (thread-safe).
@@ -87,7 +92,8 @@ public:
     // Texel buffer over memory a compute kernel wrote: a typed view of the resident GPU copy (null if none).
     ID3D11ShaderResourceView* ComputeBufferSrv(u64 gpu_va, u64 size, DXGI_FORMAT fmt, u32 bpb);
     // Before reading guest memory on the host: lands pending compute results overlapping the range.
-    void SyncGuest(u64 gpu_va, u64 size);
+    void SyncGuest(u64 gpu_va, u64 size, int site = 0); // site: which consumer asked (profile)
+    int sync_site_ = 0;
 
     void DumpSurface(Surface* s, const fs::path& path);
     // Saves the next presented frame (debug / automation).
@@ -167,7 +173,15 @@ private:
     std::deque<Readback> readbacks_;
     std::vector<ComPtr<ID3D11Buffer>> staging_pool_;
     GpuBuf* ComputeBuffer(u64 addr, u32 size);
-    void Reupload(GpuBuf& b, bool all);
+    // The resident compute buffer holding [addr, addr + size), up to date with CPU writes, for drawing from directly.
+    GpuBuf* ResidentBuffer(u64 addr, u64 size);
+    // Non-indexed quads with indirect arguments (particles): a one-thread compute pass turns the arguments into
+    // those of an indexed draw over a fixed quad->triangle index list, so nothing waits on the GPU.
+    bool PrepareQuadIndirect(GpuBuf& args, u32 off);
+    ComPtr<ID3D11ComputeShader> quad_args_cs_;
+    ComPtr<ID3D11Buffer> quad_args_buf_, quad_index_buf_;
+    ComPtr<ID3D11UnorderedAccessView> quad_args_uav_;
+    void Reupload(GpuBuf& b, bool all, u32 from = 0); // all && from: only the new tail [from, size)
     // Applies finished readbacks in order; `wait` blocks for all of them, `until` for those of one buffer.
     void PollReadbacks(bool wait, const GpuBuf* until = nullptr);
     void ApplyReadback(GpuBuf& b, const u8* now, u32 size, u32 serial);

@@ -108,7 +108,7 @@ ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::T
         if (auto* v = r_.ComputeBufferSrv(addr, u64(tic.Width()) * fi.bytes_per_block, fi.dxgi, fi.bytes_per_block))
             return v;
     }
-    r_.SyncGuest(addr, 1);
+    r_.SyncGuest(addr, 1, 1);
     if (use.dim == shader::TexDim::Tex3D) {
         static int n = 0;
         if (n++ < 4)

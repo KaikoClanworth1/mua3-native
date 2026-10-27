@@ -101,6 +101,7 @@ public:
         bool indexed = false;
         u32 first = 0, count = 0;
         u32 instance = 0;
+        u64 indirect_args = 0; // non-zero: the arguments live here (compute output), count/first unknown
     } draw;
 
 private:

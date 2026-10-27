@@ -154,12 +154,17 @@ enum Wrapped {
     kWrappedCount
 };
 std::array<recomp::Fn, kWrappedCount> g_driver{}; // the sdk driver's implementation of each wrapped function
+std::array<std::string_view, kWrappedCount> g_driver_name{};
+std::array<std::atomic<u64>, kWrappedCount> g_through_calls{}, g_through_ns{}; // driver time per wrapped function
 
 // Runs the driver function; returns false if it left recompiled code mid-way (the call is then not observed).
 bool Through(State& s, Wrapped w, u64& object, u64& result) {
     object = s.x[0];
     const u64 ret = s.x[30];
+    const auto t0 = std::chrono::steady_clock::now();
     g_driver[w](s);
+    g_through_ns[w].fetch_add(u64((std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
+    g_through_calls[w].fetch_add(1, std::memory_order_relaxed);
     result = s.x[0];
     return s.pc == ret;
 }
@@ -206,7 +211,29 @@ void BufferFinalize(State& s) {
     std::lock_guard lk(o.mutex);
     o.buffers.erase(buffer);
 }
-std::atomic<u64> g_texture_generation{1}; // bumped by every texture Initialize/Finalize (registration cache)
+std::atomic<u64> g_texture_generation{1}; // bumped by every texture Initialize/Finalize
+// Per-texture generation for the registration cache: a registration is stale once its own texture was
+// initialized or finalized again (other textures changing does not touch its descriptor).
+struct TexGen {
+    std::mutex mutex;
+    std::unordered_map<u64, u64> gen;
+};
+TexGen& TG() {
+    static TexGen t;
+    return t;
+}
+void BumpTexGen(u64 tex) {
+    auto& t = TG();
+    std::lock_guard lk(t.mutex);
+    ++t.gen[tex];
+}
+u64 GetTexGen(u64 tex) {
+    auto& t = TG();
+    std::lock_guard lk(t.mutex);
+    auto it = t.gen.find(tex);
+    return it == t.gen.end() ? 0 : it->second;
+}
+std::atomic<u64> g_reg_calls{0}, g_reg_hits{0}, g_list_grows{0};
 TextureDesc DescribeTexture(State& s, u64 tex) {
     TextureDesc d;
     d.pool = Get(s, "nvnTextureGetMemoryPool", tex);
@@ -245,6 +272,7 @@ void EnsureTexture(State& s, u64 tex) {
 }
 void TextureInitialize(State& s) {
     g_texture_generation.fetch_add(1, std::memory_order_release);
+    BumpTexGen(s.x[0]);
     u64 tex, ok;
     if (!Through(s, kTextureInitialize, tex, ok) || !(ok & 1))
         return;
@@ -260,6 +288,7 @@ void TextureInitialize(State& s) {
 }
 void TextureFinalize(State& s) {
     g_texture_generation.fetch_add(1, std::memory_order_release);
+    BumpTexGen(s.x[0]);
     u64 tex, r;
     if (!Through(s, kTextureFinalize, tex, r))
         return;
@@ -301,32 +330,58 @@ void SamplerPoolInitialize(State& s) {
 void TexturePoolRegisterTexture(State& s) {
     const u32 id = u32(s.x[1]);
     const u64 tex = s.x[2], view = s.x[3];
-    // KTGL re-registers the same texture (and view) under the same id every frame: the descriptor the driver wrote
-    // last time is still in the pool, so skip the driver unless something changed: compared on the texture
-    // pointer, the view's contents and the texture generation (any texture initialized or finalized since).
-    struct Reg {
-        u64 pool = 0, tex = 0, generation = 0;
-        u64 view[5]{};
-        bool has_view = false;
+    // The descriptor the driver writes for a (texture, view) pair is the same whichever slot it goes to, and KTGL
+    // registers the same pairs under fresh ids every frame (thousands a frame): once the driver has written one,
+    // later registrations copy those 32 bytes into the new slot on the host. A texture initialized or finalized
+    // again gets a new descriptor (its generation).
+    struct Tic {
+        u64 generation = 0;
+        u8 bytes[32]{};
     };
     static std::mutex cache_mutex;
-    static std::unordered_map<u64, Reg> last; // (pool, id)
+    static std::unordered_map<u64, Tic> tics; // hash of (texture, view contents) -> descriptor
     static const bool cache = std::getenv("MUA3_NVN_NO_REGCACHE") == nullptr;
+    u64 key = 0, desc_va = 0, generation = 0;
     if (cache) {
-        Reg now{s.x[0], tex, g_texture_generation.load(std::memory_order_acquire), {}, view != 0};
+        g_reg_calls.fetch_add(1, std::memory_order_relaxed);
+        u64 words[6] = {tex, 0, 0, 0, 0, 0};
         if (view)
             for (u32 k = 0; k < 5; k++)
-                now.view[k] = recomp::Rd<u64>(s, view + k * 8);
-        std::lock_guard lk(cache_mutex);
-        auto& prev = last[(s.x[0] << 20) ^ id];
-        if (prev.pool == now.pool && prev.tex == now.tex && prev.generation == now.generation &&
-            prev.has_view == now.has_view && std::memcmp(prev.view, now.view, sizeof(now.view)) == 0)
-            return Return(s, 0);
-        prev = now;
+                words[1 + k] = recomp::Rd<u64>(s, view + k * 8);
+        key = 0xcbf29ce484222325ull;
+        for (const u8* b = reinterpret_cast<const u8*>(words); b < reinterpret_cast<const u8*>(words + 6); b++)
+            key = (key ^ *b) * 0x100000001b3ull;
+        generation = GetTexGen(tex);
+        {
+            auto& o = Obj();
+            std::lock_guard lk(o.mutex);
+            if (auto tp = o.texture_pools.find(s.x[0]); tp != o.texture_pools.end())
+                desc_va = tp->second + u64(id) * 32;
+        }
+        if (desc_va) {
+            std::lock_guard lk(cache_mutex);
+            if (auto it = tics.find(key); it != tics.end() && it->second.generation == generation &&
+                gpu::G().WriteGpu(desc_va, it->second.bytes, sizeof(it->second.bytes))) {
+                g_reg_hits.fetch_add(1, std::memory_order_relaxed);
+                return Return(s, 0);
+            }
+        }
     }
     u64 pool, r;
+    if (!Through(s, kTexturePoolRegisterTexture, pool, r))
+        return;
+    if (desc_va) { // remember what the driver wrote
+        Tic t;
+        t.generation = generation;
+        if (gpu::G().ReadGpu(desc_va, t.bytes, sizeof(t.bytes))) {
+            std::lock_guard lk(cache_mutex);
+            if (tics.size() > 1 << 16)
+                tics.clear();
+            tics[key] = t;
+        }
+    }
     static const bool learn_va = std::getenv("MUA3_NVN_LEARN") != nullptr;
-    if (!Through(s, kTexturePoolRegisterTexture, pool, r) || !learn_va) // (the rest is diagnostics)
+    if (!learn_va) // (the rest is diagnostics)
         return;
     auto& o = Obj();
     std::lock_guard lk(o.mutex);
@@ -424,7 +479,7 @@ CommandList Publish(std::vector<Command>&& list) {
 // Storage for the next recording of a command buffer whose last one had `want` commands: the smallest recycled list
 // that fits (a big command buffer regrowing into fresh pages costs more than the recording itself).
 std::vector<Command> FreshList(size_t want) {
-    want = std::max<size_t>(want + want / 4, 256);
+    want = std::max<size_t>(want * 2, 1024);
     std::vector<Command> v;
     {
         auto& p = Pool();
@@ -530,6 +585,8 @@ void Generic(State& s) {
         tls_cb = s.x[0];
     }
     Command local;
+    if (fast && tls_list->size() == tls_list->capacity())
+        g_list_grows.fetch_add(1, std::memory_order_relaxed);
     Command& c = fast ? tls_list->emplace_back() : local;
     c.fn = I;
     c.name = g.name;
@@ -697,8 +754,8 @@ void CommandBufferBeginRecording(State& s) {
     std::lock_guard lk(rec.mutex);
     auto& open = rec.open[cb];
     open.clear();
-    if (open.capacity() < 256)
-        open.reserve(256);
+    if (open.capacity() < 1024)
+        open.reserve(1024);
     rec.begins++;
 }
 void CommandBufferEndRecording(State& s) {
@@ -717,7 +774,8 @@ void CommandBufferEndRecording(State& s) {
     auto& slot = rec.handles[handle];
     auto& open = rec.open[cb];
     if (!open.empty() || !slot) {
-        const size_t n = open.size();
+        // at least as big as before: command buffers alternate between small and large recordings
+        const size_t n = std::max(open.size(), open.capacity() / 2);
         slot = Publish(std::move(open));
         open = FreshList(n);
     } else
@@ -1202,8 +1260,22 @@ void QueuePresentTexture(State& s) {
     if (now - q.fps_t0 > std::chrono::seconds(5)) {
         const double secs = std::chrono::duration<double>(now - q.fps_t0).count();
         auto& g = gpu::G();
-        LOG_INFO("NVN", "Presenting: {:.1f} fps (native) gpu busy {:.0f}% (draw {:.0f}%)", q.presents / secs,
-                 g.busy_ns.exchange(0) / (secs * 1e7), g.draw_ns.exchange(0) / (secs * 1e7));
+        std::string drv;
+        {
+            std::vector<std::pair<u64, int>> v;
+            for (int w = 0; w < kWrappedCount; w++)
+                if (const u64 ns = g_through_ns[w].exchange(0))
+                    v.emplace_back(ns, w);
+            std::sort(v.rbegin(), v.rend());
+            for (size_t i = 0; i < v.size() && i < 4; i++)
+                drv += fmt::format(" {} {:.2f}ms/s x{}", g_driver_name[v[i].second].substr(3), v[i].first / (secs * 1e6),
+                                   g_through_calls[v[i].second].exchange(0) / u64(secs));
+            for (auto& [ns, w] : v)
+                g_through_calls[w].store(0);
+        }
+        LOG_INFO("NVN", "Presenting: {:.1f} fps (native) gpu busy {:.0f}% (draw {:.0f}%) | reg {}/{} cached, {} list grows | driver:{}",
+                 q.presents / secs, g.busy_ns.exchange(0) / (secs * 1e7), g.draw_ns.exchange(0) / (secs * 1e7),
+                 g_reg_hits.exchange(0), g_reg_calls.exchange(0), g_list_grows.exchange(0), drv);
         q.presents = 0;
         q.fps_t0 = now;
     }
@@ -1473,8 +1545,10 @@ recomp::Fn Find(std::string_view name, recomp::Fn driver, u64 pc) {
             return entry->fn;
         if (!driver) // wrappers need the driver's code to run
             return nullptr;
-        if (!g_driver[entry->wrapped])
+        if (!g_driver[entry->wrapped]) {
             g_driver[entry->wrapped] = driver;
+            g_driver_name[entry->wrapped] = entry->name;
+        }
     }
     return entry->fn;
 }

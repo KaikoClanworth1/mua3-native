@@ -26,6 +26,8 @@
 #include "gpu/shader/translator.h"
 
 namespace gpu {
+std::atomic<u64> g_indirect_known{0}, g_indirect_unknown{0}, g_indirect_arrays{0};
+
 
 using namespace reg3d;
 using hle::nvn::ReplayCommand;
@@ -516,14 +518,30 @@ private:
             Draw(u32(x[1]), false, u32(x[2]), u32(x[3]), 0, 0, 0, 1, 0);
         else if (n == "DrawElementsIndirect") {
             u32 a[5]{}; // count, instances, first index, base vertex, base instance
-            SyncForRead(x[4], sizeof(a));
-            g_.ReadGpu(x[4], a, sizeof(a));
-            Draw(u32(x[1]), true, a[2], a[0], u32(x[2]), x[3], s32(a[3]), a[1], a[4]);
+            // The culling list draws: the host wrote the list and knows the count, so the arguments the GPU
+            // produced from its counter are not read back (that read waits for the whole frame so far).
+            u32 known = 0;
+            if (render_compute && g_.GetRenderer())
+                known = g_.GetRenderer()->CullListCount(x[3]);
+            if (known) {
+                g_indirect_known++;
+                Draw(u32(x[1]), true, 0, known, u32(x[2]), x[3], 0, 1, 0);
+            } else {
+                g_indirect_unknown++;
+                SyncForRead(x[4], sizeof(a));
+                g_.ReadGpu(x[4], a, sizeof(a));
+                static int logged = 0;
+                if (logged++ < 30)
+                    LOG_INFO("NVN", "indirect elements not from the host's culling list: args {:#x} count {} instances {} first {} base {} indices {:#x} type {} mode {}",
+                             x[4], a[0], a[1], a[2], a[3], x[3], x[2], x[1]);
+                Draw(u32(x[1]), true, a[2], a[0], u32(x[2]), x[3], s32(a[3]), a[1], a[4]);
+            }
         } else if (n == "DrawArraysIndirect") {
-            u32 a[4]{}; // count, instances, first, base instance
-            SyncForRead(x[2], sizeof(a));
-            g_.ReadGpu(x[2], a, sizeof(a));
-            Draw(u32(x[1]), false, a[2], a[0], 0, 0, 0, a[1], a[3]);
+            g_indirect_arrays++;
+            // arguments written by compute: the renderer draws indirectly from the resident copy (or reads them)
+            M().draw.indirect_args = x[2];
+            Draw(u32(x[1]), false, 0, 1, 0, 0, 0, 1, 0);
+            M().draw.indirect_args = 0;
         } else
             unhandled[std::string(n)]++;
     }
@@ -1388,7 +1406,9 @@ void InstallNative(Gpu& gpu) {
             hle::nvn::TimelineEvent("job-end", list->size());
             ns += g->NowNs() - t0, cmds += list->size();
             if (++jobs % 600 == 0) {
-                LOG_INFO("NVN", "native: {:.0f} commands per submit, {:.2f} ms each on the GPU thread", cmds / 600.0, ns / 600e6);
+                LOG_INFO("NVN", "native: {:.0f} commands per submit, {:.2f} ms each on the GPU thread; indirect draws/submit: {:.1f} host-known, {:.1f} read back, {:.1f} arrays",
+                         cmds / 600.0, ns / 600e6, g_indirect_known.exchange(0) / 600.0, g_indirect_unknown.exchange(0) / 600.0,
+                         g_indirect_arrays.exchange(0) / 600.0);
                 ns = cmds = 0;
             }
         });

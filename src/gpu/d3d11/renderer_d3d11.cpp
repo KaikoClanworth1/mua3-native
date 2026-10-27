@@ -212,6 +212,9 @@ static const bool g_profile = std::getenv("MUA3_PROFILE") != nullptr;
 enum ProfSection { kProfShaders, kProfState, kProfIndex, kProfVertex, kProfCbufs, kProfTextures, kProfResources, kProfSubmit, kProfCount };
 static const char* const kProfNames[kProfCount] = {"shaders", "state", "index", "vertex", "cbufs", "textures", "other", "submit"};
 static u64 g_prof_ns[kProfCount], g_prof_vb_bytes, g_prof_cb_bytes, g_prof_ib_count, g_prof_draws;
+static u64 g_prof_rb_waits, g_prof_rb_wait_ns, g_prof_rb_queued, g_prof_rb_bytes; // compute result copy-backs
+static u64 g_prof_resident; // draws reading compute output from the resident copy
+static u64 g_prof_rb_site[12]; // waits by consumer: 0 compute, 1 texture, 2/3 culling-gs, 4 index, 5 vertex, 6 cbuf, 7 geometry
 static u64 g_prof_tex_get_ns, g_prof_tex_samp_ns, g_prof_tex_calls;
 static u64 g_prof_last = 0;
 static int g_prof_section = -1;
@@ -599,13 +602,14 @@ static void CollectCpuWrites(const Ranges& ranges, std::vector<std::pair<u32, u3
     }
 }
 
-void D3D11Renderer::Reupload(GpuBuf& b, bool all) {
+void D3D11Renderer::Reupload(GpuBuf& b, bool all, u32 from) {
     auto& g = G();
     std::vector<std::pair<u32, u32>> runs;
     if (all) {
-        b.snapshot.assign(b.size, 0);
-        b.cpu_ranges.clear();
-        for (u64 off = 0; off < b.size;) {
+        b.snapshot.resize(b.size, 0);
+        if (!from)
+            b.cpu_ranges.clear();
+        for (u64 off = from; off < b.size;) {
             u64 run = 0;
             const u64 cpu = g.As().TranslateRun(b.addr + off, run);
             if (!cpu || !run)
@@ -614,9 +618,10 @@ void D3D11Renderer::Reupload(GpuBuf& b, bool all) {
             b.cpu_ranges.push_back({u32(off), cpu, n});
             off += n;
         }
-        runs.push_back({0, b.size});
-        b.cpu_pages.clear();
-        b.page_serial.assign((b.size + 0xFFF) >> 12, 0);
+        runs.push_back({from, b.size - from});
+        if (!from)
+            b.cpu_pages.clear();
+        b.page_serial.resize((b.size + 0xFFF) >> 12, 0);
     } else {
         runs = std::move(b.cpu_pages);
         b.cpu_pages.clear();
@@ -651,8 +656,12 @@ void D3D11Renderer::Reupload(GpuBuf& b, bool all) {
 void D3D11Renderer::FlushGpuBuf(GpuBuf& b) {
     if (b.gpu_dirty)
         QueueReadback(b);
-    if (b.in_flight)
+    if (b.in_flight) { // blocks until the GPU has run everything queued before the copy
+        const u64 t0 = g_profile ? ProfNow() : 0;
         PollReadbacks(true, &b);
+        if (g_profile)
+            g_prof_rb_waits++, g_prof_rb_wait_ns += ProfNow() - t0, g_prof_rb_site[sync_site_]++;
+    }
 }
 
 D3D11Renderer::GpuBuf* D3D11Renderer::ComputeBuffer(u64 addr, u32 size) {
@@ -669,22 +678,47 @@ D3D11Renderer::GpuBuf* D3D11Renderer::ComputeBuffer(u64 addr, u32 size) {
             warned = true;
             LOG_WARN("Renderer", "compute buffers overlap: {:#x}+{:#x} and {:#x}+{:#x}", addr, size, b->addr, b->size);
         }
+        sync_site_ = 8;
         FlushGpuBuf(*b);
+        sync_site_ = 0;
         b->stale = true;
         if (e)
             e->stale = true;
     }
-    if (e && size > e->capacity) {
-        FlushGpuBuf(*e);
-        std::erase_if(gbufs_, [&](auto& b) { return b.get() == e; });
-        e = nullptr;
+    if (e && size > e->capacity) { // grow on the GPU: the old contents move by a copy, nothing waits
+        const u32 capacity = u32(common::AlignUp(size, 1u << 16));
+        D3D11_BUFFER_DESC bd{capacity, D3D11_USAGE_DEFAULT,
+                             D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER,
+                             0, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS | D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS, 0};
+        ComPtr<ID3D11Buffer> nb;
+        ComPtr<ID3D11UnorderedAccessView> uav;
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+        ud.Format = DXGI_FORMAT_R32_TYPELESS;
+        ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        ud.Buffer = {0, capacity / 4, D3D11_BUFFER_UAV_FLAG_RAW};
+        if (SUCCEEDED(dev_->CreateBuffer(&bd, nullptr, &nb)) && SUCCEEDED(dev_->CreateUnorderedAccessView(nb.Get(), &ud, &uav))) {
+            const D3D11_BOX box{0, 0, 0, e->size, 1, 1};
+            ctx_->CopySubresourceRegion(nb.Get(), 0, 0, 0, 0, e->buf.Get(), 0, &box);
+            e->buf = nb;
+            e->uav = uav;
+            e->capacity = capacity;
+            e->srvs.clear();
+        } else {
+            sync_site_ = 10;
+            FlushGpuBuf(*e);
+            sync_site_ = 0;
+            std::erase_if(gbufs_, [&](auto& b) { return b.get() == e; });
+            e = nullptr;
+        }
     }
     if (!e) {
         auto nb = std::make_unique<GpuBuf>();
         nb->addr = addr;
         nb->capacity = u32(common::AlignUp(size, 1u << 16));
-        D3D11_BUFFER_DESC bd{nb->capacity, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE, 0,
-                             D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
+        // also a vertex/index buffer: draws read compute results (skinning, particles) straight from here
+        D3D11_BUFFER_DESC bd{nb->capacity, D3D11_USAGE_DEFAULT,
+                             D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER,
+                             0, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS | D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS, 0};
         if (FAILED(dev_->CreateBuffer(&bd, nullptr, &nb->buf)))
             return nullptr;
         D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
@@ -698,11 +732,17 @@ D3D11Renderer::GpuBuf* D3D11Renderer::ComputeBuffer(u64 addr, u32 size) {
     }
     e->last_use = frame_counter_;
     if (size > e->size) {
+        // Bound larger than before: only the new tail comes from guest memory (the rest holds the kernels'
+        // results; re-uploading it all would first have to wait for them to copy back).
+        const u32 old = e->size;
         e->size = size;
-        e->stale = true;
+        if (!e->stale)
+            Reupload(*e, true, old);
     }
     if (e->stale) { // full re-upload: the GPU's results have to reach guest memory first
+        sync_site_ = 9;
         FlushGpuBuf(*e);
+        sync_site_ = 0;
         Reupload(*e, true);
         return e;
     }
@@ -735,6 +775,7 @@ void D3D11Renderer::QueueReadback(GpuBuf& b) {
     ctx_->CopySubresourceRegion(rb.staging.Get(), 0, 0, 0, 0, b.buf.Get(), 0, &box);
     b.in_flight++;
     b.gpu_dirty = false;
+    g_prof_rb_queued++, g_prof_rb_bytes += b.size;
     readbacks_.push_back(std::move(rb));
 }
 
@@ -803,12 +844,79 @@ void D3D11Renderer::PollReadbacks(bool wait, const GpuBuf* until) {
     }
 }
 
-void D3D11Renderer::SyncGuest(u64 gpu_va, u64 size) {
+void D3D11Renderer::SyncGuest(u64 gpu_va, u64 size, int site) {
     if (!gpu_dirty_any_ && readbacks_.empty())
         return;
+    sync_site_ = site;
     for (auto& b : gbufs_)
         if ((b->in_flight || b->gpu_dirty) && gpu_va < b->addr + b->size && b->addr < gpu_va + size)
             FlushGpuBuf(*b);
+    sync_site_ = 0;
+}
+
+D3D11Renderer::GpuBuf* D3D11Renderer::ResidentBuffer(u64 addr, u64 size) {
+    for (auto& bp : gbufs_) {
+        GpuBuf& b = *bp;
+        if (!b.gpu_written || addr < b.addr || addr + size > b.addr + b.size)
+            continue;
+        if (ComputeBuffer(b.addr, b.size) != &b) // picks up CPU writes; never reallocates (size fits)
+            return nullptr;
+        return &b;
+    }
+    return nullptr;
+}
+
+bool D3D11Renderer::PrepareQuadIndirect(GpuBuf& args, u32 off) {
+    if (!quad_args_cs_) {
+        static const char* src =
+            "ByteAddressBuffer a : register(t0); RWByteAddressBuffer o : register(u0); "
+            "[numthreads(1,1,1)] void main() { uint4 v = a.Load4(0); o.Store4(0, uint4(v.x / 4 * 6, v.y, 0, v.z)); o.Store(16, v.w); }";
+        ComPtr<ID3DBlob> code, err;
+        if (FAILED(D3DCompile(src, std::strlen(src), nullptr, nullptr, nullptr, "main", "cs_5_0", 0, 0, &code, &err)) ||
+            FAILED(dev_->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &quad_args_cs_)))
+            return false;
+        D3D11_BUFFER_DESC bd{32, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0,
+                             D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS | D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
+        if (FAILED(dev_->CreateBuffer(&bd, nullptr, &quad_args_buf_)))
+            return false;
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+        ud.Format = DXGI_FORMAT_R32_TYPELESS;
+        ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        ud.Buffer = {0, 8, D3D11_BUFFER_UAV_FLAG_RAW};
+        if (FAILED(dev_->CreateUnorderedAccessView(quad_args_buf_.Get(), &ud, &quad_args_uav_)))
+            return false;
+        constexpr u32 kQuads = 1u << 17;
+        std::vector<u32> idx;
+        idx.reserve(size_t(kQuads) * 6);
+        for (u32 q = 0; q < kQuads; q++) {
+            const u32 b = q * 4;
+            idx.insert(idx.end(), {b, b + 1, b + 2, b, b + 2, b + 3});
+        }
+        D3D11_BUFFER_DESC id{u32(idx.size() * 4), D3D11_USAGE_IMMUTABLE, D3D11_BIND_INDEX_BUFFER, 0, 0, 0};
+        D3D11_SUBRESOURCE_DATA sd{idx.data(), 0, 0};
+        if (FAILED(dev_->CreateBuffer(&id, &sd, &quad_index_buf_)))
+            return false;
+    }
+    auto& srv = args.srvs[u64(off) | (1ull << 63)]; // raw view of the 16 argument bytes
+    if (!srv) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = DXGI_FORMAT_R32_TYPELESS;
+        sv.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+        sv.BufferEx = {off / 4, 4, D3D11_BUFFEREX_SRV_FLAG_RAW};
+        if (FAILED(dev_->CreateShaderResourceView(args.buf.Get(), &sv, &srv)))
+            return false;
+    }
+    ID3D11ShaderResourceView* s = srv.Get();
+    ID3D11UnorderedAccessView* u = quad_args_uav_.Get();
+    ctx_->CSSetShader(quad_args_cs_.Get(), nullptr, 0);
+    ctx_->CSSetShaderResources(0, 1, &s);
+    ctx_->CSSetUnorderedAccessViews(0, 1, &u, nullptr);
+    ctx_->Dispatch(1, 1, 1);
+    ID3D11ShaderResourceView* ns = nullptr;
+    ID3D11UnorderedAccessView* nu = nullptr;
+    ctx_->CSSetShaderResources(0, 1, &ns);
+    ctx_->CSSetUnorderedAccessViews(0, 1, &nu, nullptr);
+    return true;
 }
 
 ID3D11ShaderResourceView* D3D11Renderer::ComputeBufferSrv(u64 gpu_va, u64 size, DXGI_FORMAT fmt, u32 bpb) {
@@ -850,7 +958,7 @@ bool D3D11Renderer::RefreshGeometry(GeomBuf& b, D3D11_BIND_FLAG bind, bool& fill
             return false;
         }
     }
-    SyncGuest(b.addr, b.size);
+    SyncGuest(b.addr, b.size, 7);
     fill = !b.buf;
     std::vector<std::pair<u32, u32>> runs;
     if (!fill) {
@@ -1331,7 +1439,7 @@ void D3D11Renderer::EmulateCullingGs() {
         const u32 fmt = m.Reg(kIndexFormat);
         const u32 isz = fmt == 0 ? 1 : fmt == 1 ? 2 : 4;
         const u64 ia = m.Addr(kIndexAddrHigh) + u64(dr.first) * isz;
-        SyncGuest(ia, size_t(tris) * 3 * isz);
+        SyncGuest(ia, size_t(tris) * 3 * isz, 2);
         if (isz == 4)
             src = g.GpuPtr(ia, bytes);
         if (!src) {
@@ -1350,7 +1458,7 @@ void D3D11Renderer::EmulateCullingGs() {
         src = reinterpret_cast<const u8*>(out.data());
     }
     u32 counter = 0;
-    SyncGuest(counter_va, 4);
+    SyncGuest(counter_va, 4, 3);
     g.ReadGpu(counter_va, &counter, 4);
     if (trace_draws_ > 0)
         LOG_INFO("Renderer", "TRACE culling-gs: counter {:#x} = {} list {:#x} +{} tris", counter_va, counter, list_va, tris);
@@ -1358,6 +1466,9 @@ void D3D11Renderer::EmulateCullingGs() {
     const u8* cur = g.GpuPtr(list_va + u64(counter) * 4, bytes);
     if (!cur || std::memcmp(cur, src, bytes) != 0)
         g.WriteGpu(list_va + u64(counter) * 4, src, bytes);
+    if (cull_lists_.size() > 65536)
+        cull_lists_.clear();
+    cull_lists_[list_va + u64(counter) * 4] = tris * 3;
     counter += tris * 3;
     g.WriteGpu(counter_va, &counter, 4);
 }
@@ -1696,7 +1807,7 @@ void D3D11Renderer::Draw() {
 
     // ---- topology / indices
     Prof(kProfIndex);
-    const auto& dr = m.draw;
+    auto dr = m.draw;
     std::vector<u32> converted;
     u32 index_size = 0;
     u32 min_v = 0, max_v = 0;
@@ -1704,8 +1815,39 @@ void D3D11Renderer::Draw() {
     std::vector<u32> indices;
     u32 index_count = 0;
     bool direct = false; // non-indexed list/strip: Draw() straight from the vertex buffers
+    bool whole_vb = false; // the vertex range is unknown (indices stay on the GPU): bind whole vertex buffers
     const bool native_topology = dr.topology == 0 || dr.topology == 1 || dr.topology == 3 || dr.topology == 4 || dr.topology == 5;
-    if (native_topology && dr.count && trace_draws_ <= 0 && !trace_draw_) {
+    // Indirect arguments: drawn from the resident compute copy when they are one (the vertex range is then
+    // unknown, so whole vertex buffers are bound); otherwise read, waiting for the GPU to produce them.
+    GpuBuf* indirect = nullptr;
+    bool indirect_quads = false;
+    if (dr.indirect_args) {
+        if ((native_topology || dr.topology == 7) && !dr.indexed && trace_draws_ <= 0 && !trace_draw_)
+            indirect = ResidentBuffer(dr.indirect_args, 16);
+        if (indirect && dr.topology == 7 && !PrepareQuadIndirect(*indirect, u32(dr.indirect_args - indirect->addr)))
+            indirect = nullptr;
+        if (indirect) {
+            dr.first = 0;
+            dr.count = 1;
+            whole_vb = true;
+            indirect_quads = dr.topology == 7;
+            g_prof_resident++;
+        } else {
+            u32 a[4]{}; // count, instances, first, base instance
+            SyncGuest(dr.indirect_args, sizeof(a), 11);
+            g.ReadGpu(dr.indirect_args, a, sizeof(a));
+            if (!a[0] || !a[1])
+                return;
+            dr.first = a[2];
+            dr.count = a[0];
+        }
+    }
+    if (indirect_quads) { // the fixed quad index list; the GPU converted the arguments
+        topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        ctx_->IASetPrimitiveTopology(topo);
+        ctx_->IASetIndexBuffer(quad_index_buf_.Get(), DXGI_FORMAT_R32_UINT, 0);
+        index_count = 1;
+    } else if (native_topology && dr.count && trace_draws_ <= 0 && !trace_draw_) {
         static const D3D11_PRIMITIVE_TOPOLOGY kTopology[6] = {
             D3D11_PRIMITIVE_TOPOLOGY_POINTLIST, D3D11_PRIMITIVE_TOPOLOGY_LINELIST, D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED,
             D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP};
@@ -1719,7 +1861,16 @@ void D3D11Renderer::Draw() {
             const u32 fmt = m.Reg(kIndexFormat);
             index_size = fmt == 0 ? 1 : fmt == 1 ? 2 : 4;
             const bool strip = dr.topology == 3 || dr.topology == 5;
-            if (GeomBuf* ib = CachedIndices(m.Addr(kIndexAddrHigh) + u64(dr.first) * index_size, dr.count, index_size, strip)) {
+            const u64 ia = m.Addr(kIndexAddrHigh) + u64(dr.first) * index_size;
+            GpuBuf* gb = index_size > 1 && !strip ? ResidentBuffer(ia, u64(dr.count) * index_size) : nullptr;
+            if (gb && (ia - gb->addr) % index_size == 0) {
+                // compute-written indices (the culling list): drawn from the resident copy; the vertex range is
+                // unknown on the host, so per-draw vertex uploads take whole buffers
+                ctx_->IASetIndexBuffer(gb->buf.Get(), index_size == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT, u32(ia - gb->addr));
+                index_count = dr.count;
+                whole_vb = true;
+                g_prof_resident++;
+            } else if (GeomBuf* ib = CachedIndices(ia, dr.count, index_size, strip)) {
                 ctx_->IASetIndexBuffer(ib->buf.Get(), ib->index_format, 0);
                 index_count = dr.count;
                 min_v = ib->min_v;
@@ -1739,7 +1890,7 @@ void D3D11Renderer::Draw() {
             const u32 fmt = m.Reg(kIndexFormat);
             index_size = fmt == 0 ? 1 : fmt == 1 ? 2 : 4;
             std::vector<u8> raw(size_t(dr.count) * index_size);
-            SyncGuest(m.Addr(kIndexAddrHigh) + u64(dr.first) * index_size, raw.size());
+            SyncGuest(m.Addr(kIndexAddrHigh) + u64(dr.first) * index_size, raw.size(), 4);
             g.ReadGpu(m.Addr(kIndexAddrHigh) + u64(dr.first) * index_size, raw.data(), raw.size());
             indices.resize(dr.count);
             for (u32 i = 0; i < dr.count; i++)
@@ -1866,13 +2017,18 @@ void D3D11Renderer::Draw() {
     // Per-vertex buffers come from the geometry cache as whole guest buffers, indexed with absolute vertex numbers;
     // if any of them is not cached, all are uploaded per draw from the drawn vertex range instead.
     GeomBuf* cached_vb[16]{};
+    GpuBuf* resident_vb[16]{};
     bool cache_vbs = trace_draws_ <= 0;
     for (u32 b = 0; b < 16 && cache_vbs; b++) {
         if (!used_buf[b] || m.Reg(kVertexArray + b * 4 + 3))
             continue;
         const u64 addr = m.Addr(kVertexArray + b * 4 + 1);
         const u64 limit = m.Addr(kVertexArrayLimit + b * 2);
-        if (limit < addr || limit + 1 - addr > (32u << 20) || !(cached_vb[b] = CachedVertices(addr, u32(limit + 1 - addr))))
+        if (limit < addr || limit + 1 - addr > (32u << 20))
+            cache_vbs = false;
+        else if ((resident_vb[b] = ResidentBuffer(addr, 16))) // compute output (skinning, particles): drawn from the GPU copy
+            g_prof_resident++;
+        else if (!(cached_vb[b] = CachedVertices(addr, u32(limit + 1 - addr))))
             cache_vbs = false;
     }
     for (u32 b = 0; b < 16; b++) {
@@ -1884,7 +2040,11 @@ void D3D11Renderer::Draw() {
         const u64 addr = m.Addr(kVertexArray + b * 4 + 1);
         const u64 limit = m.Addr(kVertexArrayLimit + b * 2);
         if (cache_vbs && !divisor) {
-            vbufs[b] = cached_vb[b]->buf.Get();
+            if (resident_vb[b]) {
+                vbufs[b] = resident_vb[b]->buf.Get();
+                offsets[b] = u32(addr - resident_vb[b]->addr);
+            } else
+                vbufs[b] = cached_vb[b]->buf.Get();
             strides[b] = stride;
             continue;
         }
@@ -1896,13 +2056,25 @@ void D3D11Renderer::Draw() {
             begin = addr + u64(min_v) * stride;
             end = std::min<u64>(limit + 1, addr + u64(max_v + 1) * stride + 64);
             base_vertex = -s32(min_v);
+            if (whole_vb) {
+                begin = addr;
+                end = limit + 1;
+                base_vertex = 0;
+            }
         }
         if (end <= begin)
             end = begin + 16;
         const u32 size = u32(std::min<u64>(end - begin, 64ull << 20));
+        if (GpuBuf* gb = ResidentBuffer(begin, size)) { // compute output: drawn straight from the resident copy
+            vbufs[b] = gb->buf.Get();
+            offsets[b] = u32(begin - gb->addr);
+            strides[b] = stride;
+            g_prof_resident++;
+            continue;
+        }
         static thread_local std::vector<u8> tmp;
         tmp.assign(size_t(size) + 64, 0);
-        SyncGuest(begin, size);
+        SyncGuest(begin, size, 5);
         g.ReadGpu(begin, tmp.data(), size);
         vbufs[b] = dc.Vertex(b, tmp.data(), u32(tmp.size()));
         g_prof_vb_bytes += size;
@@ -2069,7 +2241,7 @@ void D3D11Renderer::Draw() {
             const bool dyn = s->info.cbuf_dyn_mask & (1u << i);
             const u32 need = dyn ? 65536u : s->info.cbuf_rows[i] * 16u;
             const u32 size = u32(common::AlignUp(std::max<u32>(std::min<u32>({b.size, 65536u, need}), 16u), 16));
-            SyncGuest(b.address, size);
+            SyncGuest(b.address, size, 6);
             // Same bytes as this slot's last upload: keep the buffer (most draws share material/scene constants).
             CbShadow& sh = cb_shadow_[stage_index * 32 + i];
             const u8* src = g.GpuPtr(b.address, size);
@@ -2198,7 +2370,11 @@ void D3D11Renderer::Draw() {
         ctx_->Begin(pick_query.Get());
     }
     Prof(kProfSubmit);
-    if (direct)
+    if (indirect_quads)
+        ctx_->DrawIndexedInstancedIndirect(quad_args_buf_.Get(), 0);
+    else if (direct && indirect)
+        ctx_->DrawInstancedIndirect(indirect->buf.Get(), u32(dr.indirect_args - indirect->addr));
+    else if (direct)
         ctx_->DrawInstanced(index_count, 1, u32(s32(dr.first) + base_vertex), 0);
     else
         ctx_->DrawIndexedInstanced(index_count, 1, 0, base_vertex, 0);
@@ -2236,6 +2412,17 @@ void D3D11Renderer::Present(const PresentInfo& p) {
                  g_prof_ib_count / 150 / 1000, (textures_->reuploads - last_reuploads) / 150.0, index_cache_.size(),
                  vertex_cache_.size());
         last_reuploads = textures_->reuploads;
+        LOG_INFO("Profile", "  copy-backs: {:.1f} queued/frame ({:.2f} MB), {:.2f} blocking waits/frame costing {:.2f} ms, {:.1f} resident binds/frame",
+                 g_prof_rb_queued / 150.0, g_prof_rb_bytes / 150 / 1048576.0, g_prof_rb_waits / 150.0, g_prof_rb_wait_ns / 150e6,
+                 g_prof_resident / 150.0);
+        g_prof_resident = 0;
+        LOG_INFO("Profile", "  waits by consumer: compute {} texture {} cull-index {} cull-counter {} index {} vertex {} cbuf {} geometry {}",
+                 g_prof_rb_site[0], g_prof_rb_site[1], g_prof_rb_site[2], g_prof_rb_site[3], g_prof_rb_site[4], g_prof_rb_site[5],
+                 g_prof_rb_site[6], g_prof_rb_site[7]);
+        LOG_INFO("Profile", "  waits inside compute: overlap {} stale {} grow-fallback {} sync-region {}", g_prof_rb_site[8], g_prof_rb_site[9],
+                 g_prof_rb_site[10], g_prof_rb_site[11]);
+        std::memset(g_prof_rb_site, 0, sizeof(g_prof_rb_site));
+        g_prof_rb_queued = g_prof_rb_bytes = g_prof_rb_waits = g_prof_rb_wait_ns = 0;
         static u64 last_uploads = 0;
         LOG_INFO("Profile", "  textures: {} lookups/frame, Get {:.2f} ms, samplers {:.2f} ms, uploads {:.1f}/frame",
                  g_prof_tex_calls / 150, g_prof_tex_get_ns / 150e6, g_prof_tex_samp_ns / 150e6,

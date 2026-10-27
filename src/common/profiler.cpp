@@ -6,6 +6,8 @@
 #include <thread>
 
 #include <windows.h>
+#include <cstring>
+#include <fmt/format.h>
 #include <dbghelp.h>
 #pragma comment(lib, "dbghelp.lib")
 
@@ -57,7 +59,19 @@ void StartSamplingProfiler(void* thread_handle, const char* name, int seconds, i
                 sym->SizeOfStruct = sizeof(SYMBOL_INFO);
                 sym->MaxNameLen = 255;
                 DWORD64 disp = 0;
-                const std::string nm = SymFromAddr(GetCurrentProcess(), pcs[i], &disp, sym) ? sym->Name : "?";
+                std::string nm;
+                if (SymFromAddr(GetCurrentProcess(), pcs[i], &disp, sym))
+                    nm = sym->Name;
+                else { // no symbol: the module and offset (generated code without one, or JIT memory)
+                    HMODULE mod = nullptr;
+                    char path[MAX_PATH]{};
+                    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                           reinterpret_cast<LPCSTR>(pcs[i]), &mod) && GetModuleFileNameA(mod, path, MAX_PATH)) {
+                        const char* base = std::strrchr(path, '\\');
+                        nm = fmt::format("{}+{:#x}", base ? base + 1 : path, (pcs[i] - reinterpret_cast<DWORD64>(mod)) & ~0xFFFull); // 4 KB bucket
+                    } else
+                        nm = "jit";
+                }
                 if (i == 0)
                     self[nm]++;
                 if (seen.insert(nm).second)

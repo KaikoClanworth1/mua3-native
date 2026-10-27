@@ -97,7 +97,7 @@ void Maxwell3D::ProcessDrawEnd() {
     if (intercept && intercept(*this))
         return;
     gpu_.draws++;
-    if (auto* r = gpu_.GetRenderer(); r && draw.count) {
+    if (auto* r = gpu_.GetRenderer(); r && (draw.count || draw.indirect_args)) {
         const u64 t0 = gpu_.NowNs();
         r->Draw();
         gpu_.draw_ns += gpu_.NowNs() - t0;

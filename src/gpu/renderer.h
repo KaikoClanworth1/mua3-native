@@ -22,6 +22,9 @@ public:
     virtual void Dispatch(const u32* regs, const u32* qmd) {}
     // Lands the results of earlier GPU work (compute) that overlap [gpu_va, +size) in guest memory.
     virtual void SyncRegion(u64 gpu_va, u64 size) {}
+    // Index count of the culling list the host wrote at `index_addr` (MUA3's indirect draws read it back from the
+    // GPU; the host keeps every triangle, so it already knows it), 0 if unknown.
+    virtual u32 CullListCount(u64 index_addr) { return 0; }
     // Called at the end of each command submission.
     virtual void FlushCommands() {}
 };
