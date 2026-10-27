@@ -666,43 +666,28 @@ private:
             attribs_[i] = i < 16 ? 0x3A400040u : 0; // the driver's "constant input" value
     }
 
+    // NVNvertexAttribState (4 bytes): stream index bits 0-4, "set" bit 6, offset bits 7-20, NVN format from bit 21.
     void BindAttribs(const ReplayCommand& c) {
         const u32 count = std::min<u32>(u32(c.x[1]), 32);
         ResetAttribs();
-        for (u32 i = 0; i < count && i < c.objects.size(); i++) {
-            u32 fmt = 0, offset = 0, stream = 0;
-            if (c.objects[i].empty())
-                no_shadow++;
-            for (const StateCall& k : c.objects[i]) {
-                if (Is(k.name, "SetFormat"))
-                    fmt = u32(k.x[1]), offset = u32(k.x[2]);
-                else if (Is(k.name, "SetStreamIndex"))
-                    stream = u32(k.x[1]);
-            }
+        for (u32 i = 0; i < count; i++) {
+            const u32 w = Raw32(c, i);
+            const u32 fmt = w >> 21, offset = (w >> 7) & 0x3FFF, stream = w & 0x1F;
             const u32 hw = AttribFormat(fmt);
             if (!hw) {
                 if (fmt)
                     unhandled[fmt::format("vertex format {:#x}", fmt)]++;
                 continue;
             }
-            attribs_[i] = (stream & 0x1F) | ((offset & 0x3FFF) << 7) | hw;
+            attribs_[i] = stream | (offset << 7) | hw;
         }
     }
 
+    // NVNvertexStreamState (8 bytes): stride, divisor.
     void BindStreams(const ReplayCommand& c) {
         const u32 count = std::min<u32>(u32(c.x[1]), 16);
-        for (u32 i = 0; i < count && i < c.objects.size(); i++) {
-            u32 stride = 0, divisor = 0;
-            if (c.objects[i].empty())
-                no_shadow++;
-            for (const StateCall& k : c.objects[i]) {
-                if (Is(k.name, "SetStride"))
-                    stride = u32(k.x[1]);
-                else if (Is(k.name, "SetDivisor"))
-                    divisor = u32(k.x[1]);
-            }
-            streams_[i].stride = stride, streams_[i].divisor = divisor;
-        }
+        for (u32 i = 0; i < count; i++)
+            streams_[i].stride = Raw32(c, i * 2), streams_[i].divisor = Raw32(c, i * 2 + 1);
     }
 
     void SetRenderTargets(const ReplayCommand& c) {

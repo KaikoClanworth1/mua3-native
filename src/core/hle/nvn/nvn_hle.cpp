@@ -1,6 +1,7 @@
 #include "core/hle/nvn/nvn_hle.h"
 
 #include <algorithm>
+#include <intrin.h>
 #include <array>
 #include <chrono>
 #include <bit>
@@ -394,7 +395,7 @@ Recording& Rec() {
 }
 std::atomic<std::function<void(std::vector<ReplaySpan>&&)>*> g_sink{nullptr};
 extern "C" __declspec(dllimport) void* __stdcall GetCurrentThread();
-std::atomic<u64> g_submit_ns{0}; // recorder cost diagnostics
+std::atomic<u64> g_submit_ns{0}, g_record_cycles{0}; // recorder cost diagnostics
 inline u64 NowNs() {
     return u64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 }
@@ -428,6 +429,7 @@ void Generic(State& s) {
         return g_generic[I].driver(s);
     if (ProfileAt() >= 0)
         MaybeProfileRecorder();
+    const u64 cycles0 = __rdtsc();
     const GenericSlot& g = g_generic[I];
     Command c;
     c.fn = I;
@@ -534,6 +536,7 @@ void Generic(State& s) {
             obj.push_back(std::move(c));
         }
     }
+    g_record_cycles.fetch_add(__rdtsc() - cycles0, std::memory_order_relaxed);
     if (g.host)
         return Return(s, 0);
     g.driver(s);
@@ -888,10 +891,11 @@ void QueueSubmitCommands(State& s) {
     }
     if (++rec.submits % 600 == 0) {
         LOG_INFO("NVN", "recorded stream, per submit: {:.0f} commands, {:.0f} draws ({:.0f} indirect), {:.1f} "
-                        "dispatches; {} unrecorded handles (recorded {}, begins {}, ends {}, empty {}); submit {:.2f} ms",
+                        "dispatches; {} unrecorded handles (recorded {}, begins {}, ends {}, empty {}); submit {:.2f} ms, "
+                        "recording {:.0f} Mcycles",
                  double(rec.cmds) / 600, double(rec.draws) / 600, double(rec.indirect) / 600,
                  double(rec.dispatches) / 600, rec.unknown, rec.recorded.load(), rec.begins, rec.ends, rec.empty_ends,
-                 g_submit_ns.exchange(0) / 600e6);
+                 g_submit_ns.exchange(0) / 600e6, g_record_cycles.exchange(0) / 600e6);
         rec.cmds = rec.draws = rec.indirect = rec.dispatches = rec.unknown = 0;
     }
     }
@@ -1101,9 +1105,9 @@ recomp::Fn Find(std::string_view name, recomp::Fn driver, u64 pc) {
         else if (name == "nvnCommandBufferSetDepthRanges")
             raw(3, 2, 8, false);
         else if (name == "nvnCommandBufferBindVertexAttribState")
-            raw(2, 1, 4, true); // (cb, count, NVNvertexAttribState array)
+            raw(2, 1, 4, false); // (cb, count, NVNvertexAttribState array): decoded from the raw words
         else if (name == "nvnCommandBufferBindVertexStreamState")
-            raw(2, 1, 8, true);
+            raw(2, 1, 8, false);
         else if (name == "nvnCommandBufferClearColor")
             raw(2, -1, 16, false); // (cb, index, const float rgba[4], mask)
         else if (name == "nvnCommandBufferBindProgram")
