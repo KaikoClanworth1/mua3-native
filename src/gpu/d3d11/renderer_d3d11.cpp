@@ -8,6 +8,7 @@
 #include <algorithm>
 
 #include <d3d11sdklayers.h>
+#include <dxgi1_4.h>
 #include <d3dcompiler.h>
 
 #include "core/memory.h"
@@ -2338,6 +2339,21 @@ void D3D11Renderer::Present(const PresentInfo& p) {
                  p.cpu_addr, p.width, p.height, s ? fmt::format("{:#x}", s->gpu_va) : "none", draws_ok, draws_skipped,
                  skip_reason_[0], skip_reason_[1], skip_reason_[2], skip_reason_[3], skip_reason_[4], skip_reason_[5],
                  clears, surfaces_.size(), shaders_->Count(), shaders_->failures.load());
+        // video memory in use by this process (the VRAM budget work)
+        if (frame_counter_ % 1500 == 1) {
+            Microsoft::WRL::ComPtr<IDXGIDevice> dd;
+            Microsoft::WRL::ComPtr<IDXGIAdapter> ad;
+            Microsoft::WRL::ComPtr<IDXGIAdapter3> ad3;
+            DXGI_QUERY_VIDEO_MEMORY_INFO vm{};
+            if (SUCCEEDED(dev_->QueryInterface(IID_PPV_ARGS(&dd))) && SUCCEEDED(dd->GetAdapter(&ad)) && SUCCEEDED(ad.As(&ad3)) &&
+                SUCCEEDED(ad3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vm))) {
+                u64 surf = 0;
+                for (auto& [k, sf] : surfaces_)
+                    surf += u64(sf->width * sf->scale) * (sf->height * sf->scale) * 4;
+                LOG_INFO("Renderer", "VRAM in use {} MB (budget {} MB); render targets ~{} MB in {} surfaces", vm.CurrentUsage >> 20,
+                         vm.Budget >> 20, surf >> 20, surfaces_.size());
+            }
+        }
         if (!s)
             for (auto& [k, sf] : surfaces_)
                 LOG_INFO("Renderer", "  surface gpu {:#x} cpu {:#x} {}x{} fmt {:#x}{}", sf->gpu_va, sf->cpu_va, sf->width,
