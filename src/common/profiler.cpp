@@ -70,7 +70,7 @@ void StartSamplingProfiler(void* thread_handle, const char* name, int seconds, i
                 v.emplace_back(c, k);
             std::sort(v.rbegin(), v.rend());
             std::string out = fmt::format("Profile {} ({} samples) {}:\n", n, samples, title);
-            for (size_t i = 0; i < std::min<size_t>(v.size(), 80); i++)
+            for (size_t i = 0; i < std::min<size_t>(v.size(), 600); i++)
                 out += fmt::format("  {:5.1f}%  {}\n", 100.0 * v[i].first / std::max(samples, 1), v[i].second);
             LOG_INFO("Profiler", "{}", out);
         };

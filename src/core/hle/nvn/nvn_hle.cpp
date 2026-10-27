@@ -456,6 +456,7 @@ struct GenericSlot {
     bool objects = false;
     bool indexed = false; // setter whose first argument selects what it sets (render target, face)
     bool host = false;    // MUA3_NVN_NATIVE: the host encoder executes it; the driver never sees it
+    bool program = false; // BindProgram: the program's shader data goes into `extra`
     // texture copies: argument indices of their NVNtextureView* and NVNcopyRegion* pairs (-1 = none)
     int copy_view[2] = {-1, -1}, copy_region[2] = {-1, -1};
 };
@@ -481,6 +482,7 @@ Recording& Rec() {
 }
 std::atomic<std::function<void(std::vector<ReplaySpan>&&)>*> g_sink{nullptr};
 extern "C" __declspec(dllimport) void* __stdcall GetCurrentThread();
+extern "C" __declspec(dllimport) unsigned long __stdcall GetCurrentThreadId();
 std::atomic<u64> g_submit_ns{0}, g_record_cycles{0}; // recorder cost diagnostics
 inline u64 NowNs() {
     return u64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -550,6 +552,14 @@ void Generic(State& s) {
             c.extra.push_back(recomp::Rd<u64>(s, s.x[2] + i * 16 + 8));
         }
     const bool replay = g_sink.load() != nullptr;
+    if (g.program && replay && s.x[1]) {
+        auto& rec = Rec();
+        std::lock_guard lk(rec.mutex);
+        if (auto it = rec.shadow.find(s.x[1]); it != rec.shadow.end())
+            for (const Command& sc : it->second)
+                if (g_generic[sc.fn].shaders && sc.extra.size() >= 2)
+                    c.extra.assign(sc.extra.begin(), sc.extra.begin() + 2);
+    }
     // copies: regions (6 ints each) into raw, views into objects (below)
     if (replay)
         for (int k = 0; k < 2; k++)
@@ -654,10 +664,8 @@ bool GenericKind(std::string_view n, Kind& kind) {
         kind = Kind::Command;
         return true;
     }
-    // (vertex attribute/stream states are decoded from their raw words at bind: their setters need no shadow)
-    for (std::string_view p : {"nvnBlendState", "nvnColorState", "nvnChannelMaskState", "nvnDepthStencilState",
-                               "nvnPolygonState", "nvnMultisampleState", "nvnTextureView", "nvnSamplerBuilder",
-                               "nvnProgramSetShaders"})
+    // (state objects are decoded from their raw words at bind: only programs need their setter recorded)
+    for (std::string_view p : {"nvnProgramSetShaders"})
         if (starts(p) && n.find("Set") != std::string_view::npos) {
             kind = Kind::Setter;
             return true;
@@ -995,6 +1003,7 @@ void QueueSubmitCommands(State& s) {
     if (sink && *sink)
         (*sink)(std::move(flat));
     g_submit_ns.fetch_add(NowNs() - submit_t0, std::memory_order_relaxed);
+    TimelineEvent("submit", flat.size());
     if (Native()) // the host renders it; the driver's queue never runs
         return Return(s, 0);
     u64 q, r;
@@ -1035,6 +1044,7 @@ u64 HostFence(u64 sync) {
     }
     gpu::G().SubmitHost([seq] {
         auto& hq = HQ();
+        TimelineEvent("fence-done", seq);
         {
             std::lock_guard lk(hq.mutex);
             hq.completed = std::max(hq.completed, seq);
@@ -1067,12 +1077,15 @@ void SyncWait(State& s) {
         return lk.unlock(), Return(s, 0);
     const u64 seq = it->second, timeout = s.x[1];
     auto done = [&] { return q.completed >= seq; };
+    TimelineEvent(timeout ? "syncwait-block" : "syncwait-poll", seq);
     bool ok;
     if (timeout >= (1ull << 62))
         q.cv.wait(lk, done), ok = true;
     else
         ok = q.cv.wait_for(lk, std::chrono::nanoseconds(timeout), done);
     lk.unlock();
+    if (timeout)
+        TimelineEvent(ok ? "syncwait-done" : "syncwait-timeout", seq);
     Return(s, ok ? 1 : 2);
 }
 // void nvnQueueWaitSync(NVNqueue*, const NVNsync*): one queue runs in order, nothing to wait for
@@ -1154,6 +1167,7 @@ void WindowAcquireTexture(State& s) {
             q.syncs[sync] = w.released.empty() ? 0 : w.released[index];
     }
     recomp::Wr<u32>(s, index_ptr, index);
+    TimelineEvent("acquire", index);
     Return(s, 0);
 }
 // void nvnQueuePresentTexture(NVNqueue*, NVNwindow*, int textureIndex)
@@ -1178,6 +1192,7 @@ void QueuePresentTexture(State& s) {
         auto& g = gpu::G();
         g.QueuePresent({g.As().Translate(t.gpu), t.width, t.height, t.width * 4, 1});
     }
+    TimelineEvent("present", index);
     const u64 released = HostFence(0); // after the present
     std::lock_guard lk(q.mutex);
     if (auto& w = q.windows[window]; index < w.released.size())
@@ -1272,6 +1287,39 @@ void ResolveMissing(State& s, recomp::Fn lookup, u64 lookup_pc, u64 device,
 }
 
 std::atomic<long long> g_learn_until_ms{0};
+
+void TimelineEvent(const char* what, u64 arg) {
+    static const u64 at = [] {
+        const char* e = std::getenv("MUA3_NVN_TIMELINE");
+        return e ? std::strtoull(e, nullptr, 10) * 1000000000ull : 0;
+    }();
+    if (!at)
+        return;
+    struct Ev {
+        u64 t;
+        u32 tid;
+        const char* what;
+        u64 arg;
+    };
+    static std::mutex m;
+    static std::vector<Ev> evs;
+    static const u64 t0 = NowNs();
+    static bool done = false;
+    const u64 t = NowNs();
+    if (done || t - t0 < at)
+        return;
+    std::lock_guard lk(m);
+    if (done)
+        return;
+    evs.push_back({t, u32(GetCurrentThreadId()), what, arg});
+    if (evs.size() >= 3000) {
+        done = true;
+        std::ofstream f("nvn_timeline.txt");
+        for (const Ev& e : evs)
+            f << fmt::format("{:.3f} {} {} {:#x}\n", (e.t - evs[0].t) / 1e6, e.tid, e.what, e.arg);
+        LOG_INFO("NVN", "wrote nvn_timeline.txt");
+    }
+}
 
 bool Native() {
     static const bool native = std::getenv("MUA3_NVN_NATIVE") != nullptr;
@@ -1409,9 +1457,9 @@ recomp::Fn Find(std::string_view name, recomp::Fn driver, u64 pc) {
         else if (name == "nvnCommandBufferClearColor")
             raw(2, -1, 16, false); // (cb, index, const float rgba[4], mask)
         else if (name == "nvnCommandBufferBindProgram")
-            raw(1, -1, 8, true);
+            g.program = true;
         else if (name.substr(0, 20) == "nvnCommandBufferBind" && name.ends_with("State"))
-            raw(1, -1, 32, true); // Bind{Blend,Color,ChannelMask,DepthStencil,Polygon,Multisample}State(cb, state)
+            raw(1, -1, 32, false); // Bind{Blend,Color,ChannelMask,DepthStencil,Polygon,Multisample}State(cb, state)
         return kGenericFns[i];
     }
     if (!entry || (entry->record && !record))

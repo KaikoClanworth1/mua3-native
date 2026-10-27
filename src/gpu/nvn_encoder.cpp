@@ -541,10 +541,8 @@ private:
     void BindProgram(const ReplayCommand& c) {
         u64 code = 0, control = 0;
         if (c.x[1]) {
-            if (!c.objects.empty())
-                for (const StateCall& k : c.objects[0])
-                    if (Is(k.name, "SetShaders") && k.handles.size() >= 2)
-                        code = k.handles[0], control = k.handles[1];
+            if (c.extra.size() >= 2) // the program's first stage {code, control}, captured at bind
+                code = c.extra[0], control = c.extra[1];
             if (!code)
                 code = hle::nvn::QueryProgramCode(c.x[1]), no_shadow++;
         }
@@ -755,117 +753,72 @@ private:
         W(0x382 + i * 4, (y & 0xFFFF) | ((y + h) << 16));
     }
 
-    const std::vector<StateCall>* Object(const ReplayCommand& c) {
-        if (c.objects.empty() || c.objects[0].empty()) {
-            no_shadow++;
-            return nullptr;
-        }
-        return &c.objects[0];
-    }
-
+    // State objects are decoded from their raw words (captured at bind; the game builds many on the stack).
+    // NVNblendState: byte 0 target, byte 3 equations (rgb | alpha << 4), bytes 4-7 src/dst rgb, src/dst alpha.
     void ApplyBlend(const ReplayCommand& c) {
-        auto* o = Object(c);
-        if (!o)
+        if (c.raw.empty())
             return;
-        u32 target = 0, src = 2, dst = 1, src_a = 2, dst_a = 1, eq = 1, eq_a = 1;
-        for (const StateCall& k : *o) {
-            if (Is(k.name, "SetBlendTarget"))
-                target = u32(k.x[1]) & 7;
-            else if (Is(k.name, "SetBlendFunc"))
-                src = u32(k.x[1]), dst = u32(k.x[2]), src_a = u32(k.x[3]), dst_a = u32(k.x[4]);
-            else if (Is(k.name, "SetBlendEquation"))
-                eq = u32(k.x[1]), eq_a = u32(k.x[2]);
-        }
+        const u64 w = c.raw[0];
+        const u32 target = u32(w) & 7, eq = u32(w >> 24) & 0xF, eq_a = u32(w >> 28) & 0xF;
+        const u32 src = u32(w >> 32) & 0xFF, dst = u32(w >> 40) & 0xFF, src_a = u32(w >> 48) & 0xFF, dst_a = u32(w >> 56) & 0xFF;
         const u32 b = kIndependentBlend + target * 8;
         W(b + 0, 0);
         W(b + 1, eq), W(b + 2, src), W(b + 3, dst), W(b + 4, eq_a), W(b + 5, src_a), W(b + 6, dst_a);
         W(0x4B9, 1);
     }
 
+    // NVNcolorState: byte 1 blend enable per target, byte 3 alpha test function (8 = always).
     void ApplyColor(const ReplayCommand& c) {
-        auto* o = Object(c);
-        if (!o)
+        if (c.raw.empty())
             return;
-        u32 enable[8]{};
-        u32 alpha_func = 8;
-        for (const StateCall& k : *o) {
-            if (Is(k.name, "SetBlendEnable") && k.x[1] < 8)
-                enable[k.x[1]] = u32(k.x[2]) & 1;
-            else if (Is(k.name, "SetAlphaTest"))
-                alpha_func = u32(k.x[1]);
-        }
+        const u32 w = u32(c.raw[0]);
+        const u32 enable = (w >> 8) & 0xFF, alpha_func = (w >> 24) & 0xF;
         for (u32 i = 0; i < 8; i++)
-            W(kBlendEnable + i, enable[i]);
-        W(kAlphaTestEnable, alpha_func != 8 ? 1 : 0);
-        W(kAlphaTestFunc, alpha_func != 8 ? alpha_func : 0);
+            W(kBlendEnable + i, (enable >> i) & 1);
+        W(kAlphaTestEnable, alpha_func && alpha_func != 8 ? 1 : 0);
+        W(kAlphaTestFunc, alpha_func && alpha_func != 8 ? alpha_func : 0);
     }
 
+    // NVNchannelMaskState: 4 bits (r, g, b, a) per target.
     void ApplyChannelMask(const ReplayCommand& c) {
-        auto* o = Object(c);
-        if (!o)
+        if (c.raw.empty())
             return;
-        u32 mask[8];
-        std::fill(std::begin(mask), std::end(mask), 0x1111u);
-        for (const StateCall& k : *o)
-            if (Is(k.name, "SetChannelMask") && k.x[1] < 8)
-                mask[k.x[1]] = (k.x[2] ? 1 : 0) | (k.x[3] ? 0x10 : 0) | (k.x[4] ? 0x100 : 0) | (k.x[5] ? 0x1000 : 0);
-        for (u32 i = 0; i < 8; i++)
-            W(kColorMask + i, mask[i]);
+        const u32 w = u32(c.raw[0]);
+        for (u32 i = 0; i < 8; i++) {
+            const u32 m = (w >> (i * 4)) & 0xF;
+            W(kColorMask + i, (m & 1) | ((m & 2) << 3) | ((m & 4) << 6) | ((m & 8) << 9));
+        }
     }
 
+    // NVNdepthStencilState: bit 0 depth test, 1 depth write, 2 stencil test, bits 4-7 depth function; from bit 32 one
+    // 16-bit word per face (front, back): function, fail, pass, depth fail ops (4 bits each).
     void ApplyDepthStencil(const ReplayCommand& c) {
-        auto* o = Object(c);
-        if (!o)
+        if (c.raw.empty())
             return;
-        u32 test = 0, write = 1, func = 2, stencil = 0;
-        u32 sfunc[2] = {8, 8}, fail[2] = {1, 1}, zfail[2] = {1, 1}, zpass[2] = {1, 1};
-        for (const StateCall& k : *o) {
-            if (Is(k.name, "SetDepthTestEnable"))
-                test = u32(k.x[1]) & 1;
-            else if (Is(k.name, "SetDepthWriteEnable"))
-                write = u32(k.x[1]) & 1;
-            else if (Is(k.name, "SetDepthFunc"))
-                func = u32(k.x[1]);
-            else if (Is(k.name, "SetStencilTestEnable"))
-                stencil = u32(k.x[1]) & 1;
-            else if (Is(k.name, "SetStencilFunc")) {
-                for (u32 f = 0; f < 2; f++)
-                    if (k.x[1] & (1u << f))
-                        sfunc[f] = u32(k.x[2]);
-            } else if (Is(k.name, "SetStencilOp")) {
-                for (u32 f = 0; f < 2; f++)
-                    if (k.x[1] & (1u << f))
-                        fail[f] = u32(k.x[2]), zfail[f] = u32(k.x[3]), zpass[f] = u32(k.x[4]);
-            }
-        }
-        W(kDepthTestEnable, test);
-        W(kDepthWriteEnable, write);
-        W(kDepthTestFunc, func);
-        W(kStencilEnable, stencil);
-        W(kStencilFrontFunc, sfunc[0]);
-        W(kStencilFrontOpFail, fail[0]), W(kStencilFrontOpZFail, zfail[0]), W(kStencilFrontOpZPass, zpass[0]);
+        const u64 w = c.raw[0];
+        W(kDepthTestEnable, u32(w) & 1);
+        W(kDepthWriteEnable, (u32(w) >> 1) & 1);
+        W(kDepthTestFunc, (u32(w) >> 4) & 0xF);
+        W(kStencilEnable, (u32(w) >> 2) & 1);
+        const u32 front = u32(w >> 32) & 0xFFFF, back = u32(w >> 48) & 0xFFFF;
+        W(kStencilFrontFunc, front & 0xF);
+        W(kStencilFrontOpFail, (front >> 4) & 0xF), W(kStencilFrontOpZPass, (front >> 8) & 0xF), W(kStencilFrontOpZFail, front >> 12);
         W(kStencilTwoSide, 1);
-        W(kStencilBackFunc, sfunc[1]);
-        W(kStencilBackOpFail, fail[1]), W(kStencilBackOpZFail, zfail[1]), W(kStencilBackOpZPass, zpass[1]);
+        W(kStencilBackFunc, back & 0xF);
+        W(kStencilBackOpFail, (back >> 4) & 0xF), W(kStencilBackOpZPass, (back >> 8) & 0xF), W(kStencilBackOpZFail, back >> 12);
     }
 
+    // NVNpolygonState: bits 0-1 cull face, bit 2 front face counter-clockwise, bits 3-4 polygon mode, bits 15-17
+    // polygon offset enables (point, line, fill).
     void ApplyPolygon(const ReplayCommand& c) {
-        auto* o = Object(c);
-        if (!o)
+        if (c.raw.empty())
             return;
-        u32 cull = 0, front = 1, offsets = 0;
-        for (const StateCall& k : *o) {
-            if (Is(k.name, "SetCullFace"))
-                cull = u32(k.x[1]);
-            else if (Is(k.name, "SetFrontFace"))
-                front = u32(k.x[1]);
-            else if (Is(k.name, "SetPolygonOffsetEnables"))
-                offsets = u32(k.x[1]);
-        }
+        const u32 w = u32(c.raw[0]);
+        const u32 cull = w & 3;
         W(kCullEnable, cull ? 1 : 0);
         W(kCullFace, cull == 1 ? 0x404 : cull == 3 ? 0x408 : 0x405);
-        W(kFrontFace, front ? 0x901 : 0x900);
-        W(kPolygonOffsetFillEnable, (offsets >> 2) & 1);
+        W(kFrontFace, (w >> 2) & 1 ? 0x901 : 0x900);
+        W(kPolygonOffsetFillEnable, (w >> 17) & 1);
     }
 
     void Draw(u32 mode, bool indexed, u32 first, u32 count, u32 index_type, u64 index_addr, s32 base_vertex,
@@ -1428,9 +1381,11 @@ void InstallNative(Gpu& gpu) {
         g->SubmitHost([list] {
             static u64 jobs = 0, ns = 0, cmds = 0;
             const u64 t0 = g->NowNs();
+            hle::nvn::TimelineEvent("job-start", list->size());
             g->SetActiveM3D(&enc->M());
             enc->Run(*list);
             g->SetActiveM3D(nullptr);
+            hle::nvn::TimelineEvent("job-end", list->size());
             ns += g->NowNs() - t0, cmds += list->size();
             if (++jobs % 600 == 0) {
                 LOG_INFO("NVN", "native: {:.0f} commands per submit, {:.2f} ms each on the GPU thread", cmds / 600.0, ns / 600e6);

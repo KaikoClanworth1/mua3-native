@@ -28,6 +28,10 @@ void ResolveMissing(recomp::State& s, recomp::Fn lookup, recomp::u64 lookup_pc, 
 // so the emulated path's resolutions can be joined with that same frame's NVN commands.
 extern std::atomic<long long> g_learn_until_ms;
 
+// MUA3_NVN_TIMELINE=<seconds>: after that long, records 3,000 events (submit, fence waits, acquire, present, GPU jobs)
+// with thread ids and times to nvn_timeline.txt.
+void TimelineEvent(const char* what, recomp::u64 arg = 0);
+
 // MUA3_NVN_NATIVE: command buffer commands the host encoder handles are recorded but never reach the driver; each
 // submit's commands run on the host (gpu/nvn_encoder.cpp).
 bool Native();
