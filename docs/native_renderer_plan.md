@@ -130,7 +130,42 @@ constant buffer (`TextureUse::cbuf_offset` vs BindTexture index), NVN format enu
 vertex attribute formats, and the blend, depth and polygon enums. Instrumenting the emulated path (when it creates
 a surface or input layout at a GPU address the NVN model knows, log the pair) learns these tables automatically.
 
-## Replay architecture (next)
+## Host encoder (done 2026-10-26)
+
+`src/gpu/nvn_encoder.cpp` turns the recorded NVN stream into writes to a `Maxwell3D` register file of its own (and
+compute launches / DMA launches), with the driver's conventions; `D3D11Renderer` draws from it unchanged through a
+redirectable `Gpu::M3D()`. Driver-owned constant buffers live in a host-backed GPU range (`Gpu::kHostBase`).
+
+Three modes, each a step towards removing the driver:
+- `MUA3_NVN_VERIFY=<s>` (with `MUA3_NVN_RECORD=1`): one frame is encoded into a capture-only register file and
+  every draw / compute launch is compared with the driver path's of the same submit (`nvn_verify*.txt`).
+  `MUA3_NVN_VERIFY_COPIES=1` picks a submit with copies and compares DMA launches. ST010: all draws and dispatches
+  match on every field the renderer reads.
+- `MUA3_NVN_REPLAY=1`: the command stream still runs, but each draw / dispatch it reaches is matched with the
+  encoder's next one and rendered from the encoder's state; clears come from the encoder. ST010: every draw and
+  dispatch comes from the encoder, image identical.
+- `MUA3_NVN_NATIVE=1`: the command-buffer commands the encoder implements never reach the driver (a host whitelist in
+  `nvn_hle.cpp`); each submit runs as a host job on the GPU thread, before the driver's own (much smaller)
+  submission of the rest (fences, counters, copies until host copies are verified). GPU methods per frame drop from
+  ~1.7M to ~20k. Gameplay renders correctly; performance and a mid-session exit are being investigated.
+
+Learned driver conventions (in addition to the earlier list):
+- Constant buffers per stage: c0 one shared driver buffer (0x7000; storage buffer table `{addr, size}` at
+  0x110 + hardware stage * 0x100; 0x610 = 0x44FFFE00), c1 = the program's constants right after its code, c2 texture
+  handles (32-bit at 0x20 + i * 8; words 1..7 = 1..7), none of c1 for tessellation stages. Two c0 words stay unknown
+  (0x100 and 0x650: driver-internal addresses).
+- State the driver writes in its own encoding: constant vertex inputs 0x3A400040 (attributes < 16), RT control
+  0xFAC6880 | count, viewport transform Y negative, screen Y control 0x10, viewport transform enable, 0x64F = 0x181D,
+  independent blend for all targets (separate-alpha word 0), back stencil masks at 0x3D6 (write) / 0x3D7 (func).
+- Compute: program = code (no blob header); block size, shared memory and constant buffer 1 from the NVN control
+  section (0x748.., AlignUp(0x754, 0x100), code + 0x700 / AlignUp(0x6FC, 0x100)); compute c0 has the grid at
+  0x200, the uniform buffer table at 0x210 and the storage buffer table at 0x310; c2 keeps 64-bit handles, images
+  at 0x120 + i * 8.
+- Several render targets and depth buffers are created where the Initialize wrapper does not see them; they are
+  described through the driver's getters when first bound. State objects are captured at record time (many are
+  built on the stack).
+
+## Replay architecture (superseded by the host encoder above)
 
 The bridge is in place (`hle::nvn::SetReplaySink`, `QueryTexture/QueryState/QueryProgramCode/QueryTexturePool`):
 each submitted frame arrives flattened in execution order. Do not write a second renderer. Translated shaders

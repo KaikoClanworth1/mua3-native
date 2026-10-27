@@ -92,6 +92,117 @@ u32 TileMode(u32 height) {
     return bh << 4;
 }
 
+// NVN format -> bytes per block and block size in texels (compressed formats use 4x4 blocks).
+struct BlockInfo {
+    u32 bpb = 0, bw = 1, bh = 1;
+};
+BlockInfo NvnBlock(u32 f) {
+    if (f >= 0x01 && f <= 0x04) return {1};
+    if (f >= 0x05 && f <= 0x09) return {2};
+    if (f >= 0x0A && f <= 0x0C) return {4};
+    if (f >= 0x0D && f <= 0x10) return {2};
+    if (f >= 0x11 && f <= 0x15) return {4};
+    if (f >= 0x16 && f <= 0x18) return {8};
+    if (f >= 0x19 && f <= 0x1C) return {3};
+    if (f >= 0x1D && f <= 0x21) return {6};
+    if (f >= 0x22 && f <= 0x24) return {12};
+    if (f >= 0x25 && f <= 0x28) return {4};
+    if (f >= 0x29 && f <= 0x2D) return {8};
+    if (f >= 0x2E && f <= 0x30) return {16};
+    switch (f) {
+    case 0x31: return {1};
+    case 0x32: return {2};
+    case 0x33: case 0x34: case 0x35: return {4};
+    case 0x36: return {8};
+    case 0x37: case 0x38: return {4};
+    case 0x39: case 0x3A: case 0x3B: case 0x3C: return {2};
+    case 0x3D: case 0x3E: case 0x3F: case 0x40: return {4};
+    case 0x41: case 0x42: case 0x45: case 0x46: case 0x49: case 0x4A: return {8, 4, 4};
+    case 0x43: case 0x44: case 0x47: case 0x48: case 0x4B: case 0x4C: return {16, 4, 4};
+    case 0x4D: case 0x4E: case 0x4F: case 0x50: return {16, 4, 4};
+    default: return {};
+    }
+}
+
+// Where one level (and array layer) of a block-linear texture lives, in blocks.
+struct TexLevel {
+    u64 addr = 0;
+    u32 bh = 0, bd = 0;            // block height / depth in GOBs, log2
+    u32 wb = 0, hb = 0, depth = 1; // level size in blocks (depth in slices for 3D)
+    BlockInfo blk;
+};
+bool LevelLayout(const hle::nvn::TextureInfo& t, u32 level, u32 layer, TexLevel& out) {
+    const BlockInfo b = NvnBlock(t.format);
+    if (!b.bpb || !t.width)
+        return false;
+    const bool is3d = t.target == 2;
+    const u32 depth = is3d ? std::max<u32>(t.depth, 1) : 1;
+    const u32 hb0 = (std::max<u32>(t.height, 1) + b.bh - 1) / b.bh;
+    u32 bh0 = 0, bd0 = 0;
+    while (bh0 < 4 && (8u << bh0) < hb0)
+        bh0++;
+    while (is3d && bd0 < 5 && (1u << bd0) < depth)
+        bd0++;
+    u64 offset = 0, layer_size = 0;
+    for (u32 l = 0; l < std::max<u32>(t.levels, 1); l++) {
+        const u32 w = std::max<u32>(t.width >> l, 1), h = std::max<u32>(t.height >> l, 1), d = std::max<u32>(depth >> l, 1);
+        TexLevel lv;
+        lv.blk = b;
+        lv.wb = (w + b.bw - 1) / b.bw, lv.hb = (h + b.bh - 1) / b.bh, lv.depth = d;
+        lv.bh = bh0, lv.bd = bd0;
+        while (lv.bh > 0 && (8u << (lv.bh - 1)) >= lv.hb)
+            lv.bh--;
+        while (lv.bd > 0 && (1u << (lv.bd - 1)) >= lv.depth)
+            lv.bd--;
+        const u64 size = u64((lv.wb * b.bpb + 63) / 64) * ((lv.hb + (8u << lv.bh) - 1) / (8u << lv.bh)) *
+                         ((lv.depth + (1u << lv.bd) - 1) >> lv.bd) * (512ull << (lv.bh + lv.bd));
+        if (l == level) {
+            out = lv;
+            out.addr = offset;
+        }
+        offset += size;
+    }
+    layer_size = common::AlignUp(offset, 512ull << (bh0 + bd0));
+    if (level >= std::max<u32>(t.levels, 1))
+        return false;
+    out.addr += t.gpu + u64(layer) * layer_size;
+    return true;
+}
+
+// DMA engine launch: the registers RunDma reads, and the LAUNCH value.
+struct DmaLaunch {
+    std::array<u32, 0x200> r{};
+    u32 launch = 0;
+};
+// The same copy, independent of how the launch encodes it (remapped elements vs bytes).
+struct CopyOp {
+    u64 src = 0, dst = 0;
+    u32 pitch_in = 0, pitch_out = 0, bytes = 0, lines = 0;
+    bool src_bl = false, dst_bl = false;
+    u32 bh = 0, bd = 0, width = 0, height = 0, depth = 0, layer = 0, ox = 0, oy = 0; // block-linear side
+};
+CopyOp Canonical(const u32* r, u32 launch) {
+    CopyOp c;
+    c.src = (u64(r[0x100] & 0xFF) << 32) | r[0x101];
+    c.dst = (u64(r[0x102] & 0xFF) << 32) | r[0x103];
+    c.pitch_in = r[0x104], c.pitch_out = r[0x105];
+    u32 bpp = 1;
+    if (launch & (1u << 10)) {
+        const u32 rm = r[0x1C2];
+        bpp = (((rm >> 16) & 3) + 1) * (((rm >> 24) & 3) + 1);
+    }
+    c.bytes = r[0x106] * bpp;
+    c.lines = (launch & (1u << 9)) ? std::max<u32>(r[0x107], 1) : 1;
+    c.src_bl = !(launch & (1u << 7)), c.dst_bl = !(launch & (1u << 8));
+    if (c.src_bl || c.dst_bl) {
+        const u32 b = c.dst_bl ? 0x1C3 : 0x1CA;
+        c.bh = (r[b] >> 4) & 0xF, c.bd = (r[b] >> 8) & 0xF;
+        c.width = r[b + 1] * bpp, c.height = r[b + 2], c.depth = std::max<u32>(r[b + 3], 1), c.layer = r[b + 4];
+        c.ox = (r[b + 5] & 0xFFFF) * bpp, c.oy = r[b + 5] >> 16;
+    }
+    return c;
+}
+
 bool Is(std::string_view name, std::string_view suffix) {
     return name.size() >= suffix.size() && name.substr(name.size() - suffix.size()) == suffix;
 }
@@ -216,9 +327,9 @@ public:
             return c.x[1] == 0 || c.x[2] == 0 || c.x[3] == 0;
         u32 a[2]{};
         if (c.name.ends_with("DrawElementsIndirect"))
-            g_.ReadGpu(c.x[4], a, sizeof(a));
+            SyncForRead(c.x[4], sizeof(a)), g_.ReadGpu(c.x[4], a, sizeof(a));
         else if (c.name.ends_with("DrawArraysIndirect"))
-            g_.ReadGpu(c.x[2], a, sizeof(a));
+            SyncForRead(c.x[2], sizeof(a)), g_.ReadGpu(c.x[2], a, sizeof(a));
         else
             return false;
         return a[1] == 0;
@@ -352,7 +463,20 @@ private:
             W(kClearDepth, c.v[0]);
             W(kClearStencil, u32(x[2]));
             W(kClearBuffers, (x[1] ? 1u : 0u) | (x[3] ? 2u : 0u));
-        } else if (n == "DispatchCompute")
+        } else if (n == "SetCopyRowStride")
+            row_stride_ = u32(x[1]);
+        else if (n == "SetCopyImageStride")
+            image_stride_ = u32(x[1]);
+        else if (n == "CopyBufferToBuffer") { // (cb, src, dst, size, flags)
+            DmaLaunch l;
+            l.r[0x100] = u32(x[1] >> 32), l.r[0x101] = u32(x[1]);
+            l.r[0x102] = u32(x[2] >> 32), l.r[0x103] = u32(x[2]);
+            l.r[0x106] = u32(x[3]);
+            l.launch = (1u << 7) | (1u << 8);
+            Copy(l);
+        } else if (n == "CopyBufferToTexture" || n == "CopyTextureToBuffer")
+            CopyTexture(c, n == "CopyBufferToTexture");
+        else if (n == "DispatchCompute")
             Dispatch(u32(x[1]), u32(x[2]), u32(x[3]));
         else if (n == "DrawElementsBaseVertex")
             Draw(u32(x[1]), true, 0, u32(x[3]), u32(x[2]), x[4], s32(x[5]), 1, 0);
@@ -362,14 +486,22 @@ private:
             Draw(u32(x[1]), false, u32(x[2]), u32(x[3]), 0, 0, 0, 1, 0);
         else if (n == "DrawElementsIndirect") {
             u32 a[5]{}; // count, instances, first index, base vertex, base instance
+            SyncForRead(x[4], sizeof(a));
             g_.ReadGpu(x[4], a, sizeof(a));
             Draw(u32(x[1]), true, a[2], a[0], u32(x[2]), x[3], s32(a[3]), a[1], a[4]);
         } else if (n == "DrawArraysIndirect") {
             u32 a[4]{}; // count, instances, first, base instance
+            SyncForRead(x[2], sizeof(a));
             g_.ReadGpu(x[2], a, sizeof(a));
             Draw(u32(x[1]), false, a[2], a[0], 0, 0, 0, a[1], a[3]);
         } else
             unhandled[std::string(n)]++;
+    }
+
+    // Indirect arguments are often written by compute just before: land those results first (rendering modes).
+    void SyncForRead(u64 addr, u64 size) {
+        if (render_compute && g_.GetRenderer())
+            g_.GetRenderer()->SyncRegion(addr, size);
     }
 
     u32 Raw32(const ReplayCommand& c, u32 i) const {
@@ -393,7 +525,66 @@ private:
             cs_code_ = code, cs_control_ = control;
     }
 
+    // Texture <-> buffer copies, one DMA launch per slice / layer: linear rows of whole blocks on the buffer side.
+    void CopyTexture(const ReplayCommand& c, bool upload) {
+        const u64 buffer = upload ? c.x[1] : c.x[4], tex = upload ? c.x[2] : c.x[1];
+        hle::nvn::TextureInfo t;
+        if (!hle::nvn::QueryTexture(tex, t)) {
+            unhandled["copy: texture not in the model"]++;
+            return;
+        }
+        s32 region[6]{}; // x, y, z, width, height, depth
+        for (u32 i = 0; i < 6; i++)
+            region[i] = s32(Raw32(c, i));
+        u32 level = 0, min_layer = 0;
+        // the view's raw words follow the region: word 0 = flags | base level << 8 | level count << 16
+        if (Raw32(c, 6) & 1)
+            level = (Raw32(c, 6) >> 8) & 0xFF;
+        if (!c.objects.empty())
+            for (const StateCall& k : c.objects[0]) {
+                if (Is(k.name, "SetLevels"))
+                    level = u32(k.x[1]);
+                else if (Is(k.name, "SetLayers"))
+                    min_layer = u32(k.x[1]);
+            }
+        const bool is3d = t.target == 2;
+        for (s32 z = region[2]; z < region[2] + std::max(region[5], 1); z++) {
+            TexLevel lv;
+            if (!LevelLayout(t, level, is3d ? 0 : min_layer + u32(z), lv)) {
+                unhandled[fmt::format("copy: layout of format {:#x} target {}", t.format, t.target)]++;
+                return;
+            }
+            const u32 wb = (u32(region[3]) + lv.blk.bw - 1) / lv.blk.bw, hb = (u32(region[4]) + lv.blk.bh - 1) / lv.blk.bh;
+            const u32 row = row_stride_ ? row_stride_ : wb * lv.blk.bpb;
+            const u32 image = image_stride_ ? image_stride_ : row * hb;
+            const u64 linear = buffer + u64(z - region[2]) * image;
+            DmaLaunch l;
+            const u32 b = upload ? 0x1C3 : 0x1CA;
+            const u64 src = upload ? linear : lv.addr, dst = upload ? lv.addr : linear;
+            l.r[0x100] = u32(src >> 32), l.r[0x101] = u32(src);
+            l.r[0x102] = u32(dst >> 32), l.r[0x103] = u32(dst);
+            l.r[upload ? 0x104 : 0x105] = row;
+            l.r[0x106] = wb * lv.blk.bpb;
+            l.r[0x107] = hb;
+            l.r[b] = (lv.bh << 4) | (lv.bd << 8);
+            l.r[b + 1] = lv.wb * lv.blk.bpb;
+            l.r[b + 2] = lv.hb;
+            l.r[b + 3] = lv.depth;
+            l.r[b + 4] = is3d ? u32(z) : 0;
+            l.r[b + 5] = ((u32(region[0]) / lv.blk.bw) * lv.blk.bpb) | ((u32(region[1]) / lv.blk.bh) << 16);
+            l.launch = (1u << 9) | (upload ? 1u << 7 : 1u << 8);
+            Copy(l);
+        }
+    }
+    void Copy(const DmaLaunch& l) {
+        if (on_copy)
+            on_copy(l);
+        else if (render_compute)
+            g_.RunDma(l.r.data(), l.launch);
+    }
+
   public:
+    std::function<void(const DmaLaunch&)> on_copy; // verification
     // Compute launch as the renderer takes it: compute engine registers and launch descriptor (QMD).
     struct Launch {
         std::array<u32, 0x1000> r{};
@@ -759,6 +950,7 @@ private:
         u32 size = 0;
     } cs_ubo_[5];
     u64 cs_code_ = 0, cs_control_ = 0;
+    u32 row_stride_ = 0, image_stride_ = 0;
     std::mutex queue_mutex_;
     std::deque<std::vector<ReplayCommand>> queue_;
     std::vector<ReplayCommand> frame_;
@@ -794,6 +986,10 @@ struct Verify {
         int cmd = -1;
     };
     std::vector<CSnap> enc_cs, drv_cs;
+    std::vector<CopyOp> enc_copy, drv_copy;
+    std::vector<int> enc_copy_cmd;
+    std::chrono::steady_clock::time_point collect_start;
+    bool copies_mode = std::getenv("MUA3_NVN_VERIFY_COPIES") != nullptr; // capture a submit with copies
     std::vector<std::string> cmd_names, cmd_lines;
     std::map<std::string, u64> unhandled; // encoder diagnostics as of the captured frame
     u64 no_shadow = 0;
@@ -833,6 +1029,54 @@ Verify::CSnap TakeCSnap(Gpu& g, const u32* r, const u32* q, int cmd) {
             g.ReadGpu(a, c.cb[i].data(), c.cb[i].size() * 4);
         }
     return c;
+}
+
+void ReportCopies(std::ofstream& f) {
+    auto& v = V();
+    const auto& E = v.enc_copy;
+    const auto& D = v.drv_copy;
+    std::ofstream log("nvn_verify_copies.txt");
+    std::map<std::string, std::pair<u64, std::vector<std::string>>> diffs;
+    auto add = [&](const std::string& k, size_t i, u64 a, u64 b) {
+        auto& d = diffs[k];
+        d.first++;
+        if (d.second.size() < 4)
+            d.second.push_back(fmt::format("k{} drv {:#x} enc {:#x}", i, a, b));
+    };
+    auto line = [](const CopyOp& c) {
+        return fmt::format("src {:#x}{} dst {:#x}{} pitch {}/{} bytes {} lines {} bl bh {} bd {} w {} h {} d {} layer {} o {},{}", c.src,
+                           c.src_bl ? "(bl)" : "", c.dst, c.dst_bl ? "(bl)" : "", c.pitch_in, c.pitch_out, c.bytes, c.lines, c.bh, c.bd,
+                           c.width, c.height, c.depth, c.layer, c.ox, c.oy);
+    };
+    size_t cursor = 0, matched = 0;
+    for (size_t i = 0; i < E.size(); i++) {
+        const auto& e = E[i];
+        size_t j = cursor;
+        for (; j < D.size() && j < cursor + 16; j++)
+            if (D[j].src_bl == e.src_bl && D[j].dst_bl == e.dst_bl && (e.dst_bl ? D[j].src == e.src : D[j].dst == e.dst))
+                break;
+        if (j >= D.size() || j >= cursor + 16) {
+            log << fmt::format("enc {} (cmd {}): no match: {}\n", i, v.enc_copy_cmd[i], line(e));
+            add("unmatched", i, 0, 0);
+            continue;
+        }
+        cursor = j + 1, matched++;
+        const auto& d = D[j];
+        log << fmt::format("enc {} (cmd {}) {}\n      drv {}: {}\n", i, v.enc_copy_cmd[i], line(e), j, line(d));
+#define CMP(field) \
+    if (d.field != e.field) \
+        add(#field, i, d.field, e.field);
+        CMP(src) CMP(dst) CMP(pitch_in) CMP(pitch_out) CMP(bytes) CMP(lines) CMP(bh) CMP(bd) CMP(width) CMP(height) CMP(depth)
+        CMP(layer) CMP(ox) CMP(oy)
+#undef CMP
+    }
+    f << fmt::format("# copies: encoder {} driver {} matched {}\n", E.size(), D.size(), matched);
+    for (const auto& [k, d] : diffs) {
+        f << fmt::format("{:<28} {:>6}  ", k, d.first);
+        for (const auto& ex : d.second)
+            f << ex << "; ";
+        f << "\n";
+    }
 }
 
 void ReportCompute(std::ofstream& f) {
@@ -1059,6 +1303,7 @@ void Report() {
         f << "\n";
     }
     ReportCompute(f);
+    ReportCopies(f);
     LOG_INFO("NVN", "verify: {} of {} encoder draws matched, {} differing items; wrote nvn_verify.txt", matched, E.size(),
              diffs.size());
 }
@@ -1156,7 +1401,36 @@ void InstallReplay(Gpu& gpu) {
     LOG_INFO("NVN", "native replay: draws come from the host NVN encoder");
 }
 
+// MUA3_NVN_NATIVE: the driver never sees the command buffer commands the encoder handles (hle::nvn::Native());
+// each submit's commands are encoded and rendered on the GPU thread, in order with the driver's own submissions
+// (copies, fences, present).
+void InstallNative(Gpu& gpu) {
+    static Gpu* g = &gpu;
+    static Encoder* enc = new Encoder(gpu);
+    enc->render_compute = true;
+    hle::nvn::SetReplaySink([](std::vector<ReplayCommand>&& cmds) {
+        auto list = std::make_shared<std::vector<ReplayCommand>>(std::move(cmds));
+        g->SubmitHost([list] {
+            static u64 jobs = 0, ns = 0, cmds = 0;
+            const u64 t0 = g->NowNs();
+            g->SetActiveM3D(&enc->M());
+            enc->Run(*list);
+            g->SetActiveM3D(nullptr);
+            ns += g->NowNs() - t0, cmds += list->size();
+            if (++jobs % 600 == 0) {
+                LOG_INFO("NVN", "native: {:.0f} commands per submit, {:.2f} ms each on the GPU thread", cmds / 600.0, ns / 600e6);
+                ns = cmds = 0;
+            }
+        });
+    });
+    LOG_INFO("NVN", "native: command buffers are encoded and rendered by the host");
+}
+
 void InstallNvnEncoder(Gpu& gpu) {
+    if (hle::nvn::Native()) {
+        InstallNative(gpu);
+        return;
+    }
     if (std::getenv("MUA3_NVN_REPLAY")) {
         InstallReplay(gpu);
         return;
@@ -1173,7 +1447,7 @@ void InstallNvnEncoder(Gpu& gpu) {
         if (v.phase.load() != 2)
             return false;
         v.drv_snaps.push_back(TakeSnap(*v.gpu, m, -1));
-        if (v.drv_snaps.size() >= v.want) {
+        if (!v.copies_mode && v.drv_snaps.size() >= v.want) {
             v.phase = 3;
             Report();
         }
@@ -1184,19 +1458,39 @@ void InstallNvnEncoder(Gpu& gpu) {
             v.drv_cs.push_back(TakeCSnap(*v.gpu, r, q, -1));
         return false;
     };
+    gpu.intercept_dma = [&v](const u32* r, u32 launch) {
+        if (v.phase.load() == 2) {
+            v.drv_copy.push_back(Canonical(r, launch));
+            if (v.copies_mode && (v.drv_copy.size() >= v.want ||
+                                  std::chrono::steady_clock::now() - v.collect_start > std::chrono::seconds(5))) {
+                v.phase = 3;
+                Report();
+            }
+        }
+        return false;
+    };
     gpu.on_tagged_job = [&v] {
-        if (v.phase.load() == 1)
+        if (v.phase.load() == 1) {
+            v.collect_start = std::chrono::steady_clock::now();
             v.phase = 2;
+        }
     };
     hle::nvn::SetReplaySink([&v](std::vector<ReplayCommand>&& cmds) {
-        size_t draws = 0;
-        for (const auto& c : cmds)
+        size_t draws = 0, copies = 0;
+        for (const auto& c : cmds) {
             draws += c.name.find("CommandBufferDraw") != std::string_view::npos;
-        const bool capture = v.phase.load() == 0 && draws >= 100 &&
+            copies += c.name.find("CommandBufferCopy") != std::string_view::npos;
+        }
+        const bool want_copies = v.copies_mode;
+        const bool capture = v.phase.load() == 0 && (want_copies ? copies >= 4 : draws >= 100) &&
                              u64(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - v.t0).count()) >= v.at_ms;
         Maxwell3D& m = v.enc->M();
         if (capture) {
             m.capture = [&v](const Maxwell3D& mm) { v.enc_snaps.push_back(TakeSnap(*v.gpu, mm, v.enc->current)); };
+            v.enc->on_copy = [&v](const DmaLaunch& l) {
+                v.enc_copy.push_back(Canonical(l.r.data(), l.launch));
+                v.enc_copy_cmd.push_back(v.enc->current);
+            };
             v.enc->on_dispatch = [&v](const Encoder::Launch& l) {
                 auto c = TakeCSnap(*v.gpu, l.r.data(), l.q.data(), v.enc->current);
                 c.code = l.code, c.control = l.control;
@@ -1241,12 +1535,13 @@ void InstallNvnEncoder(Gpu& gpu) {
         } else {
             m.capture = [](const Maxwell3D&) {};
             v.enc->on_dispatch = nullptr;
+            v.enc->on_copy = [](const DmaLaunch&) {};
         }
         v.enc->Run(cmds);
         if (capture) {
             v.unhandled = v.enc->unhandled;
             v.no_shadow = v.enc->no_shadow;
-            v.want = v.enc_snaps.size() + v.enc_snaps.size() / 4 + 32;
+            v.want = want_copies ? v.enc_copy.size() + 64 : v.enc_snaps.size() + v.enc_snaps.size() / 4 + 32;
             LOG_INFO("NVN", "verify: encoded {} commands, {} draws; waiting for the driver's", cmds.size(), v.enc_snaps.size());
             v.phase = 1;
             v.gpu->tag_next_submit = true;

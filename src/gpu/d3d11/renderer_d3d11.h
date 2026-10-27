@@ -65,6 +65,10 @@ public:
     void InvalidateRegion(u64 gpu_va, u64 size) override;
     bool Blit2D(const u32* regs) override;
     void FlushCommands() override;
+    void SyncRegion(u64 gpu_va, u64 size) override {
+        std::lock_guard ctx_lock(ContextMutex());
+        SyncGuest(gpu_va, size);
+    }
 
     // Latest presented frame for the window (thread-safe).
     ID3D11ShaderResourceView* LatestFrame(u32& w, u32& h);

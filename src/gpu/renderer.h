@@ -20,6 +20,8 @@ public:
     // Compute launch (Kepler compute LAUNCH): `regs` = compute engine registers, `qmd` = the 0x40-word launch
     // descriptor it points at.
     virtual void Dispatch(const u32* regs, const u32* qmd) {}
+    // Lands the results of earlier GPU work (compute) that overlap [gpu_va, +size) in guest memory.
+    virtual void SyncRegion(u64 gpu_va, u64 size) {}
     // Called at the end of each command submission.
     virtual void FlushCommands() {}
 };

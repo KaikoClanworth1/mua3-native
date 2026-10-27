@@ -5,6 +5,7 @@
 #include <chrono>
 #include <bit>
 #include <set>
+#include <tuple>
 #include <fstream>
 #include <atomic>
 #include <cstdlib>
@@ -92,14 +93,18 @@ void DeviceGetTextureHandle(State& s) {
 struct PoolDesc {
     u64 size = 0, cpu = 0, gpu = 0;
     u32 flags = 0;
+    u64 tex_delta = ~0ull; // texture mapping vs buffer address, learned from registered descriptors (~0: unknown)
 };
 struct BufferDesc {
     u64 pool = 0, offset = 0, size = 0, gpu = 0;
 };
 struct TextureDesc {
     u64 pool = 0, offset = 0, storage = 0;
+    u64 va = 0; // texture mapping address, from its descriptor once registered (0: unknown)
+    u32 flags = 0;
     u32 width = 0, height = 0, depth = 0, levels = 0, format = 0, target = 0;
 };
+u64 TextureVa(const PoolDesc& p, const TextureDesc& d);
 struct Objects {
     std::mutex mutex;
     std::unordered_map<u64, PoolDesc> pools;
@@ -200,6 +205,9 @@ TextureDesc DescribeTexture(State& s, u64 tex) {
     d.levels = u32(Get(s, "nvnTextureGetLevels", tex));
     d.format = u32(Get(s, "nvnTextureGetFormat", tex));
     d.target = u32(Get(s, "nvnTextureGetTarget", tex));
+    d.flags = u32(Get(s, "nvnTextureGetFlags", tex));
+    // the texture mapping address (pools can be mapped several times, by memory kind)
+    d.va = Get(s, "nvnTextureGetTextureAddress", tex);
     return d;
 }
 // Textures the Initialize wrapper did not see (render targets made before the hooks, or by unobserved code) are
@@ -284,6 +292,33 @@ void TexturePoolRegisterTexture(State& s) {
     auto& o = Obj();
     std::lock_guard lk(o.mutex);
     o.texture_ids[id] = {tex, view};
+    // Where textures of this pool are mapped: the descriptor holds the texture's address (offset by any view's base
+    // layer, so the smallest difference wins).
+    if (auto t = o.textures.find(tex); t != o.textures.end())
+        if (auto tp = o.texture_pools.find(pool); tp != o.texture_pools.end())
+            if (auto mp = o.pools.find(t->second.pool); mp != o.pools.end()) {
+                u32 tic[3]{};
+                if (gpu::G().ReadGpu(tp->second + u64(id) * 32, tic, sizeof(tic))) {
+                    const u64 va = (u64(tic[2] & 0xFFFF) << 32) | tic[1];
+                    const u64 base = mp->second.gpu + t->second.offset;
+                    if (va >= base) { // (learning table: which mapping each kind of texture uses)
+                        static std::set<std::tuple<u64, u32, u64>> seen;
+                        const u64 mult = mp->second.size ? (va - base) / mp->second.size : 0;
+                        if (seen.insert({t->second.pool, t->second.flags, mult}).second)
+                            LOG_INFO("NVN", "texture mapping: pool {:#x} (flags {:#x}) texture flags {:#x} format {:#x} -> + {} x pool size (+{:#x})",
+                                     t->second.pool, mp->second.flags, t->second.flags, t->second.format, mult, (va - base) % std::max<u64>(mp->second.size, 1));
+                    }
+                    static int mismatches = 0;
+                    if (va != TextureVa(mp->second, t->second) && mismatches++ < 8) // (views with a base layer differ)
+                        LOG_WARN("NVN", "texture {:#x}: descriptor address {:#x}, nvnTextureGetTextureAddress {:#x}", tex, va,
+                                 t->second.va);
+                    if (va >= base && va - base < (1ull << 36) && va - base < mp->second.tex_delta) {
+                        if (mp->second.tex_delta == ~0ull)
+                            LOG_INFO("NVN", "memory pool {:#x}: textures mapped at buffer address + {:#x}", t->second.pool, va - base);
+                        mp->second.tex_delta = va - base;
+                    }
+                }
+            }
     // MUA3_NVN_LEARN: the hardware descriptor the driver just wrote, per NVN format (the renderer maps TIC formats)
     static const bool learn = std::getenv("MUA3_NVN_LEARN") != nullptr;
     if (learn) { // (KTGL always passes a view; it rarely changes the format)
@@ -336,6 +371,9 @@ struct GenericSlot {
     u32 raw_elem = 0;
     bool objects = false;
     bool indexed = false; // setter whose first argument selects what it sets (render target, face)
+    bool host = false;    // MUA3_NVN_NATIVE: the host encoder executes it; the driver never sees it
+    // texture copies: argument indices of their NVNtextureView* and NVNcopyRegion* pairs (-1 = none)
+    int copy_view[2] = {-1, -1}, copy_region[2] = {-1, -1};
 };
 constexpr int kGenericSlots = 320;
 std::array<GenericSlot, kGenericSlots> g_generic;
@@ -414,6 +452,22 @@ void Generic(State& s) {
             c.handles.push_back(recomp::Rd<u64>(s, s.x[2] + i * 16 + 8));
         }
     const bool replay = g_sink.load() != nullptr;
+    // copies: regions (6 ints each) into raw, views into objects (below)
+    if (replay)
+        for (int k = 0; k < 2; k++)
+            if (g.copy_region[k] >= 0) {
+                const u64 r = s.x[g.copy_region[k]];
+                for (u32 o = 0; o < 24; o += 8)
+                    c.raw.push_back(r ? recomp::Rd<u64>(s, r + o) : 0);
+            }
+    // ... followed by the views' raw bytes (5 words each; the game fills them without setters)
+    if (replay)
+        for (int k = 0; k < 2; k++)
+            if (g.copy_view[k] >= 0) {
+                const u64 v = s.x[g.copy_view[k]];
+                for (u32 o = 0; o < 40; o += 8)
+                    c.raw.push_back(v ? recomp::Rd<u64>(s, v + o) : 0);
+            }
     u32 raw_n = 0;
     if (replay && g.raw_ptr >= 0 && s.x[g.raw_ptr]) {
         raw_n = g.raw_count >= 0 ? std::min<u32>(u32(s.x[g.raw_count]), 32) : 1;
@@ -437,6 +491,17 @@ void Generic(State& s) {
         auto& rec = Rec();
         std::lock_guard lk(rec.mutex);
         if (g.kind == Kind::Command) {
+            if (replay && g.copy_view[0] >= 0)
+                for (int k = 0; k < 2 && g.copy_view[k] >= 0; k++) {
+                    auto& calls = c.objects.emplace_back();
+                    if (auto it = rec.shadow.find(s.x[g.copy_view[k]]); s.x[g.copy_view[k]] && it != rec.shadow.end())
+                        for (const Command& sc : it->second) {
+                            StateCall& kc = calls.emplace_back();
+                            kc.name = g_generic[sc.fn].name;
+                            std::memcpy(kc.x, sc.x, sizeof(kc.x));
+                            std::memcpy(kc.v, sc.v, sizeof(kc.v));
+                        }
+                }
             if (g.objects)
                 for (u32 i = 0; i < raw_n; i++) {
                     auto& calls = c.objects.emplace_back();
@@ -464,6 +529,8 @@ void Generic(State& s) {
             obj.push_back(std::move(c));
         }
     }
+    if (g.host)
+        return Return(s, 0);
     g.driver(s);
 }
 template <size_t... I>
@@ -544,7 +611,16 @@ void CommandBufferEndRecording(State& s) {
 
 // ---- draw resolution (front half of the native replay): walks one submitted frame in order, tracking bound state,
 // and resolves each draw's resources with the learned driver conventions (docs/native_renderer_plan.md).
-constexpr u64 kTextureVaDelta = 0xC3C00000ull; // texture mapping of the main pool vs its buffer address
+// Where the driver maps a pool's textures (learned against its descriptors): a COMPRESSIBLE pool (flag 0x80) is mapped
+// again after its buffer mapping for plain textures (+ size) and once more for compressible ones (+ 2 * size, render
+// targets); other pools use their buffer mapping.
+u64 TextureVa(const PoolDesc& p, const TextureDesc& d) {
+    if (d.va)
+        return d.va;
+    if (!(p.flags & 0x80))
+        return p.gpu + d.offset;
+    return p.gpu + d.offset + p.size * ((d.flags & 8) ? 2 : 1);
+}
 const std::unordered_map<u32, u32> kRtFormat = {{0x25, 0xD5}, {0x38, 0xD6}, {0x3D, 0xD1}, {0x3F, 0xE0},
                                                 {0x0A, 0xE5}, {0x29, 0xCA}, {0x34, 0x0A}};
 struct BoundStage {
@@ -565,7 +641,7 @@ bool TextureVa(Objects& o, u64 tex, u64& va, u32& fmt) {
     auto p = o.pools.find(t->second.pool);
     if (p == o.pools.end())
         return false;
-    va = p->second.gpu + t->second.offset + kTextureVaDelta;
+    va = TextureVa(p->second, t->second);
     fmt = t->second.format;
     return true;
 }
@@ -888,6 +964,11 @@ void ResolveMissing(State& s, recomp::Fn lookup, u64 lookup_pc, u64 device,
 
 std::atomic<long long> g_learn_until_ms{0};
 
+bool Native() {
+    static const bool native = std::getenv("MUA3_NVN_NATIVE") != nullptr;
+    return native;
+}
+
 void SetReplaySink(std::function<void(std::vector<ReplayCommand>&&)> sink) {
     g_sink = new std::function<void(std::vector<ReplayCommand>&&)>(std::move(sink)); // lives for the process
 }
@@ -902,7 +983,7 @@ bool QueryTexture(u64 texture, TextureInfo& out) {
     if (p == o.pools.end())
         return false;
     const TextureDesc& d = t->second;
-    out = {p->second.gpu + d.offset + kTextureVaDelta, d.width, d.height, d.depth, d.levels, d.format, d.target};
+    out = {TextureVa(p->second, d), d.width, d.height, d.depth, d.levels, d.format, d.target};
     return true;
 }
 
@@ -959,7 +1040,7 @@ recomp::Fn Find(std::string_view name, recomp::Fn driver, u64 pc) {
         std::lock_guard lk(g_names_mutex);
         Driver().emplace(std::string(name), DriverEntry{driver, pc}); // the getters wrappers call
     }
-    static const bool record = std::getenv("MUA3_NVN_RECORD") != nullptr;
+    static const bool record = std::getenv("MUA3_NVN_RECORD") != nullptr || Native();
     if (!entry && record && driver) {
         Kind kind;
         if (!GenericKind(name, kind))
@@ -980,6 +1061,26 @@ recomp::Fn Find(std::string_view name, recomp::Fn driver, u64 pc) {
         g.defaults = name.find("SetDefaults") != std::string_view::npos;
         g.shaders = name == "nvnProgramSetShaders";
         g.rts = name == "nvnCommandBufferSetRenderTargets";
+        if (name == "nvnCommandBufferCopyBufferToTexture") // (cb, src, dst, dstView, dstRegion, flags)
+            g.copy_view[0] = 3, g.copy_region[0] = 4;
+        else if (name == "nvnCommandBufferCopyTextureToBuffer") // (cb, src, srcView, srcRegion, dst, flags)
+            g.copy_view[0] = 2, g.copy_region[0] = 3;
+        else if (name == "nvnCommandBufferCopyTextureToTexture") // (cb, src, srcView, srcRegion, dst, dstView, dstRegion, flags)
+            g.copy_view[0] = 2, g.copy_region[0] = 3, g.copy_view[1] = 5, g.copy_region[1] = 6;
+        if (kind == Kind::Command && Native()) {
+            // exactly what the host encoder implements; everything else (fences, counters, copies, ...) still goes
+            // to the driver, whose submissions run after the host's work of the same submit
+            static const std::set<std::string_view> host = {
+                "BindProgram", "BindUniformBuffer", "BindStorageBuffer", "BindTexture", "BindImage", "BindVertexBuffer",
+                "BindVertexAttribState", "BindVertexStreamState", "SetRenderTargets", "SetViewports", "SetDepthRanges",
+                "SetScissors", "SetScissor", "BindBlendState", "BindColorState", "BindChannelMaskState",
+                "BindDepthStencilState", "BindPolygonState", "BindMultisampleState", "Barrier", "SetDepthBounds",
+                "SetPatchSize", "SetShaderScratchMemory", "SetRenderEnable", "SetRenderEnableConditional",
+                "SetStencilRef", "SetStencilValueMask", "SetStencilMask", "SetPolygonOffsetClamp", "SetPrimitiveRestart",
+                "SetTexturePool", "SetSamplerPool", "ClearColor", "ClearDepthStencil", "DrawArrays", "DrawElements",
+                "DrawElementsBaseVertex", "DrawElementsIndirect", "DrawArraysIndirect", "DispatchCompute"};
+            g.host = host.count(name.substr(16)) != 0;
+        }
         for (std::string_view k : {"SetBlendEnable", "SetChannelMask", "SetStencilFunc", "SetStencilOp", "SetStencilMask",
                                    "SetStencilValueMask", "SetStencilRef"})
             g.indexed |= kind == Kind::Setter && name.find(k) != std::string_view::npos;

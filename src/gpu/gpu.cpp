@@ -236,6 +236,16 @@ void Gpu::Submit(std::vector<u64> entries, u32 syncpt_id, u32 syncpt_incr) {
         WaitIdle();
 }
 
+void Gpu::SubmitHost(std::function<void()> fn) {
+    {
+        std::lock_guard lk(queue_mutex_);
+        Job j{Job::Host};
+        j.host = std::move(fn);
+        queue_.push_back(std::move(j));
+    }
+    queue_cv_.notify_one();
+}
+
 void Gpu::QueuePresent(const PresentInfo& p) {
     {
         std::lock_guard lk(queue_mutex_);
@@ -277,6 +287,14 @@ void Gpu::ThreadMain() {
                 renderer_->FlushCommands();
             if (job.syncpt_incr)
                 IncrementSyncpoint(job.syncpt_id, job.syncpt_incr);
+            break;
+        }
+        case Job::Host: {
+            const u64 t0 = NowNs();
+            job.host();
+            busy_ns += NowNs() - t0;
+            if (renderer_)
+                renderer_->FlushCommands();
             break;
         }
         case Job::Present:
@@ -385,6 +403,8 @@ inline u64 BlockLinearOffset(u32 x, u32 y, u32 z, u32 width_bytes, u32 height, u
 
 // Maxwell DMA engine (0xB0B5): pitch/block-linear copies used by NVN for texture and buffer uploads.
 void Gpu::RunDma(const u32* r, u32 launch) {
+    if (intercept_dma && intercept_dma(r, launch))
+        return;
     const u64 src = (u64(r[0x100] & 0xFF) << 32) | r[0x101];
     const u64 dst = (u64(r[0x102] & 0xFF) << 32) | r[0x103];
     const u32 pitch_in = r[0x104], pitch_out = r[0x105];

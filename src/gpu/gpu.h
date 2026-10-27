@@ -90,6 +90,12 @@ public:
     // ---- submission (any thread). Work runs in order on the GPU thread.
     void Submit(std::vector<u64> entries, u32 syncpt_id, u32 syncpt_incr);
     void QueuePresent(const PresentInfo& p);
+    // Runs `fn` on the GPU thread, in order with the command submissions (native NVN replay).
+    void SubmitHost(std::function<void()> fn);
+    // DMA copy engine LAUNCH (0xB0B5 method 0xC0) with its registers; GPU thread.
+    void RunDma(const u32* regs, u32 launch);
+    // Sees every DMA launch first; returns true if it took care of it (verification of the native replay's copies).
+    std::function<bool(const u32* regs, u32 launch)> intercept_dma;
     void WaitIdle();
     void* NativeThreadHandle() { return thread_.native_handle(); }
 
@@ -110,8 +116,9 @@ public:
 
 private:
     struct Job {
-        enum Kind { Commands, Present, Fence } kind;
+        enum Kind { Commands, Present, Fence, Host } kind;
         bool tagged = false;
+        std::function<void()> host;
         std::vector<u64> entries;
         u32 syncpt_id = 0, syncpt_incr = 0;
         PresentInfo present;
@@ -122,7 +129,6 @@ private:
     u32 dma_mode_ = 0, dma_subch_ = 0, dma_method_ = 0, dma_count_ = 0, dma_k_ = 0; // pending method data
     void CallMethod(u32 subch, u32 method, u32 arg, bool last_in_batch);
     void FlushMacro();
-    void RunDma(const u32* regs, u32 launch);
 
     core::Memory& mem_;
     AddressSpace as_;
