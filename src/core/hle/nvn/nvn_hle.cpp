@@ -523,6 +523,8 @@ void Generic(State& s) {
             auto& obj = rec.shadow[s.x[0]];
             if (g.defaults)
                 obj.clear();
+            if (obj.capacity() < 8)
+                obj.reserve(8);
             auto same = std::find_if(obj.begin(), obj.end(),
                                      [&](const Command& o) { return o.fn == I && (!g.indexed || o.x[1] == c.x[1]); });
             if (same != obj.end())
@@ -588,7 +590,10 @@ void CommandBufferBeginRecording(State& s) {
         return;
     auto& rec = Rec();
     std::lock_guard lk(rec.mutex);
-    rec.open[cb].clear();
+    auto& open = rec.open[cb];
+    open.clear();
+    if (open.capacity() < 256)
+        open.reserve(256);
     rec.begins++;
 }
 void CommandBufferEndRecording(State& s) {
