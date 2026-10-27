@@ -206,6 +206,7 @@ void BufferFinalize(State& s) {
     std::lock_guard lk(o.mutex);
     o.buffers.erase(buffer);
 }
+std::atomic<u64> g_texture_generation{1}; // bumped by every texture Initialize/Finalize (registration cache)
 TextureDesc DescribeTexture(State& s, u64 tex) {
     TextureDesc d;
     d.pool = Get(s, "nvnTextureGetMemoryPool", tex);
@@ -243,6 +244,7 @@ void EnsureTexture(State& s, u64 tex) {
              d.format, d.pool, d.offset);
 }
 void TextureInitialize(State& s) {
+    g_texture_generation.fetch_add(1, std::memory_order_release);
     u64 tex, ok;
     if (!Through(s, kTextureInitialize, tex, ok) || !(ok & 1))
         return;
@@ -257,6 +259,7 @@ void TextureInitialize(State& s) {
                  o.textures.size(), o.buffers.size(), o.pools.size(), o.texture_ids.size(), o.sampler_ids.size());
 }
 void TextureFinalize(State& s) {
+    g_texture_generation.fetch_add(1, std::memory_order_release);
     u64 tex, r;
     if (!Through(s, kTextureFinalize, tex, r))
         return;
@@ -298,6 +301,29 @@ void SamplerPoolInitialize(State& s) {
 void TexturePoolRegisterTexture(State& s) {
     const u32 id = u32(s.x[1]);
     const u64 tex = s.x[2], view = s.x[3];
+    // KTGL re-registers the same texture (and view) under the same id every frame: the descriptor the driver wrote
+    // last time is still in the pool, so skip the driver unless something changed: compared on the texture
+    // pointer, the view's contents and the texture generation (any texture initialized or finalized since).
+    struct Reg {
+        u64 pool = 0, tex = 0, generation = 0;
+        u64 view[5]{};
+        bool has_view = false;
+    };
+    static std::mutex cache_mutex;
+    static std::unordered_map<u64, Reg> last; // (pool, id)
+    static const bool cache = std::getenv("MUA3_NVN_NO_REGCACHE") == nullptr;
+    if (cache) {
+        Reg now{s.x[0], tex, g_texture_generation.load(std::memory_order_acquire), {}, view != 0};
+        if (view)
+            for (u32 k = 0; k < 5; k++)
+                now.view[k] = recomp::Rd<u64>(s, view + k * 8);
+        std::lock_guard lk(cache_mutex);
+        auto& prev = last[(s.x[0] << 20) ^ id];
+        if (prev.pool == now.pool && prev.tex == now.tex && prev.generation == now.generation &&
+            prev.has_view == now.has_view && std::memcmp(prev.view, now.view, sizeof(now.view)) == 0)
+            return Return(s, 0);
+        prev = now;
+    }
     u64 pool, r;
     static const bool learn_va = std::getenv("MUA3_NVN_LEARN") != nullptr;
     if (!Through(s, kTexturePoolRegisterTexture, pool, r) || !learn_va) // (the rest is diagnostics)
@@ -395,17 +421,26 @@ CommandList Publish(std::vector<Command>&& list) {
         delete v;
     });
 }
-// Storage for the next recording: a recycled list if one is free.
-std::vector<Command> FreshList() {
-    auto& p = Pool();
-    std::lock_guard lk(p.mutex);
-    if (p.free.empty()) {
-        std::vector<Command> v;
-        v.reserve(256);
-        return v;
+// Storage for the next recording of a command buffer whose last one had `want` commands: the smallest recycled list
+// that fits (a big command buffer regrowing into fresh pages costs more than the recording itself).
+std::vector<Command> FreshList(size_t want) {
+    want = std::max<size_t>(want + want / 4, 256);
+    std::vector<Command> v;
+    {
+        auto& p = Pool();
+        std::lock_guard lk(p.mutex);
+        size_t best = p.free.size();
+        for (size_t i = 0; i < p.free.size(); i++)
+            if (p.free[i].capacity() >= want && (best == p.free.size() || p.free[i].capacity() < p.free[best].capacity()))
+                best = i;
+        if (best < p.free.size()) {
+            v = std::move(p.free[best]);
+            p.free[best] = std::move(p.free.back());
+            p.free.pop_back();
+        }
     }
-    std::vector<Command> v = std::move(p.free.back());
-    p.free.pop_back();
+    if (v.capacity() < want)
+        v.reserve(want);
     return v;
 }
 enum class Kind { Command, Setter };
@@ -447,7 +482,6 @@ Recording& Rec() {
 std::atomic<std::function<void(std::vector<ReplaySpan>&&)>*> g_sink{nullptr};
 extern "C" __declspec(dllimport) void* __stdcall GetCurrentThread();
 std::atomic<u64> g_submit_ns{0}, g_record_cycles{0}; // recorder cost diagnostics
-std::atomic<u64> g_grow[4]{}; // list reallocations: fast path, locked commands, shadows, nested
 inline u64 NowNs() {
     return u64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 }
@@ -482,7 +516,19 @@ void Generic(State& s) {
         return g_generic[I].driver(s);
     const u64 cycles0 = __rdtsc();
     const GenericSlot& g = g_generic[I];
-    Command c;
+    // Commands append to the calling thread's current command buffer without the lock (each command buffer is
+    // recorded by one thread; map nodes are stable, so the cached list stays valid), built in place.
+    thread_local u64 tls_cb = 0;
+    thread_local std::vector<Command>* tls_list = nullptr;
+    const bool fast = g.kind == Kind::Command && !g.objects;
+    if (fast && (tls_cb != s.x[0] || !tls_list)) {
+        auto& rec = Rec();
+        std::lock_guard lk(rec.mutex);
+        tls_list = &rec.open[s.x[0]];
+        tls_cb = s.x[0];
+    }
+    Command local;
+    Command& c = fast ? tls_list->emplace_back() : local;
     c.fn = I;
     c.name = g.name;
     for (int k = 0; k < 8; k++)
@@ -526,20 +572,10 @@ void Generic(State& s) {
         for (u32 o = 0; o < raw_n * g.raw_elem; o += 8)
             c.raw.push_back(recomp::Rd<u64>(s, s.x[g.raw_ptr] + o));
     }
-    // Commands append to the calling thread's current command buffer without the lock (each command buffer is
-    // recorded by one thread; map nodes are stable, so the cached list stays valid).
-    thread_local u64 tls_cb = 0;
-    thread_local std::vector<Command>* tls_list = nullptr;
-    if (g.kind == Kind::Command && !g.objects) {
-        if (tls_cb != s.x[0] || !tls_list) {
-            auto& rec = Rec();
-            std::lock_guard lk(rec.mutex);
-            tls_list = &rec.open[s.x[0]];
-            tls_cb = s.x[0];
-        }
-        g_grow[0] += tls_list->size() == tls_list->capacity();
-        tls_list->push_back(std::move(c));
-        Rec().recorded.fetch_add(1, std::memory_order_relaxed);
+    // per-thread counters, flushed now and then (shared atomics per command bounce between the recording threads)
+    thread_local u64 tls_recorded = 0, tls_cycles = 0;
+    if (fast) {
+        ++tls_recorded;
     } else {
         auto& rec = Rec();
         std::lock_guard lk(rec.mutex);
@@ -571,10 +607,8 @@ void Generic(State& s) {
                     }
                 }
             }
-            auto& list = rec.open[s.x[0]];
-            g_grow[1] += list.size() == list.capacity();
-            list.push_back(std::move(c));
-            rec.recorded++;
+            rec.open[s.x[0]].push_back(std::move(c));
+            ++tls_recorded;
         } else {
             auto& obj = rec.shadow[s.x[0]];
             if (g.defaults)
@@ -587,11 +621,15 @@ void Generic(State& s) {
                 obj.erase(same);
             else if (obj.size() >= 64)
                 obj.erase(obj.begin());
-            g_grow[2] += obj.size() == obj.capacity();
             obj.push_back(std::move(c));
         }
     }
-    g_record_cycles.fetch_add(__rdtsc() - cycles0, std::memory_order_relaxed);
+    tls_cycles += __rdtsc() - cycles0;
+    if ((tls_recorded & 4095) == 0 && tls_recorded) {
+        Rec().recorded.fetch_add(tls_recorded, std::memory_order_relaxed);
+        g_record_cycles.fetch_add(tls_cycles, std::memory_order_relaxed);
+        tls_recorded = tls_cycles = 0;
+    }
     if (g.host)
         return Return(s, 0);
     g.driver(s);
@@ -671,8 +709,9 @@ void CommandBufferEndRecording(State& s) {
     auto& slot = rec.handles[handle];
     auto& open = rec.open[cb];
     if (!open.empty() || !slot) {
+        const size_t n = open.size();
         slot = Publish(std::move(open));
-        open = FreshList();
+        open = FreshList(n);
     } else
         open.clear();
 }
@@ -946,11 +985,10 @@ void QueueSubmitCommands(State& s) {
     if (++rec.submits % 600 == 0) {
         LOG_INFO("NVN", "recorded stream, per submit: {:.0f} commands, {:.0f} draws ({:.0f} indirect), {:.1f} "
                         "dispatches; {} unrecorded handles (recorded {}, begins {}, ends {}, empty {}); submit {:.2f} ms, "
-                        "recording {:.0f} Mcycles, list growth {} {} {}",
+                        "recording {:.0f} Mcycles",
                  double(rec.cmds) / 600, double(rec.draws) / 600, double(rec.indirect) / 600,
                  double(rec.dispatches) / 600, rec.unknown, rec.recorded.load(), rec.begins, rec.ends, rec.empty_ends,
-                 g_submit_ns.exchange(0) / 600e6, g_record_cycles.exchange(0) / 600e6, g_grow[0].exchange(0) / 600,
-                 g_grow[1].exchange(0) / 600, g_grow[2].exchange(0) / 600);
+                 g_submit_ns.exchange(0) / 600e6, g_record_cycles.exchange(0) / 600e6);
         rec.cmds = rec.draws = rec.indirect = rec.dispatches = rec.unknown = 0;
     }
     }
