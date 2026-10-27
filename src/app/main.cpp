@@ -457,6 +457,13 @@ int main(int argc, char** argv) {
     common::SetLogLevel(common::LogLevel(std::clamp(cfg.log_level, 0, 5)));
     common::SetLogFile("mua3.log");
     timeBeginPeriod(1);
+    // The exe names its PDB without a path (/PDBALTPATH): let in-process symbol lookups (profilers, stack dumps)
+    // search the exe's folder.
+    {
+        wchar_t exe[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        SetEnvironmentVariableW(L"_NT_SYMBOL_PATH", fs::path(exe).parent_path().c_str());
+    }
 
     core::System sys(cfg);
     std::string error;

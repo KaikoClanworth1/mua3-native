@@ -203,6 +203,32 @@ CopyOp Canonical(const u32* r, u32 launch) {
     return c;
 }
 
+// One submit's commands: the recorder's shared lists (kept alive) and the commands in execution order.
+struct Frame {
+    std::vector<hle::nvn::ReplaySpan> spans;
+    std::vector<const ReplayCommand*> cmds;
+
+    explicit Frame(std::vector<hle::nvn::ReplaySpan>&& s = {}) : spans(std::move(s)) {
+        for (const auto& sp : spans)
+            for (size_t i = sp.begin; i < sp.end; i++)
+                cmds.push_back(&(*sp.list)[i]);
+    }
+    void Append(Frame&& f) {
+        spans.insert(spans.end(), std::make_move_iterator(f.spans.begin()), std::make_move_iterator(f.spans.end()));
+        cmds.insert(cmds.end(), f.cmds.begin(), f.cmds.end());
+    }
+    size_t size() const { return cmds.size(); }
+    const ReplayCommand& operator[](size_t i) const { return *cmds[i]; }
+    struct Iter {
+        const ReplayCommand* const* p;
+        const ReplayCommand& operator*() const { return **p; }
+        Iter& operator++() { return ++p, *this; }
+        bool operator!=(const Iter& o) const { return p != o.p; }
+    };
+    Iter begin() const { return {cmds.data()}; }
+    Iter end() const { return {cmds.data() + cmds.size()}; }
+};
+
 bool Is(std::string_view name, std::string_view suffix) {
     return name.size() >= suffix.size() && name.substr(name.size() - suffix.size()) == suffix;
 }
@@ -263,7 +289,7 @@ public:
     std::map<std::string, u64> unhandled;
     u64 no_shadow = 0;
 
-    void Run(const std::vector<ReplayCommand>& cmds) {
+    void Run(const Frame& cmds) {
         for (size_t i = 0; i < cmds.size(); i++) {
             current = int(i);
             Encode(cmds[i]);
@@ -273,15 +299,14 @@ public:
 
     // ---- native replay in step with the command stream (MUA3_NVN_REPLAY): submits are queued by the game thread and
     // encoded on the GPU thread, one draw command at a time.
-    void Queue(std::vector<ReplayCommand>&& cmds) {
+    void Queue(Frame&& cmds) {
         bool draws = false;
         for (const auto& c : cmds)
             draws |= c.name.find("CommandBufferDraw") != std::string_view::npos;
         std::lock_guard lk(queue_mutex_);
         // submits without draws (uploads while loading) join the previous one: only draws drain the queue
         if (!draws && !queue_.empty()) {
-            auto& last = queue_.back();
-            last.insert(last.end(), std::make_move_iterator(cmds.begin()), std::make_move_iterator(cmds.end()));
+            queue_.back().Append(std::move(cmds));
             return;
         }
         queue_.push_back(std::move(cmds));
@@ -952,8 +977,8 @@ private:
     u64 cs_code_ = 0, cs_control_ = 0;
     u32 row_stride_ = 0, image_stride_ = 0;
     std::mutex queue_mutex_;
-    std::deque<std::vector<ReplayCommand>> queue_;
-    std::vector<ReplayCommand> frame_;
+    std::deque<Frame> queue_;
+    Frame frame_;
     size_t pos_ = 0;
     u32 instances_ = 0;
     struct Stream {
@@ -1397,7 +1422,7 @@ void InstallReplay(Gpu& gpu) {
             return false;
         };
     }
-    hle::nvn::SetReplaySink([](std::vector<ReplayCommand>&& cmds) { r.enc->Queue(std::move(cmds)); });
+    hle::nvn::SetReplaySink([](std::vector<hle::nvn::ReplaySpan>&& spans) { r.enc->Queue(Frame(std::move(spans))); });
     LOG_INFO("NVN", "native replay: draws come from the host NVN encoder");
 }
 
@@ -1408,8 +1433,8 @@ void InstallNative(Gpu& gpu) {
     static Gpu* g = &gpu;
     static Encoder* enc = new Encoder(gpu);
     enc->render_compute = true;
-    hle::nvn::SetReplaySink([](std::vector<ReplayCommand>&& cmds) {
-        auto list = std::make_shared<std::vector<ReplayCommand>>(std::move(cmds));
+    hle::nvn::SetReplaySink([](std::vector<hle::nvn::ReplaySpan>&& spans) {
+        auto list = std::make_shared<Frame>(std::move(spans));
         g->SubmitHost([list] {
             static u64 jobs = 0, ns = 0, cmds = 0;
             const u64 t0 = g->NowNs();
@@ -1475,7 +1500,8 @@ void InstallNvnEncoder(Gpu& gpu) {
             v.phase = 2;
         }
     };
-    hle::nvn::SetReplaySink([&v](std::vector<ReplayCommand>&& cmds) {
+    hle::nvn::SetReplaySink([&v](std::vector<hle::nvn::ReplaySpan>&& spans) {
+        const Frame cmds(std::move(spans));
         size_t draws = 0, copies = 0;
         for (const auto& c : cmds) {
             draws += c.name.find("CommandBufferDraw") != std::string_view::npos;

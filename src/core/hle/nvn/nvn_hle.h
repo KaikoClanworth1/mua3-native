@@ -5,6 +5,7 @@
 // See docs/native_renderer_plan.md.
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <string_view>
 #include <vector>
 
@@ -40,16 +41,22 @@ struct StateCall {
     std::vector<recomp::u64> handles; // nvnProgramSetShaders: {code address, control pointer} per stage
 };
 struct ReplayCommand {
-    std::string_view name;          // NVN entry point, e.g. "nvnCommandBufferDrawElementsBaseVertex"
-    recomp::u64 x[8];               // integer/pointer arguments (x[0] = command buffer)
-    recomp::u32 v[4];               // float arguments
+    std::string_view name;          // NVN entry point, e.g. "nvnCommandBufferDrawElementsBaseVertex" (empty: nested)
+    recomp::u64 x[8]{};             // integer/pointer arguments (x[0] = command buffer)
+    recomp::u32 v[4]{};             // float arguments
     std::vector<recomp::u64> extra; // captured arrays (SetRenderTargets colour textures, ...)
     std::vector<recomp::u64> raw;   // memory the command points at, read at record time (viewports, state objects)
     // state objects the command binds (BindProgram, Bind*State, vertex attrib/stream arrays): their setter calls
     // since SetDefaults, as of record time (the game builds many of them on the stack)
     std::vector<std::vector<StateCall>> objects;
+    int fn = -1; // recorder slot (-1: Call/CopyCommands, whose nested handles are in `extra`)
 };
-void SetReplaySink(std::function<void(std::vector<ReplayCommand>&&)> sink);
+// A submit, in execution order: ranges of recorded command lists (shared, never copied).
+struct ReplaySpan {
+    std::shared_ptr<const std::vector<ReplayCommand>> list;
+    size_t begin = 0, end = 0;
+};
+void SetReplaySink(std::function<void(std::vector<ReplaySpan>&&)> sink);
 
 struct TextureInfo {
     recomp::u64 gpu = 0; // texture GPU address (texture mapping)

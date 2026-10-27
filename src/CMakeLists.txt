@@ -54,7 +54,7 @@ target_link_libraries(mua3 PRIVATE nxcore platform dbghelp)
 # incremental-link thunks would sit between every pair of recompiled functions
 # /PDBALTPATH: the exe names its PDB without a path, so copies of the game load the PDB next to them (and a running
 # copy does not lock the build's PDB).
-target_link_options(mua3 PRIVATE /INCREMENTAL:NO /PDBALTPATH:%_PDB%)
+target_link_options(mua3 PRIVATE /INCREMENTAL:NO /PDBALTPATH:mua3.pdb)
 
 add_executable(MUA3Launcher WIN32 launcher/launcher.cpp)
 target_link_libraries(MUA3Launcher PRIVATE nxloader platform windowscodecs)

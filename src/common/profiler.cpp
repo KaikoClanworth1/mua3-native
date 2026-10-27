@@ -27,22 +27,28 @@ void StartSamplingProfiler(void* thread_handle, const char* name, int seconds, i
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             if (SuspendThread(dup) == DWORD(-1))
                 break;
+            // Only raw return addresses while the thread is suspended: it may hold the heap or dbghelp locks, so
+            // nothing here may allocate (StackWalk64 does).
             CONTEXT ctx{};
             ctx.ContextFlags = CONTEXT_FULL;
-            GetThreadContext(dup, &ctx);
-            STACKFRAME64 f{};
-            f.AddrPC = {ctx.Rip, 0, AddrModeFlat};
-            f.AddrFrame = {ctx.Rbp, 0, AddrModeFlat};
-            f.AddrStack = {ctx.Rsp, 0, AddrModeFlat};
-            std::vector<DWORD64> pcs;
-            for (int i = 0; i < 12; i++) {
-                if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, GetCurrentProcess(), dup, &f, &ctx, nullptr,
-                                 SymFunctionTableAccess64, SymGetModuleBase64, nullptr) ||
-                    !f.AddrPC.Offset)
-                    break;
-                pcs.push_back(f.AddrPC.Offset);
-            }
+            DWORD64 raw[12];
+            int n = 0;
+            if (GetThreadContext(dup, &ctx))
+                for (; n < 12 && ctx.Rip; n++) {
+                    raw[n] = ctx.Rip;
+                    DWORD64 image = 0;
+                    RUNTIME_FUNCTION* fn = RtlLookupFunctionEntry(ctx.Rip, &image, nullptr);
+                    if (!fn) { // leaf: return address on top of the stack
+                        ctx.Rip = *reinterpret_cast<DWORD64*>(ctx.Rsp);
+                        ctx.Rsp += 8;
+                        continue;
+                    }
+                    void* handler_data = nullptr;
+                    DWORD64 frame = 0;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, fn, &ctx, &handler_data, &frame, nullptr);
+                }
             ResumeThread(dup);
+            std::vector<DWORD64> pcs(raw, raw + n);
             samples++;
             std::set<std::string> seen;
             for (size_t i = 0; i < pcs.size(); i++) {

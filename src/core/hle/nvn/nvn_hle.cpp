@@ -351,14 +351,11 @@ void SamplerPoolRegisterSampler(State& s) {
 // stream the native D3D11 replay will execute.
 // Every nvnCommandBuffer* command and every state-object setter goes through a generic wrapper (one template
 // instance per resolved name) that records the call's registers before the driver runs.
-struct Command {
-    int fn;                   // generic slot (name), or -1 for Call/CopyCommands
-    u64 x[8];                 // integer/pointer arguments (x0 = the object)
-    u32 v[4];                 // float arguments (low 32 bits of v0..v3)
-    std::vector<u64> handles; // Call/CopyCommands: nested command handles; ProgramSetShaders: stage data pairs
-    std::vector<u64> raw;     // memory the command points at, read at record time (state objects, viewport arrays...)
-    std::vector<std::vector<StateCall>> objects; // bound state objects' setter calls as of record time
-};
+// Commands are recorded directly in their replay form: `extra` holds Call/CopyCommands' nested handles,
+// ProgramSetShaders' stage data pairs and SetRenderTargets' colour textures; `raw` the memory the command points at
+// (read at record time); `objects` the bound state objects' setter calls as of record time.
+using Command = ReplayCommand;
+using CommandList = std::shared_ptr<std::vector<Command>>;
 enum class Kind { Command, Setter };
 struct GenericSlot {
     std::string name;
@@ -381,7 +378,7 @@ std::atomic<int> g_generic_count{0};
 struct Recording {
     std::mutex mutex;
     std::unordered_map<u64, std::vector<Command>> open;    // command buffer -> commands since BeginRecording
-    std::unordered_map<u64, std::vector<Command>> handles; // command handle -> finished list
+    std::unordered_map<u64, CommandList> handles;          // command handle -> finished list (shared with replays)
     u64 submits = 0, cmds = 0, draws = 0, indirect = 0, dispatches = 0, unknown = 0;
     std::atomic<u64> recorded{0};
     u64 begins = 0, ends = 0, empty_ends = 0; // diagnostics
@@ -395,7 +392,7 @@ Recording& Rec() {
     static Recording r;
     return r;
 }
-std::atomic<std::function<void(std::vector<ReplayCommand>&&)>*> g_sink{nullptr};
+std::atomic<std::function<void(std::vector<ReplaySpan>&&)>*> g_sink{nullptr};
 extern "C" __declspec(dllimport) void* __stdcall GetCurrentThread();
 std::atomic<u64> g_submit_ns{0}; // recorder cost diagnostics
 inline u64 NowNs() {
@@ -432,24 +429,26 @@ void Generic(State& s) {
     if (ProfileAt() >= 0)
         MaybeProfileRecorder();
     const GenericSlot& g = g_generic[I];
-    Command c{I, {}, {}, {}};
+    Command c;
+    c.fn = I;
+    c.name = g.name;
     for (int k = 0; k < 8; k++)
         c.x[k] = s.x[k];
     for (int k = 0; k < 4; k++)
         c.v[k] = u32(s.v[k].lo);
     if (g.rts) { // SetRenderTargets(cb, n, NVNtexture** colors, views, depth, depthView): the arrays are temporaries
         for (u64 i = 0; i < u32(s.x[1]) && i < 8; i++)
-            c.handles.push_back(recomp::Rd<u64>(s, s.x[2] + i * 8));
+            c.extra.push_back(recomp::Rd<u64>(s, s.x[2] + i * 8));
         if (g_sink.load()) {
-            for (u64 t : c.handles)
+            for (u64 t : c.extra)
                 EnsureTexture(s, t);
             EnsureTexture(s, s.x[4]);
         }
     }
     if (g.shaders) // nvnProgramSetShaders(program, count, const NVNshaderData*): {code address, control pointer}
         for (u64 i = 0; i < u32(s.x[1]) && i < 8; i++) {
-            c.handles.push_back(recomp::Rd<u64>(s, s.x[2] + i * 16));
-            c.handles.push_back(recomp::Rd<u64>(s, s.x[2] + i * 16 + 8));
+            c.extra.push_back(recomp::Rd<u64>(s, s.x[2] + i * 16));
+            c.extra.push_back(recomp::Rd<u64>(s, s.x[2] + i * 16 + 8));
         }
     const bool replay = g_sink.load() != nullptr;
     // copies: regions (6 ints each) into raw, views into objects (below)
@@ -511,7 +510,7 @@ void Generic(State& s) {
                             k.name = g_generic[sc.fn].name;
                             std::memcpy(k.x, sc.x, sizeof(k.x));
                             std::memcpy(k.v, sc.v, sizeof(k.v));
-                            k.handles = sc.handles;
+                            k.handles = sc.extra;
                         }
                 }
             rec.open[s.x[0]].push_back(std::move(c));
@@ -567,9 +566,10 @@ bool GenericKind(std::string_view n, Kind& kind) {
 template <Wrapped W>
 void NestCommands(State& s) {
     const u64 cb = s.x[0], count = u32(s.x[1]), array = s.x[2];
-    Command c{-1, {cb, count}, {}, {}};
+    Command c;
+    c.x[0] = cb, c.x[1] = count;
     for (u64 i = 0; i < count && i < 4096; i++)
-        c.handles.push_back(recomp::Rd<u64>(s, array + i * 8));
+        c.extra.push_back(recomp::Rd<u64>(s, array + i * 8));
     u64 obj, r;
     if (!Through(s, W, obj, r))
         return;
@@ -602,11 +602,13 @@ void CommandBufferEndRecording(State& s) {
     // (swapped rather than moved: the command buffer keeps an allocation for its next recording)
     auto& slot = rec.handles[handle];
     auto& open = rec.open[cb];
-    if (!open.empty() || slot.empty())
-        slot.swap(open);
-    open.clear();
-    if (open.capacity() < 256)
-        open.reserve(256);
+    if (!open.empty() || !slot) {
+        const size_t n = open.size();
+        slot = std::make_shared<std::vector<Command>>(std::move(open));
+        open = {};
+        open.reserve(std::max<size_t>(n, 64));
+    } else
+        open.clear();
 }
 
 // ---- draw resolution (front half of the native replay): walks one submitted frame in order, tracking bound state,
@@ -657,11 +659,11 @@ void ResolveFrame(Recording& rec, std::ofstream& f, State& s, const std::vector<
         const auto [h, depth] = walk.back();
         walk.pop_back();
         auto it = rec.handles.find(h);
-        if (it == rec.handles.end())
+        if (it == rec.handles.end() || !it->second)
             continue;
-        for (const Command& c : it->second) {
+        for (const Command& c : *it->second) {
             if (c.fn < 0) {
-                for (auto n = c.handles.rbegin(); n != c.handles.rend(); ++n)
+                for (auto n = c.extra.rbegin(); n != c.extra.rend(); ++n)
                     if (depth < 8)
                         walk.emplace_back(*n, depth + 1);
                 continue;
@@ -680,7 +682,7 @@ void ResolveFrame(Recording& rec, std::ofstream& f, State& s, const std::vector<
             else if (n == "nvnCommandBufferSetRenderTargets") {
                 st.num_rt = u32(c.x[1]);
                 for (u32 i = 0; i < st.num_rt && i < 8; i++) {
-                    const u64 tex = i < c.handles.size() ? c.handles[i] : 0;
+                    const u64 tex = i < c.extra.size() ? c.extra[i] : 0;
                     if (!TextureVa(o, tex, st.rt[i], st.rt_fmt[i]))
                         st.rt[i] = 0, unresolved_rt++;
                 }
@@ -694,14 +696,14 @@ void ResolveFrame(Recording& rec, std::ofstream& f, State& s, const std::vector<
                         continue;
                     if (auto sh = rec.shadow.find(st.program[b]); sh != rec.shadow.end())
                         for (const Command& cmd : sh->second)
-                            if (g_generic[cmd.fn].shaders && !cmd.handles.empty()) {
+                            if (g_generic[cmd.fn].shaders && !cmd.extra.empty()) {
                                 u32 w[64]{}; // where the Maxwell SPH (type 1/2, version 3) starts in the blob
-                                gpu::G().ReadGpu(cmd.handles[0], w, sizeof(w));
+                                gpu::G().ReadGpu(cmd.extra[0], w, sizeof(w));
                                 int sph = -1;
                                 for (int k = 0; k < 64 && sph < 0; k++)
                                     if (((w[k] & 0x1F) == 1 || (w[k] & 0x1F) == 2) && ((w[k] >> 5) & 0x1F) == 3)
                                         sph = k * 4;
-                                line += fmt::format(" {} {:#x}[sph+{:#x}]", "VFGCE"[b], cmd.handles[0], sph);
+                                line += fmt::format(" {} {:#x}[sph+{:#x}]", "VFGCE"[b], cmd.extra[0], sph);
                             }
                 }
                 for (u32 i = 0; i < st.num_rt && i < 8; i++) {
@@ -734,7 +736,7 @@ void QueueSubmitCommands(State& s) {
     const u64 queue = s.x[0];
     const u64 submit_t0 = NowNs();
 
-    std::vector<ReplayCommand> flat;
+    std::vector<ReplaySpan> flat;
     auto* sink = g_sink.load();
     {
     auto& rec = Rec();
@@ -748,8 +750,8 @@ void QueueSubmitCommands(State& s) {
     static bool dumped = false;
     size_t top = 0;
     for (u64 h : handles)
-        if (auto it = rec.handles.find(h); it != rec.handles.end())
-            top += it->second.size();
+        if (auto it = rec.handles.find(h); it != rec.handles.end() && it->second)
+            top += it->second->size();
     if (dump_at && !dumped && top >= 100 &&
         std::chrono::steady_clock::now() - t0 > std::chrono::seconds(dump_at)) {
         dumped = true;
@@ -762,10 +764,10 @@ void QueueSubmitCommands(State& s) {
             const auto [h, depth] = walk.back();
             walk.pop_back();
             auto it = rec.handles.find(h);
-            f << fmt::format("handle {:#x} ({} commands)\n", h, it == rec.handles.end() ? 0 : it->second.size());
-            if (it == rec.handles.end())
+            f << fmt::format("handle {:#x} ({} commands)\n", h, it == rec.handles.end() || !it->second ? 0 : it->second->size());
+            if (it == rec.handles.end() || !it->second)
                 continue;
-            for (const Command& c : it->second) {
+            for (const Command& c : *it->second) {
                 const std::string name = c.fn >= 0 ? g_generic[c.fn].name : "CallCommands";
                 f << fmt::format("  {} {:x} {:x} {:x} {:x} {:x} {:x} {:x} | {} {} {} {}\n", name, c.x[1], c.x[2], c.x[3],
                                  c.x[4], c.x[5], c.x[6], c.x[7], std::bit_cast<float>(c.v[0]),
@@ -780,7 +782,7 @@ void QueueSubmitCommands(State& s) {
                             if (rec.shadow.count(c.x[2] + k * stride))
                                 objects.insert(c.x[2] + k * stride);
                 if (depth < 8)
-                    for (u64 nested : c.handles)
+                    for (u64 nested : c.extra)
                         walk.emplace_back(nested, depth + 1);
             }
         }
@@ -792,7 +794,7 @@ void QueueSubmitCommands(State& s) {
             for (const Command& c : it->second) {
                 f << fmt::format("  {} {:x} {:x} {:x} {:x} {:x} | {} {}", g_generic[c.fn].name, c.x[1], c.x[2], c.x[3],
                                  c.x[4], c.x[5], std::bit_cast<float>(c.v[0]), std::bit_cast<float>(c.v[1]));
-                for (u64 h : c.handles)
+                for (u64 h : c.extra)
                     f << fmt::format(" {:x}", h);
                 f << "\n";
             }
@@ -819,38 +821,34 @@ void QueueSubmitCommands(State& s) {
         }
         LOG_INFO("NVN", "wrote nvn_frame.txt");
     }
-    // native replay: hand this frame's commands, in execution order, to the renderer
+    // native replay: hand this frame's commands, in execution order, to the renderer (ranges of the recorded lists;
+    // nested Call/CopyCommands run at their call site)
     if (sink && *sink) {
-        std::vector<std::pair<u64, int>> order;
+        struct Pending {
+            CommandList list;
+            size_t begin;
+            int depth;
+        };
+        std::vector<Pending> order;
         for (auto h = handles.rbegin(); h != handles.rend(); ++h)
-            order.emplace_back(*h, 0);
+            if (auto it = rec.handles.find(*h); it != rec.handles.end() && it->second)
+                order.push_back({it->second, 0, 0});
         while (!order.empty()) {
-            const auto [h, depth] = order.back();
+            Pending p = std::move(order.back());
             order.pop_back();
-            auto it = rec.handles.find(h);
-            if (it == rec.handles.end())
-                continue;
-            // nested buffers run at their call site: push the rest of this list back behind them
-            const auto& list = it->second;
-            for (size_t k = 0; k < list.size(); k++) {
-                const Command& c = list[k];
-                if (c.fn < 0) {
-                    // remaining commands of this list after the nested ones: re-queue as a synthetic tail
-                    std::vector<Command> tail(list.begin() + k + 1, list.end());
-                    if (!tail.empty()) {
-                        const u64 key = 0xFFFF000000000000ull | (rec.synthetic++ & 0xFFFFFFFFFFFFull);
-                        rec.handles[key] = std::move(tail);
-                        order.emplace_back(key, depth);
-                    }
-                    for (auto n = c.handles.rbegin(); n != c.handles.rend(); ++n)
-                        if (depth < 8)
-                            order.emplace_back(*n, depth + 1);
-                    break;
-                }
-                ReplayCommand r{g_generic[c.fn].name, {}, {}, c.handles, c.raw, c.objects};
-                std::memcpy(r.x, c.x, sizeof(r.x));
-                std::memcpy(r.v, c.v, sizeof(r.v));
-                flat.push_back(std::move(r));
+            const auto& list = *p.list;
+            size_t k = p.begin;
+            while (k < list.size() && list[k].fn >= 0)
+                k++;
+            if (k > p.begin)
+                flat.push_back({p.list, p.begin, k});
+            if (k < list.size()) { // nested: the rest of this list after them
+                if (k + 1 < list.size())
+                    order.push_back({p.list, k + 1, p.depth});
+                const auto& nested = list[k].extra;
+                for (auto n = nested.rbegin(); n != nested.rend(); ++n)
+                    if (auto it = rec.handles.find(*n); p.depth < 8 && it != rec.handles.end() && it->second)
+                        order.push_back({it->second, 0, p.depth + 1});
             }
         }
     }
@@ -862,11 +860,11 @@ void QueueSubmitCommands(State& s) {
         const auto [h, depth] = work.back();
         work.pop_back();
         auto it = rec.handles.find(h);
-        if (it == rec.handles.end()) {
+        if (it == rec.handles.end() || !it->second) {
             rec.unknown++;
             continue;
         }
-        for (const Command& c : it->second) {
+        for (const Command& c : *it->second) {
             rec.cmds++;
             if (c.fn >= 0) {
                 const GenericSlot& g = g_generic[c.fn];
@@ -874,8 +872,8 @@ void QueueSubmitCommands(State& s) {
                 rec.indirect += g.indirect;
                 rec.dispatches += g.dispatch;
             }
-            if (depth < 8)
-                for (u64 nested : c.handles)
+            if (depth < 8 && c.fn < 0)
+                for (u64 nested : c.extra)
                     work.emplace_back(nested, depth + 1);
         }
     }
@@ -969,8 +967,8 @@ bool Native() {
     return native;
 }
 
-void SetReplaySink(std::function<void(std::vector<ReplayCommand>&&)> sink) {
-    g_sink = new std::function<void(std::vector<ReplayCommand>&&)>(std::move(sink)); // lives for the process
+void SetReplaySink(std::function<void(std::vector<ReplaySpan>&&)> sink) {
+    g_sink = new std::function<void(std::vector<ReplaySpan>&&)>(std::move(sink)); // lives for the process
 }
 
 bool QueryTexture(u64 texture, TextureInfo& out) {
@@ -1009,8 +1007,8 @@ u64 QueryProgramCode(u64 program) {
     if (it == rec.shadow.end())
         return 0;
     for (const Command& c : it->second)
-        if (g_generic[c.fn].shaders && !c.handles.empty())
-            return c.handles[0];
+        if (g_generic[c.fn].shaders && !c.extra.empty())
+            return c.extra[0];
     return 0;
 }
 
