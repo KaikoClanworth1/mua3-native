@@ -299,38 +299,42 @@ void TexturePoolRegisterTexture(State& s) {
     const u32 id = u32(s.x[1]);
     const u64 tex = s.x[2], view = s.x[3];
     u64 pool, r;
-    if (!Through(s, kTexturePoolRegisterTexture, pool, r))
+    static const bool learn_va = std::getenv("MUA3_NVN_LEARN") != nullptr;
+    if (!Through(s, kTexturePoolRegisterTexture, pool, r) || !learn_va) // (the rest is diagnostics)
         return;
     auto& o = Obj();
     std::lock_guard lk(o.mutex);
     o.texture_ids[id] = {tex, view};
-    // Where textures of this pool are mapped: the descriptor holds the texture's address (offset by any view's base
-    // layer, so the smallest difference wins).
-    if (auto t = o.textures.find(tex); t != o.textures.end())
-        if (auto tp = o.texture_pools.find(pool); tp != o.texture_pools.end())
-            if (auto mp = o.pools.find(t->second.pool); mp != o.pools.end()) {
-                u32 tic[3]{};
-                if (gpu::G().ReadGpu(tp->second + u64(id) * 32, tic, sizeof(tic))) {
-                    const u64 va = (u64(tic[2] & 0xFFFF) << 32) | tic[1];
-                    const u64 base = mp->second.gpu + t->second.offset;
-                    if (va >= base) { // (learning table: which mapping each kind of texture uses)
-                        static std::set<std::tuple<u64, u32, u64>> seen;
-                        const u64 mult = mp->second.size ? (va - base) / mp->second.size : 0;
-                        if (seen.insert({t->second.pool, t->second.flags, mult}).second)
-                            LOG_INFO("NVN", "texture mapping: pool {:#x} (flags {:#x}) texture flags {:#x} format {:#x} -> + {} x pool size (+{:#x})",
-                                     t->second.pool, mp->second.flags, t->second.flags, t->second.format, mult, (va - base) % std::max<u64>(mp->second.size, 1));
-                    }
-                    static int mismatches = 0;
-                    if (va != TextureVa(mp->second, t->second) && mismatches++ < 8) // (views with a base layer differ)
-                        LOG_WARN("NVN", "texture {:#x}: descriptor address {:#x}, nvnTextureGetTextureAddress {:#x}", tex, va,
-                                 t->second.va);
-                    if (va >= base && va - base < (1ull << 36) && va - base < mp->second.tex_delta) {
-                        if (mp->second.tex_delta == ~0ull)
-                            LOG_INFO("NVN", "memory pool {:#x}: textures mapped at buffer address + {:#x}", t->second.pool, va - base);
-                        mp->second.tex_delta = va - base;
+    // MUA3_NVN_LEARN: check the texture addresses against the descriptor the driver just wrote
+    {
+        // Where textures of this pool are mapped: the descriptor holds the texture's address (offset by any view's base
+        // layer, so the smallest difference wins).
+        if (auto t = o.textures.find(tex); t != o.textures.end())
+            if (auto tp = o.texture_pools.find(pool); tp != o.texture_pools.end())
+                if (auto mp = o.pools.find(t->second.pool); mp != o.pools.end()) {
+                    u32 tic[3]{};
+                    if (gpu::G().ReadGpu(tp->second + u64(id) * 32, tic, sizeof(tic))) {
+                        const u64 va = (u64(tic[2] & 0xFFFF) << 32) | tic[1];
+                        const u64 base = mp->second.gpu + t->second.offset;
+                        if (va >= base) { // (learning table: which mapping each kind of texture uses)
+                            static std::set<std::tuple<u64, u32, u64>> seen;
+                            const u64 mult = mp->second.size ? (va - base) / mp->second.size : 0;
+                            if (seen.insert({t->second.pool, t->second.flags, mult}).second)
+                                LOG_INFO("NVN", "texture mapping: pool {:#x} (flags {:#x}) texture flags {:#x} format {:#x} -> + {} x pool size (+{:#x})",
+                                         t->second.pool, mp->second.flags, t->second.flags, t->second.format, mult, (va - base) % std::max<u64>(mp->second.size, 1));
+                        }
+                        static int mismatches = 0;
+                        if (va != TextureVa(mp->second, t->second) && mismatches++ < 8) // (views with a base layer differ)
+                            LOG_WARN("NVN", "texture {:#x}: descriptor address {:#x}, nvnTextureGetTextureAddress {:#x}", tex, va,
+                                     t->second.va);
+                        if (va >= base && va - base < (1ull << 36) && va - base < mp->second.tex_delta) {
+                            if (mp->second.tex_delta == ~0ull)
+                                LOG_INFO("NVN", "memory pool {:#x}: textures mapped at buffer address + {:#x}", t->second.pool, va - base);
+                            mp->second.tex_delta = va - base;
+                        }
                     }
                 }
-            }
+    }
     // MUA3_NVN_LEARN: the hardware descriptor the driver just wrote, per NVN format (the renderer maps TIC formats)
     static const bool learn = std::getenv("MUA3_NVN_LEARN") != nullptr;
     if (learn) { // (KTGL always passes a view; it rarely changes the format)
@@ -368,6 +372,42 @@ void SamplerPoolRegisterSampler(State& s) {
 // (read at record time); `objects` the bound state objects' setter calls as of record time.
 using Command = ReplayCommand;
 using CommandList = std::shared_ptr<std::vector<Command>>;
+// Finished lists come back here when their last user (a replay on the GPU thread, or a newer recording under the
+// same handle) drops them; recordings reuse their storage instead of allocating (and page-faulting in) megabytes
+// per frame.
+struct ListPool {
+    std::mutex mutex;
+    std::vector<std::vector<Command>> free;
+};
+ListPool& Pool() {
+    static ListPool p;
+    return p;
+}
+CommandList Publish(std::vector<Command>&& list) {
+    return CommandList(new std::vector<Command>(std::move(list)), [](std::vector<Command>* v) {
+        v->clear();
+        {
+            auto& p = Pool();
+            std::lock_guard lk(p.mutex);
+            if (p.free.size() < 64)
+                p.free.push_back(std::move(*v));
+        }
+        delete v;
+    });
+}
+// Storage for the next recording: a recycled list if one is free.
+std::vector<Command> FreshList() {
+    auto& p = Pool();
+    std::lock_guard lk(p.mutex);
+    if (p.free.empty()) {
+        std::vector<Command> v;
+        v.reserve(256);
+        return v;
+    }
+    std::vector<Command> v = std::move(p.free.back());
+    p.free.pop_back();
+    return v;
+}
 enum class Kind { Command, Setter };
 struct GenericSlot {
     std::string name;
@@ -576,9 +616,10 @@ bool GenericKind(std::string_view n, Kind& kind) {
         kind = Kind::Command;
         return true;
     }
+    // (vertex attribute/stream states are decoded from their raw words at bind: their setters need no shadow)
     for (std::string_view p : {"nvnBlendState", "nvnColorState", "nvnChannelMaskState", "nvnDepthStencilState",
-                               "nvnPolygonState", "nvnMultisampleState", "nvnVertexAttribState",
-                               "nvnVertexStreamState", "nvnTextureView", "nvnSamplerBuilder", "nvnProgramSetShaders"})
+                               "nvnPolygonState", "nvnMultisampleState", "nvnTextureView", "nvnSamplerBuilder",
+                               "nvnProgramSetShaders"})
         if (starts(p) && n.find("Set") != std::string_view::npos) {
             kind = Kind::Setter;
             return true;
@@ -630,10 +671,8 @@ void CommandBufferEndRecording(State& s) {
     auto& slot = rec.handles[handle];
     auto& open = rec.open[cb];
     if (!open.empty() || !slot) {
-        const size_t n = open.size();
-        slot = std::make_shared<std::vector<Command>>(std::move(open));
-        open = {};
-        open.reserve(std::max<size_t>(n * 2, 256));
+        slot = Publish(std::move(open));
+        open = FreshList();
     } else
         open.clear();
 }
@@ -935,6 +974,7 @@ struct HostQueue {
     std::unordered_map<u64, std::vector<u64>> builders;   // NVNwindowBuilder -> textures
     struct Window {
         std::vector<u64> textures;
+        std::vector<u64> released; // per texture: fence sequence of its last present (0 = never presented)
         u32 next = 0;
     };
     std::unordered_map<u64, Window> windows;
@@ -945,8 +985,8 @@ HostQueue& HQ() {
     static HostQueue q;
     return q;
 }
-// Signals `sync` once everything submitted so far has run.
-void HostFence(u64 sync) {
+// Signals `sync` once everything submitted so far has run; returns its sequence number.
+u64 HostFence(u64 sync) {
     auto& q = HQ();
     u64 seq;
     {
@@ -963,6 +1003,7 @@ void HostFence(u64 sync) {
         }
         hq.cv.notify_all();
     });
+    return seq;
 }
 // void nvnQueueFenceSync(NVNqueue*, NVNsync*, NVNsyncCondition, int flags)
 void QueueFenceSync(State& s) {
@@ -1062,14 +1103,19 @@ void WindowAcquireTexture(State& s) {
     const u64 window = s.x[0], sync = s.x[1], index_ptr = s.x[2];
     u32 index = 0;
     {
+        // the texture is free once its own last present has run (frames ago with 3 textures), not once everything
+        // queued so far has: that would make the game wait for the GPU every frame
         auto& q = HQ();
         std::lock_guard lk(q.mutex);
         auto& w = q.windows[window];
-        if (!w.textures.empty())
+        if (!w.textures.empty()) {
             index = w.next++ % u32(w.textures.size());
+            w.released.resize(w.textures.size());
+        }
+        if (sync)
+            q.syncs[sync] = w.released.empty() ? 0 : w.released[index];
     }
     recomp::Wr<u32>(s, index_ptr, index);
-    HostFence(sync); // available once the work queued so far (that texture's last present) has run
     Return(s, 0);
 }
 // void nvnQueuePresentTexture(NVNqueue*, NVNwindow*, int textureIndex)
@@ -1094,7 +1140,10 @@ void QueuePresentTexture(State& s) {
         auto& g = gpu::G();
         g.QueuePresent({g.As().Translate(t.gpu), t.width, t.height, t.width * 4, 1});
     }
+    const u64 released = HostFence(0); // after the present
     std::lock_guard lk(q.mutex);
+    if (auto& w = q.windows[window]; index < w.released.size())
+        w.released[index] = released;
     q.presents++;
     const auto now = std::chrono::steady_clock::now();
     if (now - q.fps_t0 > std::chrono::seconds(5)) {
