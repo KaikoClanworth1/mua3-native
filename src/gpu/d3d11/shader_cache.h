@@ -7,6 +7,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <d3d11.h>
 #include <wrl/client.h>
@@ -24,6 +25,7 @@ struct HostShader {
     u64 hash = 0;
     std::atomic<int> state{Pending};
     std::atomic<bool> claimed{false}; // a worker took it (urgent shaders can be queued twice)
+    std::atomic<bool> slow{false};    // in the out-of-process FXC queue (minutes): draws don't wait for it
     bool prewarm = false;             // queued by Prewarm (back of the queue) and not yet asked for by the game
     bool ok = false; // valid once state != Pending
     shader::TranslateResult info;
@@ -67,13 +69,27 @@ public:
     size_t Count() const { return shaders_.size(); }
     std::atomic<u32> failures{0};
     std::atomic<u32> pending{0};
+    std::atomic<u32> prewarm_total{0}; // shaders Prewarm queued this launch (progress UI: pending of these)
+    std::atomic<u64> translate_ns{0}, compile_ns{0}, create_ns{0}, cache_hits{0}, info_hits{0}; // where the time went
+    // Waits up to `budget` for `s` to leave Pending. Shaders the game asks for go to the front of the queue and,
+    // from the bytecode cache, are ready within milliseconds: a draw can wait for its shader instead of leaving a
+    // hole in the frame. Returns true when it is no longer pending.
+    bool WaitReady(HostShader* s, std::chrono::nanoseconds budget);
 
 private:
-    void Worker(bool slow);
+    // urgent_only: serves only shaders the game has asked for (never the prewarm backlog), so a cold cache's
+    // backlog never delays what the current frame needs.
+    void Worker(bool slow, bool urgent_only = false);
     // Returns false when the shader was handed to the slow queue instead of being finished.
     bool Build(HostShader& s, bool slow);
     bool Compile(HostShader& s, const std::string& hlsl, std::string& err, bool out_of_process = false);
     fs::path CachePath(const HostShader& s, const char* target) const;
+    // What the renderer needs to know about a translated shader, kept next to its bytecode so a cached vertex or
+    // pixel shader is not translated again at every launch (its HLSL is only rebuilt if a variant needs it).
+    fs::path InfoPath(const HostShader& s) const;
+    static bool SaveInfo(const fs::path& path, const shader::TranslateResult& info);
+    static bool LoadInfo(const fs::path& path, shader::TranslateResult& info);
+    void EnsureHlsl(HostShader& base);
 
     ID3D11Device* dev_;
     common::U64Map<std::unique_ptr<HostShader>> shaders_;
@@ -82,6 +98,9 @@ private:
 
     std::mutex mutex_;
     std::condition_variable cv_;
+    std::unordered_set<u64> ordered_; // programs already listed in order.txt (first-use order for Prewarm)
+    std::mutex ready_mutex_;
+    std::condition_variable ready_cv_; // a shader finished (WaitReady)
     std::deque<HostShader*> queue_;
     // FXC can take minutes on some loop shaders: they compile on their own worker so nothing else waits.
     std::deque<HostShader*> slow_queue_;
@@ -93,6 +112,7 @@ private:
     std::vector<std::pair<u64, VariantKey>> prewarm_variants_; // waiting for their base shader
     std::chrono::steady_clock::time_point prewarm_start_;
     bool prewarm_reported_ = true;
+    std::atomic<s64> prewarm_end_ns{0}; // when the last queued shader finished (the report waits for a Present)
     bool replaying_ = false; // Tick() is recreating manifest variants
 };
 

@@ -2,6 +2,7 @@
 #include "core/hle/nvn/nvn_hle.h"
 #include "gpu/shader/maxwell_isa.h"
 
+#include <chrono>
 #include <unordered_set>
 #include <set>
 
@@ -1625,6 +1626,14 @@ void D3D11Renderer::Draw() {
     if (!vs || vs->state != HostShader::Ready || (ps && ps->state != HostShader::Ready)) {
         draws_skipped++, skip_reason_[0]++;
         static std::set<u64> pending_logged;
+    // A shader the game just asked for is at the front of the compile queue: wait a moment for it (from the
+    // bytecode cache that is milliseconds) rather than leave the draw out of the frame.
+    for (HostShader* sh : {vs, ps})
+        if (sh && sh->state == HostShader::Pending && shader_wait_ns_ > 0) {
+            const auto t0 = std::chrono::steady_clock::now();
+            shaders_->WaitReady(sh, std::chrono::nanoseconds(shader_wait_ns_));
+            shader_wait_ns_ -= s64((std::chrono::steady_clock::now() - t0).count());
+        }
         for (HostShader* sh : {vs, ps})
             if (sh && sh->state == HostShader::Pending && pending_logged.size() < 64 && pending_logged.insert(sh->hash).second)
                 LOG_INFO("Renderer", "draw waiting on {} {:016x}{}", sh->stage == shader::Stage::Vertex ? "vs" : "ps",
@@ -2449,6 +2458,7 @@ void D3D11Renderer::Present(const PresentInfo& p) {
         });
     {
         // D3D debug layer messages (only present when MUA3_D3D_DEBUG is set)
+    shader_wait_ns_ = 150'000'000; // a cold cache stutters rather than showing holes
         ComPtr<ID3D11InfoQueue> q;
         if (SUCCEEDED(dev_->QueryInterface(__uuidof(ID3D11InfoQueue), (void**)&q))) {
             const UINT64 n = q->GetNumStoredMessages();

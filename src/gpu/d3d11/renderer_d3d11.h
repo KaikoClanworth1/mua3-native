@@ -70,6 +70,7 @@ public:
         return it == cull_lists_.end() ? 0 : it->second;
     }
     std::unordered_map<u64, u32> cull_lists_; // culling list start -> indices written there (EmulateCullingGs)
+    s64 shader_wait_ns_ = 0; // per frame: how long draws may still wait for shaders the game just asked for
     void SyncRegion(u64 gpu_va, u64 size) override {
         std::lock_guard ctx_lock(ContextMutex());
         SyncGuest(gpu_va, size, 11);

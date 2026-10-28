@@ -31,6 +31,7 @@
 namespace {
 
 gpu::D3D11Renderer* g_renderer = nullptr;
+platform::Display* g_display = nullptr;
 std::atomic<bool> g_script_active{false};
 
 struct Stats {
@@ -67,13 +68,31 @@ void DrawOverlay(const core::Config& cfg, platform::Input& input, bool& show) {
     }
     if (g_renderer && g_renderer->Shaders() && g_renderer->Shaders()->pending > 0) {
         // Like a PC game's first-launch shader compilation: everything the game ships is compiled up front.
-        ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x - 8 * g_ui, 8 * g_ui), 0, ImVec2(1, 0));
-        ImGui::SetNextWindowBgAlpha(0.5f);
-        ImGui::Begin("##shaders", nullptr,
-                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
-                         ImGuiWindowFlags_NoNav);
-        ImGui::Text("Compiling shaders: %u remaining", g_renderer->Shaders()->pending.load());
-        ImGui::End();
+        // Before the game shows its first frame this is the whole screen; afterwards a corner box.
+        auto* sc = g_renderer->Shaders();
+        const u32 pending = sc->pending.load(), total = std::max(sc->prewarm_total.load(), pending);
+        const float frac = total ? float(total - pending) / float(total) : 0.0f;
+        const ImVec2 ds = ImGui::GetIO().DisplaySize;
+        const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                       ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav;
+        char label[64];
+        std::snprintf(label, sizeof(label), "%u / %u", total - pending, total);
+        if (g_stats.presents == 0) {
+            ImGui::SetNextWindowPos(ImVec2(ds.x * 0.5f, ds.y * 0.5f), 0, ImVec2(0.5f, 0.5f));
+            ImGui::SetNextWindowBgAlpha(0.9f);
+            ImGui::Begin("##shaders", nullptr, flags);
+            ImGui::Text("Preparing shaders for your GPU");
+            ImGui::ProgressBar(frac, UiVec(520, 24), label);
+            ImGui::TextDisabled("Compiled once and kept; the game continues loading meanwhile.");
+            ImGui::End();
+        } else {
+            ImGui::SetNextWindowPos(ImVec2(ds.x - 8 * g_ui, 8 * g_ui), 0, ImVec2(1, 0));
+            ImGui::SetNextWindowBgAlpha(0.5f);
+            ImGui::Begin("##shaders", nullptr, flags);
+            ImGui::Text("Compiling shaders");
+            ImGui::ProgressBar(frac, UiVec(220, 16), label);
+            ImGui::End();
+        }
     }
     if (!show)
         return;
@@ -179,6 +198,8 @@ void PollCommandFile(platform::Input* input) {
                 g_script_active = false;
             } else if (cmd == "shot" && g_renderer) {
                 g_renderer->RequestFrameShot(fs::u8path(arg));
+            } else if (cmd == "shotui" && g_display) { // the window as shown, overlay included
+                g_display->capture_path = fs::u8path(arg);
             } else if (cmd == "dump") {
                 core::Sys().Kern().DumpAllThreads(arg == "host");
             } else if (cmd == "pixel" && g_renderer) { // pixel <surface gpu va hex> <x> <y>
@@ -555,6 +576,7 @@ int main(int argc, char** argv) {
         std::thread([s = std::atoi(t)] {
             std::this_thread::sleep_for(std::chrono::seconds(s));
             g_renderer->dump_surfaces_ = true;
+    g_display = &display;
         }).detach();
     display.context_mutex = &gpu::ContextMutex();
     display.context_epoch = &gpu::ContextEpoch();
