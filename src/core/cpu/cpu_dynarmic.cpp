@@ -606,7 +606,12 @@ DynarmicCore::DynarmicCore(DynarmicFactory& f, core::Memory& mem, Dynarmic::Excl
     c.wall_clock_cntpct = true;
     c.enable_cycle_counting = true; // return to the dispatcher regularly so halts are always seen
     c.define_unpredictable_behaviour = true;
-    c.code_cache_size = 128ull << 20;
+    // Per guest thread; reserved, committed as used. MUA3_JIT_CACHE_MB overrides.
+    static const u64 cache_mb = [] {
+        const char* e = std::getenv("MUA3_JIT_CACHE_MB");
+        return e ? std::max<u64>(std::strtoull(e, nullptr, 10), 2) : 128ull;
+    }();
+    c.code_cache_size = cache_mb << 20;
     jit_ = std::make_unique<Dynarmic::A64::Jit>(c);
 }
 
@@ -766,11 +771,30 @@ void ClearExclusive(State& s) { CoreOf(s).Monitor().ClearProcessor(CoreOf(s).slo
 namespace {
 u8* GuestPtr(State& s, u64 a) { return s.mem + a; }
 const char* GuestStr(State& s, u64 a) { return reinterpret_cast<const char*>(s.mem + a); }
+// A range outside the guest's address space would fault on the Switch; on the host it would scribble over our own
+// memory, so such calls do nothing (logged once).
+bool GuestRange(u64 a, u64 n, const char* what) {
+    if (a < core::layout::kSpaceEnd && n <= core::layout::kSpaceEnd - a)
+        return true;
+    static std::atomic<int> logged{0};
+    if (logged++ < 8)
+        LOG_WARN("Recomp", "{}: guest range {:#x}+{:#x} outside the address space, skipped", what, a, n);
+    return false;
+}
 } // namespace
 // Overlapping memcpy is undefined; memmove also covers callers that rely on the guest's forward copy.
-void Libc_memcpy(State& s) { std::memmove(GuestPtr(s, s.x[0]), GuestPtr(s, s.x[1]), s.x[2]); }
-void Libc_memmove(State& s) { std::memmove(GuestPtr(s, s.x[0]), GuestPtr(s, s.x[1]), s.x[2]); }
-void Libc_memset(State& s) { std::memset(GuestPtr(s, s.x[0]), int(u8(s.x[1])), s.x[2]); }
+void Libc_memcpy(State& s) {
+    if (GuestRange(s.x[0], s.x[2], "memcpy") && GuestRange(s.x[1], s.x[2], "memcpy"))
+        std::memmove(GuestPtr(s, s.x[0]), GuestPtr(s, s.x[1]), s.x[2]);
+}
+void Libc_memmove(State& s) {
+    if (GuestRange(s.x[0], s.x[2], "memmove") && GuestRange(s.x[1], s.x[2], "memmove"))
+        std::memmove(GuestPtr(s, s.x[0]), GuestPtr(s, s.x[1]), s.x[2]);
+}
+void Libc_memset(State& s) {
+    if (GuestRange(s.x[0], s.x[2], "memset"))
+        std::memset(GuestPtr(s, s.x[0]), int(u8(s.x[1])), s.x[2]);
+}
 void Libc_memcmp(State& s) {
     const u8 *a = GuestPtr(s, s.x[0]), *b = GuestPtr(s, s.x[1]);
     s.x[0] = 0;

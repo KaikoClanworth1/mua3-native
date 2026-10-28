@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <string_view>
+#include <iterator>
 #include <vector>
 
 #include "core/cpu/recomp/recomp_rt.h"
@@ -44,12 +45,54 @@ struct StateCall {
     recomp::u32 v[4];
     std::vector<recomp::u64> handles; // nvnProgramSetShaders: {code address, control pointer} per stage
 };
+// A few words kept inline (thousands of commands a frame carry a handful each): no heap traffic unless more.
+template <size_t N>
+class SmallWords {
+public:
+    size_t size() const { return n_; }
+    bool empty() const { return n_ == 0; }
+    recomp::u64* data() { return n_ <= N ? inl_ : heap_.data(); }
+    const recomp::u64* data() const { return n_ <= N ? inl_ : heap_.data(); }
+    recomp::u64& operator[](size_t i) { return data()[i]; }
+    const recomp::u64& operator[](size_t i) const { return data()[i]; }
+    recomp::u64* begin() { return data(); }
+    recomp::u64* end() { return data() + n_; }
+    const recomp::u64* begin() const { return data(); }
+    const recomp::u64* end() const { return data() + n_; }
+    std::reverse_iterator<const recomp::u64*> rbegin() const { return std::reverse_iterator<const recomp::u64*>(end()); }
+    std::reverse_iterator<const recomp::u64*> rend() const { return std::reverse_iterator<const recomp::u64*>(begin()); }
+    void push_back(recomp::u64 v) {
+        if (n_ < N)
+            inl_[n_] = v;
+        else {
+            if (n_ == N)
+                heap_.assign(inl_, inl_ + N);
+            heap_.push_back(v);
+        }
+        n_++;
+    }
+    void clear() {
+        n_ = 0;
+        heap_.clear();
+    }
+    template <typename It>
+    void assign(It a, It b) {
+        clear();
+        for (; a != b; ++a)
+            push_back(*a);
+    }
+
+private:
+    recomp::u64 inl_[N];
+    size_t n_ = 0;
+    std::vector<recomp::u64> heap_; // holds everything once there are more than N
+};
 struct ReplayCommand {
     std::string_view name;          // NVN entry point, e.g. "nvnCommandBufferDrawElementsBaseVertex" (empty: nested)
     recomp::u64 x[8]{};             // integer/pointer arguments (x[0] = command buffer)
     recomp::u32 v[4]{};             // float arguments
-    std::vector<recomp::u64> extra; // captured arrays (SetRenderTargets colour textures, ...)
-    std::vector<recomp::u64> raw;   // memory the command points at, read at record time (viewports, state objects)
+    SmallWords<8> extra;            // captured arrays (SetRenderTargets colour textures, ...)
+    SmallWords<8> raw;              // memory the command points at, read at record time (viewports, state objects)
     // state objects the command binds (BindProgram, Bind*State, vertex attrib/stream arrays): their setter calls
     // since SetDefaults, as of record time (the game builds many of them on the stack)
     std::vector<std::vector<StateCall>> objects;

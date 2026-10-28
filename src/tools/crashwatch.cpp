@@ -64,10 +64,18 @@ int main(int argc, char** argv) {
         DWORD status = DBG_CONTINUE;
         switch (ev.dwDebugEventCode) {
         case CREATE_PROCESS_DEBUG_EVENT:
+            SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+            sym_ready = SymInitialize(pi.hProcess, nullptr, FALSE);
+            if (sym_ready && ev.u.CreateProcessInfo.hFile) { // the main image: invading at this point misses it
+                char path[MAX_PATH * 2]{};
+                const DWORD n = GetFinalPathNameByHandleA(ev.u.CreateProcessInfo.hFile, path, sizeof(path), FILE_NAME_NORMALIZED);
+                const char* name = n > 4 && std::strncmp(path, "\\\\?\\", 4) == 0 ? path + 4 : path;
+                const DWORD64 base = DWORD64(ev.u.CreateProcessInfo.lpBaseOfImage);
+                std::printf("crashwatch: %s at %016llx\n", name, base);
+                SymLoadModuleEx(pi.hProcess, nullptr, name, nullptr, base, 0, nullptr, 0);
+            }
             if (ev.u.CreateProcessInfo.hFile)
                 CloseHandle(ev.u.CreateProcessInfo.hFile);
-            SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
-            sym_ready = SymInitialize(pi.hProcess, nullptr, TRUE);
             break;
         case CREATE_THREAD_DEBUG_EVENT:
             threads[ev.dwThreadId] = ev.u.CreateThread.hThread;

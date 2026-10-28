@@ -443,7 +443,25 @@ static void StartGpuSampler() {
 int main(int argc, char** argv) {
     SetUnhandledExceptionFilter(CrashFilter);
     std::signal(SIGABRT, [](int) {
-        LOG_ERROR("Crash", "abort()");
+        // the host stack of the aborting thread (symbols from mua3.pdb next to the exe)
+        void* frames[48];
+        const USHORT n = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
+        const HANDLE proc = GetCurrentProcess();
+        static bool sym_ready = false;
+        if (!sym_ready)
+            sym_ready = SymInitialize(proc, nullptr, TRUE) != 0;
+        std::string stack;
+        for (USHORT i = 0; i < n; i++) {
+            alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256]{};
+            auto* sym = reinterpret_cast<SYMBOL_INFO*>(buf);
+            sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+            sym->MaxNameLen = 255;
+            DWORD64 disp = 0;
+            const DWORD64 pc = reinterpret_cast<DWORD64>(frames[i]);
+            stack += fmt::format("\n  #{} {}", i, sym_ready && SymFromAddr(proc, pc, &disp, sym) ? fmt::format("{}+{:#x}", sym->Name, disp)
+                                                                                                    : fmt::format("{:#x}", pc));
+        }
+        LOG_ERROR("Crash", "abort(){}", stack);
         std::fflush(nullptr);
     });
     std::set_terminate([] {

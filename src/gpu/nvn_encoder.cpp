@@ -1511,7 +1511,7 @@ void InstallNvnEncoder(Gpu& gpu) {
                     l += " }";
                 }
                 if (c.name.ends_with("SetRenderTargets")) {
-                    std::vector<u64> texs = c.extra;
+                    std::vector<u64> texs(c.extra.begin(), c.extra.end());
                     texs.push_back(c.x[4]);
                     for (u64 t : texs) {
                         hle::nvn::TextureInfo ti;

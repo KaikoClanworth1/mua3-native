@@ -1350,6 +1350,8 @@ void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
     ID3D11Buffer* drv_cb = dc.Constant(1001, &drv, sizeof(drv));
     // Render targets may be sampled by the kernel: unbind them from the output stage.
     ctx_->OMSetRenderTargets(0, nullptr, nullptr);
+    std::memset(last_rtvs_, 0xFF, sizeof(last_rtvs_)); // the next draw binds its targets again
+    last_dsv_ = reinterpret_cast<ID3D11DepthStencilView*>(~uintptr_t(0));
     InvalidateBinds(); // UAVs bound below unbind VS/PS views of the same resources
     ctx_->CSSetShader(cs->cs.Get(), nullptr, 0);
     ctx_->CSSetConstantBuffers(0, 13, cbs);
@@ -1482,6 +1484,7 @@ void D3D11Renderer::Draw() {
     // Someone else used the context (UI) or a dispatch rebound resources: forget what is bound.
     if (const u64 epoch = ContextEpoch().load(); epoch != binds_epoch_) {
         binds_epoch_ = epoch;
+        InvalidatePipe();
         for (auto& b : binds_)
             std::memset(&b, 0xFF, sizeof(b));
         std::fill(std::begin(last_rtvs_), std::end(last_rtvs_), reinterpret_cast<ID3D11RenderTargetView*>(~uintptr_t(0)));
@@ -1623,9 +1626,6 @@ void D3D11Renderer::Draw() {
     }();
     if (ps && !skip_ps.empty() && skip_ps.find(fmt::format("{:016x}", ps->hash)) != std::string::npos)
         return;
-    if (!vs || vs->state != HostShader::Ready || (ps && ps->state != HostShader::Ready)) {
-        draws_skipped++, skip_reason_[0]++;
-        static std::set<u64> pending_logged;
     // A shader the game just asked for is at the front of the compile queue: wait a moment for it (from the
     // bytecode cache that is milliseconds) rather than leave the draw out of the frame.
     for (HostShader* sh : {vs, ps})
@@ -1667,8 +1667,10 @@ void D3D11Renderer::Draw() {
         last_dsv_ = dsv;
         for (auto& b : binds_)
             std::fill(std::begin(b.srv), std::end(b.srv), reinterpret_cast<ID3D11ShaderResourceView*>(~uintptr_t(0)));
+        ctx_->OMSetRenderTargets(8, rtvs, dsv);
     }
-    ctx_->OMSetRenderTargets(8, rtvs, dsv);
+    if (!pipe_.valid || debug_mode_ >= 1)
+        InvalidatePipe();
     draw_serial_++;
     for (u32 i = 0; i < 8; i++)
         bound_[i] = i < count ? colors[i] : nullptr;
@@ -1688,7 +1690,10 @@ void D3D11Renderer::Draw() {
     const float fs = float(rscale);
     D3D11_VIEWPORT vp{(tx - std::abs(sx)) * fs, (ty - std::abs(sy)) * fs, 2 * std::abs(sx) * fs, 2 * std::abs(sy) * fs,
                       0.0f, 1.0f};
-    ctx_->RSSetViewports(1, &vp);
+    if (std::memcmp(&pipe_.vp, &vp, sizeof(vp)) != 0) {
+        pipe_.vp = vp;
+        ctx_->RSSetViewports(1, &vp);
+    }
     float flip = sy > 0 ? -1.0f : 1.0f;
     if (m.Reg(kScreenYControl) & 1)
         flip = -flip;
@@ -1708,7 +1713,10 @@ void D3D11Renderer::Draw() {
         sr = {std::max<LONG>(sr.left, LONG(px)), std::max<LONG>(sr.top, LONG(py)), std::min<LONG>(sr.right, LONG(px + 1)),
               std::min<LONG>(sr.bottom, LONG(py + 1))};
     }
-    ctx_->RSSetScissorRects(1, &sr);
+    if (std::memcmp(&pipe_.scissor, &sr, sizeof(sr)) != 0) {
+        pipe_.scissor = sr;
+        ctx_->RSSetScissorRects(1, &sr);
+    }
 
     // ---- blend
     D3D11_BLEND_DESC bd{};
@@ -1740,7 +1748,11 @@ void D3D11Renderer::Draw() {
         dev_->CreateBlendState(d, o);
     });
     const float bc[4] = {m.RegF(kBlendColor), m.RegF(kBlendColor + 1), m.RegF(kBlendColor + 2), m.RegF(kBlendColor + 3)};
-    ctx_->OMSetBlendState(blend, bc, 0xFFFFFFFF);
+    if (pipe_.blend != blend || std::memcmp(pipe_.blend_color, bc, sizeof(bc)) != 0) {
+        pipe_.blend = blend;
+        std::memcpy(pipe_.blend_color, bc, sizeof(bc));
+        ctx_->OMSetBlendState(blend, bc, 0xFFFFFFFF);
+    }
 
     // ---- depth / stencil
     D3D11_DEPTH_STENCIL_DESC dd{};
@@ -1775,7 +1787,11 @@ void D3D11Renderer::Draw() {
     auto* dss = dc.Cached(dc.depth, dd, [&](const D3D11_DEPTH_STENCIL_DESC* d, ID3D11DepthStencilState** o) {
         dev_->CreateDepthStencilState(d, o);
     });
-    ctx_->OMSetDepthStencilState(dss, m.Reg(kStencilFrontRef) & 0xFF);
+    if (const u32 sref = m.Reg(kStencilFrontRef) & 0xFF; pipe_.dss != dss || pipe_.stencil_ref != sref) {
+        pipe_.dss = dss;
+        pipe_.stencil_ref = sref;
+        ctx_->OMSetDepthStencilState(dss, sref);
+    }
 
     // ---- rasterizer
     D3D11_RASTERIZER_DESC rd{};
@@ -1812,7 +1828,10 @@ void D3D11Renderer::Draw() {
     auto* rs = dc.Cached(dc.raster, rd, [&](const D3D11_RASTERIZER_DESC* d, ID3D11RasterizerState** o) {
         dev_->CreateRasterizerState(d, o);
     });
-    ctx_->RSSetState(rs);
+    if (pipe_.rs != rs) {
+        pipe_.rs = rs;
+        ctx_->RSSetState(rs);
+    }
 
     // ---- topology / indices
     Prof(kProfIndex);
@@ -2019,7 +2038,10 @@ void D3D11Renderer::Draw() {
             return;
         }
     }
-    ctx_->IASetInputLayout(layout);
+    if (pipe_.layout != layout) {
+        pipe_.layout = layout;
+        ctx_->IASetInputLayout(layout);
+    }
     ID3D11Buffer* vbufs[32]{};
     UINT strides[32]{}, offsets[32]{};
     s32 base_vertex = 0;
@@ -2109,7 +2131,20 @@ void D3D11Renderer::Draw() {
         vbufs[31] = dc.default_attrib.Get();
         strides[31] = 0;
     }
-    ctx_->IASetVertexBuffers(0, 32, vbufs, strides, offsets);
+    { // only the slots that changed
+        u32 lo = 32, hi = 0;
+        for (u32 i = 0; i < 32; i++)
+            if (pipe_.vb[i] != vbufs[i] || pipe_.vb_stride[i] != strides[i] || pipe_.vb_offset[i] != offsets[i]) {
+                lo = std::min(lo, i);
+                hi = i + 1;
+            }
+        if (lo < hi) {
+            ctx_->IASetVertexBuffers(lo, hi - lo, vbufs + lo, strides + lo, offsets + lo);
+            std::memcpy(pipe_.vb, vbufs, sizeof(vbufs));
+            std::memcpy(pipe_.vb_stride, strides, sizeof(strides));
+            std::memcpy(pipe_.vb_offset, offsets, sizeof(offsets));
+        }
+    }
     drv.misc[0] = dr.instance; // added to SV_InstanceID (always 0: each Maxwell draw is one instance)
     drv.misc[1] = m.Reg(kAlphaTestFunc) >= 0x200 ? m.Reg(kAlphaTestFunc) - 0x200 + 1 : m.Reg(kAlphaTestFunc);
     drv.misc[2] = m.Reg(kAlphaTestRef);
@@ -2350,15 +2385,24 @@ void D3D11Renderer::Draw() {
     BindRange(binds_[0].cb, &drv_cb, 13, 1, [&](u32 s, u32 n, ID3D11Buffer* const* p) { ctx_->VSSetConstantBuffers(s, n, p); });
     BindRange(binds_[1].cb, &drv_cb, 13, 1, [&](u32 s, u32 n, ID3D11Buffer* const* p) { ctx_->PSSetConstantBuffers(s, n, p); });
 
-    ctx_->VSSetShader(vs->vs.Get(), nullptr, 0);
-    ctx_->PSSetShader(ps ? ps->ps.Get() : nullptr, nullptr, 0);
+    if (pipe_.vs != vs->vs.Get()) {
+        pipe_.vs = vs->vs.Get();
+        ctx_->VSSetShader(pipe_.vs, nullptr, 0);
+    }
+    if (ID3D11PixelShader* p = ps ? ps->ps.Get() : nullptr; pipe_.ps != p) {
+        pipe_.ps = p;
+        ctx_->PSSetShader(p, nullptr, 0);
+    }
     if (debug_mode_ >= 1) { // MUA3_DEBUG_PS=1: solid magenta; 2: real shaders; both without blend/depth
         if (debug_mode_ == 1)
             ctx_->PSSetShader(debug_ps_.Get(), nullptr, 0);
         ctx_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
         ctx_->OMSetDepthStencilState(nullptr, 0);
     }
-    ctx_->GSSetShader(nullptr, nullptr, 0);
+    if (pipe_.gs) {
+        pipe_.gs = nullptr;
+        ctx_->GSSetShader(nullptr, nullptr, 0);
+    }
 
     static int traced = 0;
     if (traced < 12) {

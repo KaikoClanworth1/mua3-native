@@ -198,6 +198,29 @@ private:
     };
     StageBinds binds_[2]{};
     u64 binds_epoch_ = ~0ull;
+    // What the context's fixed-function and shader stages hold (consecutive draws mostly share it): state is
+    // set only when it differs. Filled with 0xFF (matches nothing) whenever the context may have changed.
+    struct PipeState {
+        ID3D11BlendState* blend;
+        float blend_color[4];
+        ID3D11DepthStencilState* dss;
+        u32 stencil_ref;
+        ID3D11RasterizerState* rs;
+        ID3D11InputLayout* layout;
+        ID3D11VertexShader* vs;
+        ID3D11PixelShader* ps;
+        ID3D11GeometryShader* gs;
+        D3D11_VIEWPORT vp;
+        D3D11_RECT scissor;
+        ID3D11Buffer* vb[32];
+        UINT vb_stride[32], vb_offset[32];
+        bool valid;
+    };
+    PipeState pipe_{};
+    void InvalidatePipe() {
+        std::memset(&pipe_, 0xFF, sizeof(pipe_));
+        pipe_.valid = true;
+    }
     ID3D11RenderTargetView* last_rtvs_[8]{};
     ID3D11DepthStencilView* last_dsv_ = nullptr;
     void InvalidateBinds() { binds_epoch_ = ~0ull; }

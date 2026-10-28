@@ -217,6 +217,12 @@ std::atomic<u64> g_texture_generation{1}; // bumped by every texture Initialize/
 struct TexGen {
     std::mutex mutex;
     std::unordered_map<u64, u64> gen;
+    struct Tic {
+        u64 generation = 0;
+        u8 bytes[32]{};
+    };
+    std::unordered_map<u64, Tic> tics;       // hash of (texture, view contents) -> descriptor the driver wrote
+    std::unordered_map<u64, u64> pool_base;  // texture pool -> descriptor memory (from Obj().texture_pools)
 };
 TexGen& TG() {
     static TexGen t;
@@ -298,6 +304,11 @@ void TextureFinalize(State& s) {
 }
 
 // NVNboolean nvnTexturePoolInitialize(NVNtexturePool*, const NVNmemoryPool*, ptrdiff_t offset, int numDescriptors)
+void ForgetPoolBase(u64 pool) {
+    auto& t = TG();
+    std::lock_guard lk(t.mutex);
+    t.pool_base.erase(pool);
+}
 void TexturePoolInitialize(State& s) {
     const u64 mem_pool = s.x[1], offset = s.x[2];
     u64 pool, ok;
@@ -307,6 +318,7 @@ void TexturePoolInitialize(State& s) {
     std::lock_guard lk(o.mutex);
     if (auto p = o.pools.find(mem_pool); p != o.pools.end()) {
         o.texture_pools[pool] = p->second.gpu + offset;
+        ForgetPoolBase(pool);
         LOG_INFO("NVN", "texture pool {:#x}: descriptors at {:#x}", pool, p->second.gpu + offset);
     }
 }
@@ -334,12 +346,6 @@ void TexturePoolRegisterTexture(State& s) {
     // registers the same pairs under fresh ids every frame (thousands a frame): once the driver has written one,
     // later registrations copy those 32 bytes into the new slot on the host. A texture initialized or finalized
     // again gets a new descriptor (its generation).
-    struct Tic {
-        u64 generation = 0;
-        u8 bytes[32]{};
-    };
-    static std::mutex cache_mutex;
-    static std::unordered_map<u64, Tic> tics; // hash of (texture, view contents) -> descriptor
     static const bool cache = std::getenv("MUA3_NVN_NO_REGCACHE") == nullptr;
     u64 key = 0, desc_va = 0, generation = 0;
     if (cache) {
@@ -351,33 +357,46 @@ void TexturePoolRegisterTexture(State& s) {
         key = 0xcbf29ce484222325ull;
         for (const u8* b = reinterpret_cast<const u8*>(words); b < reinterpret_cast<const u8*>(words + 6); b++)
             key = (key ^ *b) * 0x100000001b3ull;
-        generation = GetTexGen(tex);
-        {
-            auto& o = Obj();
-            std::lock_guard lk(o.mutex);
-            if (auto tp = o.texture_pools.find(s.x[0]); tp != o.texture_pools.end())
-                desc_va = tp->second + u64(id) * 32;
+        auto& t = TG();
+        std::unique_lock lk(t.mutex);
+        if (auto g = t.gen.find(tex); g != t.gen.end())
+            generation = g->second;
+        if (auto pb = t.pool_base.find(s.x[0]); pb != t.pool_base.end())
+            desc_va = pb->second + u64(id) * 32;
+        else {
+            lk.unlock();
+            u64 base = 0;
+            {
+                auto& o = Obj();
+                std::lock_guard ok(o.mutex);
+                if (auto tp = o.texture_pools.find(s.x[0]); tp != o.texture_pools.end())
+                    base = tp->second;
+            }
+            lk.lock();
+            if (base) {
+                t.pool_base[s.x[0]] = base;
+                desc_va = base + u64(id) * 32;
+            }
         }
-        if (desc_va) {
-            std::lock_guard lk(cache_mutex);
-            if (auto it = tics.find(key); it != tics.end() && it->second.generation == generation &&
+        if (desc_va)
+            if (auto it = t.tics.find(key); it != t.tics.end() && it->second.generation == generation &&
                 gpu::G().WriteGpu(desc_va, it->second.bytes, sizeof(it->second.bytes))) {
                 g_reg_hits.fetch_add(1, std::memory_order_relaxed);
                 return Return(s, 0);
             }
-        }
     }
     u64 pool, r;
     if (!Through(s, kTexturePoolRegisterTexture, pool, r))
         return;
     if (desc_va) { // remember what the driver wrote
-        Tic t;
-        t.generation = generation;
-        if (gpu::G().ReadGpu(desc_va, t.bytes, sizeof(t.bytes))) {
-            std::lock_guard lk(cache_mutex);
-            if (tics.size() > 1 << 16)
-                tics.clear();
-            tics[key] = t;
+        TexGen::Tic d;
+        d.generation = generation;
+        if (gpu::G().ReadGpu(desc_va, d.bytes, sizeof(d.bytes))) {
+            auto& t = TG();
+            std::lock_guard lk(t.mutex);
+            if (t.tics.size() > 1 << 16)
+                t.tics.clear();
+            t.tics[key] = d;
         }
     }
     static const bool learn_va = std::getenv("MUA3_NVN_LEARN") != nullptr;
@@ -669,7 +688,7 @@ void Generic(State& s) {
                             k.name = g_generic[sc.fn].name;
                             std::memcpy(k.x, sc.x, sizeof(k.x));
                             std::memcpy(k.v, sc.v, sizeof(k.v));
-                            k.handles = sc.extra;
+                            k.handles.assign(sc.extra.begin(), sc.extra.end());
                         }
                     }
                 }
