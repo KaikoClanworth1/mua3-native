@@ -27,6 +27,8 @@ public:
     virtual u32 CullListCount(u64 index_addr) { return 0; }
     // Called at the end of each command submission.
     virtual void FlushCommands() {}
+    // Called after Present, outside any renderer lock: blocks while too many frames are still queued on the host GPU.
+    virtual void ThrottleFrames() {}
 };
 
 } // namespace gpu

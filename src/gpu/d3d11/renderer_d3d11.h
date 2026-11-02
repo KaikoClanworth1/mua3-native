@@ -65,6 +65,14 @@ public:
     void InvalidateRegion(u64 gpu_va, u64 size) override;
     bool Blit2D(const u32* regs) override;
     void FlushCommands() override;
+    // At most kFramesInFlight game frames queued on the host GPU. Guest fences are host-side, so nothing else
+    // stops the game from recording frames faster than the GPU runs them; the driver then keeps every renamed
+    // WRITE_DISCARD buffer of every queued frame alive (8 MB chunks: up to ~20 GB of commit in gameplay).
+    void ThrottleFrames() override;
+    static constexpr u32 kFramesInFlight = 2;
+    ComPtr<ID3D11Query> frame_queries_[kFramesInFlight + 1];
+    u64 frame_query_count_ = 0;
+    u64 throttle_wait_ns_ = 0, throttle_frames_ = 0;
     u32 CullListCount(u64 index_addr) override {
         auto it = cull_lists_.find(index_addr);
         return it == cull_lists_.end() ? 0 : it->second;

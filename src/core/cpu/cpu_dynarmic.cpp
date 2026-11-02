@@ -1,6 +1,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <deque>
 #include <fstream>
 #include <mutex>
 #include <set>
@@ -26,6 +27,7 @@ namespace {
 constexpr auto kHaltStop = Dynarmic::HaltReason::UserDefined1;
 constexpr auto kHaltInvalidate = Dynarmic::HaltReason::UserDefined2;
 constexpr auto kHaltCallback = Dynarmic::HaltReason::UserDefined3;
+constexpr auto kHaltNative = Dynarmic::HaltReason::UserDefined4; // reached a recompiled entry
 
 class DynarmicFactory;
 
@@ -36,91 +38,110 @@ public:
     ~DynarmicCore() override;
 
     // ---- Core
+    // Guest threads run recompiled code directly; the register file lives in st_. Only when a thread reaches code
+    // without a native version does it get a dynarmic JIT (created on first need: each one commits ~18 MB, and the
+    // game creates hundreds of short-lived threads), which runs until it reaches native code again.
     void Run() override {
         stop_ = false;
         while (!stop_) {
-            const auto hr = jit_->Run();
             native_halt_ = 0;
-            if (Dynarmic::Has(hr, kHaltInvalidate)) {
-                jit_->ClearHalt(kHaltInvalidate);
-                ApplyInvalidations();
-            }
-            if (Dynarmic::Has(hr, kHaltCallback)) {
-                jit_->ClearHalt(kHaltCallback);
-                std::vector<std::function<void()>> fns;
-                {
-                    std::lock_guard lk(inv_mutex_);
-                    fns.swap(callbacks_);
-                }
-                for (auto& f : fns)
-                    f();
-            }
-            if (Dynarmic::Has(hr, kHaltStop)) {
-                jit_->ClearHalt(kHaltStop);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            ServiceRequests();
+            if (stop_)
                 break;
+            if (recomp::Fn fn = NativeAt(st_.pc)) {
+                RunNativeChain(fn);
+                MaybeReport();
+            } else {
+                RunJit(false);
             }
         }
     }
     void Halt() override {
         stop_ = true;
-        native_halt_ = 1;
-        jit_->HaltExecution(kHaltStop);
+        RequestHalt(kHaltStop);
     }
-    void Step() override { jit_->Step(); }
-    // While recompiled code runs (native_), the register file lives in st_.
-    u64 Reg(int i) const override { return native_ ? st_.x[i] : jit_->GetRegister(i); }
-    void SetReg(int i, u64 v) override { native_ ? void(st_.x[i] = v) : jit_->SetRegister(i, v); }
-    u64 PC() const override { return native_ ? st_.pc : jit_->GetPC(); }
-    void SetPC(u64 v) override { native_ ? void(st_.pc = v) : jit_->SetPC(v); }
-    u64 SP() const override { return native_ ? st_.sp : jit_->GetSP(); }
-    void SetSP(u64 v) override { native_ ? void(st_.sp = v) : jit_->SetSP(v); }
+    void Step() override { RunJit(true); }
+    // The register file lives in st_ except while the JIT runs non-native code.
+    bool JitOwns() const { return in_jit_ && !native_; }
+    u64 Reg(int i) const override { return JitOwns() ? jit_->GetRegister(i) : st_.x[i]; }
+    void SetReg(int i, u64 v) override { JitOwns() ? jit_->SetRegister(i, v) : void(st_.x[i] = v); }
+    u64 PC() const override { return JitOwns() ? jit_->GetPC() : st_.pc; }
+    void SetPC(u64 v) override { JitOwns() ? jit_->SetPC(v) : void(st_.pc = v); }
+    u64 SP() const override { return JitOwns() ? jit_->GetSP() : st_.sp; }
+    void SetSP(u64 v) override { JitOwns() ? jit_->SetSP(v) : void(st_.sp = v); }
     Vec128 Vector(int i) const override {
-        return native_ ? Vec128{st_.v[i].lo, st_.v[i].hi} : jit_->GetVector(i);
+        return JitOwns() ? jit_->GetVector(i) : Vec128{st_.v[i].lo, st_.v[i].hi};
     }
     void SetVector(int i, Vec128 v) override {
-        native_ ? void(st_.v[i] = {v[0], v[1]}) : jit_->SetVector(i, v);
+        JitOwns() ? jit_->SetVector(i, v) : void(st_.v[i] = {v[0], v[1]});
     }
-    u32 Fpcr() const override { return native_ ? st_.fpcr : jit_->GetFpcr(); }
-    void SetFpcr(u32 v) override { native_ ? void(st_.fpcr = v) : jit_->SetFpcr(v); }
-    u32 Fpsr() const override { return native_ ? st_.fpsr : jit_->GetFpsr(); }
-    void SetFpsr(u32 v) override { native_ ? void(st_.fpsr = v) : jit_->SetFpsr(v); }
-    u32 Pstate() const override { return native_ ? (pstate_rest_ | st_.nzcv) : jit_->GetPstate(); }
+    u32 Fpcr() const override { return JitOwns() ? jit_->GetFpcr() : st_.fpcr; }
+    void SetFpcr(u32 v) override { JitOwns() ? jit_->SetFpcr(v) : void(st_.fpcr = v); }
+    u32 Fpsr() const override { return JitOwns() ? jit_->GetFpsr() : st_.fpsr; }
+    void SetFpsr(u32 v) override { JitOwns() ? jit_->SetFpsr(v) : void(st_.fpsr = v); }
+    u32 Pstate() const override { return JitOwns() ? jit_->GetPstate() : (pstate_rest_ | st_.nzcv); }
     void SetPstate(u32 v) override {
-        if (native_) {
+        if (JitOwns()) {
+            jit_->SetPstate(v);
+        } else {
             st_.nzcv = v & 0xF0000000u;
             pstate_rest_ = v & 0x0FFFFFFFu;
-        } else {
-            jit_->SetPstate(v);
         }
     }
-    u64 TpidrEl0() const override { return native_ ? st_.tpidr : tpidr_el0_; }
-    void SetTpidrEl0(u64 v) override { native_ ? void(st_.tpidr = v) : void(tpidr_el0_ = v); }
-    void SetTpidrroEl0(u64 v) override { tpidrro_el0_ = v; }
-    void InvalidateCache(u64 addr, u64 size) override { jit_->InvalidateCacheRange(addr, size); }
-    void ClearExclusive() override { jit_->ClearExclusiveState(); }
+    u64 TpidrEl0() const override { return JitOwns() ? tpidr_el0_ : st_.tpidr; }
+    void SetTpidrEl0(u64 v) override { JitOwns() ? void(tpidr_el0_ = v) : void(st_.tpidr = v); }
+    void SetTpidrroEl0(u64 v) override { tpidrro_el0_ = st_.tpidrro = v; }
+    void InvalidateCache(u64 addr, u64 size) override {
+        if (jit_)
+            jit_->InvalidateCacheRange(addr, size);
+    }
+    void ClearExclusive() override {
+        if (jit_)
+            jit_->ClearExclusiveState();
+        else
+            monitor_.ClearProcessor(slot_);
+    }
 
+    // Makes the thread leave native code (next back edge / SVC return) and the JIT (next block) and come back to
+    // Run(). Pairs with the fence in RunJit: either the JIT sees native_halt_ before it starts, or we see its JIT.
+    void RequestHalt(Dynarmic::HaltReason why) {
+        native_halt_ = 1;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (auto* j = jit_ptr_.load(std::memory_order_seq_cst))
+            j->HaltExecution(why);
+    }
     void RunOnCore(std::function<void()> fn) override {
         {
             std::lock_guard lk(inv_mutex_);
             callbacks_.push_back(std::move(fn));
         }
-        native_halt_ = 1;
-        jit_->HaltExecution(kHaltCallback);
+        RequestHalt(kHaltCallback);
     }
     void QueueInvalidate(u64 addr, u64 size) {
         {
             std::lock_guard lk(inv_mutex_);
             pending_.emplace_back(addr, size);
         }
-        native_halt_ = 1;
-        jit_->HaltExecution(kHaltInvalidate);
+        RequestHalt(kHaltInvalidate);
     }
-    void ApplyInvalidations() {
-        std::lock_guard lk(inv_mutex_);
-        for (auto [a, s] : pending_)
-            jit_->InvalidateCacheRange(a, s);
-        pending_.clear();
+    void ServiceRequests() {
+        std::vector<std::function<void()>> fns;
+        {
+            std::lock_guard lk(inv_mutex_);
+            fns.swap(callbacks_);
+            if (jit_)
+                for (auto [a, s] : pending_)
+                    jit_->InvalidateCacheRange(a, s);
+            pending_.clear(); // without a JIT there is no translated code to drop
+        }
+        for (auto& f : fns)
+            f();
     }
+    void EnsureJit();
+    void RunJit(bool single_step);
+    void RunNativeChain(recomp::Fn fn);
+    void MaybeReport();
 
     // ---- UserCallbacks
     std::optional<u32> MemoryReadCode(u64 vaddr) override {
@@ -132,7 +153,6 @@ public:
         return mem_.Read<u32>(vaddr);
     }
     recomp::Fn NativeAt(u64 pc) const;
-    void RunNative(recomp::Fn fn, u64 pc);
     static constexpr u32 kTrapWord = 0xD4200000u | (0xDEADu << 5); // BRK #0xdead
     template <typename T>
     T SlowRead(u64 a) {
@@ -188,8 +208,9 @@ public:
     void CallSVC(u32 swi) override { cb_.svc(swi); }
     void ExceptionRaised(u64 pc, Dynarmic::A64::Exception e) override {
         using E = Dynarmic::A64::Exception;
-        if (auto fn = NativeAt(pc)) {
-            RunNative(fn, pc);
+        if (NativeAt(pc)) { // the JIT reached native code: Run() continues there
+            jit_->SetPC(pc);
+            jit_->HaltExecution(kHaltNative);
             return;
         }
         switch (e) {
@@ -238,7 +259,9 @@ private:
     Dynarmic::ExclusiveMonitor& monitor_;
     CpuCallbacks cb_;
     u64 tpidr_el0_ = 0, tpidrro_el0_ = 0;
-    std::unique_ptr<Dynarmic::A64::Jit> jit_;
+    std::unique_ptr<Dynarmic::A64::Jit> jit_;   // created on first need (EnsureJit)
+    std::atomic<Dynarmic::A64::Jit*> jit_ptr_{nullptr}; // the same, for halt requests from other threads
+    bool in_jit_ = false;
     volatile bool stop_ = false;
     std::mutex inv_mutex_;
     std::vector<std::pair<u64, u64>> pending_;
@@ -315,9 +338,12 @@ public:
                     if (!Verify(t, i)) {
                         *t.ok[i] = 0;
                         native_.erase(f.entry);
+                        SetSlot(f.entry, nullptr);
                         for (u32 k = 0; k < t.num_resumes; k++)
-                            if (t.resumes[k].func == i)
+                            if (t.resumes[k].func == i) {
                                 native_.erase(t.resumes[k].pc);
+                                SetSlot(t.resumes[k].pc, nullptr);
+                            }
                         changed = true;
                         LOG_INFO("Recomp", "code at {:#x} changed: function {:#x} back to the JIT", addr, f.entry);
                     }
@@ -325,54 +351,84 @@ public:
                 }
             }
         }
-        if (changed)
-            Publish();
+        (void)changed;
     }
     void DisableNative(u64 pc) {
         {
             std::unique_lock lk(native_mutex_);
             if (!native_.erase(pc))
                 return;
-            Publish();
+            SetSlot(pc, nullptr);
         }
         std::lock_guard lk(mutex_);
         for (auto* c : cores_)
             c->QueueInvalidate(pc, 4);
     }
-    // Lock-free lookup: an immutable open-addressing table, replaced (old one leaked) when native_ changes.
+    // Lock-free lookup: an open-addressing table whose keys never change once published. Changing or removing the
+    // entry of a pc already in the table only swaps its function pointer (nullptr = not native); only a new pc
+    // rebuilds the table. The full table is ~64 MB (700k entries), so replaced tables are freed after a grace
+    // period instead of being leaked: every NVN override used to leak one (11 GB at boot).
+    struct NativeSlot {
+        u64 pc = 0;
+        std::atomic<recomp::Fn> fn{nullptr};
+    };
     struct NativeMap {
-        u64 mask;
-        std::vector<std::pair<u64, recomp::Fn>> slots;
+        u64 mask = 0;
+        std::unique_ptr<NativeSlot[]> slots;
     };
     static u64 Slot(u64 pc) { return (pc >> 2) * 0x9E3779B97F4A7C15ull >> 20; }
-    void Publish() {
+    static NativeSlot* Find(const NativeMap* m, u64 pc) {
+        for (u64 i = Slot(pc) & m->mask;; i = (i + 1) & m->mask) {
+            NativeSlot& e = m->slots[i];
+            if (e.pc == pc)
+                return &e;
+            if (!e.pc)
+                return nullptr;
+        }
+    }
+    // native_mutex_ held. Brings the published table in line with native_[pc] (fn == nullptr: removed).
+    void SetSlot(u64 pc, recomp::Fn fn) {
+        if (NativeMap* m = map_.load(std::memory_order_relaxed))
+            if (NativeSlot* e = Find(m, pc)) {
+                e->fn.store(fn, std::memory_order_release);
+                return;
+            }
+        if (fn)
+            Publish();
+    }
+    void Publish() { // native_mutex_ held
         auto* m = new NativeMap;
         u64 size = 1024;
         while (size < native_.size() * 4)
             size *= 2;
         m->mask = size - 1;
-        m->slots.assign(size, {0, nullptr});
+        m->slots.reset(new NativeSlot[size]);
         for (auto [pc, fn] : native_) {
             u64 i = Slot(pc) & m->mask;
-            while (m->slots[i].first)
+            while (m->slots[i].pc)
                 i = (i + 1) & m->mask;
-            m->slots[i] = {pc, fn};
+            m->slots[i].pc = pc;
+            m->slots[i].fn.store(fn, std::memory_order_relaxed);
         }
-        map_.store(m, std::memory_order_release);
+        NativeMap* old = map_.exchange(m, std::memory_order_acq_rel);
+        // Readers only hold a table for the duration of one Lookup: free replaced ones once they are 10 s old.
+        const auto now = std::chrono::steady_clock::now();
+        if (old)
+            retired_.emplace_back(now, old);
+        while (!retired_.empty() && now - retired_.front().first > std::chrono::seconds(10)) {
+            delete retired_.front().second;
+            retired_.pop_front();
+        }
     }
     recomp::Fn Lookup(u64 pc) const {
         const NativeMap* m = map_.load(std::memory_order_acquire);
         if (!m)
             return nullptr;
-        for (u64 i = Slot(pc) & m->mask;; i = (i + 1) & m->mask) {
-            const auto& e = m->slots[i];
-            if (e.first == pc)
-                return e.second;
-            if (!e.first)
-                return nullptr;
-        }
+        const NativeSlot* e = Find(m, pc);
+        return e ? e->fn.load(std::memory_order_acquire) : nullptr;
     }
     std::atomic<u64> transitions_{0};
+    std::atomic<u32> jit_cores_{0}; // guest threads that ever needed the JIT (since boot)
     bool TableReady() const { return table_ready_.load(std::memory_order_acquire); }
 
     // ---- coverage: fraction of guest instructions executed by recompiled code
@@ -438,7 +494,7 @@ public:
             {
                 std::unique_lock lk(native_mutex_);
                 native_[ptr] = host;
-                Publish();
+                SetSlot(ptr, host);
             }
             std::lock_guard lk(mutex_);
             for (auto* c : cores_)
@@ -488,8 +544,9 @@ public:
         if (n + j)
             g_native_percent = float(100.0 * double(n) / double(n + j));
         if (n + j)
-            LOG_INFO("Recomp", "native {:.1f}% of {} M guest instructions, {} k JIT->native entries (last 10 s)",
-                     100.0 * double(n) / double(n + j), (n + j) / 1000000, tr / 1000);
+            LOG_INFO("Recomp", "native {:.2f}% of {} M guest instructions, {} k native entries (last 10 s); "
+                     "{} threads have needed the JIT since boot",
+                     100.0 * double(n) / double(n + j), (n + j) / 1000000, tr / 1000, jit_cores_.load());
         // the busiest guest threads (host thread ids), for comparing per-thread work between runs
         std::vector<std::pair<u64, u32>> per;
         {
@@ -579,6 +636,7 @@ private:
     std::once_flag table_once_;
     std::shared_mutex native_mutex_;
     std::atomic<NativeMap*> map_{nullptr};
+    std::deque<std::pair<std::chrono::steady_clock::time_point, NativeMap*>> retired_;
     std::unordered_map<u64, recomp::Fn> native_;
     std::thread sampler_;
     std::atomic<bool> sampler_stop_{false};
@@ -588,17 +646,23 @@ private:
 
 DynarmicCore::DynarmicCore(DynarmicFactory& f, core::Memory& mem, Dynarmic::ExclusiveMonitor& monitor,
                            CpuCallbacks cb, size_t slot)
-    : slot_(slot), factory_(f), mem_(mem), monitor_(monitor), cb_(std::move(cb)) {
+    : slot_(slot), factory_(f), mem_(mem), monitor_(monitor), cb_(std::move(cb)) {}
+
+DynarmicCore::~DynarmicCore() { factory_.Release(this); }
+
+void DynarmicCore::EnsureJit() {
+    if (jit_)
+        return;
     Dynarmic::A64::UserConfig c{};
     c.callbacks = this;
-    c.processor_id = slot;
-    c.global_monitor = &monitor;
+    c.processor_id = slot_;
+    c.global_monitor = &monitor_;
     c.tpidrro_el0 = &tpidrro_el0_;
     c.tpidr_el0 = &tpidr_el0_;
     c.cntfrq_el0 = 19200000;
     c.dczid_el0 = 4;
     c.ctr_el0 = 0x8444c004;
-    c.fastmem_pointer = reinterpret_cast<uintptr_t>(mem.Base());
+    c.fastmem_pointer = reinterpret_cast<uintptr_t>(mem_.Base());
     c.fastmem_address_space_bits = core::layout::kSpaceBits;
     c.silently_mirror_fastmem = false;
     c.fastmem_exclusive_access = true;
@@ -613,9 +677,53 @@ DynarmicCore::DynarmicCore(DynarmicFactory& f, core::Memory& mem, Dynarmic::Excl
     }();
     c.code_cache_size = cache_mb << 20;
     jit_ = std::make_unique<Dynarmic::A64::Jit>(c);
+    jit_ptr_.store(jit_.get(), std::memory_order_seq_cst);
+    factory_.jit_cores_.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<int> logged{0};
+    if (logged++ < 20)
+        LOG_INFO("Recomp", "JIT needed at {:#x} (thread slot {}): no native code there", st_.pc, slot_);
 }
 
-DynarmicCore::~DynarmicCore() { factory_.Release(this); }
+// Runs the JIT from st_ until it reaches native code again (or a halt). single_step: one instruction (debugger).
+void DynarmicCore::RunJit(bool single_step) {
+    EnsureJit();
+    auto regs = jit_->GetRegisters();
+    std::memcpy(regs.data(), st_.x, sizeof(st_.x));
+    jit_->SetRegisters(regs);
+    auto vecs = jit_->GetVectors();
+    std::memcpy(vecs.data(), st_.v, sizeof(st_.v));
+    jit_->SetVectors(vecs);
+    jit_->SetSP(st_.sp);
+    jit_->SetPC(st_.pc);
+    jit_->SetPstate(pstate_rest_ | st_.nzcv);
+    jit_->SetFpcr(st_.fpcr);
+    jit_->SetFpsr(st_.fpsr);
+    tpidr_el0_ = st_.tpidr;
+    tpidrro_el0_ = st_.tpidrro;
+    in_jit_ = true;
+    std::atomic_thread_fence(std::memory_order_seq_cst); // see RequestHalt
+    if (single_step)
+        jit_->Step();
+    else if (!native_halt_)
+        jit_->Run();
+    in_jit_ = false;
+    for (auto r : {kHaltStop, kHaltInvalidate, kHaltCallback, kHaltNative})
+        jit_->ClearHalt(r);
+    regs = jit_->GetRegisters();
+    std::memcpy(st_.x, regs.data(), sizeof(st_.x));
+    vecs = jit_->GetVectors();
+    std::memcpy(st_.v, vecs.data(), sizeof(st_.v));
+    st_.sp = jit_->GetSP();
+    st_.pc = jit_->GetPC();
+    const u32 pstate = jit_->GetPstate();
+    st_.nzcv = pstate & 0xF0000000u;
+    pstate_rest_ = pstate & 0x0FFFFFFFu;
+    st_.fpcr = jit_->GetFpcr();
+    st_.fpsr = jit_->GetFpsr();
+    st_.tpidr = tpidr_el0_;
+}
+
+void DynarmicCore::MaybeReport() { factory_.MaybeReport(); }
 
 recomp::Fn DynarmicCore::NativeAt(u64 pc) const {
     if (!factory_.TableReady()) [[unlikely]]
@@ -623,21 +731,9 @@ recomp::Fn DynarmicCore::NativeAt(u64 pc) const {
     return factory_.Lookup(pc);
 }
 
-void DynarmicCore::RunNative(recomp::Fn fn, u64 pc) {
+void DynarmicCore::RunNativeChain(recomp::Fn fn) {
     auto& s = st_;
-    s.pc = pc;
-    auto regs = jit_->GetRegisters();
-    std::memcpy(s.x, regs.data(), sizeof(s.x));
-    auto vecs = jit_->GetVectors();
-    std::memcpy(s.v, vecs.data(), sizeof(s.v));
-    s.sp = jit_->GetSP();
-    const u32 pstate = jit_->GetPstate();
-    s.nzcv = pstate & 0xF0000000u;
-    pstate_rest_ = pstate & 0x0FFFFFFFu;
-    s.fpcr = jit_->GetFpcr();
-    s.fpsr = jit_->GetFpsr();
-    s.tpidr = tpidr_el0_;
-    s.tpidrro = tpidrro_el0_;
+    const u64 pc = s.pc;
     s.mem = mem_.Base();
     s.halt = &native_halt_;
     s.core = this;
@@ -660,17 +756,19 @@ void DynarmicCore::RunNative(recomp::Fn fn, u64 pc) {
         _mm_setcsr(guest_mxcsr_);
     // Chain native functions (tail jumps, returns into other entries) until the guest leaves recompiled code.
     for (;;) {
-        const u64 before = s.icount;
+        const u64 before = s.icount, at = s.pc;
         fn(s);
-        // no progress (stack floor, disabled function): let the JIT take over
-        if (s.icount == before) {
+        // No progress (stack floor, a function that refused to run): the JIT has to run this pc. Host-implemented
+        // C library routines return without counting instructions, but they do move the pc.
+        if (s.icount == before && s.pc == at) {
+            if (native_halt_)
+                break; // a halt request, not a failure
             static std::atomic<int> reports{0};
             if (reports++ < 10)
-                LOG_WARN("Recomp", "no progress at {:#x} (pc after {:#x}, stack {:#x}, floor {:#x}, halt {})", pc,
-                         s.pc, reinterpret_cast<u64>(_AddressOfReturnAddress()), s.stack_limit, native_halt_);
-            // Never trap here again, or the JIT and native code would hand this pc back and forth forever.
-            if (s.pc == pc && !native_halt_)
-                factory_.DisableNative(pc);
+                LOG_WARN("Recomp", "no progress at {:#x} (chain from {:#x}, stack {:#x}, floor {:#x})", at, pc,
+                         reinterpret_cast<u64>(_AddressOfReturnAddress()), s.stack_limit);
+            // Never enter native code here again, or Run() and the JIT would hand this pc back and forth forever.
+            factory_.DisableNative(at);
             break;
         }
         if (native_halt_ || !(fn = factory_.Lookup(s.pc)))
@@ -686,17 +784,6 @@ void DynarmicCore::RunNative(recomp::Fn fn, u64 pc) {
     instr_window_.fetch_add(s.icount - icount0, std::memory_order_relaxed);
     if (!host_tid_)
         host_tid_ = GetCurrentThreadId();
-
-    std::memcpy(regs.data(), s.x, sizeof(s.x));
-    jit_->SetRegisters(regs);
-    std::memcpy(vecs.data(), s.v, sizeof(s.v));
-    jit_->SetVectors(vecs);
-    jit_->SetSP(s.sp);
-    jit_->SetPstate(pstate_rest_ | s.nzcv);
-    jit_->SetFpcr(s.fpcr);
-    jit_->SetFpsr(s.fpsr);
-    tpidr_el0_ = s.tpidr;
-    jit_->SetPC(s.pc);
 }
 
 void DynarmicCore::AddTicks(u64 ticks) {

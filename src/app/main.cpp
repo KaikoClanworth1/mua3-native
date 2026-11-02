@@ -1,4 +1,5 @@
 // MUA3 runtime entry point: window/input/audio on the main thread, the game on its own threads.
+#include <atomic>
 #include <algorithm>
 #include <csignal>
 #include <exception>
@@ -324,7 +325,31 @@ void RunInputScript(const fs::path& path) {
 
 } // namespace
 
+void StartAllocTrace(); // alloc_trace.cpp
+
 // Unhandled host crash: log the exception and a symbolized stack (RelWithDebInfo has PDBs) before dying.
+// The calling thread's host stack, symbolized from mua3.pdb next to the exe.
+static std::string HostStack() {
+    void* frames[48];
+    const USHORT n = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
+    const HANDLE proc = GetCurrentProcess();
+    static bool sym_ready = false;
+    if (!sym_ready)
+        sym_ready = SymInitialize(proc, nullptr, TRUE) != 0;
+    std::string stack;
+    for (USHORT i = 0; i < n; i++) {
+        alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256]{};
+        auto* sym = reinterpret_cast<SYMBOL_INFO*>(buf);
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen = 255;
+        DWORD64 disp = 0;
+        const DWORD64 pc = reinterpret_cast<DWORD64>(frames[i]);
+        stack += fmt::format("\n  #{} {}", i, sym_ready && SymFromAddr(proc, pc, &disp, sym) ? fmt::format("{}+{:#x}", sym->Name, disp)
+                                                                                                : fmt::format("{:#x}", pc));
+    }
+    return stack;
+}
+
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
     static std::atomic<bool> once{false};
     if (once.exchange(true))
@@ -443,26 +468,18 @@ static void StartGpuSampler() {
 int main(int argc, char** argv) {
     SetUnhandledExceptionFilter(CrashFilter);
     std::signal(SIGABRT, [](int) {
-        // the host stack of the aborting thread (symbols from mua3.pdb next to the exe)
-        void* frames[48];
-        const USHORT n = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
-        const HANDLE proc = GetCurrentProcess();
-        static bool sym_ready = false;
-        if (!sym_ready)
-            sym_ready = SymInitialize(proc, nullptr, TRUE) != 0;
-        std::string stack;
-        for (USHORT i = 0; i < n; i++) {
-            alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256]{};
-            auto* sym = reinterpret_cast<SYMBOL_INFO*>(buf);
-            sym->SizeOfStruct = sizeof(SYMBOL_INFO);
-            sym->MaxNameLen = 255;
-            DWORD64 disp = 0;
-            const DWORD64 pc = reinterpret_cast<DWORD64>(frames[i]);
-            stack += fmt::format("\n  #{} {}", i, sym_ready && SymFromAddr(proc, pc, &disp, sym) ? fmt::format("{}+{:#x}", sym->Name, disp)
-                                                                                                    : fmt::format("{:#x}", pc));
-        }
-        LOG_ERROR("Crash", "abort(){}", stack);
+        LOG_ERROR("Crash", "abort(){}", HostStack());
         std::fflush(nullptr);
+    });
+    // C++ throws, logged where they happen (the first few): one escaping a thread kills the process with little
+    // trace otherwise.
+    AddVectoredExceptionHandler(0, [](EXCEPTION_POINTERS* ep) -> LONG {
+        if (ep->ExceptionRecord->ExceptionCode == 0xE06D7363) {
+            static std::atomic<int> logged{0};
+            if (logged++ < 6)
+                LOG_WARN("Crash", "C++ exception thrown{}", HostStack());
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
     });
     std::set_terminate([] {
         LOG_ERROR("Crash", "std::terminate (uncaught C++ exception)");
@@ -501,6 +518,7 @@ int main(int argc, char** argv) {
     common::SetLogLevel(common::LogLevel(std::clamp(cfg.log_level, 0, 5)));
     common::SetLogFile("mua3.log");
     timeBeginPeriod(1);
+    StartAllocTrace(); // MUA3_TRACE_VALLOC (diagnostic)
     // The exe names its PDB without a path (/PDBALTPATH): let in-process symbol lookups (profilers, stack dumps)
     // search the exe's folder.
     {
@@ -576,6 +594,7 @@ int main(int argc, char** argv) {
     gpu::G().SetRenderer(&renderer);
     gpu::InstallNvnEncoder(gpu::G());
     g_renderer = &renderer;
+    g_display = &display;
     // First launch: harvest every shader program the game ships into the prewarm manifest (about 30 s, in the
     // background); the renderer picks them up and compiles them while the intro and menus run.
     if (const fs::path shaders = cfg.game_dir / "romfs" / "SHADER", marker = "shader_dump/harvested.txt";
@@ -594,7 +613,6 @@ int main(int argc, char** argv) {
         std::thread([s = std::atoi(t)] {
             std::this_thread::sleep_for(std::chrono::seconds(s));
             g_renderer->dump_surfaces_ = true;
-    g_display = &display;
         }).detach();
     display.context_mutex = &gpu::ContextMutex();
     display.context_epoch = &gpu::ContextEpoch();

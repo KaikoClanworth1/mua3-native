@@ -2725,6 +2725,48 @@ bool D3D11Renderer::Blit2D(const u32* regs) { return false; }
 
 void D3D11Renderer::FlushCommands() {}
 
+void D3D11Renderer::ThrottleFrames() {
+    constexpr u32 kRing = kFramesInFlight + 1;
+    {
+        std::lock_guard lk(ContextMutex());
+        auto& q = frame_queries_[frame_query_count_ % kRing];
+        if (!q) {
+            const D3D11_QUERY_DESC d{D3D11_QUERY_EVENT, 0};
+            dev_->CreateQuery(&d, &q);
+        }
+        if (q)
+            ctx_->End(q.Get());
+    }
+    frame_query_count_++;
+    if (frame_query_count_ <= kFramesInFlight)
+        return;
+    // The query ended kFramesInFlight presents ago must have completed before this frame's successor is recorded.
+    ID3D11Query* old = frame_queries_[(frame_query_count_ - 1 - kFramesInFlight) % kRing].Get();
+    if (!old)
+        return;
+    const u64 t0 = ProfNow();
+    for (u32 spin = 0;; spin++) {
+        BOOL done = FALSE;
+        HRESULT hr;
+        {
+            std::lock_guard lk(ContextMutex()); // never held while sleeping: other threads need the context
+            hr = ctx_->GetData(old, &done, sizeof(done), 0);
+        }
+        if (hr != S_FALSE)
+            break; // S_OK = done; a failure (device removed) must not hang the GPU thread
+        if (spin < 64)
+            std::this_thread::yield();
+        else
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    throttle_wait_ns_ += ProfNow() - t0;
+    if (++throttle_frames_ % 600 == 0) {
+        LOG_INFO("Renderer", "frame throttle: {:.2f} ms/frame waiting for the GPU ({} frames in flight max)",
+                 double(throttle_wait_ns_) / 1e6 / 600.0, kFramesInFlight);
+        throttle_wait_ns_ = 0;
+    }
+}
+
 void D3D11Renderer::BindRenderTargets(Surface**, u32, Surface*) {}
 
 } // namespace gpu

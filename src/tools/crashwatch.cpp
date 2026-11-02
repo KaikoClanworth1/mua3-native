@@ -57,6 +57,7 @@ int main(int argc, char** argv) {
     threads[pi.dwThreadId] = pi.hThread;
     bool sym_ready = false;
     DWORD exit_code = 0;
+    DWORD64 main_base = 0;
     for (;;) {
         DEBUG_EVENT ev{};
         if (!WaitForDebugEvent(&ev, INFINITE))
@@ -73,6 +74,12 @@ int main(int argc, char** argv) {
                 const DWORD64 base = DWORD64(ev.u.CreateProcessInfo.lpBaseOfImage);
                 std::printf("crashwatch: %s at %016llx\n", name, base);
                 SymLoadModuleEx(pi.hProcess, nullptr, name, nullptr, base, 0, nullptr, 0);
+                IMAGEHLP_MODULE64 mi{};
+                mi.SizeOfStruct = sizeof(mi);
+                if (SymGetModuleInfo64(pi.hProcess, base, &mi))
+                    std::printf("crashwatch: symbols %s (%s)\n", mi.SymType == SymPdb ? "from pdb" : mi.SymType == SymNone ? "NONE" : "other",
+                                mi.LoadedPdbName);
+                main_base = base;
             }
             if (ev.u.CreateProcessInfo.hFile)
                 CloseHandle(ev.u.CreateProcessInfo.hFile);
@@ -97,8 +104,9 @@ int main(int argc, char** argv) {
             const auto& er = ev.u.Exception.ExceptionRecord;
             const bool first = ev.u.Exception.dwFirstChance != 0;
             const DWORD code = er.ExceptionCode;
+            // C++ throws (0xE06D7363) are reported at first chance: the stack is still intact at the throw site.
             const bool interesting = !first || code == STATUS_STACK_BUFFER_OVERRUN || code == STATUS_HEAP_CORRUPTION ||
-                                     code == STATUS_STACK_OVERFLOW || code == 0xC0000374;
+                                     code == STATUS_STACK_OVERFLOW || code == 0xC0000374 || code == 0xE06D7363;
             if (code == EXCEPTION_BREAKPOINT && first) {
                 status = DBG_CONTINUE; // loader breakpoint
                 break;

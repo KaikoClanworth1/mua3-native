@@ -298,8 +298,10 @@ void Gpu::ThreadMain() {
             break;
         }
         case Job::Present:
-            if (renderer_)
+            if (renderer_) {
                 renderer_->Present(job.present);
+                renderer_->ThrottleFrames();
+            }
             presents++;
             if (on_present)
                 on_present(job.present);

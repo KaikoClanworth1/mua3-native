@@ -49,7 +49,7 @@ target_link_libraries(nxcore PUBLIC nxrecomp)
 add_library(platform STATIC platform/display.cpp platform/input.cpp platform/audio.cpp platform/platform.h ${D3D11_SOURCES})
 target_link_libraries(platform PUBLIC nxcore imgui SDL3::SDL3-static d3d11 dxgi d3dcompiler xinput xaudio2 winmm)
 
-add_executable(mua3 app/main.cpp)
+add_executable(mua3 app/main.cpp app/alloc_trace.cpp)
 target_link_libraries(mua3 PRIVATE nxcore platform dbghelp)
 # incremental-link thunks would sit between every pair of recompiled functions
 # /PDBALTPATH: the exe names its PDB without a path, so copies of the game load the PDB next to them (and a running
