@@ -64,5 +64,7 @@ std::unique_ptr<CoreFactory> CreateDynarmicFactory(core::Memory& memory, size_t 
 
 // Share of guest instructions run by recompiled code over the last 10 s (percent; < 0 until measured).
 extern std::atomic<float> g_native_percent;
+// Guest threads that have needed the JIT fallback (code without a recompiled version) since boot.
+extern std::atomic<u32> g_jit_threads;
 
 } // namespace cpu

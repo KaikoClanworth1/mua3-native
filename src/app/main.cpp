@@ -108,11 +108,15 @@ void DrawOverlay(const core::Config& cfg, platform::Input& input, bool& show) {
     ImGui::Text("Input: %s   Audio: %s", input.DeviceName().c_str(), platform::Audio().BackendName().c_str());
     ImGui::Separator();
     if (const float pct = cpu::g_native_percent; pct >= 0)
-        ImGui::Text("CPU: %.1f%% of guest code native (AOT recompiled), rest on the dynarmic JIT", pct);
+        ImGui::Text("CPU: %.2f%% of guest code native (statically recompiled x64)", pct);
     else
-        ImGui::Text("CPU: AOT recompiled code + dynarmic JIT fallback");
+        ImGui::Text("CPU: statically recompiled x64");
+    if (const u32 jit = cpu::g_jit_threads.load(); jit)
+        ImGui::Text("     JIT fallback used by %u thread(s) for code with no recompiled version", jit);
+    else
+        ImGui::Text("     JIT fallback: never used");
     if (g_renderer && g_renderer->Shaders())
-        ImGui::Text("GPU: Maxwell commands -> D3D11, %zu shaders (%u compiling)", g_renderer->Shaders()->Count(),
+        ImGui::Text("GPU: NVN -> native D3D11, %zu shaders (%u compiling)", g_renderer->Shaders()->Count(),
                     g_renderer->Shaders()->pending.load());
     if (ImGui::Button("Dump guest threads to log"))
         core::Sys().Kern().DumpAllThreads();

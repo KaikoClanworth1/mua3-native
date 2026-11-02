@@ -2590,7 +2590,7 @@ void D3D11Renderer::Present(const PresentInfo& p) {
                  skip_reason_[0], skip_reason_[1], skip_reason_[2], skip_reason_[3], skip_reason_[4], skip_reason_[5],
                  clears, surfaces_.size(), shaders_->Count(), shaders_->failures.load());
         // video memory in use by this process (the VRAM budget work)
-        if (frame_counter_ % 1500 == 1) {
+        if (frame_counter_ % 300 == 1) {
             Microsoft::WRL::ComPtr<IDXGIDevice> dd;
             Microsoft::WRL::ComPtr<IDXGIAdapter> ad;
             Microsoft::WRL::ComPtr<IDXGIAdapter3> ad3;
@@ -2600,8 +2600,10 @@ void D3D11Renderer::Present(const PresentInfo& p) {
                 u64 surf = 0;
                 for (auto& [k, sf] : surfaces_)
                     surf += u64(sf->width * sf->scale) * (sf->height * sf->scale) * 4;
-                LOG_INFO("Renderer", "VRAM in use {} MB (budget {} MB); render targets ~{} MB in {} surfaces", vm.CurrentUsage >> 20,
-                         vm.Budget >> 20, surf >> 20, surfaces_.size());
+                DXGI_QUERY_VIDEO_MEMORY_INFO sys{};
+                ad3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &sys);
+                LOG_INFO("Renderer", "VRAM in use {} MB (budget {} MB), GPU system memory {} MB; render targets ~{} MB in {} surfaces",
+                         vm.CurrentUsage >> 20, vm.Budget >> 20, sys.CurrentUsage >> 20, surf >> 20, surfaces_.size());
             }
         }
         if (!s)

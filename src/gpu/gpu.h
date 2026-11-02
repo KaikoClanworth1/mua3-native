@@ -56,22 +56,14 @@ public:
 
     core::Memory& Mem() { return mem_; }
     AddressSpace& As() { return as_; }
-    // The 3D engine the renderer reads: the command stream's, or the native NVN replay's (gpu/nvn_encoder.cpp).
+    // The register-level draw state the renderer reads: the host NVN encoder's (gpu/nvn_encoder.cpp) while it runs.
     Maxwell3D& M3D() { return *active_m3d_; }
-    Maxwell3D& StreamM3D() { return m3d_; }
     void SetActiveM3D(Maxwell3D* m) { active_m3d_ = m ? m : &m3d_; }
 
     // Host-backed GPU memory at [kHostBase, kHostBase + kHostSize): constant buffers the native replay builds itself
     // (driver constants, texture handles). Reads and writes through the helpers below reach it like mapped memory.
     static constexpr u64 kHostBase = 0xFF00000000ull, kHostSize = 0x4000000;
     u8* HostMem() { return host_mem_.get(); }
-
-    // Verification (MUA3_NVN_VERIFY): the next Submit() after tag_next_submit is set runs with on_tagged_job called
-    // first, on the GPU thread.
-    std::atomic<bool> tag_next_submit{false};
-    std::function<void()> on_tagged_job;
-    // Sees every compute launch before the renderer; returns true if it took care of it (native replay).
-    std::function<bool(const u32* regs, const u32* qmd)> intercept_dispatch;
 
     void SetRenderer(Renderer* r);
     // Native handle of the GPU command thread (profiling).
@@ -88,14 +80,15 @@ public:
     bool WaitSyncpoint(u32 id, u32 value, s64 timeout_us);
 
     // ---- submission (any thread). Work runs in order on the GPU thread.
-    void Submit(std::vector<u64> entries, u32 syncpt_id, u32 syncpt_incr);
+    // A GPFIFO submission from the NVN driver (only its channel setup at boot: the host encoder renders everything).
+    // There is no command-stream emulation: the pushbuffer is not executed, only the fence it would have reached is
+    // completed, in order with the host's work.
+    void CompleteFence(u32 syncpt_id, u32 target);
     void QueuePresent(const PresentInfo& p);
     // Runs `fn` on the GPU thread, in order with the command submissions (native NVN replay).
     void SubmitHost(std::function<void()> fn);
     // DMA copy engine LAUNCH (0xB0B5 method 0xC0) with its registers; GPU thread.
     void RunDma(const u32* regs, u32 launch);
-    // Sees every DMA launch first; returns true if it took care of it (verification of the native replay's copies).
-    std::function<bool(const u32* regs, u32 launch)> intercept_dma;
     void WaitIdle();
     void* NativeThreadHandle() { return thread_.native_handle(); }
 
@@ -123,20 +116,11 @@ public:
 
 private:
     struct Job {
-        enum Kind { Commands, Present, Fence, Host } kind;
-        bool tagged = false;
-        u64 queued_ns = 0; // MUA3_GPU_TIMELINE
+        enum Kind { Present, Host } kind;
         std::function<void()> host;
-        std::vector<u64> entries;
-        u32 syncpt_id = 0, syncpt_incr = 0;
         PresentInfo present;
     };
     void ThreadMain();
-    void RunCommands(const std::vector<u64>& entries);
-    void ProcessPushbuffer(u64 gpu_va, u32 words);
-    u32 dma_mode_ = 0, dma_subch_ = 0, dma_method_ = 0, dma_count_ = 0, dma_k_ = 0; // pending method data
-    void CallMethod(u32 subch, u32 method, u32 arg, bool last_in_batch);
-    void FlushMacro();
 
     core::Memory& mem_;
     AddressSpace as_;
@@ -156,13 +140,6 @@ private:
     bool busy_ = false;
     std::atomic<bool> running_{true};
     std::thread thread_;
-
-    // Per-subchannel engine binding and generic register files for the simple engines.
-    u32 bound_class_[8]{};
-    std::vector<u32> regs_[8];
-    // Pending macro call (params accumulate until the batch ends).
-    s32 macro_index_ = -1;
-    std::vector<u32> macro_params_;
 };
 
 Gpu& G();

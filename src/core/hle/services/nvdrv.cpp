@@ -1,4 +1,5 @@
 // nvdrv: /dev/nvmap, nvhost-as-gpu, nvhost-gpu, nvhost-ctrl, nvhost-ctrl-gpu.
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <unordered_map>
@@ -246,29 +247,27 @@ struct GpuChannelDev final : Device {
                                                  MakeEvent("nvgpu:3")};
 
     u32 Submit(std::vector<u8>& in, std::vector<u8>& out, size_t hdr_size, const u64* entries_override) {
+        // The host renders everything the game records (hle::nvn); the only GPFIFO submissions left are the NVN
+        // driver's channel setup at boot. Nothing executes them: the fence they would reach is completed in order.
         u32 n = Arg<u32>(in, 8);
         const u32 flags = Arg<u32>(in, 12);
         if (entries_override && t_inline_in)
             n = std::min<u32>(n, u32(t_inline_in->size() / 8));
-        std::vector<u64> entries(n);
-        if (entries_override)
-            std::memcpy(entries.data(), entries_override, n * 8);
-        else
-            for (u32 i = 0; i < n; i++)
-                entries[i] = Arg<u64>(in, hdr_size + i * 8);
+        static std::atomic<u64> submits{0};
+        if (const u64 k = ++submits; k <= 4 || (k & (k - 1)) == 0)
+            LOG_INFO("nvdrv", "GPFIFO submit #{} ({} entries): not executed, fence completed", k, n);
         auto& g = gpu::G();
         // flags: bit0 wait on the input fence, bit1 the driver appends a syncpoint increment,
         // bit8 the pushbuffer itself increments the channel syncpoint by fence.value (NVN's mode).
-        u32 driver_incr = 0, value;
-        if (flags & (1u << 8)) {
+        u32 value;
+        if (flags & (1u << 8))
             value = g.ReserveSyncpoint(syncpt, Arg<u32>(in, 20));
-        } else if (flags & 2) {
-            driver_incr = 1;
+        else if (flags & 2)
             value = g.ReserveSyncpoint(syncpt, 1);
-        } else {
+        else
             value = g.SyncpointMax(syncpt);
-        }
-        g.Submit(std::move(entries), syncpt, driver_incr);
+        g.CompleteFence(syncpt, value);
+        (void)hdr_size, (void)entries_override;
         out.resize(std::max<size_t>(out.size(), 0x18));
         std::memcpy(out.data(), in.data(), std::min<size_t>(0x18, in.size()));
         Set<u32>(out, 16, syncpt);

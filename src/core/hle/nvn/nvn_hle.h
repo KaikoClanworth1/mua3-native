@@ -33,12 +33,9 @@ extern std::atomic<long long> g_learn_until_ms;
 // with thread ids and times to nvn_timeline.txt.
 void TimelineEvent(const char* what, recomp::u64 arg = 0);
 
-// Native rendering (default; MUA3_NVN_NATIVE=0 turns it off): command buffer commands the host encoder handles are recorded but never reach the driver; each
-// submit's commands run on the host (gpu/nvn_encoder.cpp).
-bool Native();
-
-// ---- native replay interface (MUA3_NVN_REPLAY): each submitted frame's commands, flattened in execution order
-// (nested Call/CopyCommands expanded), handed to the renderer's sink; queries resolve the objects they reference.
+// ---- native rendering: command buffer commands the host encoder handles are recorded and never reach the NVN
+// driver. Each submitted frame's commands, flattened in execution order (nested Call/CopyCommands expanded), go to
+// the sink (gpu/nvn_encoder.cpp); queries resolve the objects they reference.
 struct StateCall {
     std::string_view name; // setter, e.g. "nvnBlendStateSetBlendFunc"
     recomp::u64 x[8];      // x[0] = the object

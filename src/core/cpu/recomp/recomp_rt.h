@@ -4,6 +4,7 @@
 // The generator translates each guest basic block with dynarmic's A64 frontend and emits one C++ statement per IR
 // microinstruction. Generic IR opcodes become calls to the inline functions in namespace `op` below (same names as
 // the IR opcodes), so the semantics here must match dynarmic's x64 backend exactly.
+#include <algorithm>
 #include <atomic>
 #include <bit>
 #include <limits>
@@ -52,6 +53,7 @@ using Fn = void (*)(State&);
 
 // ---- runtime services (recomp_runtime.cpp)
 void Svc(State& s, u32 imm);
+void SetFpcr(State& s, u32 v); // MSR FPCR: also re-derives the host MXCSR (rounding mode, flush-to-zero)
 u64 Cntpct(State& s);
 void Barrier();
 u8 ExRead8(State& s, u64 a);
@@ -1073,5 +1075,64 @@ RC_INLINE V128 VectorSignedSaturatedDoublingMultiplyHigh16(State& s, V128 a, V12
 RC_INLINE V128 VectorSignedSaturatedDoublingMultiplyHigh32(State& s, V128 a, V128 b) { return SatDMulH<int32_t, false>(s, a, b); }
 RC_INLINE V128 VectorSignedSaturatedDoublingMultiplyHighRounding16(State& s, V128 a, V128 b) { return SatDMulH<int16_t, true>(s, a, b); }
 RC_INLINE V128 VectorSignedSaturatedDoublingMultiplyHighRounding32(State& s, V128 a, V128 b) { return SatDMulH<int32_t, true>(s, a, b); }
+// SQSHL (register): per-lane signed shift by the low byte of the shift lane, saturating left shifts
+template <typename T>
+RC_INLINE V128 SatShiftLeft(State& s, V128 a, V128 b) {
+    using U = std::make_unsigned_t<T>;
+    return SatLanes2<T>(s, a, b, [](T x, T sh_lane, bool& q) {
+        constexpr T kMax = T(sizeof(T) * 8 - 1);
+        const T sh = std::clamp<T>(T(int8_t(u8(U(sh_lane) & 0xFF))), T(-kMax), std::numeric_limits<T>::max());
+        const T sat = T((U(x) >> kMax) + (U(1) << kMax) - 1); // max for x >= 0, min for x < 0
+        if (x == 0)
+            return T(0);
+        if (sh < 0)
+            return T(x >> -sh);
+        if (U(sh) > U(kMax)) {
+            q = true;
+            return sat;
+        }
+        const T shifted = T(U(x) << sh);
+        if (T(shifted >> sh) != x) {
+            q = true;
+            return sat;
+        }
+        return shifted;
+    });
+}
+RC_INLINE V128 VectorSignedSaturatedShiftLeft8(State& s, V128 a, V128 b) { return SatShiftLeft<int8_t>(s, a, b); }
+RC_INLINE V128 VectorSignedSaturatedShiftLeft16(State& s, V128 a, V128 b) { return SatShiftLeft<int16_t>(s, a, b); }
+RC_INLINE V128 VectorSignedSaturatedShiftLeft32(State& s, V128 a, V128 b) { return SatShiftLeft<int32_t>(s, a, b); }
+RC_INLINE V128 VectorSignedSaturatedShiftLeft64(State& s, V128 a, V128 b) { return SatShiftLeft<int64_t>(s, a, b); }
+// Scalar SQADD / SQSUB / SQDMULH (the JIT ORs the overflow straight into FPSR.QC as well)
+template <typename T, typename F>
+RC_INLINE T SatScalar(State& s, T x, T y, F f) {
+    bool q = false;
+    const T r = f(x, y, q);
+    if (q)
+        s.fpsr |= kQC;
+    return r;
+}
+RC_INLINE u8 SignedSaturatedAdd8(State& s, u8 a, u8 b) { return u8(SatScalar<int8_t>(s, int8_t(a), int8_t(b), SatAddS<int8_t>)); }
+RC_INLINE u16 SignedSaturatedAdd16(State& s, u16 a, u16 b) { return u16(SatScalar<int16_t>(s, int16_t(a), int16_t(b), SatAddS<int16_t>)); }
+RC_INLINE u32 SignedSaturatedAdd32(State& s, u32 a, u32 b) { return u32(SatScalar<int32_t>(s, int32_t(a), int32_t(b), SatAddS<int32_t>)); }
+RC_INLINE u64 SignedSaturatedAdd64(State& s, u64 a, u64 b) { return u64(SatScalar<int64_t>(s, int64_t(a), int64_t(b), SatAddS<int64_t>)); }
+RC_INLINE u8 SignedSaturatedSub8(State& s, u8 a, u8 b) { return u8(SatScalar<int8_t>(s, int8_t(a), int8_t(b), SatSubS<int8_t>)); }
+RC_INLINE u16 SignedSaturatedSub16(State& s, u16 a, u16 b) { return u16(SatScalar<int16_t>(s, int16_t(a), int16_t(b), SatSubS<int16_t>)); }
+RC_INLINE u32 SignedSaturatedSub32(State& s, u32 a, u32 b) { return u32(SatScalar<int32_t>(s, int32_t(a), int32_t(b), SatSubS<int32_t>)); }
+RC_INLINE u64 SignedSaturatedSub64(State& s, u64 a, u64 b) { return u64(SatScalar<int64_t>(s, int64_t(a), int64_t(b), SatSubS<int64_t>)); }
+template <typename T>
+RC_INLINE T SatDMulHScalar(T x, T y, bool& q) {
+    if (x == std::numeric_limits<T>::min() && y == x) {
+        q = true;
+        return std::numeric_limits<T>::max();
+    }
+    return T((2 * s64(x) * s64(y)) >> (sizeof(T) * 8));
+}
+RC_INLINE u16 SignedSaturatedDoublingMultiplyReturnHigh16(State& s, u16 a, u16 b) {
+    return u16(SatScalar<int16_t>(s, int16_t(a), int16_t(b), SatDMulHScalar<int16_t>));
+}
+RC_INLINE u32 SignedSaturatedDoublingMultiplyReturnHigh32(State& s, u32 a, u32 b) {
+    return u32(SatScalar<int32_t>(s, int32_t(a), int32_t(b), SatDMulHScalar<int32_t>));
+}
 
 } // namespace recomp

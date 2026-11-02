@@ -90,11 +90,7 @@ u64 AddressSpace::Translate(u64 gpu_va) const {
 }
 
 // ---------------------------------------------------------------- Gpu
-Gpu::Gpu(core::Memory& mem) : mem_(mem), m3d_(*this) {
-    for (auto& r : regs_)
-        r.assign(0x1000, 0);
-    thread_ = std::thread([this] { ThreadMain(); });
-}
+Gpu::Gpu(core::Memory& mem) : mem_(mem), m3d_(*this) { thread_ = std::thread([this] { ThreadMain(); }); }
 
 Gpu::~Gpu() {
     running_ = false;
@@ -218,22 +214,15 @@ bool Gpu::WaitSyncpoint(u32 id, u32 value, s64 timeout_us) {
     return sync_cv_.wait_for(lk, std::chrono::microseconds(timeout_us), done);
 }
 
-void Gpu::Submit(std::vector<u64> entries, u32 syncpt_id, u32 syncpt_incr) {
+void Gpu::CompleteFence(u32 syncpt_id, u32 target) {
     submits++;
-    {
-        std::lock_guard lk(queue_mutex_);
-        Job j{Job::Commands};
-        j.entries = std::move(entries);
-        j.syncpt_id = syncpt_id;
-        j.syncpt_incr = syncpt_incr;
-        j.tagged = tag_next_submit.exchange(false);
-        queue_.push_back(std::move(j));
-    }
-    queue_cv_.notify_one();
-    // Debug: MUA3_SYNC_GPU=1 runs command submission synchronously (rules out CPU/GPU races).
-    static const bool sync = std::getenv("MUA3_SYNC_GPU") != nullptr;
-    if (sync)
-        WaitIdle();
+    SubmitHost([this, syncpt_id, target] {
+        if (syncpt_id >= kNumSyncpoints)
+            return;
+        const s32 behind = s32(target - syncpoints_[syncpt_id].load());
+        if (behind > 0)
+            IncrementSyncpoint(syncpt_id, u32(behind));
+    });
 }
 
 void Gpu::SubmitHost(std::function<void()> fn) {
@@ -277,18 +266,6 @@ void Gpu::ThreadMain() {
             busy_ = true;
         }
         switch (job.kind) {
-        case Job::Commands: {
-            if (job.tagged && on_tagged_job)
-                on_tagged_job();
-            const u64 t0 = NowNs();
-            RunCommands(job.entries);
-            busy_ns += NowNs() - t0;
-            if (renderer_)
-                renderer_->FlushCommands();
-            if (job.syncpt_incr)
-                IncrementSyncpoint(job.syncpt_id, job.syncpt_incr);
-            break;
-        }
         case Job::Host: {
             const u64 t0 = NowNs();
             job.host();
@@ -312,81 +289,6 @@ void Gpu::ThreadMain() {
     }
 }
 
-void Gpu::RunCommands(const std::vector<u64>& entries) {
-    for (u64 e : entries) {
-        const u64 va = e & 0xFFFFFFFFFCull;
-        const u32 words = u32((e >> 42) & 0x1FFFFF);
-        if (words)
-            ProcessPushbuffer(va, words);
-    }
-    FlushMacro();
-}
-
-void Gpu::ProcessPushbuffer(u64 gpu_va, u32 words) {
-    static thread_local std::vector<u32> w;
-    w.resize(words);
-    if (!ReadGpu(gpu_va, w.data(), size_t(words) * 4)) {
-        LOG_WARN("GPU", "Pushbuffer at unmapped GPU VA {:#x}", gpu_va);
-        return;
-    }
-    // A method's data words may continue in the next GPFIFO entry: NVN submits indirect draw/dispatch arguments
-    // as a data-only entry right after the macro call header. The pending method therefore persists across calls.
-    u32 i = 0;
-    auto consume = [&] {
-        while (dma_count_ && i < words) {
-            const u32 method = dma_mode_ == 1   ? dma_method_ + dma_k_
-                               : dma_mode_ == 5 ? dma_method_ + (dma_k_ ? 1 : 0)
-                                                : dma_method_;
-            dma_count_--;
-            dma_k_++;
-            CallMethod(dma_subch_, method, w[i++], dma_count_ == 0);
-        }
-    };
-    consume();
-    while (i < words) {
-        const u32 hdr = w[i++];
-        const u32 mode = hdr >> 29;
-        const u32 subch = (hdr >> 13) & 7;
-        const u32 method = hdr & 0x1FFF;
-        const u32 count = (hdr >> 16) & 0x1FFF;
-        switch (mode) {
-        case 1: // increasing
-        case 3: // non-increasing
-        case 5: // increase once
-            dma_mode_ = mode;
-            dma_subch_ = subch;
-            dma_method_ = method;
-            dma_count_ = count;
-            dma_k_ = 0;
-            consume();
-            break;
-        case 4: // inline immediate
-            CallMethod(subch, method, count, true);
-            break;
-        default:
-            break;
-        }
-    }
-}
-
-void Gpu::FlushMacro() {
-    if (macro_index_ < 0)
-        return;
-    const u32 idx = u32(macro_index_);
-    macro_index_ = -1;
-    // Reuse parameter buffers (one per nesting level: a macro's methods can start another macro).
-    static thread_local std::vector<std::vector<u32>> pool;
-    static thread_local size_t depth = 0;
-    if (pool.size() <= depth)
-        pool.resize(depth + 1);
-    std::vector<u32>& params = pool[depth];
-    params.swap(macro_params_);
-    macro_params_.clear();
-    depth++;
-    m3d_.CallMacro(idx, params);
-    depth--;
-}
-
 namespace {
 inline u32 GobOffset(u32 x, u32 y) {
     return ((x % 64) / 32) * 256 + ((y % 8) / 2) * 64 + ((x % 32) / 16) * 32 + (y % 2) * 16 + (x % 16);
@@ -405,8 +307,6 @@ inline u64 BlockLinearOffset(u32 x, u32 y, u32 z, u32 width_bytes, u32 height, u
 
 // Maxwell DMA engine (0xB0B5): pitch/block-linear copies used by NVN for texture and buffer uploads.
 void Gpu::RunDma(const u32* r, u32 launch) {
-    if (intercept_dma && intercept_dma(r, launch))
-        return;
     const u64 src = (u64(r[0x100] & 0xFF) << 32) | r[0x101];
     const u64 dst = (u64(r[0x102] & 0xFF) << 32) | r[0x103];
     const u32 pitch_in = r[0x104], pitch_out = r[0x105];
@@ -538,151 +438,5 @@ void Gpu::RunDma(const u32* r, u32 launch) {
     LOG_TRACE("GPU", "DMA block-linear -> block-linear copy not handled");
 }
 
-void Gpu::CallMethod(u32 subch, u32 method, u32 arg, bool last_in_batch) {
-    methods++;
-    if (method < 0x40) { // GPFIFO / puller methods (any subchannel)
-        u32* r = regs_[0].data();
-        r[method] = arg;
-        switch (method) {
-        case 0x0:
-            bound_class_[subch] = arg & 0xFFFF;
-            break;
-        case 0x7: { // SEMAPHORED
-            const u64 addr = (u64(r[0x4] & 0xFF) << 32) | r[0x5];
-            if ((arg & 7) == 2) { // release
-                WriteGpu(addr, &r[0x6], 4);
-                if (!(arg & (1u << 24))) {
-                    const u64 ts = NowNs();
-                    WriteGpu(addr + 8, &ts, 8);
-                }
-            }
-            break;
-        }
-        case 0x1D: // SYNCPOINTB
-            if (arg & 1)
-                IncrementSyncpoint((arg >> 8) & 0xFF);
-            break;
-        default:
-            break;
-        }
-        return;
-    }
-    const u32 cls = bound_class_[subch];
-    if (cls == 0xB197) {
-        if (method >= reg3d::kMacroCallBase) {
-            const s32 idx = s32((method - reg3d::kMacroCallBase) >> 1);
-            if (!(method & 1)) {
-                FlushMacro();
-                macro_index_ = idx;
-                macro_params_.assign(1, arg);
-            } else {
-                macro_params_.push_back(arg);
-            }
-            if (last_in_batch)
-                FlushMacro();
-            return;
-        }
-        FlushMacro();
-        m3d_.CallMethod(method, arg);
-        return;
-    }
-
-    u32* r = regs_[subch].data();
-    if (method < 0x1000)
-        r[method] = arg;
-
-    // Inline-to-memory (stand-alone A140 / compute's copy)
-    if (method == 0x6C) {
-        r[0xF00] = 0;
-        return;
-    }
-    if (method == 0x6D) {
-        const u64 dst = (u64(r[0x62] & 0xFF) << 32) | r[0x63];
-        const u32 line_len = r[0x60], lines = std::max<u32>(r[0x61], 1);
-        const u32 cur = r[0xF00];
-        if (cur < line_len * lines) {
-            const u32 line = line_len ? cur / line_len : 0;
-            const u32 col = line_len ? cur % line_len : cur;
-            const u64 a = dst + u64(line) * r[0x64] + col;
-            WriteGpu(a, &arg, std::min<u32>(4, line_len * lines - cur));
-            if (renderer_)
-                renderer_->InvalidateRegion(a, 4);
-        }
-        r[0xF00] = cur + 4;
-        return;
-    }
-
-    if (method == 0xB2 && (cls == 0xB1C0 || cls == 0x902D)) { // other engines' syncpoint increments
-        IncrementSyncpoint(arg & 0xFFFF);
-        return;
-    }
-    if (cls == 0xB1C0) { // compute: launches and report semaphores
-        if (method == 0xAF) { // LAUNCH: the queue meta data (QMD) lives at LAUNCH_DESC_LOC << 8
-            static u32 launches = 0;
-            u32 q[0x40]{};
-            ReadGpu(u64(r[0xAD]) << 8, q, sizeof(q));
-            if (renderer_ && !(intercept_dispatch && intercept_dispatch(r, q)))
-                renderer_->Dispatch(r, q);
-            const u64 code = (u64(r[0x582] & 0xFF) << 32) | r[0x583];
-            if (launches++ < 8)
-                LOG_INFO("GPU", "compute launch #{}: code {:#x}+{:#x} grid {}x{}x{} block {}x{}x{} shared {:#x} cb mask {:#x}",
-                         launches, code, q[8], q[0xC] & 0x7FFFFFFF, q[0xD] & 0xFFFF, q[0xD] >> 16, q[0x12] >> 16, q[0x13] & 0xFFFF,
-                         q[0x13] >> 16, q[0x11] & 0x3FFFF, q[0x14] & 0xFF);
-            // Dump each program once behind a zeroed 0x50-byte header (graphics tooling layout); the launch shape
-            // goes in the name because it is not part of the program.
-            const fs::path dump = fmt::format("shader_dump/compute_{:x}_{}x{}x{}_{:x}.bin", q[8], q[0x12] >> 16, q[0x13] & 0xFFFF,
-                                              q[0x13] >> 16, q[0x11] & 0x3FFFF);
-            static std::set<u32> dumped;
-            if (dumped.insert(q[8]).second && !fs::exists(dump)) {
-                std::vector<u8> prog(0x50 + 0x40000, 0);
-                ReadGpuPartial(code + q[8], prog.data() + 0x50, 0x40000);
-                common::WriteFile(dump, prog);
-                // Its constant buffer 1 too: jump tables for BRX live there.
-                if (q[0x14] & 2) {
-                    const u64 cb1 = (u64(q[0x20] & 0xFF) << 32) | q[0x1F];
-                    std::vector<u8> cb(std::min<u32>(q[0x20] >> 15, 0x10000), 0);
-                    ReadGpuPartial(cb1, cb.data(), cb.size());
-                    fs::path cbp = dump;
-                    cbp.replace_extension(".cb1");
-                    common::WriteFile(cbp, cb);
-                }
-            }
-        }
-        if (method == 0x6C3) {
-            const u64 addr = (u64(r[0x6C0] & 0xFF) << 32) | r[0x6C1];
-            if ((arg & 3) == 0) {
-                if (arg & (1u << 28)) {
-                    WriteGpu(addr, &r[0x6C2], 4);
-                } else {
-                    const u64 v[2] = {r[0x6C2], GpuTimestamp()};
-                    WriteGpu(addr, v, 16);
-                }
-            }
-        }
-        return;
-    }
-
-    if (cls == 0x902D) { // Fermi 2D
-        if (method == 0x22F && renderer_) // PIXELS_FROM_MEMORY_SRC_Y0_INT (last register written) -> blit
-            renderer_->Blit2D(r);
-        return;
-    }
-
-    if (cls == 0xB0B5) { // DMA copy
-        if (method == 0xC0) { // LAUNCH_DMA
-            RunDma(r, arg);
-            const u32 sem = (arg >> 3) & 3;
-            if (sem) {
-                const u64 addr = (u64(r[0x90] & 0xFF) << 32) | r[0x91];
-                WriteGpu(addr, &r[0x92], 4);
-                if (sem == 2) {
-                    const u64 ts = NowNs();
-                    WriteGpu(addr + 8, &ts, 8);
-                }
-            }
-        }
-        return;
-    }
-}
 
 } // namespace gpu

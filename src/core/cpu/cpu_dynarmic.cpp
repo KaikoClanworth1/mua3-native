@@ -249,6 +249,16 @@ public:
             _mm_setcsr(guest_mxcsr_);
     }
     u32 host_mxcsr_ = 0, guest_mxcsr_ = 0;
+    // FPCR RMode (23:22: RN, RP, RM, RZ) -> MXCSR RC (14:13: RN, RM, RP, RZ); FZ -> FTZ + DAZ
+    u32 GuestMxcsr(u32 fpcr) const {
+        static constexpr u32 kRc[4] = {0u << 13, 2u << 13, 1u << 13, 3u << 13};
+        return (host_mxcsr_ & ~0xE040u) | kRc[(fpcr >> 22) & 3] | ((fpcr >> 24) & 1 ? 0x8040u : 0u);
+    }
+    void NativeSetFpcr(u32 v) { // MSR FPCR inside recompiled code
+        st_.fpcr = v;
+        guest_mxcsr_ = GuestMxcsr(v);
+        _mm_setcsr(guest_mxcsr_);
+    }
     u64 Cntpct() { return cb_.cntpct(); }
     Dynarmic::ExclusiveMonitor& Monitor() { return monitor_; }
     DynarmicFactory& Factory() { return factory_; }
@@ -679,6 +689,7 @@ void DynarmicCore::EnsureJit() {
     jit_ = std::make_unique<Dynarmic::A64::Jit>(c);
     jit_ptr_.store(jit_.get(), std::memory_order_seq_cst);
     factory_.jit_cores_.fetch_add(1, std::memory_order_relaxed);
+    g_jit_threads.fetch_add(1, std::memory_order_relaxed);
     static std::atomic<int> logged{0};
     if (logged++ < 20)
         LOG_INFO("Recomp", "JIT needed at {:#x} (thread slot {}): no native code there", st_.pc, slot_);
@@ -748,10 +759,8 @@ void DynarmicCore::RunNativeChain(recomp::Fn fn) {
     if (!fpcr_logged.exchange(true))
         LOG_INFO("Recomp", "first native entry {:#x}, guest FPCR {:#x}", s.pc, s.fpcr);
     native_ = true;
-    // FPCR RMode (23:22: RN, RP, RM, RZ) -> MXCSR RC (14:13: RN, RM, RP, RZ); FZ -> FTZ + DAZ
-    static constexpr u32 kRc[4] = {0u << 13, 2u << 13, 1u << 13, 3u << 13};
     host_mxcsr_ = _mm_getcsr();
-    guest_mxcsr_ = (host_mxcsr_ & ~0xE040u) | kRc[(s.fpcr >> 22) & 3] | ((s.fpcr >> 24) & 1 ? 0x8040u : 0u);
+    guest_mxcsr_ = GuestMxcsr(s.fpcr);
     if (guest_mxcsr_ != host_mxcsr_)
         _mm_setcsr(guest_mxcsr_);
     // Chain native functions (tail jumps, returns into other entries) until the guest leaves recompiled code.
@@ -794,6 +803,7 @@ void DynarmicCore::AddTicks(u64 ticks) {
 } // namespace
 
 std::atomic<float> g_native_percent{-1.0f};
+std::atomic<u32> g_jit_threads{0};
 
 std::unique_ptr<CoreFactory> CreateDynarmicFactory(core::Memory& memory, size_t max_cores) {
     return std::make_unique<DynarmicFactory>(memory, max_cores);
@@ -824,6 +834,7 @@ u32 ExWrite(State& s, u64 a, T v) {
 } // namespace
 
 void Svc(State& s, u32 imm) { CoreOf(s).Svc(imm); }
+void SetFpcr(State& s, u32 v) { CoreOf(s).NativeSetFpcr(v); }
 u64 Cntpct(State& s) { return CoreOf(s).Cntpct(); }
 void Barrier() { std::atomic_thread_fence(std::memory_order_seq_cst); }
 u8 ExRead8(State& s, u64 a) { return ExRead<u8>(s, a); }

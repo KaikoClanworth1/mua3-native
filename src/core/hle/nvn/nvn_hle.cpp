@@ -495,18 +495,21 @@ CommandList Publish(std::vector<Command>&& list) {
         delete v;
     });
 }
-// Storage for the next recording of a command buffer whose last one had `want` commands: the smallest recycled list
-// that fits (a big command buffer regrowing into fresh pages costs more than the recording itself).
-std::vector<Command> FreshList(size_t want) {
-    want = std::max<size_t>(want * 2, 1024);
+// Storage for a published list of exactly `want` commands: a recycled list that fits without wasting more than
+// half of itself, else a new one. Published lists must not carry spare capacity: the handle map keeps up to 4,096
+// of them alive (one per command memory handle), and lists that inherited a recording buffer's capacity (up to
+// 26k commands, ~8 MB each) held 10-20 GB of mostly empty memory in gameplay.
+std::vector<Command> ExactList(size_t want) {
     std::vector<Command> v;
     {
         auto& p = Pool();
         std::lock_guard lk(p.mutex);
         size_t best = p.free.size();
-        for (size_t i = 0; i < p.free.size(); i++)
-            if (p.free[i].capacity() >= want && (best == p.free.size() || p.free[i].capacity() < p.free[best].capacity()))
+        for (size_t i = 0; i < p.free.size(); i++) {
+            const size_t c = p.free[i].capacity();
+            if (c >= want && c <= want * 2 + 16 && (best == p.free.size() || c < p.free[best].capacity()))
                 best = i;
+        }
         if (best < p.free.size()) {
             v = std::move(p.free[best]);
             p.free[best] = std::move(p.free.back());
@@ -581,15 +584,8 @@ void MaybeProfileRecorder() {
 }
 template <int I>
 void Generic(State& s) {
-    // Test aid: MUA3_NVN_RECORD=2 installs the wrappers but records nothing (measures the wrapping alone).
-    static const bool passthrough = [] {
-        const char* e = std::getenv("MUA3_NVN_RECORD");
-        return e && e[0] == '2';
-    }();
     if (ProfileAt() >= 0)
         MaybeProfileRecorder();
-    if (passthrough)
-        return g_generic[I].driver(s);
     const u64 cycles0 = __rdtsc();
     const GenericSlot& g = g_generic[I];
     // Commands append to the calling thread's current command buffer without the lock (each command buffer is
@@ -789,16 +785,16 @@ void CommandBufferEndRecording(State& s) {
     rec.empty_ends += rec.open[cb].empty();
     // Handles identify command memory, which the game reuses: an empty recording must not hide a real one that
     // is still waiting to be submitted.
-    // (swapped rather than moved: the command buffer keeps an allocation for its next recording)
+    // The commands move into an exactly sized list; the command buffer keeps its recording buffer (and its capacity)
+    // for the next recording.
     auto& slot = rec.handles[handle];
     auto& open = rec.open[cb];
     if (!open.empty() || !slot) {
-        // at least as big as before: command buffers alternate between small and large recordings
-        const size_t n = std::max(open.size(), open.capacity() / 2);
-        slot = Publish(std::move(open));
-        open = FreshList(n);
-    } else
-        open.clear();
+        std::vector<Command> list = ExactList(open.size());
+        std::move(open.begin(), open.end(), std::back_inserter(list));
+        slot = Publish(std::move(list));
+    }
+    open.clear();
 }
 
 // ---- draw resolution (front half of the native replay): walks one submitted frame in order, tracking bound state,
@@ -1081,10 +1077,7 @@ void QueueSubmitCommands(State& s) {
         (*sink)(std::move(flat));
     g_submit_ns.fetch_add(NowNs() - submit_t0, std::memory_order_relaxed);
     TimelineEvent("submit", flat.size());
-    if (Native()) // the host renders it; the driver's queue never runs
-        return Return(s, 0);
-    u64 q, r;
-    Through(s, kQueueSubmitCommands, q, r);
+    Return(s, 0); // the host renders it; the driver's queue never runs
 }
 
 // ---- queue, sync and window on the host (MUA3_NVN_NATIVE). Fences complete in submission order on the GPU thread
@@ -1132,21 +1125,11 @@ u64 HostFence(u64 sync) {
 }
 // void nvnQueueFenceSync(NVNqueue*, NVNsync*, NVNsyncCondition, int flags)
 void QueueFenceSync(State& s) {
-    if (!Native()) {
-        u64 o, r;
-        Through(s, kQueueFenceSync, o, r);
-        return;
-    }
     HostFence(s.x[1]);
     Return(s, 0);
 }
 // NVNsyncWaitResult nvnSyncWait(const NVNsync*, uint64_t timeoutNs): 0 already signaled, 1 satisfied, 2 timeout
 void SyncWait(State& s) {
-    if (!Native()) {
-        u64 o, r;
-        Through(s, kSyncWait, o, r);
-        return;
-    }
     auto& q = HQ();
     std::unique_lock lk(q.mutex);
     auto it = q.syncs.find(s.x[0]);
@@ -1167,27 +1150,12 @@ void SyncWait(State& s) {
 }
 // void nvnQueueWaitSync(NVNqueue*, const NVNsync*): one queue runs in order, nothing to wait for
 void QueueWaitSync(State& s) {
-    if (!Native()) {
-        u64 o, r;
-        Through(s, kQueueWaitSync, o, r);
-        return;
-    }
     Return(s, 1);
 }
 void QueueFlush(State& s) {
-    if (!Native()) {
-        u64 o, r;
-        Through(s, kQueueFlush, o, r);
-        return;
-    }
     Return(s, 0);
 }
 void QueueFinish(State& s) {
-    if (!Native()) {
-        u64 o, r;
-        Through(s, kQueueFinish, o, r);
-        return;
-    }
     HostFence(0);
     auto& q = HQ();
     std::unique_lock lk(q.mutex);
@@ -1223,11 +1191,6 @@ void WindowInitialize(State& s) {
 }
 // NVNwindowAcquireTextureResult nvnWindowAcquireTexture(NVNwindow*, NVNsync* available, int* textureIndex)
 void WindowAcquireTexture(State& s) {
-    if (!Native()) {
-        u64 o, r;
-        Through(s, kWindowAcquireTexture, o, r);
-        return;
-    }
     const u64 window = s.x[0], sync = s.x[1], index_ptr = s.x[2];
     u32 index = 0;
     {
@@ -1249,11 +1212,6 @@ void WindowAcquireTexture(State& s) {
 }
 // void nvnQueuePresentTexture(NVNqueue*, NVNwindow*, int textureIndex)
 void QueuePresentTexture(State& s) {
-    if (!Native()) {
-        u64 o, r;
-        Through(s, kQueuePresentTexture, o, r);
-        return;
-    }
     const u64 window = s.x[1];
     const u32 index = u32(s.x[2]);
     u64 tex = 0;
@@ -1305,7 +1263,7 @@ struct Entry {
     std::string_view name;
     recomp::Fn fn;
     int wrapped = -1;    // index into g_driver for pass-through wrappers
-    bool record = false; // only with MUA3_NVN_RECORD=1
+    bool record = false; // part of the command recorder
 };
 #define NVN_ENTRY(NAME) {"nvn" #NAME, NAME, k##NAME}
 const Entry kHostFunctions[] = {
@@ -1412,15 +1370,6 @@ void TimelineEvent(const char* what, u64 arg) {
     }
 }
 
-bool Native() { // the default; MUA3_NVN_NATIVE=0 keeps the NVN driver + GPU command stream path (for comparison)
-    static const bool native = [] {
-        const char* e = std::getenv("MUA3_NVN_NATIVE");
-        const char* hle = std::getenv("MUA3_NVN_HLE");
-        return !(e && e[0] == '0') && !(hle && hle[0] == '0');
-    }();
-    return native;
-}
-
 void SetReplaySink(std::function<void(std::vector<ReplaySpan>&&)> sink) {
     g_sink = new std::function<void(std::vector<ReplaySpan>&&)>(std::move(sink)); // lives for the process
 }
@@ -1474,16 +1423,10 @@ u64 QueryTexturePool(u64 pool) {
 }
 
 recomp::Fn Find(std::string_view name, recomp::Fn driver, u64 pc) {
-    static const bool enabled = [] {
-        const char* e = std::getenv("MUA3_NVN_HLE");
-        return !(e && e[0] == '0');
-    }();
     {
         std::lock_guard lk(g_resolved_mutex);
         Resolved().emplace(std::string(name), pc);
     }
-    if (!enabled)
-        return nullptr;
     const Entry* entry = nullptr;
     for (const auto& e : kHostFunctions)
         if (e.name == name)
@@ -1492,8 +1435,7 @@ recomp::Fn Find(std::string_view name, recomp::Fn driver, u64 pc) {
         std::lock_guard lk(g_names_mutex);
         Driver().emplace(std::string(name), DriverEntry{driver, pc}); // the getters wrappers call
     }
-    static const bool record = std::getenv("MUA3_NVN_RECORD") != nullptr || Native();
-    if (!entry && record && driver) {
+    if (!entry && driver) {
         Kind kind;
         if (!GenericKind(name, kind))
             return nullptr;
@@ -1519,9 +1461,9 @@ recomp::Fn Find(std::string_view name, recomp::Fn driver, u64 pc) {
             g.copy_view[0] = 2, g.copy_region[0] = 3;
         else if (name == "nvnCommandBufferCopyTextureToTexture") // (cb, src, srcView, srcRegion, dst, dstView, dstRegion, flags)
             g.copy_view[0] = 2, g.copy_region[0] = 3, g.copy_view[1] = 5, g.copy_region[1] = 6;
-        if (kind == Kind::Command && Native()) {
-            // exactly what the host encoder implements; everything else (fences, counters, ...) still goes
-            // to the driver, whose submissions run after the host's work of the same submit
+        if (kind == Kind::Command) {
+            // exactly what the host encoder implements; the driver records the rest into its command memory, which
+            // is never submitted (the queue, fences and present are host functions)
             static const std::set<std::string_view> host = {
                 "BindProgram", "BindUniformBuffer", "BindStorageBuffer", "BindTexture", "BindImage", "BindVertexBuffer",
                 "BindVertexAttribState", "BindVertexStreamState", "SetRenderTargets", "SetViewports", "SetDepthRanges",
@@ -1557,7 +1499,7 @@ recomp::Fn Find(std::string_view name, recomp::Fn driver, u64 pc) {
             raw(1, -1, 32, false); // Bind{Blend,Color,ChannelMask,DepthStencil,Polygon,Multisample}State(cb, state)
         return kGenericFns[i];
     }
-    if (!entry || (entry->record && !record))
+    if (!entry)
         return nullptr;
     if (entry->wrapped >= 0) {
         if (driver == entry->fn) // resolved again after the swap

@@ -11,7 +11,6 @@ class Gpu;
 
 // Maxwell B (0xB197) 3D engine register offsets (in 32-bit words).
 namespace reg3d {
-constexpr u32 kMacroUploadAddr = 0x45, kMacroUploadData = 0x46, kMacroEntry = 0x47, kMacroBind = 0x48;
 constexpr u32 kI2MLineLength = 0x60, kI2MLineCount = 0x61, kI2MDstHigh = 0x62, kI2MDstLow = 0x63, kI2MPitch = 0x64;
 constexpr u32 kI2MExec = 0x6C, kI2MData = 0x6D;
 constexpr u32 kSyncInfo = 0xB2;
@@ -56,7 +55,6 @@ constexpr u32 kShaderConfig = 0x800;     // [6] x 0x10: enable|program, offset
 constexpr u32 kCbSize = 0x8E0, kCbAddrHigh = 0x8E1, kCbAddrLow = 0x8E2, kCbPos = 0x8E3, kCbData = 0x8E4;
 constexpr u32 kCbBind = 0x904; // [5] x 8
 constexpr u32 kTexCbIndex = 0x982;
-constexpr u32 kMacroCallBase = 0xE00;
 } // namespace reg3d
 
 enum class ShaderStage { Vertex = 0, TessControl, TessEval, Geometry, Fragment, Compute };
@@ -72,7 +70,6 @@ public:
     explicit Maxwell3D(Gpu& gpu);
 
     void CallMethod(u32 method, u32 arg);
-    void CallMacro(u32 index, const std::vector<u32>& params);
 
     u32 Reg(u32 r) const { return regs_[r]; }
     float RegF(u32 r) const {
@@ -85,13 +82,9 @@ public:
     // Bound constant buffers per graphics stage (0..4).
     const ConstBufferBinding& CBuf(u32 stage, u32 index) const { return cbufs_[stage][index]; }
 
-    // Host NVN encoder (src/gpu/nvn_encoder.cpp). `intercept` sees every draw before it is rendered and returns true
-    // if it took care of it (the native replay draws it from its own register file); `suppress_clears` drops
-    // CLEAR_BUFFERS (the replay clears instead). With `capture` set, draws only report their state, and clears and
-    // constant buffer uploads are ignored (a register file filled by the encoder, compared against the driver's).
-    std::function<bool(const Maxwell3D&)> intercept;
+    // Host NVN encoder (src/gpu/nvn_encoder.cpp): with `capture` set, draws only report their state, and clears and
+    // constant buffer uploads are ignored.
     std::function<void(const Maxwell3D&)> capture;
-    bool suppress_clears = false;
     const std::array<u32, 0x1000>& Regs() const { return regs_; }
     const ConstBufferBinding (&CBufs() const)[5][18] { return cbufs_; }
 
@@ -111,12 +104,9 @@ private:
     void ProcessCbBind(u32 stage, u32 arg);
     void ProcessQuery(u32 arg);
     void ProcessI2M(u32 method, u32 arg);
-    void ExecuteMacro(u32 start, const std::vector<u32>& params);
 
     Gpu& gpu_;
     std::array<u32, 0x1000> regs_{};
-    std::array<u32, 0x2000> macro_code_{};
-    std::array<u32, 0x80> macro_entry_{};
     ConstBufferBinding cbufs_[5][18];
     bool index_count_written_ = false;
     u32 instance_counter_ = 0;
