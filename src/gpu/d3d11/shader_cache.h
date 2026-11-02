@@ -26,6 +26,11 @@ struct HostShader {
     std::atomic<int> state{Pending};
     std::atomic<bool> claimed{false}; // a worker took it (urgent shaders can be queued twice)
     std::atomic<bool> slow{false};    // in the out-of-process FXC queue (minutes): draws don't wait for it
+    // The D3D object exists. Each one costs the driver ~2.8 MB, so cached bytecode nobody is waiting for is only
+    // loaded at prewarm; Draw creates the object at first use (Realize, ~0.2 ms) and objects unused for a while
+    // are released again (Tick), to be recreated from the bytecode kept in `dxbc`.
+    std::atomic<bool> created{true};
+    u32 last_used = 0; // ShaderCache::frame when a draw last bound it (GPU thread)
     bool prewarm = false;             // queued by Prewarm (back of the queue) and not yet asked for by the game
     bool ok = false; // valid once state != Pending
     shader::TranslateResult info;
@@ -75,6 +80,10 @@ public:
     // from the bytecode cache, are ready within milliseconds: a draw can wait for its shader instead of leaving a
     // hole in the frame. Returns true when it is no longer pending.
     bool WaitReady(HostShader* s, std::chrono::nanoseconds budget);
+    // Creates the D3D object of a Ready shader whose bytecode was only loaded (created == false). GPU thread.
+    void Realize(HostShader* s);
+    std::atomic<u32> frame{0}; // Tick count, for HostShader::last_used
+    u32 realized = 0, released = 0, live_objects = 0; // driver objects created by draws / released as unused / now
 
 private:
     // urgent_only: serves only shaders the game has asked for (never the prewarm backlog), so a cold cache's
@@ -83,12 +92,30 @@ private:
     // Returns false when the shader was handed to the slow queue instead of being finished.
     bool Build(HostShader& s, bool slow);
     bool Compile(HostShader& s, const std::string& hlsl, std::string& err, bool out_of_process = false);
+    bool CreateObject(HostShader& s, const std::vector<u8>& blob, std::string& err);
     fs::path CachePath(const HostShader& s, const char* target) const;
     // What the renderer needs to know about a translated shader, kept next to its bytecode so a cached vertex or
     // pixel shader is not translated again at every launch (its HLSL is only rebuilt if a variant needs it).
     fs::path InfoPath(const HostShader& s) const;
-    static bool SaveInfo(const fs::path& path, const shader::TranslateResult& info);
-    static bool LoadInfo(const fs::path& path, shader::TranslateResult& info);
+    static std::vector<u8> EncodeInfo(const shader::TranslateResult& info);
+    static bool DecodeInfo(const std::vector<u8>& data, shader::TranslateResult& info);
+    // The packed cache: every cached bytecode, translation info and failure marker of this translator version
+    // in one append-only file (shader_cache/pack_v<N>.bin), memory-mapped at launch. Opening thousands of small
+    // files cost a warm start ~30 s of worker time; the pack costs one open. The per-shader files stay as the
+    // fallback (and are folded into the pack when hit).
+    // PackProgram + stage index: the guest program (what shader_dump/<hash>.<vs|ps|cs>.bin holds); PackOpt: a
+    // compute program's launch options (.cs.opt).
+    enum PackKind : u8 { PackDxbc = 1, PackInfo = 2, PackFail = 3, PackProgram = 4, PackOpt = 7 };
+    static int StageIndex(shader::Stage s) { return s == shader::Stage::Vertex ? 0 : s == shader::Stage::Compute ? 2 : 1; }
+    void OpenPack();
+    bool PackGet(PackKind kind, u64 hash, std::vector<u8>& out) const;
+    void PackPut(PackKind kind, u64 hash, std::span<const u8> data);
+    bool HasBytecode(const HostShader& s) const;
+    bool GetBytecode(const HostShader& s, std::vector<u8>& out);
+    bool LoadInfoFor(const HostShader& s, shader::TranslateResult& info);
+    void SaveInfoFor(const HostShader& s, const shader::TranslateResult& info);
+    bool HasFailed(u64 hash) const;
+    void MarkFailed(u64 hash);
     void EnsureHlsl(HostShader& base);
 
     ID3D11Device* dev_;
@@ -99,6 +126,19 @@ private:
     std::mutex mutex_;
     std::condition_variable cv_;
     std::unordered_set<u64> ordered_; // programs already listed in order.txt (first-use order for Prewarm)
+    struct PackEntry {
+        size_t offset = 0;
+        u32 size = 0;
+    };
+    void* pack_file_ = nullptr; // HANDLE
+    void* pack_map_ = nullptr;  // HANDLE
+    const u8* pack_ = nullptr;
+    size_t pack_size_ = 0;
+    std::unordered_map<u64, PackEntry> pack_dxbc_, pack_info_, pack_prog_[3], pack_opt_;
+    std::unordered_set<u64> pack_fail_;
+    mutable std::mutex pack_mutex_; // appends (and the fail set, which grows at runtime)
+    FILE* pack_out_ = nullptr;
+    bool overrides_ = false; // a shader_override directory exists (debug aid): only then look for overrides
     std::mutex ready_mutex_;
     std::condition_variable ready_cv_; // a shader finished (WaitReady)
     std::deque<HostShader*> queue_;

@@ -32,6 +32,8 @@ ShaderCache::ShaderCache(ID3D11Device* dev) : dev_(dev) {
     std::error_code ec;
     fs::create_directories(dump_dir_, ec);
     fs::create_directories(cache_dir_, ec);
+    overrides_ = fs::exists("shader_override", ec);
+    OpenPack();
     const unsigned n = std::clamp(std::thread::hardware_concurrency() / 2, 2u, 6u);
     for (unsigned i = 0; i < n; i++)
         workers_.emplace_back([this] { Worker(false); });
@@ -51,6 +53,14 @@ ShaderCache::~ShaderCache() {
     cv_.notify_all();
     for (auto& t : workers_)
         t.join();
+    if (pack_out_)
+        std::fclose(pack_out_);
+    if (pack_)
+        UnmapViewOfFile(pack_);
+    if (pack_map_)
+        CloseHandle(pack_map_);
+    if (pack_file_)
+        CloseHandle(pack_file_);
 }
 
 void ShaderCache::Worker(bool slow, bool urgent_only) {
@@ -78,7 +88,7 @@ bool ShaderCache::Build(HostShader& s, bool slow) {
     const char* tag = StageTag(s.stage);
     // Vertex and pixel shaders with cached bytecode: the renderer's view of them comes from the cache too.
     if (!s.is_variant && !s.translated && !s.no_cache && s.stage != shader::Stage::Compute &&
-        fs::exists(CachePath(s, StageTarget(s.stage))) && LoadInfo(InfoPath(s), s.info)) {
+        HasBytecode(s) && LoadInfoFor(s, s.info)) {
         s.translated = true;
         info_hits++;
     }
@@ -95,12 +105,12 @@ bool ShaderCache::Build(HostShader& s, bool slow) {
         s.translated = true;
         translate_ns += u64((std::chrono::steady_clock::now() - t0).count());
         if (s.info.ok && !s.no_cache && s.stage != shader::Stage::Compute)
-            SaveInfo(InfoPath(s), s.info);
+            SaveInfoFor(s, s.info);
     }
     const char* target = StageTarget(s.stage);
     // Compute shaders go through the direct DXBC backend (milliseconds): no slow FXC queue for them.
     const bool direct = s.stage == shader::Stage::Compute && !std::getenv("MUA3_FXC_COMPUTE");
-    if (!slow && !direct && s.info.ok && s.info.uses_loop && !fs::exists(CachePath(s, target))) {
+    if (!slow && !direct && s.info.ok && s.info.uses_loop && !HasBytecode(s)) {
         s.slow = true;
         s.claimed = false;
         {
@@ -125,11 +135,11 @@ bool ShaderCache::Build(HostShader& s, bool slow) {
         err = s.info.error;
     }
     compile_ns += u64((std::chrono::steady_clock::now() - c0).count());
-    s.ok = err.empty() && (s.vs || s.ps || s.cs);
+    s.ok = err.empty() && (s.vs || s.ps || s.cs || !s.created);
     if (!s.ok) {
         failures++;
         if (!s.is_variant && !s.no_cache) // don't retry it at every launch's prewarm
-            std::ofstream(cache_dir_ / fmt::format("{:016x}_v{}.fail", s.hash, kTranslatorVersion));
+            MarkFailed(s.hash);
         common::WriteFile(dump_dir_ / fmt::format("{:016x}.{}.hlsl", s.hash, tag),
                           std::span(reinterpret_cast<const u8*>(s.info.hlsl.data()), s.info.hlsl.size()));
         LOG_ERROR("Shader", "{} {:016x} failed: {}", tag, s.hash, err.substr(0, 1500));
@@ -200,7 +210,7 @@ struct InfoReader {
 constexpr u32 kInfoMagic = 0x464E4953; // 'SINF'
 } // namespace
 
-bool ShaderCache::SaveInfo(const fs::path& path, const shader::TranslateResult& info) {
+std::vector<u8> ShaderCache::EncodeInfo(const shader::TranslateResult& info) {
     InfoWriter w;
     w.U32(kInfoMagic);
     w.U32(kTranslatorVersion);
@@ -225,11 +235,10 @@ bool ShaderCache::SaveInfo(const fs::path& path, const shader::TranslateResult& 
     w.U32(u32(info.unimplemented.size()));
     for (const auto& u : info.unimplemented)
         w.Str(u);
-    return common::WriteFile(path, w.out);
+    return std::move(w.out);
 }
 
-bool ShaderCache::LoadInfo(const fs::path& path, shader::TranslateResult& info) {
-    const auto data = common::ReadFile(path);
+bool ShaderCache::DecodeInfo(const std::vector<u8>& data, shader::TranslateResult& info) {
     if (data.empty())
         return false;
     InfoReader r{data};
@@ -268,6 +277,142 @@ bool ShaderCache::LoadInfo(const fs::path& path, shader::TranslateResult& info) 
     return true;
 }
 
+void ShaderCache::OpenPack() {
+    const fs::path path = cache_dir_ / fmt::format("pack_v{}.bin", kTranslatorVersion);
+    constexpr u32 kMagic = 0x314B5053; // 'SPK1'
+    pack_file_ = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                             FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (pack_file_ != INVALID_HANDLE_VALUE) {
+        LARGE_INTEGER size{};
+        GetFileSizeEx(pack_file_, &size);
+        pack_size_ = size_t(size.QuadPart);
+        if (pack_size_ >= 8) {
+            pack_map_ = CreateFileMappingW(pack_file_, nullptr, PAGE_READONLY, 0, 0, nullptr);
+            if (pack_map_)
+                pack_ = static_cast<const u8*>(MapViewOfFile(pack_map_, FILE_MAP_READ, 0, 0, 0));
+        }
+    } else {
+        pack_file_ = nullptr;
+    }
+    size_t entries = 0, pos = 0;
+    if (pack_) {
+        u32 magic = 0, version = 0;
+        std::memcpy(&magic, pack_, 4);
+        std::memcpy(&version, pack_ + 4, 4);
+        pos = magic == kMagic && version == u32(kTranslatorVersion) ? 8 : pack_size_;
+        while (pos + 13 <= pack_size_) { // kind u8, hash u64, size u32, data
+            const u8 kind = pack_[pos];
+            u64 hash;
+            u32 size;
+            std::memcpy(&hash, pack_ + pos + 1, 8);
+            std::memcpy(&size, pack_ + pos + 9, 4);
+            if (pos + 13 + size > pack_size_)
+                break; // a partial entry at the end (crashed mid-write): ignored, overwritten by the next append
+            if (kind == PackDxbc)
+                pack_dxbc_[hash] = {pos + 13, size};
+            else if (kind == PackInfo)
+                pack_info_[hash] = {pos + 13, size};
+            else if (kind == PackFail)
+                pack_fail_.insert(hash);
+            else if (kind >= PackProgram && kind < PackProgram + 3)
+                pack_prog_[kind - PackProgram][hash] = {pos + 13, size};
+            else if (kind == PackOpt)
+                pack_opt_[hash] = {pos + 13, size};
+            pos += 13 + size;
+            entries++;
+        }
+    }
+    // Appends go after the last complete entry; a new or foreign-version pack starts over.
+    const bool fresh = !pack_ || entries == 0; // (a foreign-version pack is rewritten)
+    pack_out_ = _wfopen(path.c_str(), fresh ? L"wb" : L"r+b");
+    if (pack_out_) {
+        if (fresh) {
+            const u32 hdr[2] = {kMagic, u32(kTranslatorVersion)};
+            std::fwrite(hdr, 1, 8, pack_out_);
+            std::fflush(pack_out_);
+        } else {
+            _fseeki64(pack_out_, s64(pos), SEEK_SET);
+        }
+    }
+    LOG_INFO("Shader", "packed cache: {} entries ({} MB), {} bytecodes, {} infos, {} failures, {} programs", entries,
+             pack_size_ >> 20, pack_dxbc_.size(), pack_info_.size(), pack_fail_.size(),
+             pack_prog_[0].size() + pack_prog_[1].size() + pack_prog_[2].size());
+}
+
+bool ShaderCache::PackGet(PackKind kind, u64 hash, std::vector<u8>& out) const {
+    const auto& map = kind == PackDxbc    ? pack_dxbc_
+                      : kind == PackInfo  ? pack_info_
+                      : kind == PackOpt   ? pack_opt_
+                                          : pack_prog_[kind - PackProgram];
+    const auto it = map.find(hash);
+    if (it == map.end())
+        return false;
+    out.assign(pack_ + it->second.offset, pack_ + it->second.offset + it->second.size);
+    return true;
+}
+
+void ShaderCache::PackPut(PackKind kind, u64 hash, std::span<const u8> data) {
+    std::lock_guard lk(pack_mutex_);
+    if (!pack_out_)
+        return;
+    const u32 size = u32(data.size());
+    std::fwrite(&kind, 1, 1, pack_out_);
+    std::fwrite(&hash, 1, 8, pack_out_);
+    std::fwrite(&size, 1, 4, pack_out_);
+    if (size)
+        std::fwrite(data.data(), 1, size, pack_out_);
+    std::fflush(pack_out_);
+}
+
+bool ShaderCache::HasBytecode(const HostShader& s) const {
+    return pack_dxbc_.count(s.hash) || fs::exists(CachePath(s, StageTarget(s.stage)));
+}
+
+bool ShaderCache::GetBytecode(const HostShader& s, std::vector<u8>& out) {
+    if (PackGet(PackDxbc, s.hash, out))
+        return true;
+    out = common::ReadFile(CachePath(s, StageTarget(s.stage)));
+    if (out.empty())
+        return false;
+    PackPut(PackDxbc, s.hash, out); // folded in: the next launch reads it from the pack
+    return true;
+}
+
+bool ShaderCache::LoadInfoFor(const HostShader& s, shader::TranslateResult& info) {
+    std::vector<u8> data;
+    if (PackGet(PackInfo, s.hash, data))
+        return DecodeInfo(data, info);
+    data = common::ReadFile(InfoPath(s));
+    if (!DecodeInfo(data, info))
+        return false;
+    PackPut(PackInfo, s.hash, data);
+    return true;
+}
+
+void ShaderCache::SaveInfoFor(const HostShader& s, const shader::TranslateResult& info) {
+    const auto data = EncodeInfo(info);
+    PackPut(PackInfo, s.hash, data);
+    common::WriteFile(InfoPath(s), data);
+}
+
+bool ShaderCache::HasFailed(u64 hash) const {
+    {
+        std::lock_guard lk(pack_mutex_);
+        if (pack_fail_.count(hash))
+            return true;
+    }
+    return fs::exists(cache_dir_ / fmt::format("{:016x}_v{}.fail", hash, kTranslatorVersion));
+}
+
+void ShaderCache::MarkFailed(u64 hash) {
+    {
+        std::lock_guard lk(pack_mutex_);
+        pack_fail_.insert(hash);
+    }
+    PackPut(PackFail, hash, {});
+    std::ofstream(cache_dir_ / fmt::format("{:016x}_v{}.fail", hash, kTranslatorVersion));
+}
+
 // A cached base shader skipped translation: its variants are rewritten from the HLSL, so translate it now.
 void ShaderCache::EnsureHlsl(HostShader& base) {
     if (!base.info.hlsl.empty() || base.is_variant)
@@ -295,7 +440,7 @@ bool ShaderCache::Compile(HostShader& s, const std::string& hlsl, std::string& e
         std::string derr;
         std::string src = hlsl;
         const fs::path ovr = fs::path("shader_override") / fmt::format("{:016x}.cs.hlsl", s.hash);
-        if (fs::exists(ovr)) {
+        if (overrides_ && fs::exists(ovr)) {
             const auto text = common::ReadFile(ovr);
             src.assign(text.begin(), text.end());
             LOG_INFO("Shader", "using override {}", ovr.string());
@@ -325,14 +470,14 @@ bool ShaderCache::Compile(HostShader& s, const std::string& hlsl, std::string& e
         s.direct_dxbc = true; // tried; the FXC path below runs once
     }
     fs::path cached = s.no_cache ? fs::path() : CachePath(s, target);
-    std::vector<u8> blob = s.no_cache ? std::vector<u8>() : common::ReadFile(cached);
-    if (!blob.empty())
+    std::vector<u8> blob;
+    if (!s.no_cache && GetBytecode(s, blob))
         cache_hits++;
     // Debug aid: shader_override/<hash>.<vs|ps>.hlsl replaces the translated HLSL (never cached).
     std::string source = hlsl;
     const fs::path override_path =
         fs::path("shader_override") / fmt::format("{:016x}.{}.hlsl", s.hash, StageTag(s.stage));
-    if (fs::exists(override_path)) {
+    if (overrides_ && fs::exists(override_path)) {
         const auto text = common::ReadFile(override_path);
         source.assign(text.begin(), text.end());
         blob.clear();
@@ -368,8 +513,10 @@ bool ShaderCache::Compile(HostShader& s, const std::string& hlsl, std::string& e
         if (err.empty()) {
             if (code == 0) {
                 blob = common::ReadFile(out);
-                if (!cached.empty())
+                if (!cached.empty()) {
                     common::WriteFile(cached, blob);
+                    PackPut(PackDxbc, s.hash, blob);
+                }
             } else {
                 const auto e = common::ReadFile(out.string() + ".err");
                 err.assign(e.begin(), e.end());
@@ -392,25 +539,51 @@ bool ShaderCache::Compile(HostShader& s, const std::string& hlsl, std::string& e
             return false;
         }
         blob.assign((const u8*)code->GetBufferPointer(), (const u8*)code->GetBufferPointer() + code->GetBufferSize());
-        if (!cached.empty())
+        if (!cached.empty()) {
             common::WriteFile(cached, blob);
+            PackPut(PackDxbc, s.hash, blob);
+        }
     }
+    if (s.prewarm && s.stage != shader::Stage::Compute) {
+        // Nobody is waiting for it: the driver object (~2.8 MB of driver memory each) is created at first use.
+        s.dxbc = std::move(blob);
+        s.created = false;
+        return true;
+    }
+    return CreateObject(s, blob, err);
+}
+
+bool ShaderCache::CreateObject(HostShader& s, const std::vector<u8>& blob, std::string& err) {
     HRESULT hr;
     const auto k0 = std::chrono::steady_clock::now(); // the driver builds its native code here
-    if (s.stage == shader::Stage::Vertex) {
+    if (s.stage == shader::Stage::Vertex)
         hr = dev_->CreateVertexShader(blob.data(), blob.size(), nullptr, &s.vs);
-        s.dxbc = blob;
-    }
     else if (s.stage == shader::Stage::Compute)
         hr = dev_->CreateComputeShader(blob.data(), blob.size(), nullptr, &s.cs);
     else
         hr = dev_->CreatePixelShader(blob.data(), blob.size(), nullptr, &s.ps);
+    if (&blob != &s.dxbc && s.stage != shader::Stage::Compute)
+        s.dxbc = blob; // kept: input layouts (vertex), and recreation after the object was released as unused
     create_ns += u64((std::chrono::steady_clock::now() - k0).count());
     if (FAILED(hr)) {
         err = fmt::format("Create shader failed {:#x}", u32(hr));
         return false;
     }
     return true;
+}
+
+void ShaderCache::Realize(HostShader* s) {
+    if (s->created.load(std::memory_order_acquire))
+        return;
+    std::string err;
+    if (!CreateObject(*s, s->dxbc, err)) {
+        LOG_ERROR("Shader", "{} {:016x}: {}", StageTag(s->stage), s->hash, err);
+        s->ok = false;
+        s->state = HostShader::Failed;
+    }
+    realized++;
+    live_objects++;
+    s->created.store(true, std::memory_order_release);
 }
 
 HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size, const shader::TranslateOptions* opt) {
@@ -435,6 +608,7 @@ HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size, c
         return found;
     }
     common::WriteFile(dump_dir_ / fmt::format("{:016x}.{}.bin", hash, StageTag(stage)), std::span(code, size));
+    PackPut(PackKind(PackProgram + StageIndex(stage)), hash, std::span(code, size));
     if (opt) { // compute launch shape and constant buffer 1, so Prewarm can rebuild the kernel exactly
         std::vector<u8> o(16 + opt->cbuf1_size);
         const u32 shape[4] = {opt->block[0], opt->block[1], opt->block[2], opt->shared_bytes};
@@ -442,6 +616,7 @@ HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size, c
         if (opt->cbuf1_size)
             std::memcpy(o.data() + 16, opt->cbuf1, opt->cbuf1_size);
         common::WriteFile(dump_dir_ / fmt::format("{:016x}.cs.opt", hash), std::span(o.data(), o.size()));
+        PackPut(PackOpt, hash, std::span(o.data(), o.size()));
     }
     return Queue(stage, hash, code, size, opt, false);
 }
@@ -506,7 +681,7 @@ HostShader* ShaderCache::GetVariant(HostShader* base, const VariantKey& v) {
     // Debug overrides of the base shader apply to its variants too.
     const fs::path override_path = fs::path("shader_override") /
         fmt::format("{:016x}.{}.hlsl", base->hash, base->stage == shader::Stage::Vertex ? "vs" : "ps");
-    if (fs::exists(override_path)) {
+    if (overrides_ && fs::exists(override_path)) {
         const auto text = common::ReadFile(override_path);
         src.assign(text.begin(), text.end());
         s->no_cache = true;
@@ -606,16 +781,25 @@ void ShaderCache::Prewarm() {
     std::error_code ec;
     // Programs in the order the game first asked for them (order.txt, appended by Get), then the rest: a cold
     // cache compiles the boot and menu shaders first.
-    std::unordered_map<u64, fs::path> files;
+    struct Prog {
+        int stage; // StageIndex
+        fs::path path; // empty: in the pack
+    };
+    std::unordered_map<u64, Prog> files;
     std::vector<u64> order;
-    for (const auto& e : fs::directory_iterator(dump_dir_, ec)) {
+    for (int st = 0; st < 3; st++)
+        for (const auto& [h, e] : pack_prog_[st])
+            files[h] = {st, {}};
+    for (const auto& e : fs::directory_iterator(dump_dir_, ec)) { // dumps not yet in the pack (older launches)
         const std::string name = e.path().filename().string(); // <16 hex>.<vs|ps>.bin
         if (name.size() != 23 || !name.ends_with(".bin"))
             continue;
         const std::string tag = name.substr(17, 2);
         if (tag != "vs" && tag != "ps" && tag != "cs")
             continue;
-        files[std::strtoull(name.substr(0, 16).c_str(), nullptr, 16)] = e.path();
+        const u64 h = std::strtoull(name.substr(0, 16).c_str(), nullptr, 16);
+        if (!files.count(h))
+            files[h] = {tag == "vs" ? 0 : tag == "ps" ? 1 : 2, e.path()};
     }
     {
         std::ifstream in(dump_dir_ / "order.txt");
@@ -631,17 +815,26 @@ void ShaderCache::Prewarm() {
                 order.push_back(h);
     }
     for (const u64 hash : order) {
-        const fs::path& path = files[hash];
-        const std::string name = path.filename().string();
-        const std::string tag = name.substr(17, 2);
-        if (shaders_.find(hash) != shaders_.end() ||
-            fs::exists(cache_dir_ / fmt::format("{:016x}_v{}.fail", hash, kTranslatorVersion)))
+        const Prog& prog = files[hash];
+        const shader::Stage stage = prog.stage == 0   ? shader::Stage::Vertex
+                                    : prog.stage == 1 ? shader::Stage::Fragment
+                                                      : shader::Stage::Compute;
+        if (shaders_.find(hash) != shaders_.end() || HasFailed(hash))
             continue;
-        const auto code = common::ReadFile(path);
-        if (code.empty())
-            continue;
-        if (tag == "cs") { // needs the launch options recorded next to it
-            const auto o = common::ReadFile(dump_dir_ / (name.substr(0, 16) + ".cs.opt"));
+        std::vector<u8> code;
+        if (!PackGet(PackKind(PackProgram + prog.stage), hash, code)) {
+            code = common::ReadFile(prog.path);
+            if (code.empty())
+                continue;
+            PackPut(PackKind(PackProgram + prog.stage), hash, code); // folded in for the next launch
+        }
+        if (stage == shader::Stage::Compute) { // needs the launch options recorded next to it
+            std::vector<u8> o;
+            if (!PackGet(PackOpt, hash, o)) {
+                o = common::ReadFile(dump_dir_ / fmt::format("{:016x}.cs.opt", hash));
+                if (o.size() >= 16)
+                    PackPut(PackOpt, hash, o);
+            }
             if (o.size() < 16)
                 continue;
             shader::TranslateOptions opt;
@@ -652,8 +845,7 @@ void ShaderCache::Prewarm() {
             opt.cbuf1_size = u32(o.size() - 16);
             Queue(shader::Stage::Compute, hash, code.data(), code.size(), &opt, true);
         } else {
-            Queue(tag == "vs" ? shader::Stage::Vertex : shader::Stage::Fragment, hash, code.data(), code.size(), nullptr,
-                  true);
+            Queue(stage, hash, code.data(), code.size(), nullptr, true);
         }
         n++;
     }
@@ -676,6 +868,25 @@ void ShaderCache::Prewarm() {
 void ShaderCache::Tick() {
     if (rescan_.exchange(false)) // new programs in the manifest (first-launch harvest)
         Prewarm();
+    const u32 now = ++frame;
+    if (now % 600 == 0) { // every ~5 s: release driver objects no draw has bound for a minute
+        u32 n = 0;
+        for (auto& [hash, sp] : shaders_) {
+            HostShader& s = *sp;
+            if (!s.created || s.state != HostShader::Ready || s.dxbc.empty() || now - s.last_used < 3600 ||
+                s.stage == shader::Stage::Compute)
+                continue;
+            s.vs.Reset();
+            s.ps.Reset();
+            s.created = false;
+            n++;
+        }
+        released += n;
+        live_objects -= n;
+        if (now % 6000 == 0 || n)
+            LOG_INFO("Shader", "shader objects: {} live, {} created by draws so far, {} released as unused", live_objects,
+                     realized, released);
+    }
     if (prewarm_reported_)
         return;
     replaying_ = true;

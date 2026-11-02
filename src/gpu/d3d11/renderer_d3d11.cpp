@@ -1634,6 +1634,15 @@ void D3D11Renderer::Draw() {
             shaders_->WaitReady(sh, std::chrono::nanoseconds(shader_wait_ns_));
             shader_wait_ns_ -= s64((std::chrono::steady_clock::now() - t0).count());
         }
+    for (HostShader* sh : {vs, ps}) // the driver object is made at first use and dropped again when unused
+        if (sh) {
+            sh->last_used = shaders_->frame;
+            if (sh->state == HostShader::Ready && !sh->created.load(std::memory_order_acquire))
+                shaders_->Realize(sh);
+        }
+    if (!vs || vs->state != HostShader::Ready || (ps && ps->state != HostShader::Ready)) {
+        draws_skipped++, skip_reason_[0]++;
+        static std::set<u64> pending_logged;
         for (HostShader* sh : {vs, ps})
             if (sh && sh->state == HostShader::Pending && pending_logged.size() < 64 && pending_logged.insert(sh->hash).second)
                 LOG_INFO("Renderer", "draw waiting on {} {:016x}{}", sh->stage == shader::Stage::Vertex ? "vs" : "ps",
@@ -2455,6 +2464,7 @@ void D3D11Renderer::Present(const PresentInfo& p) {
     std::lock_guard ctx_lock(ContextMutex());
     frame_counter_++;
     shaders_->Tick();
+    shader_wait_ns_ = 150'000'000; // a cold cache stutters rather than showing holes
     if (g_profile && frame_counter_ % 150 == 0) {
         std::string line;
         for (int i = 0; i < kProfCount; i++)
@@ -2502,7 +2512,6 @@ void D3D11Renderer::Present(const PresentInfo& p) {
         });
     {
         // D3D debug layer messages (only present when MUA3_D3D_DEBUG is set)
-    shader_wait_ns_ = 150'000'000; // a cold cache stutters rather than showing holes
         ComPtr<ID3D11InfoQueue> q;
         if (SUCCEEDED(dev_->QueryInterface(__uuidof(ID3D11InfoQueue), (void**)&q))) {
             const UINT64 n = q->GetNumStoredMessages();
