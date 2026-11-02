@@ -23,6 +23,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "core/main_code_patches.h"
+
 #include <dynarmic/frontend/A64/a64_location_descriptor.h>
 #include <dynarmic/frontend/A64/translate/a64_translate.h>
 #include <dynarmic/interface/A64/config.h>
@@ -70,6 +72,11 @@ u32 Word(u64 a) {
     const Module* m = ModOf(a);
     u32 w;
     std::memcpy(&w, m->image.data() + (a - m->base), 4);
+    // main's frame-rate patches (the runtime applies the same words before any code runs)
+    if (m->base == mua3patches::kMainLoadBase)
+        for (const auto& p : mua3patches::kCodePatches)
+            if (a - m->base == p.site && w == p.original)
+                return p.Ldr();
     return w;
 }
 template <typename T>
@@ -212,6 +219,8 @@ std::vector<u64> JumpTableTargets(u64 br) {
     return out;
 }
 size_t g_jump_tables = 0, g_jump_targets = 0;
+std::set<u64> g_missing;             // --missing: pcs the runtime had to run on the JIT
+std::unordered_set<u64> g_extra_resume; // of those, block starts of recompiled functions
 
 const std::unordered_set<std::string>& GenericOps() {
     static const std::unordered_set<std::string> ops = {
@@ -1080,6 +1089,11 @@ int main(int argc, char** argv) {
             std::ifstream in(argv[i + 1]);
             for (std::string a; in >> a;)
                 skip_funcs.insert(std::strtoull(a.c_str(), nullptr, 16));
+        } else if (k == "--missing") { // recomp_missing.txt from the runtime ("<pc hex> <count>" lines)
+            std::ifstream in(argv[i + 1]);
+            std::string a, n;
+            while (in >> a >> n)
+                g_missing.insert(std::strtoull(a.c_str(), nullptr, 16));
         } else if (k == "--stats")
             stats_only = true;
         else if (k == "--max-funcs")
@@ -1128,6 +1142,28 @@ int main(int argc, char** argv) {
             }
         }
         std::printf("%zu entries added from uncovered profile pcs\n", added);
+    }
+    // pcs where the JIT had to start (recomp_missing.txt from the runtime): a block start of a recompiled function
+    // becomes one of its resume points; anything else becomes a function entry of its own (even inside another
+    // function's block: code reached through a pointer the scans cannot see).
+    {
+        std::unordered_set<u64> starts;
+        for (auto& f : funcs)
+            starts.insert(f.blocks.begin(), f.blocks.end());
+        size_t entries = 0;
+        for (u64 pc : g_missing) {
+            if (!InText(pc) || g_entries.count(pc))
+                continue;
+            if (starts.count(pc)) {
+                g_extra_resume.insert(pc);
+            } else {
+                g_entries.insert(pc);
+                funcs.push_back(Discover(pc));
+                entries++;
+            }
+        }
+        std::printf("missing pcs: %zu, %zu new entries, %zu resume points\n", g_missing.size(), entries,
+                    g_extra_resume.size());
     }
     size_t nblocks = 0;
     for (auto& f : funcs)
@@ -1285,7 +1321,7 @@ int main(int argc, char** argv) {
         // blocks after SVCs (a thread halted inside an SVC continues there).
         std::vector<u64> resume;
         for (u64 b : f.blocks) {
-            for (const u64 r : {g_blocks[b].ret, g_blocks[b].svc_next})
+            for (const u64 r : {g_blocks[b].ret, g_blocks[b].svc_next, g_extra_resume.count(b) ? b : 0})
                 if (r && r != f.entry && blockset.count(r) && g_blocks[r].supported)
                     resume.push_back(r);
         }

@@ -245,11 +245,19 @@ public:
     void Svc(u32 imm) {
         if (guest_mxcsr_ != host_mxcsr_)
             _mm_setcsr(host_mxcsr_);
+        // Fully native threads rarely leave their chain: the 10 s coverage report also runs from here.
+        if ((++svc_count_ & 255) == 0 && native_) {
+            CreditNative();
+            MaybeReport();
+        }
         cb_.svc(imm);
         if (guest_mxcsr_ != host_mxcsr_)
             _mm_setcsr(guest_mxcsr_);
     }
     u32 host_mxcsr_ = 0, guest_mxcsr_ = 0;
+    u32 svc_count_ = 0;
+    u64 icount_credited_ = 0;
+    void CreditNative();
     // FPCR RMode (23:22: RN, RP, RM, RZ) -> MXCSR RC (14:13: RN, RM, RP, RZ); FZ -> FTZ + DAZ
     u32 GuestMxcsr(u32 fpcr) const {
         static constexpr u32 kRc[4] = {0u << 13, 2u << 13, 1u << 13, 3u << 13};
@@ -804,10 +812,18 @@ void DynarmicCore::RunNativeChain(recomp::Fn fn) {
     if (factory_.profiling_ && (++exit_count_ & 63) == 0)
         factory_.RecordSample(s.pc, 64);
     native_ = false;
-    factory_.native_instr_.fetch_add(s.icount - icount0, std::memory_order_relaxed);
-    instr_window_.fetch_add(s.icount - icount0, std::memory_order_relaxed);
+    (void)icount0;
+    CreditNative();
     if (!host_tid_)
         host_tid_ = GetCurrentThreadId();
+}
+
+// Adds the native instructions run since the last credit to the coverage counters (chain exits and SVCs).
+void DynarmicCore::CreditNative() {
+    const u64 n = st_.icount - icount_credited_;
+    icount_credited_ = st_.icount;
+    factory_.native_instr_.fetch_add(n, std::memory_order_relaxed);
+    instr_window_.fetch_add(n, std::memory_order_relaxed);
 }
 
 void DynarmicCore::AddTicks(u64 ticks) {

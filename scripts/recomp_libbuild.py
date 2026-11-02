@@ -32,7 +32,10 @@ def generate():
            os.path.join(NSO, 'main.bin'), '8004000', '159d340', os.path.join(NSO, 'sdk.bin'), 'df54000', '51c600',
            os.path.join(NSO, 'subsdk0.bin'), 'cfc5000', '377110', os.path.join(NSO, 'subsdk1.bin'), 'd6e5000', '4ce300',
            *[a for p in sorted(n for n in os.listdir(S) if re.fullmatch(r'prof\d+\.txt', n))
-             for a in ('--profile', os.path.join(S, p))], '--all', '1',
+             for a in ('--profile', os.path.join(S, p))],
+           # recomp_missing.txt files from game runs (pcs the JIT had to run), renamed missing<N>.txt
+           *[a for p in sorted(n for n in os.listdir(S) if re.fullmatch(r'missing\d+\.txt', n))
+             for a in ('--missing', os.path.join(S, p))], '--all', '1',
            '--noopt', NOOPT, '--skip', SKIP]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, check=True)
 

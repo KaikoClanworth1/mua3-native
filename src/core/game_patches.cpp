@@ -2,7 +2,10 @@
 
 #include <cstring>
 
+#include <algorithm>
+
 #include "core/config.h"
+#include "core/main_code_patches.h"
 #include "core/memory.h"
 
 namespace core {
@@ -16,9 +19,8 @@ constexpr u8 kMainBuildId[8] = {0xe8, 0x53, 0xc4, 0x4f, 0xdf, 0x18, 0xb8, 0x8f};
 // constructor and the game set 2 (30 fps), the engine also supports 1 (60 fps). Game systems read the interval and the frame
 // delta (+0x18, clamped below by 1/60 or 1/30 from a table at main+0x19f33d8), so forcing interval 1 gives a
 // correctly timed 60 fps. The frame limiter sleeps to a target rate stored once at startup (30.0f).
-constexpr u64 kInitInterval = 0x8403b0;   // timing block constructor: mov x9, #0x200000002 (+0x60/+0x64 = 2) -> 1
-constexpr u64 kSetInterval2 = 0x41eb48;   // orr w9, wzr, #2  -> #1
-constexpr u64 kLimiterTarget = 0x839eb8;  // movz w8, #0x41f0, lsl #16 (30.0f) -> target fps
+// The instructions are patched the same way for every configuration (core/main_code_patches.h: the recompiled
+// code is built from the patched words); only the literal slots they load from depend on fps_target.
 constexpr u64 kMinDeltaTable = 0x19f33d8; // float[2] {1/60, 1/30}: minimum frame delta per interval
 
 bool Patch32(Memory& mem, u64 addr, u32 expect, u32 value, const char* what) {
@@ -42,19 +44,28 @@ u32 FloatBits(float f) {
 void ApplyGamePatches(Memory& mem, const std::string& module, u64 base, std::span<const u8> build_id, const Config& cfg) {
     if (module != "main" || build_id.size() < 8 || std::memcmp(build_id.data(), kMainBuildId, 8) != 0)
         return;
-    const int fps = cfg.fps_target;
-    if (fps <= 30)
-        return;
-    // movz w8, #hi16(float fps), lsl #16: the float must have zero low bits (true for 60, 120, 144, 240, ...).
-    const u32 bits = FloatBits(float(fps));
-    if (bits & 0xFFFF) {
-        LOG_WARN("Patch", "fps_target {} cannot be encoded; keeping 30", fps);
-        return;
+    using namespace mua3patches;
+    for (const CodePatch& p : kCodePatches) {
+        const u32 slot_words = p.wide ? 2 : 1;
+        for (u32 k = 0; k < slot_words; k++)
+            if (mem.Read<u32>(base + p.slot + k * 4) != 0) {
+                LOG_WARN("Patch", "frame rate: padding at main+{:#x} is not free; no patches", p.slot);
+                return;
+            }
+        if (mem.Read<u32>(base + p.site) != p.original) {
+            LOG_WARN("Patch", "frame rate: unexpected code at main+{:#x}; no patches", p.site);
+            return;
+        }
     }
-    if (!Patch32(mem, base + kInitInterval, 0xB21F03E9, 0xB20003E9, "initial interval") ||
-        !Patch32(mem, base + kSetInterval2, 0x321F03E9, 0x320003E9, "60 fps interval"))
+    const int fps = std::max(cfg.fps_target, 30);
+    const bool unlocked = fps > 30;
+    for (const CodePatch& p : kCodePatches)
+        mem.Write<u32>(base + p.site, p.Ldr());
+    mem.Write<u64>(base + kInitInterval.slot, unlocked ? 0x100000001ull : 0x200000002ull);
+    mem.Write<u32>(base + kSetInterval.slot, unlocked ? 1 : 2);
+    mem.Write<u32>(base + kLimiterTarget.slot, FloatBits(float(fps)));
+    if (!unlocked)
         return;
-    Patch32(mem, base + kLimiterTarget, 0x52A83E08, 0x52A00008 | ((bits >> 16) << 5), "frame limiter target");
     if (fps > 60) {
         // Above 60 the minimum frame delta (1/60) would speed the game up: lower it to one target frame.
         // Experimental: some systems may still assume 60 updates per second.

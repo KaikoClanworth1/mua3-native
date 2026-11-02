@@ -66,6 +66,7 @@ add_executable(stackdump tools/stackdump.cpp)
 
 add_executable(recomp tools/recomp.cpp)
 target_link_libraries(recomp PRIVATE dynarmic Boost::boost merry::mcl)
+target_include_directories(recomp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 add_executable(crashwatch tools/crashwatch.cpp)
 target_link_libraries(crashwatch PRIVATE dbghelp)
