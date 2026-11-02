@@ -17,13 +17,51 @@
 #include <dynarmic/interface/exclusive_monitor.h>
 
 #include "core/cpu/cpu.h"
+#include "core/cpu/exclusive_monitor.h"
 #include "core/cpu/recomp/recomp_rt.h"
 #include "core/hle/nvn/nvn_hle.h"
+#include "core/kernel/kernel.h"
 #include "core/memory.h"
+#include "core/system.h"
 
 namespace cpu {
 
 namespace {
+
+// The dynarmic JIT is a development fallback only (CMake MUA3_WITH_JIT, off by default): without it the game binary
+// contains no code generator at all, and guest code without a recompiled version stops the game with a report.
+#if MUA3_WITH_JIT
+using JitT = Dynarmic::A64::Jit;
+using MonitorT = Dynarmic::ExclusiveMonitor; // the JIT needs its own type
+#else
+using MonitorT = NativeExclusiveMonitor;
+struct JitT { // never constructed: keeps the shared code paths compiling without linking the JIT
+    u64 GetRegister(int) const { return 0; }
+    void SetRegister(int, u64) {}
+    u64 GetPC() const { return 0; }
+    void SetPC(u64) {}
+    u64 GetSP() const { return 0; }
+    void SetSP(u64) {}
+    Dynarmic::A64::Vector GetVector(int) const { return {}; }
+    void SetVector(int, Dynarmic::A64::Vector) {}
+    u32 GetFpcr() const { return 0; }
+    void SetFpcr(u32) {}
+    u32 GetFpsr() const { return 0; }
+    void SetFpsr(u32) {}
+    u32 GetPstate() const { return 0; }
+    void SetPstate(u32) {}
+    std::array<u64, 31> GetRegisters() const { return {}; }
+    void SetRegisters(const std::array<u64, 31>&) {}
+    std::array<Dynarmic::A64::Vector, 32> GetVectors() const { return {}; }
+    void SetVectors(const std::array<Dynarmic::A64::Vector, 32>&) {}
+    void InvalidateCacheRange(u64, size_t) {}
+    void ClearExclusiveState() {}
+    void HaltExecution(Dynarmic::HaltReason) {}
+    void ClearHalt(Dynarmic::HaltReason) {}
+    Dynarmic::HaltReason Run() { return {}; }
+    Dynarmic::HaltReason Step() { return {}; }
+};
+#endif
 
 constexpr auto kHaltStop = Dynarmic::HaltReason::UserDefined1;
 constexpr auto kHaltInvalidate = Dynarmic::HaltReason::UserDefined2;
@@ -34,7 +72,7 @@ class DynarmicFactory;
 
 class DynarmicCore final : public Core, public Dynarmic::A64::UserCallbacks {
 public:
-    DynarmicCore(DynarmicFactory& f, core::Memory& mem, Dynarmic::ExclusiveMonitor& monitor, CpuCallbacks cb,
+    DynarmicCore(DynarmicFactory& f, core::Memory& mem, MonitorT& monitor, CpuCallbacks cb,
                  size_t slot);
     ~DynarmicCore() override;
 
@@ -53,8 +91,10 @@ public:
             if (recomp::Fn fn = NativeAt(st_.pc)) {
                 RunNativeChain(fn);
                 MaybeReport();
-            } else {
+            } else if (JitFallback()) {
                 RunJit(false);
+            } else {
+                NoNativeCode();
             }
         }
     }
@@ -62,7 +102,24 @@ public:
         stop_ = true;
         RequestHalt(kHaltStop);
     }
-    void Step() override { RunJit(true); }
+    void Step() override {
+        if (JitFallback())
+            RunJit(true);
+    }
+    // All guest code runs as statically recompiled x64. Code no build has seen (recomp_missing.txt) stops the game
+    // with a report instead of being emulated; MUA3_JIT_FALLBACK=1 (development) runs it on dynarmic instead.
+    static bool JitFallback() {
+        if (!MUA3_WITH_JIT)
+            return false;
+        static const bool on = [] {
+            const char* e = std::getenv("MUA3_JIT_FALLBACK");
+            const char* off = std::getenv("MUA3_RECOMP"); // MUA3_RECOMP=0 (comparison runs) is JIT-only
+            return (e && e[0] == '1') || (off && off[0] == '0');
+        }();
+        return on;
+    }
+    [[noreturn]] void NoNativeCode();
+    static void RecordMissing(u64 pc);
     // The register file lives in st_ except while the JIT runs non-native code.
     bool JitOwns() const { return in_jit_ && !native_; }
     u64 Reg(int i) const override { return JitOwns() ? jit_->GetRegister(i) : st_.x[i]; }
@@ -263,23 +320,28 @@ public:
         static constexpr u32 kRc[4] = {0u << 13, 2u << 13, 1u << 13, 3u << 13};
         return (host_mxcsr_ & ~0xE040u) | kRc[(fpcr >> 22) & 3] | ((fpcr >> 24) & 1 ? 0x8040u : 0u);
     }
+    void RaiseUndefined() { // the same report the JIT's exception callback makes
+        if (guest_mxcsr_ != host_mxcsr_)
+            _mm_setcsr(host_mxcsr_);
+        cb_.exception(st_.pc, int(Dynarmic::A64::Exception::UnallocatedEncoding));
+    }
     void NativeSetFpcr(u32 v) { // MSR FPCR inside recompiled code
         st_.fpcr = v;
         guest_mxcsr_ = GuestMxcsr(v);
         _mm_setcsr(guest_mxcsr_);
     }
     u64 Cntpct() { return cb_.cntpct(); }
-    Dynarmic::ExclusiveMonitor& Monitor() { return monitor_; }
+    MonitorT& Monitor() { return monitor_; }
     DynarmicFactory& Factory() { return factory_; }
 
 private:
     DynarmicFactory& factory_;
     core::Memory& mem_;
-    Dynarmic::ExclusiveMonitor& monitor_;
+    MonitorT& monitor_;
     CpuCallbacks cb_;
     u64 tpidr_el0_ = 0, tpidrro_el0_ = 0;
-    std::unique_ptr<Dynarmic::A64::Jit> jit_;   // created on first need (EnsureJit)
-    std::atomic<Dynarmic::A64::Jit*> jit_ptr_{nullptr}; // the same, for halt requests from other threads
+    std::unique_ptr<JitT> jit_;   // created on first need (EnsureJit)
+    std::atomic<JitT*> jit_ptr_{nullptr}; // the same, for halt requests from other threads
     bool in_jit_ = false;
     volatile bool stop_ = false;
     std::mutex inv_mutex_;
@@ -645,7 +707,7 @@ public:
 
 private:
     core::Memory& mem_;
-    Dynarmic::ExclusiveMonitor monitor_;
+    MonitorT monitor_;
     size_t max_;
     std::mutex mutex_;
     std::set<DynarmicCore*> cores_;
@@ -663,7 +725,7 @@ private:
     std::unordered_map<u64, u64> samples_;
 };
 
-DynarmicCore::DynarmicCore(DynarmicFactory& f, core::Memory& mem, Dynarmic::ExclusiveMonitor& monitor,
+DynarmicCore::DynarmicCore(DynarmicFactory& f, core::Memory& mem, MonitorT& monitor,
                            CpuCallbacks cb, size_t slot)
     : slot_(slot), factory_(f), mem_(mem), monitor_(monitor), cb_(std::move(cb)) {}
 
@@ -672,6 +734,9 @@ DynarmicCore::~DynarmicCore() { factory_.Release(this); }
 void DynarmicCore::EnsureJit() {
     if (jit_)
         return;
+#if !MUA3_WITH_JIT
+    NoNativeCode(); // unreachable: JitFallback() is false without the JIT
+#else
     Dynarmic::A64::UserConfig c{};
     c.callbacks = this;
     c.processor_id = slot_;
@@ -702,24 +767,37 @@ void DynarmicCore::EnsureJit() {
     static std::atomic<int> logged{0};
     if (logged++ < 20)
         LOG_INFO("Recomp", "JIT needed at {:#x} (thread slot {}): no native code there", st_.pc, slot_);
+#endif
 }
 
 // Runs the JIT from st_ until it reaches native code again (or a halt). single_step: one instruction (debugger).
-void DynarmicCore::RunJit(bool single_step) {
-    // Every pc the JIT has to run is code the recompiler has not seen: record each once, in the generator's profile
-    // format ("<pc hex> <count>"), so the next library build covers it (copy recomp_missing.txt into
-    // build/recomp_work as prof<N>.txt).
-    {
-        static std::mutex m;
-        static std::unordered_set<u64> seen;
-        std::lock_guard lk(m);
-        if (seen.insert(st_.pc).second) {
-            if (FILE* f = std::fopen("recomp_missing.txt", "a")) {
-                std::fprintf(f, "%llx 1\n", static_cast<unsigned long long>(st_.pc));
-                std::fclose(f);
-            }
+// Every pc without recompiled code is recorded once, in the generator's format ("<pc hex> <count>"), so the next
+// library build covers it (copy recomp_missing.txt into build/recomp_work as missing<N>.txt).
+void DynarmicCore::RecordMissing(u64 pc) {
+    static std::mutex m;
+    static std::unordered_set<u64> seen;
+    std::lock_guard lk(m);
+    if (seen.insert(pc).second) {
+        if (FILE* f = std::fopen("recomp_missing.txt", "a")) {
+            std::fprintf(f, "%llx 1\n", static_cast<unsigned long long>(pc));
+            std::fclose(f);
         }
     }
+}
+
+void DynarmicCore::NoNativeCode() {
+    const u64 pc = st_.pc;
+    RecordMissing(pc);
+    LOG_ERROR("Recomp", "guest code at {:#x} has no recompiled version (lr {:#x}, sp {:#x}); recorded in "
+                        "recomp_missing.txt for the next build of the recompiled library",
+              pc, st_.x[30], st_.sp);
+    core::Sys().Kern().DumpAllThreads();
+    PANIC("This part of the game has not been recompiled yet (guest code at {:#x}).\n\nIts address was saved to "
+          "recomp_missing.txt next to the game; rebuilding the recompiled code with it adds this part.", pc);
+}
+
+void DynarmicCore::RunJit(bool single_step) {
+    RecordMissing(st_.pc);
     EnsureJit();
     auto regs = jit_->GetRegisters();
     std::memcpy(regs.data(), st_.x, sizeof(st_.x));
@@ -866,6 +944,7 @@ u32 ExWrite(State& s, u64 a, T v) {
 
 void Svc(State& s, u32 imm) { CoreOf(s).Svc(imm); }
 void SetFpcr(State& s, u32 v) { CoreOf(s).NativeSetFpcr(v); }
+void Undefined(State& s) { CoreOf(s).RaiseUndefined(); }
 u64 Cntpct(State& s) { return CoreOf(s).Cntpct(); }
 void Barrier() { std::atomic_thread_fence(std::memory_order_seq_cst); }
 u8 ExRead8(State& s, u64 a) { return ExRead<u8>(s, a); }

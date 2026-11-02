@@ -54,6 +54,7 @@ using Fn = void (*)(State&);
 // ---- runtime services (recomp_runtime.cpp)
 void Svc(State& s, u32 imm);
 void SetFpcr(State& s, u32 v); // MSR FPCR: also re-derives the host MXCSR (rounding mode, flush-to-zero)
+void Undefined(State& s);      // an undecodable instruction at s.pc: the guest's undefined-instruction exception
 u64 Cntpct(State& s);
 void Barrier();
 u8 ExRead8(State& s, u64 a);

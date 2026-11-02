@@ -1,6 +1,7 @@
 #include "core/kernel/kernel.h"
 
 #include <algorithm>
+#include <memory>
 #include <random>
 #include <windows.h>
 #include <dbghelp.h>
@@ -119,8 +120,26 @@ ThreadPtr Kernel::CreateThread(u64 entry, u64 arg, u64 stack_top, s32 prio, s32 
 
 void Kernel::StartThread(const ThreadPtr& t) {
     t->state = Thread::State::Running;
-    t->host = std::thread([this, t] { ThreadMain(t); });
-    t->host.detach();
+    // Recompiled guest code recurses on the host stack, with frames larger than the guest's: a 32 MB reservation
+    // (committed only as it is used) keeps deep guest call chains native instead of hitting the stack floor.
+    struct Start {
+        Kernel* kernel;
+        ThreadPtr thread;
+    };
+    auto* start = new Start{this, t};
+    const HANDLE h = ::CreateThread(
+        nullptr, 32u << 20,
+        [](LPVOID p) -> DWORD {
+            std::unique_ptr<Start> s(static_cast<Start*>(p));
+            s->kernel->ThreadMain(s->thread);
+            return 0;
+        },
+        start, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    if (!h) {
+        delete start;
+        PANIC("CreateThread failed for guest thread {} ({})", t->id, GetLastError());
+    }
+    CloseHandle(h);
 }
 
 ThreadPtr Kernel::GetThread(Handle h) {
