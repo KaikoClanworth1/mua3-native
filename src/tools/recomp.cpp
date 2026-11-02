@@ -112,8 +112,106 @@ struct BlockInfo {
     std::vector<u64> calls;    // BL targets
     bool supported = true;
     u64 ret = 0;               // call blocks: the return point
+    u64 svc_next = 0;          // blocks with an SVC: where the thread continues (a thread halted in the SVC resumes there)
     std::vector<std::string> unsupported_ops;
 };
+
+// Switch statements compiled to a jump table ending a block:
+//   [adrp xB, page; add xB, xB, #lo] ... cmp wI/xI, #N; b.hi default ... ldrsw xT, [xB, xI, lsl #2];
+//   add xT, xT, xB (or xB, xT); br xT
+// The table holds N+1 signed 32-bit offsets from its base. Returns the targets (empty if the pattern is not found).
+std::vector<u64> JumpTableTargets(u64 br) {
+    std::vector<u64> out;
+    const u32 w_br = Word(br);
+    if ((w_br & 0xFFFFFC1Fu) != 0xD61F0000u)
+        return out;
+    const u32 t = (w_br >> 5) & 31;
+    // ADD xT, xT, xB (shifted register, LSL #0) a few instructions before the BR (others may sit in between, e.g.
+    // "mov w8, #1"), then LDRSW xT, [xB, xI, LSL #2] shortly before that.
+    auto writes = [](u32 w, u32 r) { return (w & 31) == r && (w & 0x9F000000u) != 0x14000000u; }; // rough: Rd field
+    u64 add_at = 0;
+    for (u64 a = br - 4; a + 4 * 5 > br && InText(a); a -= 4) {
+        const u32 w = Word(a);
+        if ((w & 0xFFE0FC00u) == 0x8B000000u && (w & 31) == t) {
+            add_at = a;
+            break;
+        }
+        if (writes(w, t))
+            return out;
+    }
+    if (!add_at)
+        return out;
+    const u32 w_add = Word(add_at);
+    const u32 an = (w_add >> 5) & 31, am = (w_add >> 16) & 31;
+    u64 ld_at = 0;
+    for (u64 a = add_at - 4; a + 4 * 4 > add_at && InText(a); a -= 4) {
+        const u32 w = Word(a);
+        if ((w & 0xFFE0FC00u) == 0xB8A07800u && (w & 31) == t) { // LDRSW Xt, [Xn, Xm, LSL #2]
+            ld_at = a;
+            break;
+        }
+    }
+    if (!ld_at)
+        return out;
+    const u32 w_ld = Word(ld_at);
+    const u32 base_reg = (w_ld >> 5) & 31;
+    u32 idx_reg = (w_ld >> 16) & 31;
+    if (!((an == t && am == base_reg) || (am == t && an == base_reg)))
+        return out;
+    // Walk back for the bound (CMP idx, #imm then B.HI / B.HS; the index may have been copied with MOV after the
+    // check) and the base: ADRP + ADD of base_reg, or ADR. Loops keep the table base in a callee-saved register set
+    // up long before, so the base search goes further back than the bound search.
+    std::optional<u64> page, lo, adr;
+    std::optional<u32> count;
+    for (u64 a = ld_at - 4; a + 4 * 600 > ld_at && InText(a); a -= 4) {
+        const u32 w = Word(a);
+        const bool near = a + 4 * 32 > ld_at;
+        if (near && !count) {
+            // MOV Wd, Wm (ORR Wd, WZR, Wm) / MOV Xd, Xm into the index: follow the copy
+            if ((w & 0x7FE0FFE0u) == 0x2A0003E0u && (w & 31) == idx_reg)
+                idx_reg = (w >> 16) & 31;
+            // CMP Wn/Xn, #imm12 (SUBS with Rd = zr, no shift), then a B.HI or B.HS right after it
+            else if ((w & 0x7FC0001Fu) == 0x7100001Fu && ((w >> 5) & 31) == idx_reg && InText(a + 4)) {
+                const u32 n = (w >> 10) & 0xFFF, next = Word(a + 4);
+                if ((next & 0xFF00001Fu) == 0x54000008u) // B.HI
+                    count = n + 1;
+                else if ((next & 0xFF00001Fu) == 0x54000002u) // B.HS
+                    count = n;
+            }
+        }
+        if (!lo && !adr && (w & 0xFFC00000u) == 0x91000000u && (w & 31) == base_reg && ((w >> 5) & 31) == base_reg)
+            lo = (w >> 10) & 0xFFF; // ADD xB, xB, #imm12
+        else if (lo && !page && (w & 0x9F000000u) == 0x90000000u && (w & 31) == base_reg) { // ADRP xB
+            const int64_t imm = int64_t(int32_t((((w >> 5) & 0x7FFFF) << 2 | ((w >> 29) & 3)) << 11) >> 11);
+            page = (a & ~0xFFFull) + u64(imm << 12);
+        } else if (!lo && !adr && (w & 0x9F000000u) == 0x10000000u && (w & 31) == base_reg) { // ADR xB
+            const int64_t imm = int64_t(int32_t((((w >> 5) & 0x7FFFF) << 2 | ((w >> 29) & 3)) << 11) >> 11);
+            adr = a + u64(imm);
+        }
+        if (count && (adr || (page && lo)))
+            break;
+        if (!near && !count)
+            break; // no bound close to the load: not a recognisable switch
+    }
+    if (!count || *count == 0 || *count > 4096 || !(adr || (page && lo)))
+        return out;
+    const u64 table = adr ? *adr : *page + *lo;
+    const Module* m = ModOf(br);
+    for (u32 k = 0; k < *count; k++) {
+        const u64 at = table + u64(k) * 4;
+        if (at < m->base || at + 4 > m->base + m->image.size())
+            return {};
+        int32_t off;
+        std::memcpy(&off, m->image.data() + (at - m->base), 4);
+        const u64 target = table + u64(int64_t(off));
+        // a wrong base gives scattered garbage: real cases sit near their switch and start with code
+        if (!InText(target) || (target > br ? target - br : br - target) > (1u << 20) || Word(target) == 0)
+            return {};
+        out.push_back(target);
+    }
+    return out;
+}
+size_t g_jump_tables = 0, g_jump_targets = 0;
 
 const std::unordered_set<std::string>& GenericOps() {
     static const std::unordered_set<std::string> ops = {
@@ -234,6 +332,11 @@ const std::unordered_set<std::string>& StateOps() {
         "VectorSignedSaturatedDoublingMultiplyHigh32",
         "VectorSignedSaturatedDoublingMultiplyHighRounding16",
         "VectorSignedSaturatedDoublingMultiplyHighRounding32",
+        "VectorSignedSaturatedShiftLeft8", "VectorSignedSaturatedShiftLeft16", "VectorSignedSaturatedShiftLeft32",
+        "VectorSignedSaturatedShiftLeft64", "SignedSaturatedAdd8", "SignedSaturatedAdd16", "SignedSaturatedAdd32",
+        "SignedSaturatedAdd64", "SignedSaturatedSub8", "SignedSaturatedSub16", "SignedSaturatedSub32",
+        "SignedSaturatedSub64", "SignedSaturatedDoublingMultiplyReturnHigh16",
+        "SignedSaturatedDoublingMultiplyReturnHigh32",
         "FPDoubleToHalf", "FPSingleToFixedS16", "FPSingleToFixedS32", "FPSingleToFixedS64", "FPSingleToFixedU16",
         "FPSingleToFixedU32", "FPSingleToFixedU64", "FPDoubleToFixedS16", "FPDoubleToFixedS32",
         "FPDoubleToFixedS64", "FPDoubleToFixedU16", "FPDoubleToFixedU32", "FPDoubleToFixedU64",
@@ -266,6 +369,7 @@ bool IsSpecialSupported(Op o) {
     case Op::A64SetQ:
     case Op::A64SetSP:
     case Op::A64SetFPSR:
+    case Op::A64SetFPCR:
     case Op::A64SetPC:
     case Op::A64CallSupervisor:
     case Op::A64DataCacheOperationRaised:
@@ -404,6 +508,15 @@ const BlockInfo& Analyze(u64 pc) {
         bi.succ.push_back(sh.ret_loc);
         bi.ret = sh.ret_loc;
     }
+    if (sh.has_svc && sh.setpc_imm)
+        bi.svc_next = *sh.setpc_imm;
+    // A register branch through a jump table: its targets are blocks of this function.
+    if (!is_call && IsDynamic(term) && !sh.setpc_imm && bi.end >= pc + 4) {
+        if (const auto targets = JumpTableTargets(bi.end - 4); !targets.empty()) {
+            g_jump_tables++, g_jump_targets += targets.size();
+            bi.succ.insert(bi.succ.end(), targets.begin(), targets.end());
+        }
+    }
     return g_blocks.emplace(pc, std::move(bi)).first->second;
 }
 
@@ -457,6 +570,38 @@ void FindEntries(u64 text_size) {
         }
     }
     const size_t from_bl = g_entries.size();
+    // Code addresses materialised with ADRP + ADD (thread entry points, callbacks handed to the OS): PIC code needs no
+    // relocation for them, so they are neither BL targets nor relocations. Accepted when the target starts a
+    // function by the usual layout: the word before it ends the previous one (RET, B, BR, UDF/padding, BRK, NOP).
+    auto ends_function = [](u32 w) {
+        return w == 0xD65F03C0u ||                 // RET
+               (w & 0xFC000000u) == 0x14000000u || // B
+               (w & 0xFFFFFC1Fu) == 0xD61F0000u || // BR
+               w == 0 ||                           // UDF #0 / padding
+               (w & 0xFFE0001Fu) == 0xD4200000u || // BRK
+               w == 0xD503201Fu;                   // NOP
+    };
+    size_t from_adrp = 0;
+    for (u64 a = g_base; a < g_text_end; a += 4) {
+        const u32 w = Word(a);
+        if ((w & 0x9F000000u) != 0x90000000u) // ADRP
+            continue;
+        const u32 rd = w & 31;
+        const int64_t imm = int64_t(int32_t((((w >> 5) & 0x7FFFF) << 2 | ((w >> 29) & 3)) << 11) >> 11);
+        const u64 page = (a & ~0xFFFull) + u64(imm << 12);
+        for (u64 b = a + 4; b < a + 4 * 8 && b < g_text_end; b += 4) {
+            const u32 x = Word(b);
+            // ADD Xd, Xrd, #imm12 (64-bit, shift 0)
+            if ((x & 0xFFC00000u) == 0x91000000u && ((x >> 5) & 31) == rd) {
+                const u64 t = page + ((x >> 10) & 0xFFF);
+                if (InText(t) && Word(t) != 0 && ends_function(Word(t - 4)) && g_entries.insert(t).second)
+                    from_adrp++;
+                break;
+            }
+            if ((x & 31) == rd && (x & 0x9F000000u) != 0x90000000u)
+                break; // rd overwritten by something else
+        }
+    }
     // MOD0 -> dynamic -> RELA (relative relocations into text) and function symbols
     const u32 mod0 = ImgRead<u32>(4);
     if (ImgRead<u32>(mod0) != 0x30444F4D) {
@@ -505,7 +650,8 @@ void FindEntries(u64 text_size) {
             }
         }
     }
-    std::printf("entries: %zu from BL, %zu from relocations, %zu from symbols\n", from_bl, from_rel, from_sym);
+    std::printf("entries: %zu from BL, %zu from ADRP+ADD, %zu from relocations, %zu from symbols\n", from_bl, from_adrp,
+                from_rel, from_sym);
 }
 
 // ---------------------------------------------------------------- emission
@@ -521,6 +667,56 @@ struct Emitter {
     BlockShape sh;
     bool is_call = false;
     std::set<u64>* called = nullptr; // generated functions this shard calls directly (for its declarations)
+    // Block-local register promotion: the guest registers, SP and NZCV a block touches live in locals (MSVC
+    // cannot keep s.x[] in host registers across the volatile memory accesses); they are loaded at the block's
+    // start and written back before anything that observes the State (calls, SVCs, returns, jumps).
+    std::set<int> used_regs, dirty_regs;
+    bool sp_used = false, sp_dirty = false, nz_used = false, nz_dirty = false;
+    std::string R(int r) {
+        used_regs.insert(r);
+        return "x_" + std::to_string(r);
+    }
+    std::string RW(int r) {
+        dirty_regs.insert(r);
+        return R(r);
+    }
+    std::string SpR() {
+        sp_used = true;
+        return "x_sp";
+    }
+    std::string SpW() {
+        sp_dirty = true;
+        return SpR();
+    }
+    std::string NzR() {
+        nz_used = true;
+        return "nzcv";
+    }
+    std::string NzW() {
+        nz_dirty = true;
+        return NzR();
+    }
+    std::string FlushText(const std::string& pad) const {
+        std::string t;
+        for (int r : dirty_regs)
+            t += pad + "s.x[" + std::to_string(r) + "] = x_" + std::to_string(r) + ";\n";
+        if (sp_dirty)
+            t += pad + "s.sp = x_sp;\n";
+        if (nz_dirty)
+            t += pad + "s.nzcv = nzcv;\n";
+        return t;
+    }
+    std::string LoadText(bool declare) const {
+        std::string t;
+        for (int r : used_regs)
+            t += (declare ? "  u64 x_" : "  x_") + std::to_string(r) + " = s.x[" + std::to_string(r) + "];\n";
+        if (sp_used)
+            t += std::string(declare ? "  u64 x_sp" : "  x_sp") + " = s.sp;\n";
+        if (nz_used)
+            t += std::string(declare ? "  u32 nzcv" : "  nzcv") + " = s.nzcv;\n";
+        return t;
+    }
+    void Flush(const std::string& pad) { o << FlushText(pad); }
 
     std::string Fn(u64 pc) const {
         if (called)
@@ -574,29 +770,32 @@ struct Emitter {
         case Op::Void: return;
         case Op::Identity: o << "auto " << Def(in) << " = " << A(0) << ";\n"; return;
         case Op::A64SetCheckBit: o << "cbit = " << A(0) << ";\n"; return;
-        case Op::A64GetCFlag: o << "bool " << Def(in) << " = (s.nzcv & kC) != 0;\n"; return;
-        case Op::A64GetNZCVRaw: o << "u32 " << Def(in) << " = s.nzcv;\n"; return;
-        case Op::A64SetNZCVRaw: o << "s.nzcv = " << A(0) << " & 0xF0000000u;\n"; return;
-        case Op::A64SetNZCV: o << "s.nzcv = " << A(0) << ";\n"; return;
-        case Op::A64GetW: o << "u32 " << Def(in) << " = u32(s.x[" << A(0) << "]);\n"; return;
-        case Op::A64GetX: o << "u64 " << Def(in) << " = s.x[" << A(0) << "];\n"; return;
+        case Op::A64GetCFlag: o << "bool " << Def(in) << " = (" << NzR() << " & kC) != 0;\n"; return;
+        case Op::A64GetNZCVRaw: o << "u32 " << Def(in) << " = " << NzR() << ";\n"; return;
+        case Op::A64SetNZCVRaw: o << NzW() << " = " << A(0) << " & 0xF0000000u;\n"; return;
+        case Op::A64SetNZCV: o << NzW() << " = " << A(0) << ";\n"; return;
+        case Op::A64GetW: o << "u32 " << Def(in) << " = u32(" << R(int(in.GetArg(0).GetA64RegRef())) << ");\n"; return;
+        case Op::A64GetX: o << "u64 " << Def(in) << " = " << R(int(in.GetArg(0).GetA64RegRef())) << ";\n"; return;
         case Op::A64GetS: o << "V128 " << Def(in) << "{u64(u32(s.v[" << A(0) << "].lo)), 0};\n"; return;
         case Op::A64GetD: o << "V128 " << Def(in) << "{s.v[" << A(0) << "].lo, 0};\n"; return;
         case Op::A64GetQ: o << "V128 " << Def(in) << " = s.v[" << A(0) << "];\n"; return;
-        case Op::A64GetSP: o << "u64 " << Def(in) << " = s.sp;\n"; return;
+        case Op::A64GetSP: o << "u64 " << Def(in) << " = " << SpR() << ";\n"; return;
         case Op::A64GetFPCR: o << "u32 " << Def(in) << " = s.fpcr;\n"; return;
         case Op::A64GetFPSR: o << "u32 " << Def(in) << " = s.fpsr;\n"; return;
-        case Op::A64SetW: o << "s.x[" << A(0) << "] = u64(" << A(1) << ");\n"; return;
-        case Op::A64SetX: o << "s.x[" << A(0) << "] = " << A(1) << ";\n"; return;
+        case Op::A64SetW: o << RW(int(in.GetArg(0).GetA64RegRef())) << " = u64(" << A(1) << ");\n"; return;
+        case Op::A64SetX: o << RW(int(in.GetArg(0).GetA64RegRef())) << " = " << A(1) << ";\n"; return;
         case Op::A64SetS: o << "s.v[" << A(0) << "] = V128{u64(u32(" << A(1) << ".lo)), 0};\n"; return;
         case Op::A64SetD: o << "s.v[" << A(0) << "] = V128{" << A(1) << ".lo, 0};\n"; return;
         case Op::A64SetQ: o << "s.v[" << A(0) << "] = " << A(1) << ";\n"; return;
-        case Op::A64SetSP: o << "s.sp = " << A(0) << ";\n"; return;
+        case Op::A64SetSP: o << SpW() << " = " << A(0) << ";\n"; return;
         case Op::A64SetFPSR: o << "s.fpsr = " << A(0) << ";\n"; return;
+        case Op::A64SetFPCR: o << "SetFpcr(s, " << A(0) << ");\n"; return;
         case Op::A64SetPC: o << "s.pc = " << A(0) << ";\n"; return;
         case Op::A64CallSupervisor:
             // Handlers may redirect the thread (SetPC) or stop it (Halt).
-            o << "Svc(s, " << A(0) << "); if (*s.halt || s.pc != " << Hex(sh.setpc_imm.value_or(0)) << ") return;\n";
+            // (the handler reads and writes the State: write the locals back first, reload them after)
+            o << "\n" << FlushText("  ") << "  Svc(s, " << A(0) << "); if (*s.halt || s.pc != " << Hex(sh.setpc_imm.value_or(0))
+              << ") return;\n@RELOAD@";
             return;
         case Op::A64DataCacheOperationRaised:
         case Op::A64InstructionCacheOperationRaised:
@@ -676,7 +875,7 @@ struct Emitter {
         std::string args;
         const bool state_op = StateOps().count(name) != 0;
         if (name.rfind("ConditionalSelect", 0) == 0)
-            args = "s.nzcv";
+            args = NzR();
         else if (state_op)
             args = "s";
         for (size_t k = 0; k < in.NumArgs(); k++)
@@ -691,6 +890,7 @@ struct Emitter {
 
     void Jump(u64 t, int depth) {
         const std::string pad(depth * 2, ' ');
+        Flush(pad);
         if (is_call && !sh.has_svc) {
             const u64 ret = sh.ret_loc;
             o << pad << "s.pc = " << Hex(t) << "; ";
@@ -724,7 +924,7 @@ struct Emitter {
         } else if (auto* l = boost::get<IR::Term::LinkBlockFast>(&t)) {
             Jump(PcOf(l->next), depth);
         } else if (auto* i = boost::get<IR::Term::If>(&t)) {
-            o << pad << "if (CondHolds(s.nzcv, " << int(i->if_) << ")) {\n";
+            o << pad << "if (CondHolds(" << NzR() << ", " << int(i->if_) << ")) {\n";
             Term(i->then_, depth + 1);
             o << pad << "} else {\n";
             Term(i->else_, depth + 1);
@@ -742,6 +942,7 @@ struct Emitter {
             if (sh.setpc_imm && !(is_call && !sh.has_svc)) {
                 Jump(*sh.setpc_imm, depth);
             } else if (is_call) {
+                Flush(pad);
                 o << pad << "Dispatch(s);";
                 if (blockset.count(sh.ret_loc))
                     o << " if (s.pc != " << Hex(sh.ret_loc) << ") return; goto b_" << std::hex << sh.ret_loc
@@ -749,9 +950,11 @@ struct Emitter {
                 else
                     o << " return;\n";
             } else if (boost::get<IR::Term::PopRSBHint>(&t)) {
+                Flush(pad);
                 o << pad << "return;\n";
             } else {
                 // Register branch: a local jump table target, a tail call or unknown code.
+                Flush(pad);
                 if (f.blocks.size() <= 4096) {
                     o << pad << "switch (s.pc) {\n";
                     for (u64 b : f.blocks)
@@ -761,6 +964,7 @@ struct Emitter {
                 o << pad << "Dispatch(s); return;\n";
             }
         } else {
+            Flush(pad);
             o << pad << "s.pc = " << Hex(cur) << "; return;\n";
         }
     }
@@ -790,13 +994,24 @@ struct Emitter {
         sh = Shape(b);
         is_call = sh.has_push_rsb && !sh.has_svc;
         names.clear();
+        used_regs.clear();
+        dirty_regs.clear();
+        sp_used = sp_dirty = nz_used = nz_dirty = false;
+        const std::string head = o.str();
+        o.str("");
+        o.clear();
         o << "  s.icount += " << b.CycleCount() << ";\n";
         for (const auto& in : b) {
             o << "  ";
             Inst(in);
         }
         Term(b.GetTerminal(), 1);
-        o << "}\n";
+        std::string body = o.str();
+        for (size_t at; (at = body.find("@RELOAD@")) != std::string::npos;)
+            body.replace(at, 8, LoadText(false));
+        o.str("");
+        o.clear();
+        o << head << LoadText(true) << body << "}\n";
     }
 };
 
@@ -1066,12 +1281,13 @@ int main(int argc, char** argv) {
         cur << "void f_" << std::hex << f.entry << std::dec << "(State& s) {\n  if (!ok_" << std::hex << f.entry << std::dec
             << " || reinterpret_cast<u64>(_AddressOfReturnAddress()) < s.stack_limit) return;\n"
                "  bool cbit = false;\n";
-        // Resume points: call-return blocks, so the JIT can come back into this function after a callee it ran.
+        // Resume points: call-return blocks (the JIT can come back into this function after a callee it ran) and the
+        // blocks after SVCs (a thread halted inside an SVC continues there).
         std::vector<u64> resume;
         for (u64 b : f.blocks) {
-            const u64 r = g_blocks[b].ret;
-            if (r && r != f.entry && blockset.count(r) && g_blocks[r].supported)
-                resume.push_back(r);
+            for (const u64 r : {g_blocks[b].ret, g_blocks[b].svc_next})
+                if (r && r != f.entry && blockset.count(r) && g_blocks[r].supported)
+                    resume.push_back(r);
         }
         std::sort(resume.begin(), resume.end());
         resume.erase(std::unique(resume.begin(), resume.end()), resume.end());
@@ -1146,6 +1362,7 @@ int main(int argc, char** argv) {
     std::printf("%zu blocks failed to emit\n", g_emit_failures);
     std::printf("%zu C library routines run on the host\n", g_intrinsics.size());
     std::printf("%zu resume points\n", resumes.size());
+    std::printf("%zu jump tables resolved (%zu targets)\n", g_jump_tables, g_jump_targets);
     std::printf("emitted %zu functions, %zu blocks (%zu exit to the JIT) in %zu shards\n", funcs.size(),
                 emitted_blocks, unsupported_blocks, shard);
     if (!unsupported_weight.empty()) {

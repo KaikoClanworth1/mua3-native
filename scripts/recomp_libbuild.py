@@ -1,4 +1,4 @@
-﻿"""Compile build/recomp_full into a prebuilt static library (outside MSBuild, which loses all progress whenever one
+"""Compile build/recomp_full into a prebuilt static library (outside MSBuild, which loses all progress whenever one
 compiler dies). Objects are reused while newer than their source; MSVC internal crashes are bisected to a function,
 added to noopt.txt and the code regenerated (only changed shards are rewritten)."""
 import os
@@ -28,6 +28,7 @@ def log(*a):
 
 def generate():
     cmd = [os.path.join(P, r'build\bin\RelWithDebInfo\recomp.exe'), GEN,
+           os.path.join(NSO, 'rtld.bin'), '8000000', '19f0',  # process entry: the main thread starts here
            os.path.join(NSO, 'main.bin'), '8004000', '159d340', os.path.join(NSO, 'sdk.bin'), 'df54000', '51c600',
            os.path.join(NSO, 'subsdk0.bin'), 'cfc5000', '377110', os.path.join(NSO, 'subsdk1.bin'), 'd6e5000', '4ce300',
            *[a for p in sorted(n for n in os.listdir(S) if re.fullmatch(r'prof\d+\.txt', n))

@@ -8,6 +8,7 @@
 #include <shared_mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <windows.h>
 
@@ -697,6 +698,20 @@ void DynarmicCore::EnsureJit() {
 
 // Runs the JIT from st_ until it reaches native code again (or a halt). single_step: one instruction (debugger).
 void DynarmicCore::RunJit(bool single_step) {
+    // Every pc the JIT has to run is code the recompiler has not seen: record each once, in the generator's profile
+    // format ("<pc hex> <count>"), so the next library build covers it (copy recomp_missing.txt into
+    // build/recomp_work as prof<N>.txt).
+    {
+        static std::mutex m;
+        static std::unordered_set<u64> seen;
+        std::lock_guard lk(m);
+        if (seen.insert(st_.pc).second) {
+            if (FILE* f = std::fopen("recomp_missing.txt", "a")) {
+                std::fprintf(f, "%llx 1\n", static_cast<unsigned long long>(st_.pc));
+                std::fclose(f);
+            }
+        }
+    }
     EnsureJit();
     auto regs = jit_->GetRegisters();
     std::memcpy(regs.data(), st_.x, sizeof(st_.x));
