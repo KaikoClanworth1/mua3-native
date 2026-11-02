@@ -169,20 +169,29 @@ public:
         if (auto* j = jit_ptr_.load(std::memory_order_seq_cst))
             j->HaltExecution(why);
     }
+    // Without a JIT only a stop has to unwind recompiled code (Run() checks stop_ before looking up the pc, so where
+    // it left does not matter). Callbacks run at the thread's next SVC instead, where its registers are in st_ and
+    // it can continue in place: a halt would leave at an arbitrary loop head, which may not be a resume point.
     void RunOnCore(std::function<void()> fn) override {
         {
             std::lock_guard lk(inv_mutex_);
             callbacks_.push_back(std::move(fn));
         }
-        RequestHalt(kHaltCallback);
+        if (JitFallback())
+            RequestHalt(kHaltCallback);
+        else
+            requests_pending_.store(true, std::memory_order_release);
     }
     void QueueInvalidate(u64 addr, u64 size) {
+        if (!JitFallback())
+            return; // only the JIT holds translated code
         {
             std::lock_guard lk(inv_mutex_);
             pending_.emplace_back(addr, size);
         }
         RequestHalt(kHaltInvalidate);
     }
+    std::atomic<bool> requests_pending_{false};
     void ServiceRequests() {
         std::vector<std::function<void()>> fns;
         {
@@ -306,6 +315,10 @@ public:
         if ((++svc_count_ & 255) == 0 && native_) {
             CreditNative();
             MaybeReport();
+        }
+        if (requests_pending_.load(std::memory_order_acquire)) [[unlikely]] {
+            requests_pending_.store(false, std::memory_order_relaxed);
+            ServiceRequests(); // RunOnCore callbacks (no JIT): registers are in st_ here
         }
         cb_.svc(imm);
         if (guest_mxcsr_ != host_mxcsr_)
@@ -791,7 +804,8 @@ void DynarmicCore::NoNativeCode() {
     LOG_ERROR("Recomp", "guest code at {:#x} has no recompiled version (lr {:#x}, sp {:#x}); recorded in "
                         "recomp_missing.txt for the next build of the recompiled library",
               pc, st_.x[30], st_.sp);
-    core::Sys().Kern().DumpAllThreads();
+    // (no DumpAllThreads: it asks every running thread, this one included, to report from its own core, and a
+    // thread that cannot answer gets suspended for a host stack walk: this thread would suspend itself.)
     PANIC("This part of the game has not been recompiled yet (guest code at {:#x}).\n\nIts address was saved to "
           "recomp_missing.txt next to the game; rebuilding the recompiled code with it adds this part.", pc);
 }
