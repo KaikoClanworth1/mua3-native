@@ -179,12 +179,27 @@ std::vector<u64> JumpTableTargets(u64 br) {
             if ((w & 0x7FE0FFE0u) == 0x2A0003E0u && (w & 31) == idx_reg)
                 idx_reg = (w >> 16) & 31;
             // CMP Wn/Xn, #imm12 (SUBS with Rd = zr, no shift), then a B.HI or B.HS right after it
-            else if ((w & 0x7FC0001Fu) == 0x7100001Fu && ((w >> 5) & 31) == idx_reg && InText(a + 4)) {
-                const u32 n = (w >> 10) & 0xFFF, next = Word(a + 4);
-                if ((next & 0xFF00001Fu) == 0x54000008u) // B.HI
-                    count = n + 1;
-                else if ((next & 0xFF00001Fu) == 0x54000002u) // B.HS
-                    count = n;
+            else if ((w & 0x7FC0001Fu) == 0x7100001Fu && ((w >> 5) & 31) == idx_reg) {
+                // the B.HI / B.HS may follow a few instructions later (stores and moves scheduled in between;
+                // anything that sets flags or branches ends the search)
+                const u32 n = (w >> 10) & 0xFFF;
+                for (u64 b = a + 4; b <= a + 16 && InText(b); b += 4) {
+                    const u32 next = Word(b);
+                    if ((next & 0xFF00001Fu) == 0x54000008u) { // B.HI
+                        count = n + 1;
+                        break;
+                    }
+                    if ((next & 0xFF00001Fu) == 0x54000002u) { // B.HS
+                        count = n;
+                        break;
+                    }
+                    const bool sets_flags = (next & 0x1F000000u) == 0x11000000u ? (next >> 29) & 1 // add/sub imm
+                                          : (next & 0x1F000000u) == 0x0B000000u ? (next >> 29) & 1 // add/sub reg
+                                          : (next & 0x7F800000u) == 0x72000000u;                  // ands/tst imm
+                    if (sets_flags || (next & 0x7C000000u) == 0x14000000u || (next & 0xFE000000u) == 0x54000000u ||
+                        (next & 0xFE000000u) == 0xD6000000u)
+                        break;
+                }
             }
         }
         if (!lo && !adr && (w & 0xFFC00000u) == 0x91000000u && (w & 31) == base_reg && ((w >> 5) & 31) == base_reg)
@@ -981,13 +996,15 @@ struct Emitter {
                 // Register branch: a local jump table target, a tail call or unknown code. The block's own
                 // jump table targets when it has one, else every block of a function of reasonable size.
                 Flush(pad);
+                // Only the block's own jump table targets when it has one: a switch over every block makes each of
+                // them a successor of every register branch, which costs MSVC's optimizer ~16% of guest speed.
+                // Targets outside this function are resume points elsewhere and reached through Dispatch.
                 std::vector<u64> local;
-                if (f.blocks.size() <= 4096)
+                for (u64 b : cur_bi->succ)
+                    if (g_jt_targets.count(b) && blockset.count(b))
+                        local.push_back(b);
+                if (local.empty() && f.blocks.size() <= 4096)
                     local = f.blocks;
-                else
-                    for (u64 b : cur_bi->succ)
-                        if (blockset.count(b))
-                            local.push_back(b);
                 std::sort(local.begin(), local.end());
                 local.erase(std::unique(local.begin(), local.end()), local.end());
                 if (!local.empty()) {
@@ -1427,8 +1444,10 @@ int main(int argc, char** argv) {
         // blocks after SVCs (a thread halted inside an SVC continues there).
         std::vector<u64> resume;
         for (u64 b : f.blocks) {
+            // (loop heads are not resume points: without the JIT only a thread stop leaves at a back edge, and with
+            // it the JIT runs from there; the extra entry edges into loops would cost the optimizer)
             for (const u64 r : {g_blocks[b].ret, g_blocks[b].svc_next, g_extra_resume.count(b) ? b : 0,
-                                em.halt_targets.count(b) ? b : 0, g_jt_targets.count(b) ? b : 0})
+                                g_jt_targets.count(b) ? b : 0})
                 if (r && r != f.entry && blockset.count(r) && g_blocks[r].supported)
                     resume.push_back(r);
         }
