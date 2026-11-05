@@ -35,7 +35,7 @@ def generate():
              for a in ('--profile', os.path.join(S, p))],
            # recomp_missing.txt files from game runs (pcs the JIT had to run), renamed missing<N>.txt
            *[a for p in sorted(n for n in os.listdir(S) if re.fullmatch(r'missing\d+\.txt', n))
-             for a in ('--missing', os.path.join(S, p))], '--all', '1',
+             for a in ('--missing', os.path.join(S, p))], '--all', '1', '--sweep', '1',
            '--noopt', NOOPT, '--skip', SKIP]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, check=True)
 

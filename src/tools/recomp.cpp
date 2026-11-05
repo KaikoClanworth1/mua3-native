@@ -120,6 +120,7 @@ struct BlockInfo {
     bool supported = true;
     u64 ret = 0;               // call blocks: the return point
     u64 svc_next = 0;          // blocks with an SVC: where the thread continues (a thread halted in the SVC resumes there)
+    bool untranslatable = false; // dynarmic cannot decode the first instruction: the block raises the guest exception
     std::vector<std::string> unsupported_ops;
 };
 
@@ -219,7 +220,11 @@ std::vector<u64> JumpTableTargets(u64 br) {
     return out;
 }
 size_t g_jump_tables = 0, g_jump_targets = 0;
+// Jump table targets: resume points of every function containing them, so a register branch from a function that
+// does not hold the target (block lists are capped, entries split functions) still finds it through Dispatch.
+std::unordered_set<u64> g_jt_targets;
 std::set<u64> g_missing;             // --missing: pcs the runtime had to run on the JIT
+bool g_sweep = false;                 // --sweep: entries for every code gap no scan reached
 std::unordered_set<u64> g_extra_resume; // of those, block starts of recompiled functions
 
 const std::unordered_set<std::string>& GenericOps() {
@@ -492,9 +497,10 @@ const BlockInfo& Analyze(u64 pc) {
     try {
         tb.emplace(TranslateAt(pc));
     } catch (const std::exception&) {
+        // An encoding the decoder rejects: like the hardware (and the JIT), executing it raises the guest's
+        // undefined-instruction exception, which the generated code does by calling Undefined().
         bi.end = pc + 4;
-        bi.supported = false;
-        bi.unsupported_ops.push_back("(translation failed)");
+        bi.untranslatable = true;
         return g_blocks.emplace(pc, std::move(bi)).first->second;
     }
     IR::Block& b = *tb;
@@ -509,8 +515,12 @@ const BlockInfo& Analyze(u64 pc) {
     const BlockShape sh = Shape(b);
     const bool is_call = sh.has_push_rsb && !sh.has_svc;
     const IR::Terminal term = b.GetTerminal();
-    if (boost::get<IR::Term::Interpret>(&term) || boost::get<IR::Term::Invalid>(&term))
+    // An Interpret terminal (UDF #0 after no-return calls, unallocated encodings) is emitted as Undefined(); only an
+    // Invalid terminal is unexpected.
+    if (boost::get<IR::Term::Invalid>(&term)) {
         bi.supported = false;
+        bi.unsupported_ops.push_back("(invalid terminal)");
+    }
     CollectTargets(term, sh, is_call, bi);
     if (is_call)
     {
@@ -524,6 +534,7 @@ const BlockInfo& Analyze(u64 pc) {
         if (const auto targets = JumpTableTargets(bi.end - 4); !targets.empty()) {
             g_jump_tables++, g_jump_targets += targets.size();
             bi.succ.insert(bi.succ.end(), targets.begin(), targets.end());
+            g_jt_targets.insert(targets.begin(), targets.end());
         }
     }
     return g_blocks.emplace(pc, std::move(bi)).first->second;
@@ -673,6 +684,8 @@ struct Emitter {
     std::unordered_map<const IR::Inst*, unsigned> names;
     unsigned next_name = 0;
     u64 cur = 0;
+    const BlockInfo* cur_bi = nullptr;
+    std::set<u64> halt_targets; // loop heads where a halt request leaves the function (resume points)
     BlockShape sh;
     bool is_call = false;
     std::set<u64>* called = nullptr; // generated functions this shard calls directly (for its declarations)
@@ -914,8 +927,11 @@ struct Emitter {
             return;
         }
         if (blockset.count(t) && (t == f.entry || !g_entries.count(t))) {
-            if (t <= cur)
+            if (t <= cur) {
+                // a halt request leaves at back edges: the loop head must be a resume point to come back to
                 o << pad << "if (*s.halt) { s.pc = " << Hex(t) << "; return; }\n";
+                halt_targets.insert(t);
+            }
             o << pad << "goto b_" << std::hex << t << std::dec << ";\n";
             return;
         }
@@ -962,16 +978,31 @@ struct Emitter {
                 Flush(pad);
                 o << pad << "return;\n";
             } else {
-                // Register branch: a local jump table target, a tail call or unknown code.
+                // Register branch: a local jump table target, a tail call or unknown code. The block's own
+                // jump table targets when it has one, else every block of a function of reasonable size.
                 Flush(pad);
-                if (f.blocks.size() <= 4096) {
+                std::vector<u64> local;
+                if (f.blocks.size() <= 4096)
+                    local = f.blocks;
+                else
+                    for (u64 b : cur_bi->succ)
+                        if (blockset.count(b))
+                            local.push_back(b);
+                std::sort(local.begin(), local.end());
+                local.erase(std::unique(local.begin(), local.end()), local.end());
+                if (!local.empty()) {
                     o << pad << "switch (s.pc) {\n";
-                    for (u64 b : f.blocks)
+                    for (u64 b : local)
                         o << pad << "case " << Hex(b) << ": goto b_" << std::hex << b << std::dec << ";\n";
                     o << pad << "default: break;\n" << pad << "}\n";
                 }
                 o << pad << "Dispatch(s); return;\n";
             }
+        } else if (auto* in = boost::get<IR::Term::Interpret>(&t)) {
+            // An instruction dynarmic cannot decode (UDF #0 after no-return calls, unallocated encodings): the
+            // guest's undefined-instruction exception, raised natively.
+            Flush(pad);
+            o << pad << "s.pc = " << Hex(PcOf(in->next)) << "; Undefined(s); return;\n";
         } else {
             Flush(pad);
             o << pad << "s.pc = " << Hex(cur) << "; return;\n";
@@ -994,7 +1025,12 @@ struct Emitter {
     }
     void BlockBody(u64 pc, const BlockInfo& bi) {
         cur = pc;
+        cur_bi = &bi;
         o << "b_" << std::hex << pc << std::dec << ": {\n";
+        if (bi.untranslatable) {
+            o << "  s.pc = " << Hex(pc) << "; Undefined(s); return;\n}\n";
+            return;
+        }
         if (!bi.supported) {
             o << "  s.pc = " << Hex(pc) << "; return;\n}\n";
             return;
@@ -1094,7 +1130,9 @@ int main(int argc, char** argv) {
             std::string a, n;
             while (in >> a >> n)
                 g_missing.insert(std::strtoull(a.c_str(), nullptr, 16));
-        } else if (k == "--stats")
+        } else if (k == "--sweep")
+            g_sweep = argv[i + 1][0] != '0';
+        else if (k == "--stats")
             stats_only = true;
         else if (k == "--max-funcs")
             max_funcs = std::strtoull(argv[i + 1], nullptr, 10);
@@ -1164,6 +1202,69 @@ int main(int argc, char** argv) {
         }
         std::printf("missing pcs: %zu, %zu new entries, %zu resume points\n", g_missing.size(), entries,
                     g_extra_resume.size());
+    }
+    // Linear sweep (--sweep): text segments hold code and padding only (jump tables and constants are in rodata),
+    // so every non-zero word no discovered block covers is code of a function no scan reached (called through a
+    // pointer computed at run time, or dead). Each gap start becomes an entry until the text is covered.
+    {
+        auto coverage = [&](size_t& covered, size_t& code) {
+            covered = code = 0;
+            for (const auto& m : g_mods) {
+                std::vector<bool> in((m.text_end - m.base) / 4);
+                for (auto& [b, bi] : g_blocks)
+                    if (b >= m.base && b < m.text_end)
+                        for (u64 a = b; a < bi.end && a < m.text_end; a += 4)
+                            in[(a - m.base) / 4] = true;
+                for (size_t i = 0; i < in.size(); i++) {
+                    const bool nz = Word(m.base + i * 4) != 0;
+                    code += nz;
+                    covered += nz && in[i];
+                }
+            }
+        };
+        size_t covered, code;
+        coverage(covered, code);
+        std::printf("text coverage before sweep: %zu of %zu code words (%.3f%%)\n", covered, code,
+                    100.0 * double(covered) / double(std::max<size_t>(code, 1)));
+        if (g_sweep) {
+            size_t added = 0;
+            for (int pass = 0; pass < 8; pass++) {
+                size_t pass_added = 0;
+                for (const auto& m : g_mods) {
+                    std::vector<bool> in((m.text_end - m.base) / 4);
+                    for (auto& [b, bi] : g_blocks)
+                        if (b >= m.base && b < m.text_end)
+                            for (u64 a = b; a < bi.end && a < m.text_end; a += 4)
+                                in[(a - m.base) / 4] = true;
+                    bool boundary = true; // previous word ended code (block end, padding, start of text)
+                    for (size_t i = 0; i < in.size(); i++) {
+                        const u64 a = m.base + i * 4;
+                        const u32 w = Word(a);
+                        if (in[i] || w == 0 || w == 0xD503201Fu) { // covered, UDF #0 padding, NOP
+                            boundary = true;
+                            continue;
+                        }
+                        if (boundary && !g_entries.count(a)) {
+                            g_entries.insert(a);
+                            Function f = Discover(a);
+                            for (u64 b : f.blocks)
+                                for (u64 x = b; x < g_blocks[b].end && x < m.text_end; x += 4)
+                                    if (x >= a)
+                                        in[(x - m.base) / 4] = true;
+                            funcs.push_back(std::move(f));
+                            pass_added++;
+                        }
+                        boundary = false;
+                    }
+                }
+                added += pass_added;
+                if (!pass_added)
+                    break;
+            }
+            coverage(covered, code);
+            std::printf("sweep: %zu entries added; text coverage %zu of %zu code words (%.3f%%)\n", added, covered,
+                        code, 100.0 * double(covered) / double(std::max<size_t>(code, 1)));
+        }
     }
     size_t nblocks = 0;
     for (auto& f : funcs)
@@ -1237,6 +1338,11 @@ int main(int argc, char** argv) {
         std::sort(v.rbegin(), v.rend());
         for (size_t i = 0; i < v.size() && i < 60; i++)
             std::printf("  %8llu %s\n", v[i].first, v[i].second.c_str());
+        size_t listed = 0;
+        for (auto& [pc, bi] : g_blocks)
+            if (!bi.supported && listed++ < 40)
+                std::printf("  unsupported block %llx (%s)\n", (unsigned long long)pc,
+                            bi.unsupported_ops.empty() ? "?" : bi.unsupported_ops[0].c_str());
         return 0;
     }
     if (funcs.size() > max_funcs)
@@ -1321,7 +1427,8 @@ int main(int argc, char** argv) {
         // blocks after SVCs (a thread halted inside an SVC continues there).
         std::vector<u64> resume;
         for (u64 b : f.blocks) {
-            for (const u64 r : {g_blocks[b].ret, g_blocks[b].svc_next, g_extra_resume.count(b) ? b : 0})
+            for (const u64 r : {g_blocks[b].ret, g_blocks[b].svc_next, g_extra_resume.count(b) ? b : 0,
+                                em.halt_targets.count(b) ? b : 0, g_jt_targets.count(b) ? b : 0})
                 if (r && r != f.entry && blockset.count(r) && g_blocks[r].supported)
                     resume.push_back(r);
         }
