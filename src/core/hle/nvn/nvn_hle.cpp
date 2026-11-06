@@ -1097,6 +1097,8 @@ struct HostQueue {
     std::unordered_map<u64, Window> windows;
     u64 presents = 0;
     std::chrono::steady_clock::time_point fps_t0 = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point last_present{};
+    std::vector<float> frame_ms; // since the last report
 };
 HostQueue& HQ() {
     static HostQueue q;
@@ -1234,9 +1236,20 @@ void QueuePresentTexture(State& s) {
         w.released[index] = released;
     q.presents++;
     const auto now = std::chrono::steady_clock::now();
+    if (q.last_present != std::chrono::steady_clock::time_point{})
+        q.frame_ms.push_back(std::chrono::duration<float, std::milli>(now - q.last_present).count());
+    q.last_present = now;
     if (now - q.fps_t0 > std::chrono::seconds(5)) {
         const double secs = std::chrono::duration<double>(now - q.fps_t0).count();
         auto& g = gpu::G();
+        float p50 = 0, p99 = 0, worst = 0;
+        if (!q.frame_ms.empty()) {
+            std::sort(q.frame_ms.begin(), q.frame_ms.end());
+            p50 = q.frame_ms[q.frame_ms.size() / 2];
+            p99 = q.frame_ms[q.frame_ms.size() * 99 / 100];
+            worst = q.frame_ms.back();
+            q.frame_ms.clear();
+        }
         std::string drv;
         {
             std::vector<std::pair<u64, int>> v;
@@ -1250,9 +1263,9 @@ void QueuePresentTexture(State& s) {
             for (auto& [ns, w] : v)
                 g_through_calls[w].store(0);
         }
-        LOG_INFO("NVN", "Presenting: {:.1f} fps (native) gpu busy {:.0f}% (draw {:.0f}%) | reg {}/{} cached, {} list grows | driver:{}",
+        LOG_INFO("NVN", "Presenting: {:.1f} fps (native) gpu busy {:.0f}% (draw {:.0f}%) | frame ms p50 {:.2f} p99 {:.2f} max {:.2f} | reg {}/{} cached, {} list grows | driver:{}",
                  q.presents / secs, g.busy_ns.exchange(0) / (secs * 1e7), g.draw_ns.exchange(0) / (secs * 1e7),
-                 g_reg_hits.exchange(0), g_reg_calls.exchange(0), g_list_grows.exchange(0), drv);
+                 p50, p99, worst, g_reg_hits.exchange(0), g_reg_calls.exchange(0), g_list_grows.exchange(0), drv);
         q.presents = 0;
         q.fps_t0 = now;
     }
