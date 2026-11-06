@@ -111,10 +111,11 @@ public:
     static bool JitFallback() {
         if (!MUA3_WITH_JIT)
             return false;
+        // A JIT build exists for coverage playtests: the fallback is on unless MUA3_JIT_FALLBACK=0.
         static const bool on = [] {
             const char* e = std::getenv("MUA3_JIT_FALLBACK");
             const char* off = std::getenv("MUA3_RECOMP"); // MUA3_RECOMP=0 (comparison runs) is JIT-only
-            return (e && e[0] == '1') || (off && off[0] == '0');
+            return !(e && e[0] == '0') || (off && off[0] == '0');
         }();
         return on;
     }

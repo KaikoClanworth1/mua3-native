@@ -121,6 +121,8 @@ struct BlockInfo {
     u64 ret = 0;               // call blocks: the return point
     u64 svc_next = 0;          // blocks with an SVC: where the thread continues (a thread halted in the SVC resumes there)
     bool untranslatable = false; // dynarmic cannot decode the first instruction: the block raises the guest exception
+    bool switch_like = false;    // ends in an unresolved register branch fed by an indexed table load (a switch)
+    bool tail_call = false;      // ends in a register branch that is certainly a call (PLT stub, after an epilogue)
     std::vector<std::string> unsupported_ops;
 };
 
@@ -151,12 +153,17 @@ std::vector<u64> JumpTableTargets(u64 br) {
         return out;
     const u32 w_add = Word(add_at);
     const u32 an = (w_add >> 5) & 31, am = (w_add >> 16) & 31;
+    // LDRSW Xl, [Xb, Xi, LSL #2] where Xl is one ADD operand and Xb the other (Xl may differ from the branch
+    // register: "ldrsw x11, [x10, x9, lsl #2]; add x10, x11, x10; br x10")
     u64 ld_at = 0;
     for (u64 a = add_at - 4; a + 4 * 4 > add_at && InText(a); a -= 4) {
         const u32 w = Word(a);
-        if ((w & 0xFFE0FC00u) == 0xB8A07800u && (w & 31) == t) { // LDRSW Xt, [Xn, Xm, LSL #2]
-            ld_at = a;
-            break;
+        if ((w & 0xFFE0FC00u) == 0xB8A07800u) {
+            const u32 rt = w & 31, rb = (w >> 5) & 31;
+            if ((rt == an && rb == am) || (rt == am && rb == an)) {
+                ld_at = a;
+                break;
+            }
         }
     }
     if (!ld_at)
@@ -164,8 +171,6 @@ std::vector<u64> JumpTableTargets(u64 br) {
     const u32 w_ld = Word(ld_at);
     const u32 base_reg = (w_ld >> 5) & 31;
     u32 idx_reg = (w_ld >> 16) & 31;
-    if (!((an == t && am == base_reg) || (am == t && an == base_reg)))
-        return out;
     // Walk back for the bound (CMP idx, #imm then B.HI / B.HS; the index may have been copied with MOV after the
     // check) and the base: ADRP + ADD of base_reg, or ADR. Loops keep the table base in a callee-saved register set
     // up long before, so the base search goes further back than the bound search.
@@ -238,6 +243,8 @@ size_t g_jump_tables = 0, g_jump_targets = 0;
 // Jump table targets: resume points of every function containing them, so a register branch from a function that
 // does not hold the target (block lists are capped, entries split functions) still finds it through Dispatch.
 std::unordered_set<u64> g_jt_targets;
+std::unordered_set<u64> g_ext_targets; // jump targets outside the jumping function that are no entry
+std::vector<u64> g_unresolved_br;      // register branches (not calls/returns) without a recognised jump table
 std::set<u64> g_missing;             // --missing: pcs the runtime had to run on the JIT
 bool g_sweep = false;                 // --sweep: entries for every code gap no scan reached
 std::unordered_set<u64> g_extra_resume; // of those, block starts of recompiled functions
@@ -550,6 +557,28 @@ const BlockInfo& Analyze(u64 pc) {
             g_jump_tables++, g_jump_targets += targets.size();
             bi.succ.insert(bi.succ.end(), targets.begin(), targets.end());
             g_jt_targets.insert(targets.begin(), targets.end());
+        } else if ((Word(bi.end - 4) & 0xFFFFFC1Fu) == 0xD61F0000u) { // BR Xn (not RET / BLR) left unresolved
+            g_unresolved_br.push_back(bi.end - 4);
+            // A switch whose table form is not recognised: an indexed load (LDR/LDRB/LDRH/LDRSW... [Xn, Xm/Wm])
+            // shortly before. Its function keeps a switch over all its blocks and all of them become resume
+            // points. Other register branches (PLT stubs, tail calls through pointers) go straight to Dispatch.
+            for (u64 a = bi.end - 8; a + 4 * 8 > bi.end && a >= pc && InText(a); a -= 4) {
+                const u32 w = Word(a);
+                if ((w & 0x3B200C00u) == 0x38200800u && ((w >> 22) & 3) != 0) {
+                    bi.switch_like = true;
+                    break;
+                }
+            }
+            // certainly a call: "ldr x17, [x16, #..]; add x16, x16, #..; br x17" (PLT), or the instruction before
+            // the BR pops the frame (LDP/LDR post-index on SP, or ADD SP, SP, #imm)
+            if (!bi.switch_like && InText(bi.end - 8)) {
+                const u32 p = Word(bi.end - 8);
+                const bool post_sp = ((p & 0x7FC00000u) == 0x28C00000u || (p & 0xFFE00C00u) == 0xF8400400u) &&
+                                     ((p >> 5) & 31) == 31; // LDP/LDR Xt, [SP], #imm
+                const bool add_sp = (p & 0xFF8003FFu) == 0x910003FFu;  // ADD SP, SP, #imm
+                const bool plt = (p & 0xFFC003FFu) == 0x91000210u;     // ADD X16, X16, #imm
+                bi.tail_call = post_sp || add_sp || plt;
+            }
         }
     }
     return g_blocks.emplace(pc, std::move(bi)).first->second;
@@ -1003,7 +1032,9 @@ struct Emitter {
                 for (u64 b : cur_bi->succ)
                     if (g_jt_targets.count(b) && blockset.count(b))
                         local.push_back(b);
-                if (local.empty() && f.blocks.size() <= 4096)
+                // unrecognised switch, or a computed jump of unknown form: any block may be the target (PLT stubs and
+                // tail calls right after an epilogue's stack pop go straight to Dispatch)
+                if (local.empty() && (cur_bi->switch_like || (!cur_bi->tail_call && f.blocks.size() <= 4096)))
                     local = f.blocks;
                 std::sort(local.begin(), local.end());
                 local.erase(std::unique(local.begin(), local.end()), local.end());
@@ -1400,6 +1431,20 @@ int main(int argc, char** argv) {
     std::vector<std::tuple<u64, u32, u32, u64>> table; // entry, range_first, range_count, hash
     std::vector<std::pair<u64, u32>> resumes;           // pc, function index
     std::set<u64> disabled;                             // entry block failed to emit: not registered
+    // Jumps that leave their function for a block that is no function's entry (block lists capped at kMaxBlocks,
+    // gap-sweep entries that start in the middle of a bigger function): the target must be a resume point of the
+    // functions holding it, or nothing could continue there (Run looks targets up in the entry/resume table).
+    {
+        size_t n = 0;
+        for (const Function& f : funcs) {
+            const std::unordered_set<u64> own(f.blocks.begin(), f.blocks.end());
+            for (u64 b : f.blocks)
+                for (u64 t : g_blocks[b].succ)
+                    if (!own.count(t) && !g_entries.count(t) && g_ext_targets.insert(t).second)
+                        n++;
+        }
+        std::printf("%zu jump targets outside their function become resume points\n", n);
+    }
     for (u32 idx = 0; idx < funcs.size(); idx++) {
         const Function& f = funcs[idx];
         if ((f.entry >> 18) != cur_bucket) {
@@ -1443,11 +1488,16 @@ int main(int argc, char** argv) {
         // Resume points: call-return blocks (the JIT can come back into this function after a callee it ran) and the
         // blocks after SVCs (a thread halted inside an SVC continues there).
         std::vector<u64> resume;
+        // A function with an unrecognised switch: every block is a resume point (the switch's targets are unknown,
+        // and the same code may also be reached from a function that split it off).
+        bool switchy = false;
+        for (u64 b : f.blocks)
+            switchy |= g_blocks[b].switch_like;
         for (u64 b : f.blocks) {
             // (loop heads are not resume points: without the JIT only a thread stop leaves at a back edge, and with
             // it the JIT runs from there; the extra entry edges into loops would cost the optimizer)
             for (const u64 r : {g_blocks[b].ret, g_blocks[b].svc_next, g_extra_resume.count(b) ? b : 0,
-                                g_jt_targets.count(b) ? b : 0})
+                                g_jt_targets.count(b) ? b : 0, g_ext_targets.count(b) ? b : 0, switchy ? b : 0})
                 if (r && r != f.entry && blockset.count(r) && g_blocks[r].supported)
                     resume.push_back(r);
         }
@@ -1524,7 +1574,13 @@ int main(int argc, char** argv) {
     std::printf("%zu blocks failed to emit\n", g_emit_failures);
     std::printf("%zu C library routines run on the host\n", g_intrinsics.size());
     std::printf("%zu resume points\n", resumes.size());
-    std::printf("%zu jump tables resolved (%zu targets)\n", g_jump_tables, g_jump_targets);
+    std::printf("%zu jump tables resolved (%zu targets), %zu register branches unresolved\n", g_jump_tables,
+                g_jump_targets, g_unresolved_br.size());
+    if (FILE* uf = std::fopen((out / "unresolved_br.txt").string().c_str(), "w")) {
+        for (u64 a : g_unresolved_br)
+            std::fprintf(uf, "%llx\n", (unsigned long long)a);
+        std::fclose(uf);
+    }
     std::printf("emitted %zu functions, %zu blocks (%zu exit to the JIT) in %zu shards\n", funcs.size(),
                 emitted_blocks, unsupported_blocks, shard);
     if (!unsupported_weight.empty()) {
