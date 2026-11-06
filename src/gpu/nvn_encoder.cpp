@@ -141,7 +141,9 @@ bool LevelLayout(const hle::nvn::TextureInfo& t, u32 level, u32 layer, TexLevel&
     const u32 depth = is3d ? std::max<u32>(t.depth, 1) : 1;
     const u32 hb0 = (std::max<u32>(t.height, 1) + b.bh - 1) / b.bh;
     u32 bh0 = 0, bd0 = 0;
-    while (bh0 < 4 && (8u << bh0) < hb0)
+    // The driver's choice, as its texture descriptors show: a block may be up to a third shorter than the texture
+    // (20 rows of blocks use 16-row blocks, 22 use 32-row ones). Copies must match or the image lands scrambled.
+    while (bh0 < 4 && (8u << bh0) * 4 < hb0 * 3)
         bh0++;
     while (is3d && bd0 < 5 && (1u << bd0) < depth)
         bd0++;
