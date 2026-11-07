@@ -234,6 +234,28 @@ static void Prof(int section) {
     g_prof_last = now;
 }
 
+// Debug switches that change depth state per pixel shader: those draws can't reuse the last state object.
+static const bool g_debug_ps_state = std::getenv("MUA3_TESTS_OFF") || std::getenv("MUA3_ZBIAS_PS");
+
+// Direct3D state built from the DrawState, kept until its serial changes.
+struct SeenState {
+    u32 blend = 0, depth = 0, raster = 0;
+    bool depth_on = false;
+    float flip = 0;
+    ID3D11BlendState* blend_obj = nullptr;
+    ID3D11DepthStencilState* depth_obj = nullptr;
+    ID3D11RasterizerState* raster_obj = nullptr;
+    u64 attr_vs = 0;
+    u32 attr_serial = 0;
+    ShaderCache::VariantKey attr_key;
+    u64 layout_vs = 0;
+    u32 layout_serial = 0;
+    ID3D11InputLayout* layout = nullptr;
+    bool used_buf[16]{};
+    bool need_default = false;
+};
+static SeenState g_seen;
+
 } // namespace
 
 // Per-renderer pooled GPU buffers and state objects.
@@ -1548,16 +1570,36 @@ void D3D11Renderer::Draw() {
     }
     // Integer vertex attributes and integer textures need integer-typed shader declarations (a float4
     // declaration would receive converted values): pick the matching shader variant.
-    auto int_textures = [&](HostShader* sh, u32 stage_index, ShaderCache::VariantKey& key) {
+    // This draw's texture handles and descriptors per stage (0 vertex, 1 fragment), read once. The game rebuilds its
+    // handles every frame, so they can't identify a texture from one draw or frame to the next.
+    struct StageTexture {
+        u32 handle;
+        TicEntry tic;
+    };
+    static thread_local StageTexture stage_textures[2][32];
+    bool stage_read[2] = {false, false};
+    auto read_stage_textures = [&](HostShader* sh, u32 stage_index) {
+        const u32 st = stage_index == kCbVertex ? 0 : 1;
+        if (stage_read[st])
+            return;
+        stage_read[st] = true;
         const auto& tcb = m.cb[stage_index][kTextureHandleCb];
-        const u64 tic_base = m.tic_base;
         for (auto& t : sh->info.textures) {
             if (t.slot >= 32)
                 continue;
-            u32 handle = 0;
-            g.ReadGpu(tcb.address + t.cbuf_offset, &handle, 4);
-            TicEntry tic;
-            g.ReadGpu(tic_base + u64(handle & 0xFFFFF) * 32, tic.w.data(), 32);
+            StageTexture& e = stage_textures[st][t.slot];
+            e.handle = 0;
+            g.ReadGpu(tcb.address + t.cbuf_offset, &e.handle, 4);
+            g.ReadGpu(m.tic_base + u64(e.handle & 0xFFFFF) * 32, e.tic.w.data(), 32);
+        }
+    };
+    auto int_textures = [&](HostShader* sh, u32 stage_index, ShaderCache::VariantKey& key) {
+        read_stage_textures(sh, stage_index);
+        const u32 st = stage_index == kCbVertex ? 0 : 1;
+        for (auto& t : sh->info.textures) {
+            if (t.slot >= 32)
+                continue;
+            const TicEntry& tic = stage_textures[st][t.slot].tic;
             if (FindSurfaceByGpu(tic.Address()))
                 continue; // render targets are float/unorm surfaces
             switch (DxgiIntKind(TicFormat(tic.Format(), tic.RType(), tic.Srgb()).dxgi)) {
@@ -1568,26 +1610,32 @@ void D3D11Renderer::Draw() {
         }
     };
     if (vs && vs->state == HostShader::Ready) {
-        ShaderCache::VariantKey key;
-        for (u32 i = 0; i < 32; i++) {
-            if (!(vs->info.attrib_in_mask & (1u << i)))
-                continue;
-            const u32 f = m.attrib[i];
-            const u32 b = f & 0x1F;
-            if ((f & 0x40) || b >= 16 || !m.streams[b].enabled || AttribFormat(f) == DXGI_FORMAT_UNKNOWN)
-                continue; // fed from the float default slot
-            if (((f >> 21) & 0x3F) == 0x30 && ((f >> 27) & 7) == 1) {
-                key.attr_snorm10 |= 1u << i;
-                continue;
+        if (g_seen.attr_vs != vs->hash || g_seen.attr_serial != m.vertex_format_serial) {
+            ShaderCache::VariantKey key;
+            for (u32 i = 0; i < 32; i++) {
+                if (!(vs->info.attrib_in_mask & (1u << i)))
+                    continue;
+                const u32 f = m.attrib[i];
+                const u32 b = f & 0x1F;
+                if ((f & 0x40) || b >= 16 || !m.streams[b].enabled || AttribFormat(f) == DXGI_FORMAT_UNKNOWN)
+                    continue; // fed from the float default slot
+                if (((f >> 21) & 0x3F) == 0x30 && ((f >> 27) & 7) == 1) {
+                    key.attr_snorm10 |= 1u << i;
+                    continue;
+                }
+                switch ((f >> 27) & 7) {
+                case 3: key.attr_sint |= 1u << i; break;
+                case 4: key.attr_uint |= 1u << i; break;
+                case 5: key.attr_uint |= 1u << i; key.attr_scaled |= 1u << i; break;
+                case 6: key.attr_sint |= 1u << i; key.attr_scaled |= 1u << i; break;
+                default: break;
+                }
             }
-            switch ((f >> 27) & 7) {
-            case 3: key.attr_sint |= 1u << i; break;
-            case 4: key.attr_uint |= 1u << i; break;
-            case 5: key.attr_uint |= 1u << i; key.attr_scaled |= 1u << i; break;
-            case 6: key.attr_sint |= 1u << i; key.attr_scaled |= 1u << i; break;
-            default: break;
-            }
+            g_seen.attr_vs = vs->hash;
+            g_seen.attr_serial = m.vertex_format_serial;
+            g_seen.attr_key = key;
         }
+        ShaderCache::VariantKey key = g_seen.attr_key;
         int_textures(vs, 0, key);
         vs = shaders_->GetVariant(vs, key);
     }
@@ -1697,23 +1745,27 @@ void D3D11Renderer::Draw() {
     }
 
     // ---- blend
-    D3D11_BLEND_DESC bd{};
-    bd.IndependentBlendEnable = TRUE;
-    for (u32 i = 0; i < 8; i++) {
-        auto& t = bd.RenderTarget[i];
-        const auto& b = m.blend[i];
-        t.BlendEnable = m.blend_enable[i];
-        t.BlendOp = BlendOp(b.eq_rgb);
-        t.SrcBlend = BlendFactor(b.src_rgb);
-        t.DestBlend = BlendFactor(b.dst_rgb);
-        t.BlendOpAlpha = BlendOp(b.eq_a);
-        t.SrcBlendAlpha = AlphaFactor(BlendFactor(b.src_a));
-        t.DestBlendAlpha = AlphaFactor(BlendFactor(b.dst_a));
-        t.RenderTargetWriteMask = u8(m.color_mask[i]);
+    if (g_seen.blend != m.blend_serial) {
+        g_seen.blend = m.blend_serial;
+        D3D11_BLEND_DESC bd{};
+        bd.IndependentBlendEnable = TRUE;
+        for (u32 i = 0; i < 8; i++) {
+            auto& t = bd.RenderTarget[i];
+            const auto& b = m.blend[i];
+            t.BlendEnable = m.blend_enable[i];
+            t.BlendOp = BlendOp(b.eq_rgb);
+            t.SrcBlend = BlendFactor(b.src_rgb);
+            t.DestBlend = BlendFactor(b.dst_rgb);
+            t.BlendOpAlpha = BlendOp(b.eq_a);
+            t.SrcBlendAlpha = AlphaFactor(BlendFactor(b.src_a));
+            t.DestBlendAlpha = AlphaFactor(BlendFactor(b.dst_a));
+            t.RenderTargetWriteMask = u8(m.color_mask[i]);
+        }
+        g_seen.blend_obj = dc.Cached(dc.blend, bd, [&](const D3D11_BLEND_DESC* d, ID3D11BlendState** o) {
+            dev_->CreateBlendState(d, o);
+        });
     }
-    auto* blend = dc.Cached(dc.blend, bd, [&](const D3D11_BLEND_DESC* d, ID3D11BlendState** o) {
-        dev_->CreateBlendState(d, o);
-    });
+    ID3D11BlendState* const blend = g_seen.blend_obj;
     const float* const bc = m.blend_color;
     if (pipe_.blend != blend || std::memcmp(pipe_.blend_color, bc, sizeof(pipe_.blend_color)) != 0) {
         pipe_.blend = blend;
@@ -1722,36 +1774,41 @@ void D3D11Renderer::Draw() {
     }
 
     // ---- depth / stencil
-    D3D11_DEPTH_STENCIL_DESC dd{};
-    dd.DepthEnable = depth && m.depth_test;
-    dd.DepthWriteMask = m.depth_write ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
-    dd.DepthFunc = CompareFunc(m.depth_func);
-    dd.StencilEnable = depth && m.stencil_test;
-    dd.StencilReadMask = u8(m.stencil_read_mask);
-    dd.StencilWriteMask = u8(m.stencil_write_mask);
-    dd.FrontFace = {StencilOp(m.stencil_front.op_fail), StencilOp(m.stencil_front.op_zfail),
-                    StencilOp(m.stencil_front.op_zpass), CompareFunc(m.stencil_front.func)};
-    dd.BackFace = {StencilOp(m.stencil_back.op_fail), StencilOp(m.stencil_back.op_zfail),
-                   StencilOp(m.stencil_back.op_zpass), CompareFunc(m.stencil_back.func)};
-    // Debug: MUA3_TESTS_OFF=<ps hash>:<z|s|zs> disables the depth and/or stencil test for one pixel shader.
-    static const std::pair<u64, std::string> tests_off = [] {
-        const char* e = std::getenv("MUA3_TESTS_OFF");
-        if (!e)
-            return std::pair<u64, std::string>{0, ""};
-        const std::string v = e;
-        const size_t c = v.find(':');
-        return std::pair<u64, std::string>{std::strtoull(v.substr(0, c).c_str(), nullptr, 16),
-                                           c == std::string::npos ? "zs" : v.substr(c + 1)};
-    }();
-    if (ps && tests_off.first == ps->hash) {
-        if (tests_off.second.find('z') != std::string::npos)
-            dd.DepthEnable = FALSE;
-        if (tests_off.second.find('s') != std::string::npos)
-            dd.StencilEnable = FALSE;
+    if (g_debug_ps_state || g_seen.depth != m.depth_serial || g_seen.depth_on != (depth != nullptr)) {
+        g_seen.depth = m.depth_serial;
+        g_seen.depth_on = depth != nullptr;
+        D3D11_DEPTH_STENCIL_DESC dd{};
+        dd.DepthEnable = depth && m.depth_test;
+        dd.DepthWriteMask = m.depth_write ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
+        dd.DepthFunc = CompareFunc(m.depth_func);
+        dd.StencilEnable = depth && m.stencil_test;
+        dd.StencilReadMask = u8(m.stencil_read_mask);
+        dd.StencilWriteMask = u8(m.stencil_write_mask);
+        dd.FrontFace = {StencilOp(m.stencil_front.op_fail), StencilOp(m.stencil_front.op_zfail),
+                        StencilOp(m.stencil_front.op_zpass), CompareFunc(m.stencil_front.func)};
+        dd.BackFace = {StencilOp(m.stencil_back.op_fail), StencilOp(m.stencil_back.op_zfail),
+                       StencilOp(m.stencil_back.op_zpass), CompareFunc(m.stencil_back.func)};
+        // Debug: MUA3_TESTS_OFF=<ps hash>:<z|s|zs> disables the depth and/or stencil test for one pixel shader.
+        static const std::pair<u64, std::string> tests_off = [] {
+            const char* e = std::getenv("MUA3_TESTS_OFF");
+            if (!e)
+                return std::pair<u64, std::string>{0, ""};
+            const std::string v = e;
+            const size_t c = v.find(':');
+            return std::pair<u64, std::string>{std::strtoull(v.substr(0, c).c_str(), nullptr, 16),
+                                               c == std::string::npos ? "zs" : v.substr(c + 1)};
+        }();
+        if (ps && tests_off.first == ps->hash) {
+            if (tests_off.second.find('z') != std::string::npos)
+                dd.DepthEnable = FALSE;
+            if (tests_off.second.find('s') != std::string::npos)
+                dd.StencilEnable = FALSE;
+        }
+        g_seen.depth_obj = dc.Cached(dc.depth, dd, [&](const D3D11_DEPTH_STENCIL_DESC* d, ID3D11DepthStencilState** o) {
+            dev_->CreateDepthStencilState(d, o);
+        });
     }
-    auto* dss = dc.Cached(dc.depth, dd, [&](const D3D11_DEPTH_STENCIL_DESC* d, ID3D11DepthStencilState** o) {
-        dev_->CreateDepthStencilState(d, o);
-    });
+    ID3D11DepthStencilState* const dss = g_seen.depth_obj;
     if (const u32 sref = m.stencil_ref & 0xFF; pipe_.dss != dss || pipe_.stencil_ref != sref) {
         pipe_.dss = dss;
         pipe_.stencil_ref = sref;
@@ -1759,40 +1816,45 @@ void D3D11Renderer::Draw() {
     }
 
     // ---- rasterizer
-    D3D11_RASTERIZER_DESC rd{};
-    rd.FillMode = D3D11_FILL_SOLID;
-    rd.CullMode = D3D11_CULL_NONE;
-    if (m.cull_enable) {
-        const u32 cf = m.cull_face;
-        rd.CullMode = cf == 0x404 ? D3D11_CULL_FRONT : cf == 0x405 ? D3D11_CULL_BACK : D3D11_CULL_NONE;
+    if (g_debug_ps_state || g_seen.raster != m.raster_serial || g_seen.flip != flip) {
+        g_seen.raster = m.raster_serial;
+        g_seen.flip = flip;
+        D3D11_RASTERIZER_DESC rd{};
+        rd.FillMode = D3D11_FILL_SOLID;
+        rd.CullMode = D3D11_CULL_NONE;
+        if (m.cull_enable) {
+            const u32 cf = m.cull_face;
+            rd.CullMode = cf == 0x404 ? D3D11_CULL_FRONT : cf == 0x405 ? D3D11_CULL_BACK : D3D11_CULL_NONE;
+        }
+        bool ccw = m.front_ccw;
+        if (flip < 0)
+            ccw = !ccw;
+        rd.FrontCounterClockwise = ccw;
+        rd.DepthClipEnable = TRUE;
+        // Polygon offset (shadow casters).
+        if (m.polygon_offset) {
+            rd.DepthBias = INT(std::lround(m.depth_bias));
+            rd.SlopeScaledDepthBias = m.slope_scale_depth_bias;
+            rd.DepthBiasClamp = m.depth_bias_clamp;
+        }
+        // Debug: MUA3_ZBIAS_PS=<ps hash>:<depth bias units> biases one pixel shader's depth.
+        static const std::pair<u64, int> zbias = [] {
+            const char* e = std::getenv("MUA3_ZBIAS_PS");
+            if (!e)
+                return std::pair<u64, int>{0, 0};
+            const std::string v = e;
+            const size_t c = v.find(':');
+            return std::pair<u64, int>{std::strtoull(v.substr(0, c).c_str(), nullptr, 16),
+                                       c == std::string::npos ? 0 : std::atoi(v.c_str() + c + 1)};
+        }();
+        if (ps && zbias.first == ps->hash)
+            rd.DepthBias = zbias.second;
+        rd.ScissorEnable = TRUE;
+        g_seen.raster_obj = dc.Cached(dc.raster, rd, [&](const D3D11_RASTERIZER_DESC* d, ID3D11RasterizerState** o) {
+            dev_->CreateRasterizerState(d, o);
+        });
     }
-    bool ccw = m.front_ccw;
-    if (flip < 0)
-        ccw = !ccw;
-    rd.FrontCounterClockwise = ccw;
-    rd.DepthClipEnable = TRUE;
-    // Polygon offset (shadow casters).
-    if (m.polygon_offset) {
-        rd.DepthBias = INT(std::lround(m.depth_bias));
-        rd.SlopeScaledDepthBias = m.slope_scale_depth_bias;
-        rd.DepthBiasClamp = m.depth_bias_clamp;
-    }
-    // Debug: MUA3_ZBIAS_PS=<ps hash>:<depth bias units> biases one pixel shader's depth.
-    static const std::pair<u64, int> zbias = [] {
-        const char* e = std::getenv("MUA3_ZBIAS_PS");
-        if (!e)
-            return std::pair<u64, int>{0, 0};
-        const std::string v = e;
-        const size_t c = v.find(':');
-        return std::pair<u64, int>{std::strtoull(v.substr(0, c).c_str(), nullptr, 16),
-                                   c == std::string::npos ? 0 : std::atoi(v.c_str() + c + 1)};
-    }();
-    if (ps && zbias.first == ps->hash)
-        rd.DepthBias = zbias.second;
-    rd.ScissorEnable = TRUE;
-    auto* rs = dc.Cached(dc.raster, rd, [&](const D3D11_RASTERIZER_DESC* d, ID3D11RasterizerState** o) {
-        dev_->CreateRasterizerState(d, o);
-    });
+    ID3D11RasterizerState* const rs = g_seen.raster_obj;
     if (pipe_.rs != rs) {
         pipe_.rs = rs;
         ctx_->RSSetState(rs);
@@ -1956,53 +2018,63 @@ void D3D11Renderer::Draw() {
     for (u32 i = 0; i < 32; i++)
         drv.attrib[i][0] = m.attrib[i];
     // ---- vertex input: Maxwell attribute formats -> D3D11 input layout
-    static thread_local std::vector<D3D11_INPUT_ELEMENT_DESC> elems;
-    elems.clear();
-    bool used_buf[16]{};
-    bool need_default = false;
-    for (u32 i = 0; i < 32; i++) {
-        if (!(vs->info.attrib_in_mask & (1u << i)))
-            continue;
-        const u32 f = m.attrib[i];
-        const u32 b = f & 0x1F;
-        const bool constant = f & 0x40;
-        const DXGI_FORMAT fmt = AttribFormat(f);
-        const bool stream_on = b < 16 && m.streams[b].enabled;
-        D3D11_INPUT_ELEMENT_DESC e{"ATTR", i, fmt, b, (f >> 7) & 0x3FFF, D3D11_INPUT_PER_VERTEX_DATA, 0};
-        if (constant || fmt == DXGI_FORMAT_UNKNOWN || !stream_on) {
-            e = {"ATTR", i, DXGI_FORMAT_R32G32B32A32_FLOAT, 31, 0, D3D11_INPUT_PER_VERTEX_DATA, 0};
-            need_default = true;
-        } else {
-            const u32 divisor = m.streams[b].divisor;
-            if (divisor) {
-                // Maxwell issues one draw per instance; the buffer is uploaded starting at this
-                // instance's element, so every draw reads element 0.
-                e.InputSlotClass = D3D11_INPUT_PER_INSTANCE_DATA;
-                e.InstanceDataStepRate = 1;
+    if (g_seen.layout_vs != vs->hash || g_seen.layout_serial != m.vertex_format_serial) {
+        static thread_local std::vector<D3D11_INPUT_ELEMENT_DESC> elems;
+        elems.clear();
+        bool used_buf[16]{};
+        bool need_default = false;
+        for (u32 i = 0; i < 32; i++) {
+            if (!(vs->info.attrib_in_mask & (1u << i)))
+                continue;
+            const u32 f = m.attrib[i];
+            const u32 b = f & 0x1F;
+            const bool constant = f & 0x40;
+            const DXGI_FORMAT fmt = AttribFormat(f);
+            const bool stream_on = b < 16 && m.streams[b].enabled;
+            D3D11_INPUT_ELEMENT_DESC e{"ATTR", i, fmt, b, (f >> 7) & 0x3FFF, D3D11_INPUT_PER_VERTEX_DATA, 0};
+            if (constant || fmt == DXGI_FORMAT_UNKNOWN || !stream_on) {
+                e = {"ATTR", i, DXGI_FORMAT_R32G32B32A32_FLOAT, 31, 0, D3D11_INPUT_PER_VERTEX_DATA, 0};
+                need_default = true;
+            } else {
+                const u32 divisor = m.streams[b].divisor;
+                if (divisor) {
+                    // Maxwell issues one draw per instance; the buffer is uploaded starting at this
+                    // instance's element, so every draw reads element 0.
+                    e.InputSlotClass = D3D11_INPUT_PER_INSTANCE_DATA;
+                    e.InstanceDataStepRate = 1;
+                }
+                used_buf[b] = true;
             }
-            used_buf[b] = true;
+            elems.push_back(e);
         }
-        elems.push_back(e);
+        ID3D11InputLayout* layout = nullptr;
+        if (!elems.empty()) {
+            u64 key = vs->hash;
+            for (auto& e : elems)
+                key = key * 31 + Hash64(&e.SemanticIndex, sizeof(e) - offsetof(D3D11_INPUT_ELEMENT_DESC, SemanticIndex));
+            auto it = dc.layouts.find(key);
+            if (it == dc.layouts.end()) {
+                ComPtr<ID3D11InputLayout> l;
+                const HRESULT hr = dev_->CreateInputLayout(elems.data(), UINT(elems.size()), vs->dxbc.data(), vs->dxbc.size(), &l);
+                if (FAILED(hr))
+                    LOG_WARN("Renderer", "CreateInputLayout failed {:#x} (vs {:016x})", u32(hr), vs->hash);
+                it = dc.layouts.emplace(key, l).first;
+            }
+            layout = it->second.Get();
+            if (!layout) {
+                draws_skipped++, skip_reason_[4]++;
+                return;
+            }
+        }
+        g_seen.layout_vs = vs->hash;
+        g_seen.layout_serial = m.vertex_format_serial;
+        g_seen.layout = layout;
+        std::memcpy(g_seen.used_buf, used_buf, sizeof(used_buf));
+        g_seen.need_default = need_default;
     }
-    ID3D11InputLayout* layout = nullptr;
-    if (!elems.empty()) {
-        u64 key = vs->hash;
-        for (auto& e : elems)
-            key = key * 31 + Hash64(&e.SemanticIndex, sizeof(e) - offsetof(D3D11_INPUT_ELEMENT_DESC, SemanticIndex));
-        auto it = dc.layouts.find(key);
-        if (it == dc.layouts.end()) {
-            ComPtr<ID3D11InputLayout> l;
-            const HRESULT hr = dev_->CreateInputLayout(elems.data(), UINT(elems.size()), vs->dxbc.data(), vs->dxbc.size(), &l);
-            if (FAILED(hr))
-                LOG_WARN("Renderer", "CreateInputLayout failed {:#x} (vs {:016x})", u32(hr), vs->hash);
-            it = dc.layouts.emplace(key, l).first;
-        }
-        layout = it->second.Get();
-        if (!layout) {
-            draws_skipped++, skip_reason_[4]++;
-            return;
-        }
-    }
+    ID3D11InputLayout* const layout = g_seen.layout;
+    const bool* const used_buf = g_seen.used_buf;
+    const bool need_default = g_seen.need_default;
     if (pipe_.layout != layout) {
         pipe_.layout = layout;
         ctx_->IASetInputLayout(layout);
@@ -2278,20 +2350,18 @@ void D3D11Renderer::Draw() {
         Prof(kProfTextures);
         ID3D11ShaderResourceView* srvs[32]{};
         ID3D11SamplerState* smps[16]{};
-        const u32 tex_cb = kTextureHandleCb;
-        const auto& tcb = m.cb[stage_index][tex_cb];
-        const u64 tic_base = m.tic_base, tsc_base = m.tsc_base;
+        read_stage_textures(s, stage_index);
+        const u64 tsc_base = m.tsc_base;
         for (auto& t : s->info.textures) {
             if (t.slot >= 32)
                 continue;
-            u32 handle = 0;
-            g.ReadGpu(tcb.address + t.cbuf_offset, &handle, 4);
+            const StageTexture& st = stage_textures[is_vs ? 0 : 1][t.slot];
+            const u32 handle = st.handle;
+            const TicEntry& tic = st.tic;
             if (LearnEnabled() && LearnOnce((u64(handle) << 16) ^ (u64(stage_index) << 8) ^ t.cbuf_offset ^ (1ull << 63)))
-                LOG_INFO("Learn", "texture stage {} cbuf {} offset {:#x} handle {:#x}", stage_index, tex_cb,
+                LOG_INFO("Learn", "texture stage {} cbuf {} offset {:#x} handle {:#x}", stage_index, kTextureHandleCb,
                          t.cbuf_offset, handle);
             const u32 tic_idx = handle & 0xFFFFF, tsc_idx = (handle >> 20) & 0xFFF;
-            TicEntry tic;
-            g.ReadGpu(tic_base + u64(tic_idx) * 32, tic.w.data(), 32);
             u32 tsc[8];
             g.ReadGpu(tsc_base + u64(tsc_idx) * 32, tsc, 32);
             u32 swz = 0xB1A;

@@ -95,6 +95,12 @@ struct DrawState {
     ConstBufferBinding cb[5][18];
 
     DrawCall draw;
+
+    // Bumped when the matching state above changes, so the renderer only rebuilds its Direct3D objects then.
+    u32 blend_serial = 1;         // blend, blend enables, colour masks
+    u32 depth_serial = 1;         // depth and stencil tests, stencil masks
+    u32 raster_serial = 1;        // culling, front face, polygon offset
+    u32 vertex_format_serial = 1; // attributes, which streams are on, divisors
 };
 
 // One compute dispatch.

@@ -280,6 +280,8 @@ private:
         } else if (n == "BindVertexBuffer") {
             if (x[1] < 16) {
                 auto& st = s_.streams[x[1]];
+                if (st.enabled != (x[2] != 0))
+                    s_.vertex_format_serial++;
                 st.enabled = x[2] != 0;
                 st.addr = Va(x[2]);
                 st.limit = Va(x[2] + (x[3] ? x[3] - 1 : 0));
@@ -329,12 +331,17 @@ private:
             g_.WriteGpu(x[2], v, sizeof(v));
         } else if (n == "SetStencilRef" || n == "SetStencilValueMask" || n == "SetStencilMask") {
             // Direct3D has one reference and one pair of masks: the front face's
-            if (x[1] & 1)
-                (n == "SetStencilRef" ? s_.stencil_ref : n == "SetStencilMask" ? s_.stencil_write_mask : s_.stencil_read_mask) = u32(x[2]);
+            if (x[1] & 1) {
+                u32& v = n == "SetStencilRef" ? s_.stencil_ref : n == "SetStencilMask" ? s_.stencil_write_mask : s_.stencil_read_mask;
+                if (v != u32(x[2]) && n != "SetStencilRef")
+                    s_.depth_serial++;
+                v = u32(x[2]);
+            }
         } else if (n == "SetPolygonOffsetClamp") {
             s_.slope_scale_depth_bias = U2F(c.v[0]);
             s_.depth_bias = U2F(c.v[1]);
             s_.depth_bias_clamp = U2F(c.v[2]);
+            s_.raster_serial++;
         } else if (n == "SetTexturePool" || n == "SetSamplerPool") {
             (n == "SetTexturePool" ? s_.tic_base : s_.tsc_base) = Va(hle::nvn::QueryTexturePool(x[1]));
         } else if (n == "ClearColor") {
@@ -509,7 +516,9 @@ private:
     // NVNvertexAttribState (4 bytes): stream index bits 0-4, "set" bit 6, offset bits 7-20, NVN format from bit 21.
     void BindAttribs(const ReplayCommand& c) {
         const u32 count = std::min<u32>(u32(c.x[1]), 32);
-        ResetAttribs();
+        u32 attrib[32];
+        for (u32 i = 0; i < 32; i++)
+            attrib[i] = i < 16 ? 0x3A400040u : 0;
         for (u32 i = 0; i < count; i++) {
             const u32 w = Raw32(c, i);
             const u32 fmt = w >> 21, offset = (w >> 7) & 0x3FFF, stream = w & 0x1F;
@@ -519,15 +528,23 @@ private:
                     Unhandled(fmt::format("vertex format {:#x}", fmt));
                 continue;
             }
-            s_.attrib[i] = stream | (offset << 7) | hw;
+            attrib[i] = stream | (offset << 7) | hw;
+        }
+        if (std::memcmp(attrib, s_.attrib, sizeof(attrib)) != 0) {
+            std::memcpy(s_.attrib, attrib, sizeof(attrib));
+            s_.vertex_format_serial++;
         }
     }
 
     // NVNvertexStreamState (8 bytes): stride, divisor.
     void BindStreams(const ReplayCommand& c) {
         const u32 count = std::min<u32>(u32(c.x[1]), 16);
-        for (u32 i = 0; i < count; i++)
-            s_.streams[i].stride = Raw32(c, i * 2) & 0xFFF, s_.streams[i].divisor = Raw32(c, i * 2 + 1);
+        for (u32 i = 0; i < count; i++) {
+            const u32 divisor = Raw32(c, i * 2 + 1);
+            if (s_.streams[i].divisor != divisor)
+                s_.vertex_format_serial++;
+            s_.streams[i].stride = Raw32(c, i * 2) & 0xFFF, s_.streams[i].divisor = divisor;
+        }
     }
 
     void SetRenderTargets(const ReplayCommand& c) {
@@ -583,6 +600,10 @@ private:
         if (c.raw.empty())
             return;
         const u64 w = c.raw[0];
+        if (w == last_blend_[u32(w) & 7])
+            return;
+        last_blend_[u32(w) & 7] = w;
+        s_.blend_serial++;
         auto& b = s_.blend[u32(w) & 7];
         b.eq_rgb = u32(w >> 24) & 0xF, b.eq_a = u32(w >> 28) & 0xF;
         b.src_rgb = u32(w >> 32) & 0xFF, b.dst_rgb = u32(w >> 40) & 0xFF;
@@ -594,6 +615,10 @@ private:
         if (c.raw.empty())
             return;
         const u32 w = u32(c.raw[0]);
+        if (w == last_color_)
+            return;
+        last_color_ = w;
+        s_.blend_serial++;
         const u32 enable = (w >> 8) & 0xFF, alpha_func = (w >> 24) & 0xF;
         for (u32 i = 0; i < 8; i++)
             s_.blend_enable[i] = (enable >> i) & 1;
@@ -606,6 +631,10 @@ private:
         if (c.raw.empty())
             return;
         const u32 w = u32(c.raw[0]);
+        if (w == last_mask_)
+            return;
+        last_mask_ = w;
+        s_.blend_serial++;
         for (u32 i = 0; i < 8; i++)
             s_.color_mask[i] = (w >> (i * 4)) & 0xF;
     }
@@ -616,6 +645,10 @@ private:
         if (c.raw.empty())
             return;
         const u64 w = c.raw[0];
+        if (w == last_depth_)
+            return;
+        last_depth_ = w;
+        s_.depth_serial++;
         s_.depth_test = u32(w) & 1;
         s_.depth_write = (u32(w) >> 1) & 1;
         s_.depth_func = (u32(w) >> 4) & 0xF;
@@ -631,6 +664,10 @@ private:
         if (c.raw.empty())
             return;
         const u32 w = u32(c.raw[0]);
+        if (w == last_polygon_)
+            return;
+        last_polygon_ = w;
+        s_.raster_serial++;
         const u32 cull = w & 3;
         s_.cull_enable = cull != 0;
         s_.cull_face = cull == 1 ? 0x404 : cull == 3 ? 0x408 : 0x405;
@@ -715,6 +752,10 @@ private:
     u64 cs_code_ = 0, cs_control_ = 0;
     u32 row_stride_ = 0, image_stride_ = 0;
     bool program_constants_dirty_ = false;
+    // The raw state words last applied: the game rebinds the same states constantly.
+    u64 last_blend_[8] = {~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull};
+    u64 last_depth_ = ~0ull;
+    u32 last_color_ = ~0u, last_mask_ = ~0u, last_polygon_ = ~0u;
     Gpu& g_;
     DrawState& s_;
     float viewport_[16][4]{};
