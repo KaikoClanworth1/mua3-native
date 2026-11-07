@@ -67,6 +67,7 @@ add_executable(shadertool tools/shadertool.cpp)
 target_link_libraries(shadertool PRIVATE nxcore d3dcompiler)
 
 add_executable(stackdump tools/stackdump.cpp)
+add_executable(threadprof tools/threadprof.cpp)
 
 add_executable(recomp tools/recomp.cpp)
 target_link_libraries(recomp PRIVATE dynarmic Boost::boost merry::mcl)
