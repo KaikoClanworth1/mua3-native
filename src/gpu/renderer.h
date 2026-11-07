@@ -4,22 +4,21 @@
 namespace gpu {
 
 struct PresentInfo;
+struct ComputeLaunch;
 
-// Host graphics backend. Called on the GPU thread; reads engine state from gpu::G().M3D().
+// Host graphics backend. Called on the GPU thread; draws from gpu::G().State().
 class Renderer {
 public:
     virtual ~Renderer() = default;
-    // CLEAR_BUFFERS: `mask` bit0 depth, bit1 stencil, bits 2-5 RGBA; `rt` = render target index.
-    virtual void Clear(u32 rt, u32 mask) = 0;
+    virtual void ClearColor(u32 rt, const float color[4]) = 0;
+    virtual void ClearDepthStencil(bool depth, bool stencil, float depth_value, u8 stencil_value) = 0;
     virtual void Draw() = 0;
     virtual void Present(const PresentInfo& p) = 0;
     // Guest-visible memory was written by the GPU (I2M, DMA, 2D); drop cached copies overlapping it.
     virtual void InvalidateRegion(u64 gpu_va, u64 size) {}
     // 2D engine surface copy (Fermi 0x902D); returns false if unsupported.
     virtual bool Blit2D(const u32* regs) { return false; }
-    // Compute launch (Kepler compute LAUNCH): `regs` = compute engine registers, `qmd` = the 0x40-word launch
-    // descriptor it points at.
-    virtual void Dispatch(const u32* regs, const u32* qmd) {}
+    virtual void Dispatch(const ComputeLaunch& l) {}
     // Lands the results of earlier GPU work (compute) that overlap [gpu_va, +size) in guest memory.
     virtual void SyncRegion(u64 gpu_va, u64 size) {}
     // Index count of the culling list the host wrote at `index_addr` (MUA3's indirect draws read it back from the

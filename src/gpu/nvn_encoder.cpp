@@ -7,11 +7,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
-#include <fstream>
-#include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -21,7 +19,7 @@
 #include "core/hle/nvn/nvn_hle.h"
 #include "core/memory.h"
 #include "gpu/gpu.h"
-#include "gpu/maxwell3d.h"
+#include "gpu/draw_state.h"
 #include "gpu/renderer.h"
 #include "gpu/shader/translator.h"
 
@@ -29,7 +27,6 @@ namespace gpu {
 std::atomic<u64> g_indirect_known{0}, g_indirect_unknown{0}, g_indirect_arrays{0};
 
 
-using namespace reg3d;
 using hle::nvn::ReplayCommand;
 using hle::nvn::StateCall;
 
@@ -178,34 +175,6 @@ struct DmaLaunch {
     std::array<u32, 0x200> r{};
     u32 launch = 0;
 };
-// The same copy, independent of how the launch encodes it (remapped elements vs bytes).
-struct CopyOp {
-    u64 src = 0, dst = 0;
-    u32 pitch_in = 0, pitch_out = 0, bytes = 0, lines = 0;
-    bool src_bl = false, dst_bl = false;
-    u32 bh = 0, bd = 0, width = 0, height = 0, depth = 0, layer = 0, ox = 0, oy = 0; // block-linear side
-};
-CopyOp Canonical(const u32* r, u32 launch) {
-    CopyOp c;
-    c.src = (u64(r[0x100] & 0xFF) << 32) | r[0x101];
-    c.dst = (u64(r[0x102] & 0xFF) << 32) | r[0x103];
-    c.pitch_in = r[0x104], c.pitch_out = r[0x105];
-    u32 bpp = 1;
-    if (launch & (1u << 10)) {
-        const u32 rm = r[0x1C2];
-        bpp = (((rm >> 16) & 3) + 1) * (((rm >> 24) & 3) + 1);
-    }
-    c.bytes = r[0x106] * bpp;
-    c.lines = (launch & (1u << 9)) ? std::max<u32>(r[0x107], 1) : 1;
-    c.src_bl = !(launch & (1u << 7)), c.dst_bl = !(launch & (1u << 8));
-    if (c.src_bl || c.dst_bl) {
-        const u32 b = c.dst_bl ? 0x1C3 : 0x1CA;
-        c.bh = (r[b] >> 4) & 0xF, c.bd = (r[b] >> 8) & 0xF;
-        c.width = r[b + 1] * bpp, c.height = r[b + 2], c.depth = std::max<u32>(r[b + 3], 1), c.layer = r[b + 4];
-        c.ox = (r[b + 5] & 0xFFFF) * bpp, c.oy = r[b + 5] >> 16;
-    }
-    return c;
-}
 
 // One submit's commands: the recorder's shared lists (kept alive) and the commands in execution order.
 struct Frame {
@@ -217,61 +186,24 @@ struct Frame {
             for (size_t i = sp.begin; i < sp.end; i++)
                 cmds.push_back(&(*sp.list)[i]);
     }
-    void Append(Frame&& f) {
-        spans.insert(spans.end(), std::make_move_iterator(f.spans.begin()), std::make_move_iterator(f.spans.end()));
-        cmds.insert(cmds.end(), f.cmds.begin(), f.cmds.end());
-    }
     size_t size() const { return cmds.size(); }
     const ReplayCommand& operator[](size_t i) const { return *cmds[i]; }
-    struct Iter {
-        const ReplayCommand* const* p;
-        const ReplayCommand& operator*() const { return **p; }
-        Iter& operator++() { return ++p, *this; }
-        bool operator!=(const Iter& o) const { return p != o.p; }
-    };
-    Iter begin() const { return {cmds.data()}; }
-    Iter end() const { return {cmds.data() + cmds.size()}; }
 };
 
 bool Is(std::string_view name, std::string_view suffix) {
     return name.size() >= suffix.size() && name.substr(name.size() - suffix.size()) == suffix;
 }
 
-// ---------------------------------------------------------------- snapshots (verification)
-struct Snap {
-    std::array<u32, 0x1000> regs;
-    ConstBufferBinding cb[5][18];
-    Maxwell3D::DrawState draw;
-    u64 prog[6]{};
-    std::vector<u32> cbdata[5][3];
-    int cmd = -1;
-};
-
-std::unique_ptr<Snap> TakeSnap(Gpu& g, const Maxwell3D& m, int cmd) {
-    auto s = std::make_unique<Snap>();
-    s->regs = m.Regs();
-    std::memcpy(s->cb, m.CBufs(), sizeof(s->cb));
-    s->draw = m.draw;
-    s->cmd = cmd;
-    const u64 base = m.Addr(kCodeAddrHigh);
-    for (u32 p = 0; p < 6; p++)
-        if ((m.Reg(kShaderConfig + p * 0x10) & 1) || p == 1)
-            s->prog[p] = base + m.Reg(kShaderConfig + p * 0x10 + 1);
-    for (u32 st = 0; st < 5; st++)
-        for (u32 c = 0; c < 3; c++)
-            if (s->cb[st][c].enabled) {
-                auto& d = s->cbdata[st][c];
-                d.resize(std::min<u32>(s->cb[st][c].size, c == 0 ? 0x7000 : 0x400) / 4);
-                g.ReadGpu(s->cb[st][c].address, d.data(), d.size() * 4);
-            }
-    return s;
+// GPU addresses have 40 bits.
+constexpr u64 Va(u64 a) {
+    return a & 0xFFFFFFFFFFull;
 }
 
 // ---------------------------------------------------------------- encoder
 class Encoder {
 public:
-    explicit Encoder(Gpu& g) : g_(g), m_(g) {
-        // driver constant buffers c0-c2 of every graphics stage, and the texture handle buffer index
+    explicit Encoder(Gpu& g) : g_(g), s_(g.State()) {
+        // driver constant buffers c0-c2 of every graphics stage
         // (as the driver: one c0 shared by all stages, c1 = the bound program's constants, none for tessellation)
         for (u32 hw = 0; hw < 5; hw++) {
             Bind(hw, 0, DrvCb(0, 0), 0x7000);
@@ -281,112 +213,32 @@ public:
         }
         for (u32 i = 1; i < 8; i++)
             DrvWrite(5, 2, i * 4, i);
-        W(kTexCbIndex, 2);
-        W(kScreenYControl, 0x10);
-        W(kViewportTransformEnable, 1);
-        W(0x64F, 0x181D);
         DrvWrite(0, 0, 0x610, 0x44FFFE00u); // driver constant (seen in every draw)
         ResetAttribs();
     }
-    Maxwell3D& M() { return m_; }
-    int current = -1; // command being encoded (snapshots)
-    std::map<std::string, u64> unhandled;
-    u64 no_shadow = 0;
 
     void Run(const Frame& cmds) {
-        for (size_t i = 0; i < cmds.size(); i++) {
-            current = int(i);
+        for (size_t i = 0; i < cmds.size(); i++)
             Encode(cmds[i]);
-        }
-        current = -1;
     }
-
-    // ---- native replay in step with the command stream (MUA3_NVN_REPLAY): submits are queued by the game thread and
-    // encoded on the GPU thread, one draw command at a time.
-    void Queue(Frame&& cmds) {
-        bool draws = false;
-        for (const auto& c : cmds)
-            draws |= c.name.find("CommandBufferDraw") != std::string_view::npos;
-        std::lock_guard lk(queue_mutex_);
-        // submits without draws (uploads while loading) join the previous one: only draws drain the queue
-        if (!draws && !queue_.empty()) {
-            queue_.back().Append(std::move(cmds));
-            return;
-        }
-        queue_.push_back(std::move(cmds));
-        if (queue_.size() > 256)
-            queue_.pop_front(), dropped++;
-    }
-    // Encodes the commands up to the next draw command (clears included). False if nothing is queued.
-    bool ToDraw() {
-        for (;;) {
-            if (pos_ >= frame_.size()) {
-                std::lock_guard lk(queue_mutex_);
-                if (queue_.empty())
-                    return false;
-                frame_ = std::move(queue_.front());
-                queue_.pop_front();
-                pos_ = 0;
-                continue;
-            }
-            const ReplayCommand& c = frame_[pos_];
-            if (c.name.find("CommandBufferDraw") != std::string_view::npos || c.name.ends_with("DispatchCompute"))
-                return true;
-            Encode(c);
-            pos_++;
-        }
-    }
-    // Programs of the pending draw (vertex, fragment Maxwell program header addresses).
-    bool PendingDispatch() const { return frame_[pos_].name.ends_with("DispatchCompute"); }
-    // Program and grid of the pending dispatch.
-    u64 DispatchProgram() const { return cs_code_; }
-    u32 DispatchGrid(u32 i) const { return u32(frame_[pos_].x[1 + i]); }
-    u64 DrawVs() const { return prog_[0]; }
-    u64 DrawFs() const { return prog_[1]; }
-    // Encodes the pending draw command; returns the hardware draws (instances) it issued.
-    u32 RunDraw() {
-        instances_ = 0;
-        Encode(frame_[pos_++]);
-        return instances_;
-    }
-    // The pending draw command issues no hardware draw (indirect with zero instances).
-    bool PendingIssuesNothing() {
-        const ReplayCommand& c = frame_[pos_];
-        if (c.name.ends_with("DispatchCompute"))
-            return c.x[1] == 0 || c.x[2] == 0 || c.x[3] == 0;
-        u32 a[2]{};
-        if (c.name.ends_with("DrawElementsIndirect"))
-            SyncForRead(c.x[4], sizeof(a)), g_.ReadGpu(c.x[4], a, sizeof(a));
-        else if (c.name.ends_with("DrawArraysIndirect"))
-            SyncForRead(c.x[2], sizeof(a)), g_.ReadGpu(c.x[2], a, sizeof(a));
-        else
-            return false;
-        return a[1] == 0;
-    }
-    // Skips the rest of the current submit without rendering (after losing step with the stream).
-    void Discard() {
-        m_.capture = [](const Maxwell3D&) {};
-        while (pos_ < frame_.size())
-            Encode(frame_[pos_++]);
-        m_.capture = nullptr;
-    }
-    u64 dropped = 0;
 
 private:
-    void W(u32 r, u32 v) { m_.CallMethod(r, v); }
-    void WA(u32 hi, u64 a) {
-        W(hi, u32(a >> 32));
-        W(hi + 1, u32(a));
-    }
     void Bind(u32 hw, u32 index, u64 addr, u32 size) {
-        W(kCbSize, size);
-        WA(kCbAddrHigh, addr);
-        W(kCbBind + hw * 8, (index << 4) | (addr && size ? 1 : 0));
+        if (index >= 18)
+            return;
+        auto& b = s_.cb[hw][index];
+        b.enabled = addr && size;
+        b.address = Va(addr);
+        b.size = size;
     }
     template <class T>
     void DrvWrite(u32 hw, u32 cb, u32 offset, const T& v) {
         if (offset + sizeof(T) <= kDrvCbSize)
             std::memcpy(g_.HostMem() + (DrvCb(hw, cb) - Gpu::kHostBase) + offset, &v, sizeof(T));
+    }
+    void Unhandled(std::string name) {
+        if (unhandled_.insert(name).second)
+            LOG_WARN("NVN", "encoder ignores: {}", name);
     }
 
     void Encode(const ReplayCommand& c) {
@@ -426,8 +278,12 @@ private:
             else if (x[1] == 5 && x[2] < 128) // compute keeps the whole 64-bit handle
                 DrvWrite(5, 2, (n == "BindImage" ? 0x120 : 0x20) + u32(x[2]) * 8, x[3]);
         } else if (n == "BindVertexBuffer") {
-            if (x[1] < 16)
-                streams_[x[1]].addr = x[2], streams_[x[1]].size = x[3];
+            if (x[1] < 16) {
+                auto& st = s_.streams[x[1]];
+                st.enabled = x[2] != 0;
+                st.addr = Va(x[2]);
+                st.limit = Va(x[2] + (x[3] ? x[3] - 1 : 0));
+            }
         } else if (n == "BindVertexAttribState")
             BindAttribs(c);
         else if (n == "BindVertexStreamState")
@@ -440,18 +296,20 @@ private:
                 const u32 k = u32(x[1]) + i;
                 if (vp) {
                     for (u32 j = 0; j < 4; j++)
-                        viewport_[k][j] = Raw32(c, i * 4 + j);
+                        viewport_[k][j] = U2F(Raw32(c, i * 4 + j));
                 } else {
-                    depth_range_[k][0] = Raw32(c, i * 2);
-                    depth_range_[k][1] = Raw32(c, i * 2 + 1);
+                    depth_range_[k][0] = U2F(Raw32(c, i * 2));
+                    depth_range_[k][1] = U2F(Raw32(c, i * 2 + 1));
                 }
-                WriteViewport(k);
+                if (k == 0)
+                    WriteViewport();
             }
         } else if (n == "SetScissors") {
             for (u32 i = 0; i < u32(x[2]) && x[1] + i < 16; i++)
-                SetScissor(u32(x[1]) + i, Raw32(c, i * 4), Raw32(c, i * 4 + 1), Raw32(c, i * 4 + 2), Raw32(c, i * 4 + 3));
+                if (x[1] + i == 0)
+                    SetScissor(Raw32(c, i * 4), Raw32(c, i * 4 + 1), Raw32(c, i * 4 + 2), Raw32(c, i * 4 + 3));
         } else if (n == "SetScissor")
-            SetScissor(0, u32(x[1]), u32(x[2]), u32(x[3]), u32(x[4]));
+            SetScissor(u32(x[1]), u32(x[2]), u32(x[3]), u32(x[4]));
         else if (n == "BindBlendState")
             ApplyBlend(c);
         else if (n == "BindColorState")
@@ -463,40 +321,29 @@ private:
         else if (n == "BindPolygonState")
             ApplyPolygon(c);
         else if (n == "BindMultisampleState" || n == "Barrier" || n == "SetDepthBounds" || n == "SetPatchSize" ||
-                 n == "SetShaderScratchMemory" || n == "SetRenderEnable" ||
-                 n == "SetRenderEnableConditional") {
-            // no renderer state (render enables: the emulated path draws unconditionally too)
+                 n == "SetShaderScratchMemory" || n == "SetRenderEnable" || n == "SetRenderEnableConditional" ||
+                 n == "SetPrimitiveRestart") {
+            // not applied by the renderer (render enables: every draw is drawn)
         } else if (n == "ReportCounter") { // (cb, counter type, address) -> {value, GPU timestamp}
-            if (render_compute) {
-                const u64 v[2] = {0, g_.GpuTimestamp()};
-                g_.WriteGpu(x[2], v, sizeof(v));
-            }
+            const u64 v[2] = {0, g_.GpuTimestamp()};
+            g_.WriteGpu(x[2], v, sizeof(v));
         } else if (n == "SetStencilRef" || n == "SetStencilValueMask" || n == "SetStencilMask") {
-            const u32 front = n == "SetStencilRef" ? kStencilFrontRef : n == "SetStencilMask" ? kStencilFrontMask : kStencilFrontFuncMask;
-            const u32 back = n == "SetStencilRef" ? 0x3D5u : n == "SetStencilMask" ? 0x3D6u : 0x3D7u;
+            // Direct3D has one reference and one pair of masks: the front face's
             if (x[1] & 1)
-                W(front, u32(x[2]));
-            if (x[1] & 2)
-                W(back, u32(x[2]));
+                (n == "SetStencilRef" ? s_.stencil_ref : n == "SetStencilMask" ? s_.stencil_write_mask : s_.stencil_read_mask) = u32(x[2]);
         } else if (n == "SetPolygonOffsetClamp") {
-            W(kSlopeScaleDepthBias, c.v[0]);
-            W(kDepthBias, F2U(U2F(c.v[1]) * 2));
-            W(kDepthBiasClamp, c.v[2]);
-        } else if (n == "SetPrimitiveRestart") {
-            W(0x591, u32(x[1]) & 1);
-            W(0x592, x[1] & 1 ? u32(x[2]) : 0);
+            s_.slope_scale_depth_bias = U2F(c.v[0]);
+            s_.depth_bias = U2F(c.v[1]);
+            s_.depth_bias_clamp = U2F(c.v[2]);
         } else if (n == "SetTexturePool" || n == "SetSamplerPool") {
-            const u64 base = hle::nvn::QueryTexturePool(x[1]);
-            const bool tex = n == "SetTexturePool";
-            WA(tex ? kTicAddrHigh : kTscAddrHigh, base);
+            (n == "SetTexturePool" ? s_.tic_base : s_.tsc_base) = Va(hle::nvn::QueryTexturePool(x[1]));
         } else if (n == "ClearColor") {
-            for (u32 j = 0; j < 4; j++)
-                W(kClearColor + j, Raw32(c, j));
-            W(kClearBuffers, (u32(x[1]) << 6) | ((u32(x[3]) & 0xF) << 2));
+            const float color[4] = {U2F(Raw32(c, 0)), U2F(Raw32(c, 1)), U2F(Raw32(c, 2)), U2F(Raw32(c, 3))};
+            if ((x[3] & 0xF) && g_.GetRenderer())
+                g_.GetRenderer()->ClearColor(u32(x[1]) & 0xF, color);
         } else if (n == "ClearDepthStencil") {
-            W(kClearDepth, c.v[0]);
-            W(kClearStencil, u32(x[2]));
-            W(kClearBuffers, (x[1] ? 1u : 0u) | (x[3] ? 2u : 0u));
+            if ((x[1] || x[3]) && g_.GetRenderer())
+                g_.GetRenderer()->ClearDepthStencil(x[1] != 0, x[3] != 0, U2F(c.v[0]), u8(x[2]));
         } else if (n == "SetCopyRowStride")
             row_stride_ = u32(x[1]);
         else if (n == "SetCopyImageStride")
@@ -507,7 +354,7 @@ private:
             l.r[0x102] = u32(x[2] >> 32), l.r[0x103] = u32(x[2]);
             l.r[0x106] = u32(x[3]);
             l.launch = (1u << 7) | (1u << 8);
-            Copy(l);
+            g_.RunDma(l.r.data(), l.launch);
         } else if (n == "CopyBufferToTexture" || n == "CopyTextureToBuffer")
             CopyTexture(c, n == "CopyBufferToTexture");
         else if (n == "DispatchCompute")
@@ -523,7 +370,7 @@ private:
             // The culling list draws: the host wrote the list and knows the count, so the arguments the GPU
             // produced from its counter are not read back (that read waits for the whole frame so far).
             u32 known = 0;
-            if (render_compute && g_.GetRenderer())
+            if (g_.GetRenderer())
                 known = g_.GetRenderer()->CullListCount(x[3]);
             if (known) {
                 g_indirect_known++;
@@ -541,16 +388,16 @@ private:
         } else if (n == "DrawArraysIndirect") {
             g_indirect_arrays++;
             // arguments written by compute: the renderer draws indirectly from the resident copy (or reads them)
-            M().draw.indirect_args = x[2];
+            s_.draw.indirect_args = x[2];
             Draw(u32(x[1]), false, 0, 1, 0, 0, 0, 1, 0);
-            M().draw.indirect_args = 0;
+            s_.draw.indirect_args = 0;
         } else
-            unhandled[std::string(n)]++;
+            Unhandled(std::string(n));
     }
 
-    // Indirect arguments are often written by compute just before: land those results first (rendering modes).
+    // Indirect arguments are often written by compute just before: land those results first.
     void SyncForRead(u64 addr, u64 size) {
-        if (render_compute && g_.GetRenderer())
+        if (g_.GetRenderer())
             g_.GetRenderer()->SyncRegion(addr, size);
     }
 
@@ -564,13 +411,14 @@ private:
             if (c.extra.size() >= 2) // the program's first stage {code, control}, captured at bind
                 code = c.extra[0], control = c.extra[1];
             if (!code)
-                code = hle::nvn::QueryProgramCode(c.x[1]), no_shadow++;
+                code = hle::nvn::QueryProgramCode(c.x[1]);
         }
-        for (u32 s = 0; s < 6; s++)
+        for (u32 s = 0; s < kNumGraphicsStages; s++)
             if (c.x[2] & (1u << s))
-                prog_[s] = code ? code + 0x30 : 0; // the Maxwell program header follows NVN's 0x30-byte blob header
+                s_.program[s] = code ? Va(code + 0x30) : 0; // the Maxwell program header follows NVN's 0x30-byte blob header
         if (c.x[2] & 0x20)
             cs_code_ = code, cs_control_ = control;
+        program_constants_dirty_ = true;
     }
 
     // Texture <-> buffer copies, one DMA launch per slice / layer: linear rows of whole blocks on the buffer side.
@@ -578,7 +426,7 @@ private:
         const u64 buffer = upload ? c.x[1] : c.x[4], tex = upload ? c.x[2] : c.x[1];
         hle::nvn::TextureInfo t;
         if (!hle::nvn::QueryTexture(tex, t)) {
-            unhandled["copy: texture not in the model"]++;
+            Unhandled("copy: texture not in the model");
             return;
         }
         s32 region[6]{}; // x, y, z, width, height, depth
@@ -599,7 +447,7 @@ private:
         for (s32 z = region[2]; z < region[2] + std::max(region[5], 1); z++) {
             TexLevel lv;
             if (!LevelLayout(t, level, is3d ? 0 : min_layer + u32(z), lv)) {
-                unhandled[fmt::format("copy: layout of format {:#x} target {}", t.format, t.target)]++;
+                Unhandled(fmt::format("copy: layout of format {:#x} target {}", t.format, t.target));
                 return;
             }
             const u32 wb = (u32(region[3]) + lv.blk.bw - 1) / lv.blk.bw, hb = (u32(region[4]) + lv.blk.bh - 1) / lv.blk.bh;
@@ -621,72 +469,41 @@ private:
             l.r[b + 4] = is3d ? u32(z) : 0;
             l.r[b + 5] = ((u32(region[0]) / lv.blk.bw) * lv.blk.bpb) | ((u32(region[1]) / lv.blk.bh) << 16);
             l.launch = (1u << 9) | (upload ? 1u << 7 : 1u << 8);
-            Copy(l);
+            g_.RunDma(l.r.data(), l.launch);
         }
     }
-    void Copy(const DmaLaunch& l) {
-        if (on_copy)
-            on_copy(l);
-        else if (render_compute)
-            g_.RunDma(l.r.data(), l.launch);
-    }
 
-  public:
-    std::function<void(const DmaLaunch&)> on_copy; // verification
-    // Compute launch as the renderer takes it: compute engine registers and launch descriptor (QMD).
-    struct Launch {
-        std::array<u32, 0x1000> r{};
-        std::array<u32, 0x40> q{};
-        u64 code = 0, control = 0; // NVN shader data of the program
-    };
-    std::function<void(const Launch&)> on_dispatch; // verification
-    bool render_compute = false;                    // replay: launch on the renderer
-  private:
     void Dispatch(u32 gx, u32 gy, u32 gz) {
-        static thread_local Launch l;
-        l.r.fill(0);
-        l.q.fill(0);
-        l.code = cs_code_, l.control = cs_control_;
         // Compute code has no blob header; the launch shape and constants come from NVN's control section.
         const ComputeInfo& ci = Compute(cs_code_, cs_control_);
-        const u64 prog = cs_code_;
-        const u64 base = prog & ~0xFFFFull;
-        l.r[0x582] = u32(base >> 32), l.r[0x583] = u32(base);
-        l.r[0x55D] = m_.Reg(kTicAddrHigh), l.r[0x55E] = m_.Reg(kTicAddrLow), l.r[0x55F] = m_.Reg(kTicLimit);
-        l.r[0x557] = m_.Reg(kTscAddrHigh), l.r[0x558] = m_.Reg(kTscAddrLow), l.r[0x559] = m_.Reg(kTscLimit);
-        l.r[0x982] = 2;
-        l.q[8] = u32(prog - base);
-        l.q[0xC] = gx;
-        l.q[0xD] = gy | (gz << 16);
-        l.q[0x11] = ci.shared;
-        l.q[0x12] = ci.block[0] << 16;
-        l.q[0x13] = ci.block[1] | (ci.block[2] << 16);
+        ComputeLaunch l;
+        l.program = Va(cs_code_);
+        l.program_offset = u32(cs_code_ & 0xFFFF);
+        l.grid[0] = gx & 0x7FFFFFFF, l.grid[1] = gy & 0xFFFF, l.grid[2] = gz & 0xFFFF;
+        l.block[0] = ci.block[0], l.block[1] = ci.block[1], l.block[2] = ci.block[2];
+        l.shared_bytes = ci.shared & 0x3FFFF;
+        l.tic_base = s_.tic_base, l.tsc_base = s_.tsc_base;
         DrvWrite(5, 0, 0x200, gx);
         DrvWrite(5, 0, 0x204, gy);
         DrvWrite(5, 0, 0x208, gz);
-        u32 mask = 0;
         auto slot = [&](u32 i, u64 addr, u32 size) {
             if (!addr || !size)
                 return;
-            mask |= 1u << i;
-            l.q[0x1D + i * 2] = u32(addr);
-            l.q[0x1E + i * 2] = (u32(addr >> 32) & 0xFF) | (std::min<u32>(size, 0x10000) << 15);
+            l.cb_addr[i] = Va(addr);
+            l.cb_size[i] = std::min<u32>(size, 0x10000);
         };
         slot(0, DrvCb(5, 0), 0x1000);
         slot(1, ci.constants_size ? cs_code_ + ci.constants : 0, ci.constants_size);
-        slot(2, DrvCb(5, 2), 0x600);
+        slot(kTextureHandleCb, DrvCb(5, 2), 0x600);
         for (u32 i = 0; i < 5; i++)
             slot(3 + i, cs_ubo_[i].addr, cs_ubo_[i].size);
-        l.q[0x14] = mask | 0x60000000;
-        if (on_dispatch)
-            on_dispatch(l);
-        else if (render_compute && g_.GetRenderer())
-            g_.GetRenderer()->Dispatch(l.r.data(), l.q.data());
+        if (g_.GetRenderer())
+            g_.GetRenderer()->Dispatch(l);
     }
 
     void ResetAttribs() {
         for (u32 i = 0; i < 32; i++)
-            attribs_[i] = i < 16 ? 0x3A400040u : 0; // the driver's "constant input" value
+            s_.attrib[i] = i < 16 ? 0x3A400040u : 0; // the driver's "constant input" value
     }
 
     // NVNvertexAttribState (4 bytes): stream index bits 0-4, "set" bit 6, offset bits 7-20, NVN format from bit 21.
@@ -699,10 +516,10 @@ private:
             const u32 hw = AttribFormat(fmt);
             if (!hw) {
                 if (fmt)
-                    unhandled[fmt::format("vertex format {:#x}", fmt)]++;
+                    Unhandled(fmt::format("vertex format {:#x}", fmt));
                 continue;
             }
-            attribs_[i] = stream | (offset << 7) | hw;
+            s_.attrib[i] = stream | (offset << 7) | hw;
         }
     }
 
@@ -710,67 +527,54 @@ private:
     void BindStreams(const ReplayCommand& c) {
         const u32 count = std::min<u32>(u32(c.x[1]), 16);
         for (u32 i = 0; i < count; i++)
-            streams_[i].stride = Raw32(c, i * 2), streams_[i].divisor = Raw32(c, i * 2 + 1);
+            s_.streams[i].stride = Raw32(c, i * 2) & 0xFFF, s_.streams[i].divisor = Raw32(c, i * 2 + 1);
     }
 
     void SetRenderTargets(const ReplayCommand& c) {
         const u32 count = std::min<u32>(u32(c.x[1]), 8);
-        u32 rtc = count | 0xFAC6880; // identity slot map, as the driver writes it
         for (u32 i = 0; i < 8; i++) {
-            const u32 base = kRenderTarget + i * 0x10;
             hle::nvn::TextureInfo t;
+            auto& rt = s_.color[i];
             if (i >= count || i >= c.extra.size() || !c.extra[i] || !hle::nvn::QueryTexture(c.extra[i], t)) {
-                W(base + 4, 0);
+                rt.format = 0;
                 continue;
             }
             auto f = kNvnRtFormat.find(t.format);
             if (f == kNvnRtFormat.end())
-                unhandled[fmt::format("rt format {:#x}", t.format)]++;
-            WA(base, t.gpu);
-            W(base + 2, t.width);
-            W(base + 3, t.height);
-            W(base + 4, f == kNvnRtFormat.end() ? 0 : f->second);
-            W(base + 5, TileMode(t.height));
-            W(base + 6, std::max<u32>(t.depth, 1));
+                Unhandled(fmt::format("rt format {:#x}", t.format));
+            rt.addr = Va(t.gpu);
+            rt.width = t.width;
+            rt.height = t.height;
+            rt.format = f == kNvnRtFormat.end() ? 0 : f->second;
+            rt.tile = TileMode(t.height);
         }
-        W(kRtControl, rtc);
+        s_.rt_count = count;
         hle::nvn::TextureInfo d;
         if (c.x[4] && hle::nvn::QueryTexture(c.x[4], d)) {
             auto f = kNvnZetaFormat.find(d.format);
             if (f == kNvnZetaFormat.end())
-                unhandled[fmt::format("depth format {:#x}", d.format)]++;
-            WA(kZetaAddrHigh, d.gpu);
-            W(kZetaFormat, f == kNvnZetaFormat.end() ? 0 : f->second);
-            W(kZetaTileMode, TileMode(d.height));
-            W(kZetaWidth, d.width);
-            W(kZetaHeight, d.height);
-            W(kZetaDepth, std::max<u32>(d.depth, 1));
-            W(kZetaEnable, 1);
+                Unhandled(fmt::format("depth format {:#x}", d.format));
+            s_.depth.addr = Va(d.gpu);
+            s_.depth.format = f == kNvnZetaFormat.end() ? 0 : f->second;
+            s_.depth.width = d.width;
+            s_.depth.height = d.height;
+            s_.depth.enabled = true;
         } else
-            W(kZetaEnable, 0);
+            s_.depth.enabled = false;
     }
 
-    void WriteViewport(u32 i) {
-        const float x = U2F(viewport_[i][0]), y = U2F(viewport_[i][1]), w = U2F(viewport_[i][2]), h = U2F(viewport_[i][3]);
-        const float n = U2F(depth_range_[i][0]), f = U2F(depth_range_[i][1]);
-        const u32 t = kViewportTransform + i * 8;
-        W(t + 0, F2U(w * 0.5f));
-        W(t + 1, F2U(-h * 0.5f));
-        W(t + 2, F2U((f - n) * 0.5f));
-        W(t + 3, F2U(x + w * 0.5f));
-        W(t + 4, F2U(y + h * 0.5f));
-        W(t + 5, F2U((f + n) * 0.5f));
-        const u32 v = kViewport + i * 4;
-        W(v + 0, (u32(x) & 0xFFFF) | (u32(w) << 16));
-        W(v + 1, (u32(y) & 0xFFFF) | (u32(h) << 16));
-        W(v + 2, depth_range_[i][0]);
-        W(v + 3, depth_range_[i][1]);
+    void WriteViewport() {
+        const float x = viewport_[0][0], y = viewport_[0][1], w = viewport_[0][2], h = viewport_[0][3];
+        const float n = depth_range_[0][0], f = depth_range_[0][1];
+        s_.vp_scale[0] = w * 0.5f, s_.vp_scale[1] = -h * 0.5f, s_.vp_scale[2] = (f - n) * 0.5f;
+        s_.vp_translate[0] = x + w * 0.5f, s_.vp_translate[1] = y + h * 0.5f, s_.vp_translate[2] = (f + n) * 0.5f;
+        s_.depth_near = n, s_.depth_far = f;
     }
 
-    void SetScissor(u32 i, u32 x, u32 y, u32 w, u32 h) {
-        W(0x380 + i * 4, 1);
-        W(0x381 + i * 4, (x & 0xFFFF) | ((x + w) << 16));
-        W(0x382 + i * 4, (y & 0xFFFF) | ((y + h) << 16));
+    void SetScissor(u32 x, u32 y, u32 w, u32 h) {
+        s_.scissor_enable = true;
+        s_.scissor[0] = x & 0xFFFF, s_.scissor[1] = y & 0xFFFF;
+        s_.scissor[2] = (x + w) & 0xFFFF, s_.scissor[3] = (y + h) & 0xFFFF;
     }
 
     // State objects are decoded from their raw words (captured at bind; the game builds many on the stack).
@@ -779,12 +583,10 @@ private:
         if (c.raw.empty())
             return;
         const u64 w = c.raw[0];
-        const u32 target = u32(w) & 7, eq = u32(w >> 24) & 0xF, eq_a = u32(w >> 28) & 0xF;
-        const u32 src = u32(w >> 32) & 0xFF, dst = u32(w >> 40) & 0xFF, src_a = u32(w >> 48) & 0xFF, dst_a = u32(w >> 56) & 0xFF;
-        const u32 b = kIndependentBlend + target * 8;
-        W(b + 0, 0);
-        W(b + 1, eq), W(b + 2, src), W(b + 3, dst), W(b + 4, eq_a), W(b + 5, src_a), W(b + 6, dst_a);
-        W(0x4B9, 1);
+        auto& b = s_.blend[u32(w) & 7];
+        b.eq_rgb = u32(w >> 24) & 0xF, b.eq_a = u32(w >> 28) & 0xF;
+        b.src_rgb = u32(w >> 32) & 0xFF, b.dst_rgb = u32(w >> 40) & 0xFF;
+        b.src_a = u32(w >> 48) & 0xFF, b.dst_a = u32(w >> 56) & 0xFF;
     }
 
     // NVNcolorState: byte 1 blend enable per target, byte 3 alpha test function (8 = always).
@@ -794,9 +596,9 @@ private:
         const u32 w = u32(c.raw[0]);
         const u32 enable = (w >> 8) & 0xFF, alpha_func = (w >> 24) & 0xF;
         for (u32 i = 0; i < 8; i++)
-            W(kBlendEnable + i, (enable >> i) & 1);
-        W(kAlphaTestEnable, alpha_func && alpha_func != 8 ? 1 : 0);
-        W(kAlphaTestFunc, alpha_func && alpha_func != 8 ? alpha_func : 0);
+            s_.blend_enable[i] = (enable >> i) & 1;
+        s_.alpha_test = alpha_func && alpha_func != 8;
+        s_.alpha_func = s_.alpha_test ? alpha_func : 0;
     }
 
     // NVNchannelMaskState: 4 bits (r, g, b, a) per target.
@@ -804,10 +606,8 @@ private:
         if (c.raw.empty())
             return;
         const u32 w = u32(c.raw[0]);
-        for (u32 i = 0; i < 8; i++) {
-            const u32 m = (w >> (i * 4)) & 0xF;
-            W(kColorMask + i, (m & 1) | ((m & 2) << 3) | ((m & 4) << 6) | ((m & 8) << 9));
-        }
+        for (u32 i = 0; i < 8; i++)
+            s_.color_mask[i] = (w >> (i * 4)) & 0xF;
     }
 
     // NVNdepthStencilState: bit 0 depth test, 1 depth write, 2 stencil test, bits 4-7 depth function; from bit 32 one
@@ -816,16 +616,13 @@ private:
         if (c.raw.empty())
             return;
         const u64 w = c.raw[0];
-        W(kDepthTestEnable, u32(w) & 1);
-        W(kDepthWriteEnable, (u32(w) >> 1) & 1);
-        W(kDepthTestFunc, (u32(w) >> 4) & 0xF);
-        W(kStencilEnable, (u32(w) >> 2) & 1);
+        s_.depth_test = u32(w) & 1;
+        s_.depth_write = (u32(w) >> 1) & 1;
+        s_.depth_func = (u32(w) >> 4) & 0xF;
+        s_.stencil_test = (u32(w) >> 2) & 1;
         const u32 front = u32(w >> 32) & 0xFFFF, back = u32(w >> 48) & 0xFFFF;
-        W(kStencilFrontFunc, front & 0xF);
-        W(kStencilFrontOpFail, (front >> 4) & 0xF), W(kStencilFrontOpZPass, (front >> 8) & 0xF), W(kStencilFrontOpZFail, front >> 12);
-        W(kStencilTwoSide, 1);
-        W(kStencilBackFunc, back & 0xF);
-        W(kStencilBackOpFail, (back >> 4) & 0xF), W(kStencilBackOpZPass, (back >> 8) & 0xF), W(kStencilBackOpZFail, back >> 12);
+        s_.stencil_front = {front & 0xF, (front >> 4) & 0xF, front >> 12, (front >> 8) & 0xF};
+        s_.stencil_back = {back & 0xF, (back >> 4) & 0xF, back >> 12, (back >> 8) & 0xF};
     }
 
     // NVNpolygonState: bits 0-1 cull face, bit 2 front face counter-clockwise, bits 3-4 polygon mode, bits 15-17
@@ -835,62 +632,40 @@ private:
             return;
         const u32 w = u32(c.raw[0]);
         const u32 cull = w & 3;
-        W(kCullEnable, cull ? 1 : 0);
-        W(kCullFace, cull == 1 ? 0x404 : cull == 3 ? 0x408 : 0x405);
-        W(kFrontFace, (w >> 2) & 1 ? 0x901 : 0x900);
-        W(kPolygonOffsetFillEnable, (w >> 17) & 1);
+        s_.cull_enable = cull != 0;
+        s_.cull_face = cull == 1 ? 0x404 : cull == 3 ? 0x408 : 0x405;
+        s_.front_ccw = (w >> 2) & 1;
+        s_.polygon_offset = (w >> 17) & 1;
     }
 
     void Draw(u32 mode, bool indexed, u32 first, u32 count, u32 index_type, u64 index_addr, s32 base_vertex,
               u32 instances, u32 base_instance) {
-        // programs: one code base for this draw's stages
-        u64 base = ~0ull;
-        for (u32 s = 0; s < 5; s++)
-            if (prog_[s])
-                base = std::min(base, prog_[s] & ~0xFFull);
-        if (base == ~0ull)
-            base = 0;
-        WA(kCodeAddrHigh, base);
-        u64 slot[6]{};
-        for (u32 s = 0; s < 5; s++)
-            if (prog_[s])
-                slot[kHwProgram[s]] = prog_[s];
-        for (u32 p = 0; p < 6; p++) {
-            W(kShaderConfig + p * 0x10, slot[p] ? 1 | (p << 4) : 0);
-            W(kShaderConfig + p * 0x10 + 1, slot[p] ? u32(slot[p] - base) : 0);
+        if (program_constants_dirty_) {
+            program_constants_dirty_ = false;
+            for (u32 s : {u32(kStageVertex), u32(kStageFragment), u32(kStageGeometry)})
+                if (s_.program[s])
+                    Bind(kHwStage[s], 1, ProgramConstants(s_.program[s]), 0x10000);
         }
-        for (u32 s : {0u, 1u, 2u})
-            if (prog_[s])
-                Bind(kHwStage[s], 1, ProgramConstants(prog_[s]), 0x10000);
-        // vertex input
-        for (u32 i = 0; i < 16; i++) {
-            const Stream& st = streams_[i];
-            W(kVertexArray + i * 4, (st.stride & 0xFFF) | (st.addr ? 0x1000 : 0));
-            WA(kVertexArray + i * 4 + 1, st.addr);
-            W(kVertexArray + i * 4 + 3, st.divisor);
-            WA(kVertexArrayLimit + i * 2, st.addr + (st.size ? st.size - 1 : 0));
-        }
-        for (u32 i = 0; i < 32; i++)
-            W(kVertexAttribFormat + i, attribs_[i]);
-        // indices
         if (indexed) {
-            const u32 size = index_type == 0 ? 1 : index_type == 1 ? 2 : 4;
-            WA(kIndexAddrHigh, index_addr);
-            WA(kIndexLimitHigh, index_addr + u64(first + count) * size - 1);
-            W(kIndexFormat, index_type);
-            W(kIndexFirst, first);
-        } else {
-            W(kVertexBufferFirst, first);
-            W(kVertexBufferCount, count);
+            s_.index_addr = Va(index_addr);
+            s_.index_format = index_type;
         }
-        W(0x50D, u32(base_vertex));
-        W(0x50E, base_instance);
+        s_.base_vertex = base_vertex;
+        s_.base_instance = base_instance;
+        auto& d = s_.draw;
+        d.topology = mode & 0xFFFF;
+        d.indexed = indexed;
+        d.first = first;
+        d.count = count;
+        Renderer* r = g_.GetRenderer();
         for (u32 k = 0; k < instances && k < 4096; k++) {
-            if (indexed)
-                W(kIndexCount, count);
-            W(kDrawBegin, mode | (k ? 1u << 26 : 0));
-            instances_++;
-            W(kDrawEnd, 0);
+            d.instance = k;
+            g_.draws++;
+            if (r && (count || d.indirect_args)) {
+                const u64 t0 = g_.NowNs();
+                r->Draw();
+                g_.draw_ns += g_.NowNs() - t0;
+            }
         }
     }
 
@@ -930,7 +705,7 @@ private:
             ci.constants = at(0x700);
             ci.constants_size = u32(common::AlignUp(at(0x6FC), 0x100));
         } else
-            unhandled["compute program without control section"]++;
+            Unhandled("compute program without control section");
         return compute_.emplace(code, ci).first->second;
     }
     struct Ubo {
@@ -939,41 +714,28 @@ private:
     } cs_ubo_[5];
     u64 cs_code_ = 0, cs_control_ = 0;
     u32 row_stride_ = 0, image_stride_ = 0;
-    std::mutex queue_mutex_;
-    std::deque<Frame> queue_;
-    Frame frame_;
-    size_t pos_ = 0;
-    u32 instances_ = 0;
-    struct Stream {
-        u32 stride = 0, divisor = 0;
-        u64 addr = 0, size = 0;
-    };
+    bool program_constants_dirty_ = false;
     Gpu& g_;
-    Maxwell3D m_;
-    u64 prog_[6]{}; // NVN stage -> Maxwell program header address
-    Stream streams_[16];
-    u32 attribs_[32];
-    u32 viewport_[16][4]{};
-    u32 depth_range_[16][2]{};
+    DrawState& s_;
+    float viewport_[16][4]{};
+    float depth_range_[16][2]{};
+    std::set<std::string> unhandled_;
 };
 
 } // namespace
 
 // The driver never sees the command buffer commands the encoder handles: each submit's commands are encoded and
 // rendered on the GPU thread, in submission order with the host's fences and presents.
-void InstallNative(Gpu& gpu) {
+void InstallNvnEncoder(Gpu& gpu) {
     static Gpu* g = &gpu;
     static Encoder* enc = new Encoder(gpu);
-    enc->render_compute = true;
     hle::nvn::SetReplaySink([](std::vector<hle::nvn::ReplaySpan>&& spans) {
         auto list = std::make_shared<Frame>(std::move(spans));
         g->SubmitHost([list] {
             static u64 jobs = 0, ns = 0, cmds = 0;
             const u64 t0 = g->NowNs();
             hle::nvn::TimelineEvent("job-start", list->size());
-            g->SetActiveM3D(&enc->M());
             enc->Run(*list);
-            g->SetActiveM3D(nullptr);
             hle::nvn::TimelineEvent("job-end", list->size());
             ns += g->NowNs() - t0, cmds += list->size();
             if (++jobs % 600 == 0) {
@@ -986,7 +748,5 @@ void InstallNative(Gpu& gpu) {
     });
     LOG_INFO("NVN", "native: command buffers are encoded and rendered by the host");
 }
-
-void InstallNvnEncoder(Gpu& gpu) { InstallNative(gpu); }
 
 } // namespace gpu

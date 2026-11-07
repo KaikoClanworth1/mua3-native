@@ -116,11 +116,13 @@ function Invoke-Run([int]$N) {
 
     $fps = New-Object Collections.ArrayList; $p50 = New-Object Collections.ArrayList; $p99 = New-Object Collections.ArrayList; $max = New-Object Collections.ArrayList; $busy = New-Object Collections.ArrayList
     foreach ($l in ($text.Substring($startLen) -split "`n")) {
-        if ($l -match 'Presenting: ([\d.]+) fps \(native\) gpu busy (\d+)% .*frame ms p50 ([\d.]+) p99 ([\d.]+) max ([\d.]+)') {
-            [void]$fps.Add([double]$Matches[1]); [void]$busy.Add([double]$Matches[2]); [void]$p50.Add([double]$Matches[3]); [void]$p99.Add([double]$Matches[4]); [void]$max.Add([double]$Matches[5])
+        if ($l -match 'Presenting: ([\d.]+) fps \(native\) gpu busy (\d+)%') {
+            [void]$fps.Add([double]$Matches[1]); [void]$busy.Add([double]$Matches[2])
+            # builds before the frame-time figures report 0 for them
+            if ($l -match 'frame ms p50 ([\d.]+) p99 ([\d.]+) max ([\d.]+)') { [void]$p50.Add([double]$Matches[1]); [void]$p99.Add([double]$Matches[2]); [void]$max.Add([double]$Matches[3]) }
         }
     }
-    if (-not $fps.Count) { throw 'no Presenting lines measured (is this exe older than the frame-time log line?)' }
+    if (-not $fps.Count) { throw 'no Presenting lines measured' }
     $bad = @(($text -split "`n") | Where-Object { $_ -match 'Panic|has no recompiled version' }).Count
     function Avg($prop) { [Math]::Round(($samples | Measure-Object $prop -Average).Average, 1) }
     $otherCpu = Avg 'other_cpu'; $otherGpu = Avg 'other_gpu'

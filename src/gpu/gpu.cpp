@@ -90,7 +90,7 @@ u64 AddressSpace::Translate(u64 gpu_va) const {
 }
 
 // ---------------------------------------------------------------- Gpu
-Gpu::Gpu(core::Memory& mem) : mem_(mem), m3d_(*this) { thread_ = std::thread([this] { ThreadMain(); }); }
+Gpu::Gpu(core::Memory& mem) : mem_(mem) { thread_ = std::thread([this] { ThreadMain(); }); }
 
 Gpu::~Gpu() {
     running_ = false;

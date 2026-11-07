@@ -55,9 +55,10 @@ public:
     D3D11Renderer(ID3D11Device* dev, ID3D11DeviceContext* ctx);
     ~D3D11Renderer() override;
 
-    void Clear(u32 rt, u32 mask) override;
+    void ClearColor(u32 rt, const float color[4]) override;
+    void ClearDepthStencil(bool depth, bool stencil, float depth_value, u8 stencil_value) override;
     void Draw() override;
-    void Dispatch(const u32* regs, const u32* qmd) override;
+    void Dispatch(const ComputeLaunch& l) override;
     // Internal resolution multiplier for screen-sized render targets (1 = native).
     void SetResolutionScale(u32 s) { res_scale_ = std::max<u32>(s, 1); }
     ShaderCache* Shaders() { return shaders_.get(); }

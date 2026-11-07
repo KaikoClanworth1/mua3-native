@@ -1,7 +1,6 @@
 #pragma once
-// Host NVN encoder: turns the game's recorded NVN command stream (hle::nvn replay sink) into writes to a Maxwell3D
-// register file of its own, the same state the NVN driver would have produced, so the D3D11 renderer can draw it
-// without the driver's command buffers. See docs/native_renderer_plan.md.
+// Host NVN encoder: applies the game's recorded NVN command stream (hle::nvn replay sink) to a DrawState
+// (gpu/draw_state.h) and has the D3D11 renderer draw from it, without the driver's command buffers.
 
 namespace gpu {
 

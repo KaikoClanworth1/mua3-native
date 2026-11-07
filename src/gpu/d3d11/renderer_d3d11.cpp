@@ -20,7 +20,6 @@
 
 namespace gpu {
 
-using namespace reg3d;
 
 namespace {
 
@@ -548,43 +547,37 @@ ID3D11ShaderResourceView* D3D11Renderer::HazardSrv(Surface* s) {
 }
 
 Surface* D3D11Renderer::GetColorSurface(u32 i) {
-    const auto& m = G().M3D();
-    const u32 base = kRenderTarget + i * 0x10;
-    const u32 fmt = m.Reg(base + 4);
-    if (fmt == 0)
+    if (i >= 8)
         return nullptr;
-    return GetSurface(m.Addr(base), m.Reg(base + 2), m.Reg(base + 3), fmt, false, m.Reg(base + 5));
+    const auto& t = G().State().color[i];
+    if (t.format == 0)
+        return nullptr;
+    return GetSurface(t.addr, t.width, t.height, t.format, false, t.tile);
 }
 
 Surface* D3D11Renderer::GetDepthSurface() {
-    const auto& m = G().M3D();
-    if (!(m.Reg(kZetaEnable) & 1))
+    const auto& d = G().State().depth;
+    if (!d.enabled)
         return nullptr;
-    return GetSurface(m.Addr(kZetaAddrHigh), m.Reg(kZetaWidth), m.Reg(kZetaHeight), m.Reg(kZetaFormat), true);
+    return GetSurface(d.addr, d.width, d.height, d.format, true);
 }
 
-void D3D11Renderer::Clear(u32 rt, u32 mask) {
+void D3D11Renderer::ClearColor(u32 rt, const float color[4]) {
     std::lock_guard ctx_lock(ContextMutex());
     clears++;
-    const auto& m = G().M3D();
-    if (mask & 0x3C) {
-        if (Surface* s = GetColorSurface(rt)) {
-            const float c[4] = {m.RegF(kClearColor), m.RegF(kClearColor + 1), m.RegF(kClearColor + 2),
-                                m.RegF(kClearColor + 3)};
-            ctx_->ClearRenderTargetView(s->rtv.Get(), c);
-            s->write_serial = ++surface_writes_;
-        }
+    if (Surface* s = GetColorSurface(rt)) {
+        ctx_->ClearRenderTargetView(s->rtv.Get(), color);
+        s->write_serial = ++surface_writes_;
     }
-    if (mask & 3) {
-        if (Surface* s = GetDepthSurface()) {
-            UINT flags = 0;
-            if (mask & 1)
-                flags |= D3D11_CLEAR_DEPTH;
-            if (mask & 2)
-                flags |= D3D11_CLEAR_STENCIL;
-            ctx_->ClearDepthStencilView(s->dsv.Get(), flags, m.RegF(kClearDepth), u8(m.Reg(kClearStencil)));
-            s->write_serial = ++surface_writes_;
-        }
+}
+
+void D3D11Renderer::ClearDepthStencil(bool depth, bool stencil, float depth_value, u8 stencil_value) {
+    std::lock_guard ctx_lock(ContextMutex());
+    clears++;
+    if (Surface* s = GetDepthSurface()) {
+        const UINT flags = (depth ? D3D11_CLEAR_DEPTH : 0) | (stencil ? D3D11_CLEAR_STENCIL : 0);
+        ctx_->ClearDepthStencilView(s->dsv.Get(), flags, depth_value, stencil_value);
+        s->write_serial = ++surface_writes_;
     }
 }
 
@@ -1088,19 +1081,18 @@ static std::vector<u8> ReadBufferNow(ID3D11Device* dev, ID3D11DeviceContext* ctx
 // (counter address at GS c0[0x410], list base at c0[0x420]) and stores the vertex ids as v1, v0, v2. Later draws
 // index that list. We keep every triangle (culling is only an optimisation).
 
-void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
+void D3D11Renderer::Dispatch(const ComputeLaunch& l) {
     std::lock_guard ctx_lock(ContextMutex());
     auto& g = G();
     auto& dc = *g_dc;
     // ---- program and launch shape
-    const u64 code = (u64(r[0x582] & 0xFF) << 32) | r[0x583];
-    const u64 prog = code + q[8];
+    const u64 prog = l.program;
     shader::TranslateOptions opt;
-    opt.block[0] = std::max<u32>(q[0x12] >> 16, 1);
-    opt.block[1] = std::max<u32>(q[0x13] & 0xFFFF, 1);
-    opt.block[2] = std::max<u32>(q[0x13] >> 16, 1);
-    opt.shared_bytes = q[0x11] & 0x3FFFF;
-    const u32 grid[3] = {q[0xC] & 0x7FFFFFFF, q[0xD] & 0xFFFF, q[0xD] >> 16};
+    opt.block[0] = l.block[0];
+    opt.block[1] = l.block[1];
+    opt.block[2] = l.block[2];
+    opt.shared_bytes = l.shared_bytes;
+    const u32* const grid = l.grid;
     if (!grid[0] || !grid[1] || !grid[2])
         return;
     // Debug: MUA3_SKIP_CS=<offset hex>,... drops those compute programs.
@@ -1108,7 +1100,7 @@ void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
         const char* e = std::getenv("MUA3_SKIP_CS");
         return std::string(e ? e : "");
     }();
-    if (!skip_cs.empty() && skip_cs.find(fmt::format("{:x}", q[8])) != std::string::npos)
+    if (!skip_cs.empty() && skip_cs.find(fmt::format("{:x}", l.program_offset)) != std::string::npos)
         return;
     const u64 key = prog ^ (u64(opt.block[0]) << 40) ^ (u64(opt.block[1]) << 50) ^ (u64(opt.block[2]) << 56) ^
                     (u64(opt.shared_bytes) << 20);
@@ -1122,10 +1114,9 @@ void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
         if (got < 0x10)
             return;
         std::vector<u8> cb1;
-        if (q[0x14] & 2) { // jump tables for BRX
-            const u64 a = (u64(q[0x20] & 0xFF) << 32) | q[0x1F];
-            cb1.assign(std::min<u32>(q[0x20] >> 15, 0x10000), 0);
-            g.ReadGpuPartial(a, cb1.data(), cb1.size());
+        if (l.cb_size[1]) { // jump tables for BRX
+            cb1.assign(l.cb_size[1], 0);
+            g.ReadGpuPartial(l.cb_addr[1], cb1.data(), cb1.size());
             opt.cbuf1 = cb1.data();
             opt.cbuf1_size = u32(cb1.size());
         }
@@ -1139,18 +1130,11 @@ void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
     if (cs->state != HostShader::Ready)
         return;
     // ---- constant buffers (QMD slots)
-    const u32 cb_mask = q[0x14] & 0xFF;
-    u64 cb_addr[8]{};
-    u32 cb_size[8]{};
-    for (u32 i = 0; i < 8; i++)
-        if (cb_mask & (1u << i)) {
-            cb_addr[i] = (u64(q[0x1E + i * 2] & 0xFF) << 32) | q[0x1D + i * 2];
-            cb_size[i] = q[0x1E + i * 2] >> 15;
-        }
+    const u64* const cb_addr = l.cb_addr;
+    const u32* const cb_size = l.cb_size;
     // Integer-typed textures need a shader variant, as for draws.
-    const u64 tic_base = (u64(r[0x55D] & 0xFF) << 32) | r[0x55E];
-    const u64 tsc_base = (u64(r[0x557] & 0xFF) << 32) | r[0x558];
-    const u32 tex_cb = r[0x982] & 7;
+    const u64 tic_base = l.tic_base, tsc_base = l.tsc_base;
+    const u32 tex_cb = kTextureHandleCb;
     auto handle_of = [&](const shader::TextureUse& t) {
         u32 h = 0;
         g.ReadGpu(cb_addr[tex_cb] + t.cbuf_offset, &h, 4);
@@ -1289,7 +1273,7 @@ void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
         return e ? u32(std::strtoul(e, nullptr, 16)) : ~0u;
     }();
     static bool captured = false;
-    if (!captured && q[8] == capture_off) {
+    if (!captured && l.program_offset == capture_off) {
         captured = true;
         std::vector<u32> f;
         auto put_bytes = [&](const void* p, u32 n) {
@@ -1343,7 +1327,7 @@ void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
                 put_bytes(d.data(), u32(d.size()));
             }
         put_bytes(&drv, sizeof(drv));
-        const fs::path out = fmt::format("shader_dump/capture_{:x}.bin", q[8]);
+        const fs::path out = fmt::format("shader_dump/capture_{:x}.bin", l.program_offset);
         common::WriteFile(out, std::span(reinterpret_cast<const u8*>(f.data()), f.size() * 4));
         LOG_INFO("Renderer", "captured dispatch {:#x} to {}", prog, out.string());
     }
@@ -1420,9 +1404,9 @@ void D3D11Renderer::Dispatch(const u32* r, const u32* q) {
 
 void D3D11Renderer::EmulateCullingGs() {
     auto& g = G();
-    const auto& m = g.M3D();
+    const auto& m = g.State();
     const auto& dr = m.draw;
-    const auto& cb = m.CBuf(3, 0);
+    const auto& cb = m.cb[kCbGeometry][0];
     if (!cb.enabled || cb.size < 0x428 || dr.topology != 4)
         return;
     u32 c0[2], base[2];
@@ -1439,9 +1423,9 @@ void D3D11Renderer::EmulateCullingGs() {
     static thread_local std::vector<u32> out;
     const u8* src = nullptr;
     if (dr.indexed) {
-        const u32 fmt = m.Reg(kIndexFormat);
+        const u32 fmt = m.index_format;
         const u32 isz = fmt == 0 ? 1 : fmt == 1 ? 2 : 4;
-        const u64 ia = m.Addr(kIndexAddrHigh) + u64(dr.first) * isz;
+        const u64 ia = m.index_addr + u64(dr.first) * isz;
         SyncGuest(ia, size_t(tris) * 3 * isz, 2);
         if (isz == 4)
             src = g.GpuPtr(ia, bytes);
@@ -1479,7 +1463,7 @@ void D3D11Renderer::EmulateCullingGs() {
 void D3D11Renderer::Draw() {
     std::lock_guard ctx_lock(ContextMutex());
     auto& g = G();
-    const auto& m = g.M3D();
+    const auto& m = g.State();
     auto& dc = *g_dc;
     // Someone else used the context (UI) or a dispatch rebound resources: forget what is bound.
     if (const u64 epoch = ContextEpoch().load(); epoch != binds_epoch_) {
@@ -1502,12 +1486,9 @@ void D3D11Renderer::Draw() {
         g_prof_draws++;
 
     // ---- shaders
-    const u64 code_base = m.Addr(kCodeAddrHigh);
-    auto load_shader = [&](u32 program, shader::Stage stage) -> HostShader* {
-        const u32 cfg = m.Reg(kShaderConfig + program * 0x10);
-        if (!(cfg & 1) && program != 1) // VertexB is always enabled on Maxwell
+    auto load_shader = [&](u64 addr, shader::Stage stage) -> HostShader* {
+        if (!addr)
             return nullptr;
-        const u64 addr = code_base + m.Reg(kShaderConfig + program * 0x10 + 1);
         // Shader lookups are cached by code address; GPU writes to the code region flush the cache.
         const u64 key = addr ^ (u64(stage) << 60);
         if (auto cached = shader_by_addr_.find(key); cached != shader_by_addr_.end())
@@ -1523,14 +1504,11 @@ void D3D11Renderer::Draw() {
         code_hi_ = std::max(code_hi_, addr + shader::ProgramSize(buf.data(), got));
         return sh;
     };
-    HostShader* vs = load_shader(1, shader::Stage::Vertex);
-    if (!vs)
-        vs = load_shader(0, shader::Stage::Vertex);
-    HostShader* ps = load_shader(5, shader::Stage::Fragment);
+    HostShader* vs = load_shader(m.program[kStageVertex], shader::Stage::Vertex);
+    HostShader* ps = load_shader(m.program[kStageFragment], shader::Stage::Fragment);
     // A geometry program without any OUT (emit) instruction rasterizes nothing: MUA3 uses one to cull triangles
     // into a buffer ahead of its real draws. Drawing such a pass would leave depth the game never wrote.
-    if (m.Reg(kShaderConfig + 4 * 0x10) & 1) {
-        const u64 addr = code_base + m.Reg(kShaderConfig + 4 * 0x10 + 1);
+    if (const u64 addr = m.program[kStageGeometry]) {
         auto it = gs_emits_.find(addr);
         if (it == gs_emits_.end()) {
             std::vector<u8> buf(0x10000, 0);
@@ -1555,25 +1533,24 @@ void D3D11Renderer::Draw() {
         }
     }
     // Geometry/tessellation programs are not run yet: dump them once so they can be inspected.
-    for (u32 prog = 2; prog <= 4; prog++) {
-        const u32 cfg = m.Reg(kShaderConfig + prog * 0x10);
-        if (!(cfg & 1))
+    for (u32 prog : {u32(kStageTessControl), u32(kStageTessEval), u32(kStageGeometry)}) {
+        const u64 addr = m.program[prog];
+        if (!addr)
             continue;
         static std::set<u64> dumped;
-        const u64 addr = code_base + m.Reg(kShaderConfig + prog * 0x10 + 1);
         if (!dumped.insert(addr).second)
             continue;
         std::vector<u8> buf(0x10000, 0);
         const size_t got = g.ReadGpuPartial(addr, buf.data(), buf.size());
         buf.resize(shader::ProgramSize(buf.data(), got));
-        common::WriteFile(fmt::format("shader_dump/{:016x}.prog{}.bin", Hash64(buf.data(), buf.size()), prog), buf);
-        LOG_INFO("Renderer", "program {} enabled (not emulated), dumped {} bytes", prog, buf.size());
+        common::WriteFile(fmt::format("shader_dump/{:016x}.stage{}.bin", Hash64(buf.data(), buf.size()), prog), buf);
+        LOG_INFO("Renderer", "stage {} program enabled (not run), dumped {} bytes", prog, buf.size());
     }
     // Integer vertex attributes and integer textures need integer-typed shader declarations (a float4
     // declaration would receive converted values): pick the matching shader variant.
     auto int_textures = [&](HostShader* sh, u32 stage_index, ShaderCache::VariantKey& key) {
-        const auto& tcb = m.CBuf(stage_index, m.Reg(kTexCbIndex));
-        const u64 tic_base = m.Addr(kTicAddrHigh);
+        const auto& tcb = m.cb[stage_index][kTextureHandleCb];
+        const u64 tic_base = m.tic_base;
         for (auto& t : sh->info.textures) {
             if (t.slot >= 32)
                 continue;
@@ -1595,9 +1572,9 @@ void D3D11Renderer::Draw() {
         for (u32 i = 0; i < 32; i++) {
             if (!(vs->info.attrib_in_mask & (1u << i)))
                 continue;
-            const u32 f = m.Reg(kVertexAttribFormat + i);
+            const u32 f = m.attrib[i];
             const u32 b = f & 0x1F;
-            if ((f & 0x40) || b >= 16 || !(m.Reg(kVertexArray + b * 4) & 0x1000) || AttribFormat(f) == DXGI_FORMAT_UNKNOWN)
+            if ((f & 0x40) || b >= 16 || !m.streams[b].enabled || AttribFormat(f) == DXGI_FORMAT_UNKNOWN)
                 continue; // fed from the float default slot
             if (((f >> 21) & 0x3F) == 0x30 && ((f >> 27) & 7) == 1) {
                 key.attr_snorm10 |= 1u << i;
@@ -1651,9 +1628,8 @@ void D3D11Renderer::Draw() {
         if ((!vs || vs->state == HostShader::Failed) && logged < 3) {
             logged++;
             LOG_WARN("Renderer", "Draw skipped: vs {} ps {}; programs:", (void*)vs, (void*)ps);
-            for (u32 i = 0; i < 6; i++)
-                LOG_WARN("Renderer", "  program {}: {:#x} offset {:#x}", i, m.Reg(kShaderConfig + i * 0x10),
-                         m.Reg(kShaderConfig + i * 0x10 + 1));
+            for (u32 i = 0; i < kNumGraphicsStages; i++)
+                LOG_WARN("Renderer", "  stage {}: {:#x}", i, m.program[i]);
         }
         return;
     }
@@ -1661,10 +1637,9 @@ void D3D11Renderer::Draw() {
     // ---- render targets
     Prof(kProfState);
     Surface* colors[8]{};
-    const u32 rtc = m.Reg(kRtControl);
-    const u32 count = std::min<u32>(rtc & 0xF, 8);
+    const u32 count = m.rt_count;
     for (u32 i = 0; i < count; i++)
-        colors[i] = GetColorSurface((rtc >> (4 + i * 3)) & 7);
+        colors[i] = GetColorSurface(i);
     Surface* depth = GetDepthSurface();
     ID3D11RenderTargetView* rtvs[8]{};
     for (u32 i = 0; i < count; i++)
@@ -1686,9 +1661,8 @@ void D3D11Renderer::Draw() {
     bound_[8] = depth;
 
     // ---- viewport
-    const float sx = m.RegF(kViewportTransform + 0), sy = m.RegF(kViewportTransform + 1);
-    const float sz = m.RegF(kViewportTransform + 2), tx = m.RegF(kViewportTransform + 3);
-    const float ty = m.RegF(kViewportTransform + 4), tz = m.RegF(kViewportTransform + 5);
+    const float sx = m.vp_scale[0], sy = m.vp_scale[1], sz = m.vp_scale[2];
+    const float tx = m.vp_translate[0], ty = m.vp_translate[1], tz = m.vp_translate[2];
     // Targets stored at a higher resolution scale the viewport and scissor with them.
     u32 rscale = 1;
     for (Surface* b : bound_)
@@ -1703,17 +1677,12 @@ void D3D11Renderer::Draw() {
         pipe_.vp = vp;
         ctx_->RSSetViewports(1, &vp);
     }
-    float flip = sy > 0 ? -1.0f : 1.0f;
-    if (m.Reg(kScreenYControl) & 1)
-        flip = -flip;
+    const float flip = sy > 0 ? -1.0f : 1.0f;
 
     // ---- scissor
-    const u32 sc_enable = m.Reg(0x380);
     D3D11_RECT sr{0, 0, 16384, 16384};
-    if (sc_enable & 1) {
-        const u32 x = m.Reg(0x381), y = m.Reg(0x382);
-        sr = {LONG(x & 0xFFFF) * LONG(rscale), LONG(y & 0xFFFF) * LONG(rscale), LONG(x >> 16) * LONG(rscale), LONG(y >> 16) * LONG(rscale)};
-    }
+    if (m.scissor_enable)
+        sr = {LONG(m.scissor[0]) * LONG(rscale), LONG(m.scissor[1]) * LONG(rscale), LONG(m.scissor[2]) * LONG(rscale), LONG(m.scissor[3]) * LONG(rscale)};
     // Pixel history (debug "pick x y"): restrict every draw of one frame to that pixel and count samples.
     const bool counting = occl_frame_ == frame_counter_; // debug "occl": samples written by every draw
     const bool picking = (pick_frame_ == frame_counter_ && colors[0] && colors[0]->width >= 1280 / 2) || counting;
@@ -1730,53 +1699,40 @@ void D3D11Renderer::Draw() {
     // ---- blend
     D3D11_BLEND_DESC bd{};
     bd.IndependentBlendEnable = TRUE;
-    const bool independent = m.Reg(0x4B9) & 1;
     for (u32 i = 0; i < 8; i++) {
         auto& t = bd.RenderTarget[i];
-        t.BlendEnable = m.Reg(kBlendEnable + i) & 1;
-        u32 eq_rgb, src_rgb, dst_rgb, eq_a, src_a, dst_a;
-        if (independent) {
-            const u32 b = kIndependentBlend + i * 8;
-            eq_rgb = m.Reg(b + 1), src_rgb = m.Reg(b + 2), dst_rgb = m.Reg(b + 3);
-            eq_a = m.Reg(b + 4), src_a = m.Reg(b + 5), dst_a = m.Reg(b + 6);
-        } else {
-            eq_rgb = m.Reg(kBlendEqRgb), src_rgb = m.Reg(kBlendSrcRgb), dst_rgb = m.Reg(kBlendDstRgb);
-            eq_a = m.Reg(kBlendEqA), src_a = m.Reg(kBlendSrcA), dst_a = m.Reg(kBlendDstA);
-        }
-        t.BlendOp = BlendOp(eq_rgb);
-        t.SrcBlend = BlendFactor(src_rgb);
-        t.DestBlend = BlendFactor(dst_rgb);
-        t.BlendOpAlpha = BlendOp(eq_a);
-        t.SrcBlendAlpha = AlphaFactor(BlendFactor(src_a));
-        t.DestBlendAlpha = AlphaFactor(BlendFactor(dst_a));
-        const u32 cm = m.Reg(kColorMask + i);
-        t.RenderTargetWriteMask = u8(((cm & 1) ? 1 : 0) | ((cm & 0x10) ? 2 : 0) | ((cm & 0x100) ? 4 : 0) |
-                                     ((cm & 0x1000) ? 8 : 0));
+        const auto& b = m.blend[i];
+        t.BlendEnable = m.blend_enable[i];
+        t.BlendOp = BlendOp(b.eq_rgb);
+        t.SrcBlend = BlendFactor(b.src_rgb);
+        t.DestBlend = BlendFactor(b.dst_rgb);
+        t.BlendOpAlpha = BlendOp(b.eq_a);
+        t.SrcBlendAlpha = AlphaFactor(BlendFactor(b.src_a));
+        t.DestBlendAlpha = AlphaFactor(BlendFactor(b.dst_a));
+        t.RenderTargetWriteMask = u8(m.color_mask[i]);
     }
     auto* blend = dc.Cached(dc.blend, bd, [&](const D3D11_BLEND_DESC* d, ID3D11BlendState** o) {
         dev_->CreateBlendState(d, o);
     });
-    const float bc[4] = {m.RegF(kBlendColor), m.RegF(kBlendColor + 1), m.RegF(kBlendColor + 2), m.RegF(kBlendColor + 3)};
-    if (pipe_.blend != blend || std::memcmp(pipe_.blend_color, bc, sizeof(bc)) != 0) {
+    const float* const bc = m.blend_color;
+    if (pipe_.blend != blend || std::memcmp(pipe_.blend_color, bc, sizeof(pipe_.blend_color)) != 0) {
         pipe_.blend = blend;
-        std::memcpy(pipe_.blend_color, bc, sizeof(bc));
+        std::memcpy(pipe_.blend_color, bc, sizeof(pipe_.blend_color));
         ctx_->OMSetBlendState(blend, bc, 0xFFFFFFFF);
     }
 
     // ---- depth / stencil
     D3D11_DEPTH_STENCIL_DESC dd{};
-    dd.DepthEnable = depth && (m.Reg(kDepthTestEnable) & 1);
-    dd.DepthWriteMask = (m.Reg(kDepthWriteEnable) & 1) ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
-    dd.DepthFunc = CompareFunc(m.Reg(kDepthTestFunc));
-    dd.StencilEnable = depth && (m.Reg(kStencilEnable) & 1);
-    dd.StencilReadMask = u8(m.Reg(kStencilFrontFuncMask));
-    dd.StencilWriteMask = u8(m.Reg(kStencilFrontMask));
-    dd.FrontFace = {StencilOp(m.Reg(kStencilFrontOpFail)), StencilOp(m.Reg(kStencilFrontOpZFail)),
-                    StencilOp(m.Reg(kStencilFrontOpZPass)), CompareFunc(m.Reg(kStencilFrontFunc))};
-    dd.BackFace = (m.Reg(kStencilTwoSide) & 1)
-                      ? D3D11_DEPTH_STENCILOP_DESC{StencilOp(m.Reg(kStencilBackOpFail)), StencilOp(m.Reg(kStencilBackOpZFail)),
-                                                   StencilOp(m.Reg(kStencilBackOpZPass)), CompareFunc(m.Reg(kStencilBackFunc))}
-                      : dd.FrontFace;
+    dd.DepthEnable = depth && m.depth_test;
+    dd.DepthWriteMask = m.depth_write ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
+    dd.DepthFunc = CompareFunc(m.depth_func);
+    dd.StencilEnable = depth && m.stencil_test;
+    dd.StencilReadMask = u8(m.stencil_read_mask);
+    dd.StencilWriteMask = u8(m.stencil_write_mask);
+    dd.FrontFace = {StencilOp(m.stencil_front.op_fail), StencilOp(m.stencil_front.op_zfail),
+                    StencilOp(m.stencil_front.op_zpass), CompareFunc(m.stencil_front.func)};
+    dd.BackFace = {StencilOp(m.stencil_back.op_fail), StencilOp(m.stencil_back.op_zfail),
+                   StencilOp(m.stencil_back.op_zpass), CompareFunc(m.stencil_back.func)};
     // Debug: MUA3_TESTS_OFF=<ps hash>:<z|s|zs> disables the depth and/or stencil test for one pixel shader.
     static const std::pair<u64, std::string> tests_off = [] {
         const char* e = std::getenv("MUA3_TESTS_OFF");
@@ -1796,7 +1752,7 @@ void D3D11Renderer::Draw() {
     auto* dss = dc.Cached(dc.depth, dd, [&](const D3D11_DEPTH_STENCIL_DESC* d, ID3D11DepthStencilState** o) {
         dev_->CreateDepthStencilState(d, o);
     });
-    if (const u32 sref = m.Reg(kStencilFrontRef) & 0xFF; pipe_.dss != dss || pipe_.stencil_ref != sref) {
+    if (const u32 sref = m.stencil_ref & 0xFF; pipe_.dss != dss || pipe_.stencil_ref != sref) {
         pipe_.dss = dss;
         pipe_.stencil_ref = sref;
         ctx_->OMSetDepthStencilState(dss, sref);
@@ -1806,20 +1762,20 @@ void D3D11Renderer::Draw() {
     D3D11_RASTERIZER_DESC rd{};
     rd.FillMode = D3D11_FILL_SOLID;
     rd.CullMode = D3D11_CULL_NONE;
-    if (m.Reg(kCullEnable) & 1) {
-        const u32 cf = m.Reg(kCullFace);
+    if (m.cull_enable) {
+        const u32 cf = m.cull_face;
         rd.CullMode = cf == 0x404 ? D3D11_CULL_FRONT : cf == 0x405 ? D3D11_CULL_BACK : D3D11_CULL_NONE;
     }
-    bool ccw = m.Reg(kFrontFace) == 0x901;
+    bool ccw = m.front_ccw;
     if (flip < 0)
         ccw = !ccw;
     rd.FrontCounterClockwise = ccw;
     rd.DepthClipEnable = TRUE;
-    // Polygon offset (shadow casters): units are stored doubled, slope factor and clamp as floats.
-    if (m.Reg(kPolygonOffsetFillEnable) & 1) {
-        rd.DepthBias = INT(std::lround(m.RegF(kDepthBias) * 0.5f));
-        rd.SlopeScaledDepthBias = m.RegF(kSlopeScaleDepthBias);
-        rd.DepthBiasClamp = m.RegF(kDepthBiasClamp);
+    // Polygon offset (shadow casters).
+    if (m.polygon_offset) {
+        rd.DepthBias = INT(std::lround(m.depth_bias));
+        rd.SlopeScaledDepthBias = m.slope_scale_depth_bias;
+        rd.DepthBiasClamp = m.depth_bias_clamp;
     }
     // Debug: MUA3_ZBIAS_PS=<ps hash>:<depth bias units> biases one pixel shader's depth.
     static const std::pair<u64, int> zbias = [] {
@@ -1895,10 +1851,10 @@ void D3D11Renderer::Draw() {
             min_v = dr.first;
             max_v = dr.first + dr.count - 1;
         } else {
-            const u32 fmt = m.Reg(kIndexFormat);
+            const u32 fmt = m.index_format;
             index_size = fmt == 0 ? 1 : fmt == 1 ? 2 : 4;
             const bool strip = dr.topology == 3 || dr.topology == 5;
-            const u64 ia = m.Addr(kIndexAddrHigh) + u64(dr.first) * index_size;
+            const u64 ia = m.index_addr + u64(dr.first) * index_size;
             GpuBuf* gb = index_size > 1 && !strip ? ResidentBuffer(ia, u64(dr.count) * index_size) : nullptr;
             if (gb && (ia - gb->addr) % index_size == 0) {
                 // compute-written indices (the culling list): drawn from the resident copy; the vertex range is
@@ -1924,11 +1880,11 @@ void D3D11Renderer::Draw() {
         }
     } else {
         if (dr.indexed) {
-            const u32 fmt = m.Reg(kIndexFormat);
+            const u32 fmt = m.index_format;
             index_size = fmt == 0 ? 1 : fmt == 1 ? 2 : 4;
             std::vector<u8> raw(size_t(dr.count) * index_size);
-            SyncGuest(m.Addr(kIndexAddrHigh) + u64(dr.first) * index_size, raw.size(), 4);
-            g.ReadGpu(m.Addr(kIndexAddrHigh) + u64(dr.first) * index_size, raw.data(), raw.size());
+            SyncGuest(m.index_addr + u64(dr.first) * index_size, raw.size(), 4);
+            g.ReadGpu(m.index_addr + u64(dr.first) * index_size, raw.data(), raw.size());
             indices.resize(dr.count);
             for (u32 i = 0; i < dr.count; i++)
                 indices[i] = index_size == 1 ? raw[i] : index_size == 2 ? common::Read<u16>(&raw[i * 2])
@@ -1998,7 +1954,7 @@ void D3D11Renderer::Draw() {
     drv.viewport[2] = tz;
     drv.viewport[3] = fs;
     for (u32 i = 0; i < 32; i++)
-        drv.attrib[i][0] = m.Reg(kVertexAttribFormat + i);
+        drv.attrib[i][0] = m.attrib[i];
     // ---- vertex input: Maxwell attribute formats -> D3D11 input layout
     static thread_local std::vector<D3D11_INPUT_ELEMENT_DESC> elems;
     elems.clear();
@@ -2007,17 +1963,17 @@ void D3D11Renderer::Draw() {
     for (u32 i = 0; i < 32; i++) {
         if (!(vs->info.attrib_in_mask & (1u << i)))
             continue;
-        const u32 f = m.Reg(kVertexAttribFormat + i);
+        const u32 f = m.attrib[i];
         const u32 b = f & 0x1F;
         const bool constant = f & 0x40;
         const DXGI_FORMAT fmt = AttribFormat(f);
-        const u32 cfg = b < 16 ? m.Reg(kVertexArray + b * 4) : 0;
+        const bool stream_on = b < 16 && m.streams[b].enabled;
         D3D11_INPUT_ELEMENT_DESC e{"ATTR", i, fmt, b, (f >> 7) & 0x3FFF, D3D11_INPUT_PER_VERTEX_DATA, 0};
-        if (constant || fmt == DXGI_FORMAT_UNKNOWN || b >= 16 || !(cfg & 0x1000)) {
+        if (constant || fmt == DXGI_FORMAT_UNKNOWN || !stream_on) {
             e = {"ATTR", i, DXGI_FORMAT_R32G32B32A32_FLOAT, 31, 0, D3D11_INPUT_PER_VERTEX_DATA, 0};
             need_default = true;
         } else {
-            const u32 divisor = m.Reg(kVertexArray + b * 4 + 3);
+            const u32 divisor = m.streams[b].divisor;
             if (divisor) {
                 // Maxwell issues one draw per instance; the buffer is uploaded starting at this
                 // instance's element, so every draw reads element 0.
@@ -2060,10 +2016,10 @@ void D3D11Renderer::Draw() {
     GpuBuf* resident_vb[16]{};
     bool cache_vbs = trace_draws_ <= 0;
     for (u32 b = 0; b < 16 && cache_vbs; b++) {
-        if (!used_buf[b] || m.Reg(kVertexArray + b * 4 + 3))
+        if (!used_buf[b] || m.streams[b].divisor)
             continue;
-        const u64 addr = m.Addr(kVertexArray + b * 4 + 1);
-        const u64 limit = m.Addr(kVertexArrayLimit + b * 2);
+        const u64 addr = m.streams[b].addr;
+        const u64 limit = m.streams[b].limit;
         if (limit < addr || limit + 1 - addr > (32u << 20))
             cache_vbs = false;
         else if ((resident_vb[b] = ResidentBuffer(addr, 16))) // compute output (skinning, particles): drawn from the GPU copy
@@ -2074,11 +2030,10 @@ void D3D11Renderer::Draw() {
     for (u32 b = 0; b < 16; b++) {
         if (!used_buf[b])
             continue;
-        const u32 cfg = m.Reg(kVertexArray + b * 4);
-        const u32 stride = cfg & 0xFFF;
-        const u32 divisor = m.Reg(kVertexArray + b * 4 + 3);
-        const u64 addr = m.Addr(kVertexArray + b * 4 + 1);
-        const u64 limit = m.Addr(kVertexArrayLimit + b * 2);
+        const u32 stride = m.streams[b].stride;
+        const u32 divisor = m.streams[b].divisor;
+        const u64 addr = m.streams[b].addr;
+        const u64 limit = m.streams[b].limit;
         if (cache_vbs && !divisor) {
             if (resident_vb[b]) {
                 vbufs[b] = resident_vb[b]->buf.Get();
@@ -2155,9 +2110,9 @@ void D3D11Renderer::Draw() {
         }
     }
     drv.misc[0] = dr.instance; // added to SV_InstanceID (always 0: each Maxwell draw is one instance)
-    drv.misc[1] = m.Reg(kAlphaTestFunc) >= 0x200 ? m.Reg(kAlphaTestFunc) - 0x200 + 1 : m.Reg(kAlphaTestFunc);
-    drv.misc[2] = m.Reg(kAlphaTestRef);
-    drv.misc[3] = m.Reg(kAlphaTestEnable) & 1;
+    drv.misc[1] = m.alpha_func;
+    drv.misc[2] = m.alpha_ref;
+    drv.misc[3] = m.alpha_test;
 
     // Trace every draw into the presented surface once (debug aid, MUA3_TRACE_DRAWS).
     // With trace_rt_ set, trace draws that write that surface (any MRT slot) instead.
@@ -2177,26 +2132,24 @@ void D3D11Renderer::Draw() {
         std::string attrs;
         for (u32 i = 0; i < 32; i++)
             if (vs->info.attrib_in_mask & (1u << i)) {
-                const u32 f = m.Reg(kVertexAttribFormat + i);
+                const u32 f = m.attrib[i];
                 attrs += fmt::format(" {}:b{}+{}/s{:x}t{}{}", i, f & 0x1F, (f >> 7) & 0x3FFF, (f >> 21) & 0x3F, (f >> 27) & 7,
                                      (f & 0x40) ? "c" : "");
             }
         std::string cbs;
         for (u32 i = 0; i < 18; i++)
             if (vs->info.cbuf_mask & (1u << i))
-                cbs += fmt::format(" c{}={:#x}@{:#x}", i, m.CBuf(0, i).size, m.CBuf(0, i).address);
+                cbs += fmt::format(" c{}={:#x}@{:#x}", i, m.cb[0][i].size, m.cb[0][i].address);
         std::string progs;
-        for (u32 pidx = 0; pidx < 6; pidx++) {
-            const u32 cfg = m.Reg(kShaderConfig + pidx * 0x10);
-            progs += fmt::format(" p{}={}{:x}", pidx, cfg & 1 ? "on:" : "", (cfg >> 4) & 0xF);
-        }
+        for (u32 pidx = 0; pidx < kNumGraphicsStages; pidx++)
+            progs += fmt::format(" s{}={:#x}", pidx, m.program[pidx]);
         LOG_INFO("Renderer", "TRACE attrs{} | {} | vs cbufs{} | progs{} topo {} | base vertex {:#x} base instance {:#x} idxfmt {} first {}",
-                 attrs, trace_vb_, cbs, progs, dr.topology, m.Reg(0x50D), m.Reg(0x50E), m.Reg(kIndexFormat), dr.first);
+                 attrs, trace_vb_, cbs, progs, dr.topology, m.base_vertex, m.base_instance, m.index_format, dr.first);
         // CPU check of the first triangle: attribute-5 positions through bone 0 (c3[14..16]) and c3[10..13].
         if ((vs->info.cbuf_mask & 8) && trace_vb_stride_ && indices.size() >= 3) {
             float c[20][4]{};
-            g.ReadGpu(m.CBuf(0, 3).address, c, std::min<size_t>(sizeof(c), m.CBuf(0, 3).size));
-            const u32 f5 = m.Reg(kVertexAttribFormat + 5), off5 = (f5 >> 7) & 0x3FFF;
+            g.ReadGpu(m.cb[0][3].address, c, std::min<size_t>(sizeof(c), m.cb[0][3].size));
+            const u32 f5 = m.attrib[5], off5 = (f5 >> 7) & 0x3FFF;
             std::string tri;
             for (u32 k = 0; k < 3; k++) {
                 const size_t at = size_t(indices[k] - min_v) * trace_vb_stride_ + off5;
@@ -2242,37 +2195,34 @@ void D3D11Renderer::Draw() {
                 if (!(ps->info.cbuf_mask & (1u << cb)))
                     continue;
                 float rows[176][4]{};
-                g.ReadGpu(m.CBuf(4, cb).address, rows, std::min<size_t>(sizeof(rows), m.CBuf(4, cb).size));
-                const u32 n = std::min<u32>(176, m.CBuf(4, cb).size / 16);
+                g.ReadGpu(m.cb[4][cb].address, rows, std::min<size_t>(sizeof(rows), m.cb[4][cb].size));
+                const u32 n = std::min<u32>(176, m.cb[4][cb].size / 16);
                 for (u32 base = 0; base < n; base += 16) {
                     std::string r;
                     for (u32 k = base; k < std::min(n, base + 16); k++)
                         r += fmt::format(" [{}]({:g},{:g},{:g},{:g})", k, rows[k][0], rows[k][1], rows[k][2], rows[k][3]);
-                    LOG_INFO("Renderer", "TRACE ps c{} size {:#x}:{}", cb, m.CBuf(4, cb).size, r);
+                    LOG_INFO("Renderer", "TRACE ps c{} size {:#x}:{}", cb, m.cb[4][cb].size, r);
                 }
             }
         }
         if (vs->info.cbuf_mask & 8) {
             float rows[20][4]{};
-            g.ReadGpu(m.CBuf(0, 3).address, rows, std::min<size_t>(sizeof(rows), m.CBuf(0, 3).size));
+            g.ReadGpu(m.cb[0][3].address, rows, std::min<size_t>(sizeof(rows), m.cb[0][3].size));
             std::string r;
             for (auto& row : rows)
                 r += fmt::format(" ({:g},{:g},{:g},{:g})", row[0], row[1], row[2], row[3]);
             LOG_INFO("Renderer", "TRACE c3[0..19]{}", r);
         }
-        LOG_INFO("Renderer", "TRACE ib {:#x} first {} count {} indexed {}", m.Addr(kIndexAddrHigh), dr.first, dr.count, dr.indexed);
-        LOG_INFO("Renderer", "TRACE vp sz {:g} tz {:g} sy {:g} near {:g} far {:g} depthmode {:#x} clipctl {:#x}", m.RegF(kViewportTransform + 2),
-                 m.RegF(kViewportTransform + 5), m.RegF(kViewportTransform + 1), m.RegF(kViewport + 2), m.RegF(kViewport + 3),
-                 m.Reg(0x35F), m.Reg(0x64F));
+        LOG_INFO("Renderer", "TRACE ib {:#x} first {} count {} indexed {}", m.index_addr, dr.first, dr.count, dr.indexed);
+        LOG_INFO("Renderer", "TRACE vp sz {:g} tz {:g} sy {:g} near {:g} far {:g}", sz, tz, sy, m.depth_near, m.depth_far);
         LOG_INFO("Renderer", "TRACE draw vs {:016x} ps {:016x} n {} rts{} blend0 {} cmask {:#x} depth {} ztest {} zwrite {} zfunc {:#x}",
-                 vs->hash, ps ? ps->hash : 0, indices.size(), rts, m.Reg(kBlendEnable), m.Reg(kColorMask),
-                 depth ? fmt::format("{:#x}/{:#x}", depth->gpu_va, depth->format) : "-", m.Reg(kDepthTestEnable),
-                 m.Reg(kDepthWriteEnable), m.Reg(kDepthTestFunc));
-        LOG_INFO("Renderer", "TRACE stencil en {} func {:#x} ref {:#x} fmask {:#x} wmask {:#x} ops {:#x}/{:#x}/{:#x} twoside {} back ref {:#x} wmask {:#x} fmask {:#x} func {:#x} ops {:#x}/{:#x}/{:#x} cull {} {:#x} front {:#x}",
-                 m.Reg(kStencilEnable), m.Reg(kStencilFrontFunc), m.Reg(kStencilFrontRef), m.Reg(kStencilFrontFuncMask),
-                 m.Reg(kStencilFrontMask), m.Reg(kStencilFrontOpFail), m.Reg(kStencilFrontOpZFail), m.Reg(kStencilFrontOpZPass),
-                 m.Reg(kStencilTwoSide), m.Reg(0x3D5), m.Reg(0x3D6), m.Reg(0x3D7), m.Reg(kStencilBackFunc), m.Reg(kStencilBackOpFail),
-                 m.Reg(kStencilBackOpZFail), m.Reg(kStencilBackOpZPass), m.Reg(0x646), m.Reg(0x648), m.Reg(0x647));
+                 vs->hash, ps ? ps->hash : 0, indices.size(), rts, m.blend_enable[0], m.color_mask[0],
+                 depth ? fmt::format("{:#x}/{:#x}", depth->gpu_va, depth->format) : "-", m.depth_test,
+                 m.depth_write, m.depth_func);
+        LOG_INFO("Renderer", "TRACE stencil en {} func {:#x} ref {:#x} fmask {:#x} wmask {:#x} ops {:#x}/{:#x}/{:#x} back func {:#x} ops {:#x}/{:#x}/{:#x} cull {} {:#x} front ccw {}",
+                 m.stencil_test, m.stencil_front.func, m.stencil_ref, m.stencil_read_mask, m.stencil_write_mask,
+                 m.stencil_front.op_fail, m.stencil_front.op_zfail, m.stencil_front.op_zpass, m.stencil_back.func,
+                 m.stencil_back.op_fail, m.stencil_back.op_zfail, m.stencil_back.op_zpass, m.cull_enable, m.cull_face, m.front_ccw);
     }
     // ---- per stage resources
     Prof(kProfResources);
@@ -2284,7 +2234,7 @@ void D3D11Renderer::Draw() {
         for (u32 i = 0; i < 13; i++) {
             if (!(s->info.cbuf_mask & (1u << i)))
                 continue;
-            const auto& b = m.CBuf(stage_index, i);
+            const auto& b = m.cb[stage_index][i];
             if (!b.enabled || !b.size)
                 continue;
             if (LearnEnabled() && LearnOnce(b.address ^ (u64(stage_index * 32 + i) << 56) ^ 0x5A5A))
@@ -2328,9 +2278,9 @@ void D3D11Renderer::Draw() {
         Prof(kProfTextures);
         ID3D11ShaderResourceView* srvs[32]{};
         ID3D11SamplerState* smps[16]{};
-        const u32 tex_cb = m.Reg(kTexCbIndex);
-        const auto& tcb = m.CBuf(stage_index, tex_cb);
-        const u64 tic_base = m.Addr(kTicAddrHigh), tsc_base = m.Addr(kTscAddrHigh);
+        const u32 tex_cb = kTextureHandleCb;
+        const auto& tcb = m.cb[stage_index][tex_cb];
+        const u64 tic_base = m.tic_base, tsc_base = m.tsc_base;
         for (auto& t : s->info.textures) {
             if (t.slot >= 32)
                 continue;
@@ -2421,9 +2371,9 @@ void D3D11Renderer::Draw() {
                  colors[0] ? colors[0]->gpu_va : 0, colors[0] ? colors[0]->format : 0, colors[0] ? colors[0]->width : 0,
                  colors[0] ? colors[0]->height : 0, vp.TopLeftX, vp.TopLeftY, vp.Width, vp.Height, flip, sz, tz);
         LOG_INFO("Renderer", "     scissor en {} ({},{})-({},{}) cmask0 {:#x} blend0 {} rtc {:#x} depth {} attr0 {:#x} attr1 {:#x} vb0 {:#x} {:#x}",
-                 sc_enable & 1, sr.left, sr.top, sr.right, sr.bottom, m.Reg(kColorMask), m.Reg(kBlendEnable), rtc,
-                 depth ? 1 : 0, m.Reg(kVertexAttribFormat), m.Reg(kVertexAttribFormat + 1), m.Reg(kVertexArray),
-                 m.Addr(kVertexArray + 1));
+                 m.scissor_enable, sr.left, sr.top, sr.right, sr.bottom, m.color_mask[0], m.blend_enable[0], count,
+                 depth ? 1 : 0, m.attrib[0], m.attrib[1], m.streams[0].stride,
+                 m.streams[0].addr);
     }
     ComPtr<ID3D11Query> pick_query;
     if (picking) {
@@ -2448,13 +2398,13 @@ void D3D11Renderer::Draw() {
         if (samples || counting)
             LOG_INFO("Renderer", "{} draw vs {:016x} ps {:016x} rt0 {:#x} n {} blend {} zwrite {} samples {}",
                      counting ? "OCCL" : "PICK", vs->hash, ps ? ps->hash : 0, colors[0] ? colors[0]->gpu_va : 0,
-                     indices.size(), m.Reg(kBlendEnable), m.Reg(kDepthWriteEnable), samples);
+                     indices.size(), m.blend_enable[0], m.depth_write, samples);
     }
     draws_ok++;
     for (u32 i = 0; i < count; i++)
-        if (colors[i] && ((m.Reg(kColorMask + i) | m.Reg(kColorMask)) & 0x1111))
+        if (colors[i] && (m.color_mask[i] | m.color_mask[0]))
             colors[i]->write_serial = ++surface_writes_;
-    if (depth && ((m.Reg(kDepthWriteEnable) & 1) || (m.Reg(kStencilEnable) & 1)))
+    if (depth && (m.depth_write || m.stencil_test))
         depth->write_serial = ++surface_writes_;
 
     // Texture bindings stay in place: binding a surface as an output later unbinds it (and resets the cache).

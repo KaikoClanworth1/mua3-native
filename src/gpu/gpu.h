@@ -9,7 +9,7 @@
 #include <thread>
 
 #include "common/common.h"
-#include "gpu/maxwell3d.h"
+#include "gpu/draw_state.h"
 
 namespace core {
 class Memory;
@@ -56,9 +56,8 @@ public:
 
     core::Memory& Mem() { return mem_; }
     AddressSpace& As() { return as_; }
-    // The register-level draw state the renderer reads: the host NVN encoder's (gpu/nvn_encoder.cpp) while it runs.
-    Maxwell3D& M3D() { return *active_m3d_; }
-    void SetActiveM3D(Maxwell3D* m) { active_m3d_ = m ? m : &m3d_; }
+    // What the host NVN encoder (gpu/nvn_encoder.cpp) has set; the renderer draws from it. GPU thread.
+    DrawState& State() { return state_; }
 
     // Host-backed GPU memory at [kHostBase, kHostBase + kHostSize): constant buffers the native replay builds itself
     // (driver constants, texture handles). Reads and writes through the helpers below reach it like mapped memory.
@@ -124,8 +123,7 @@ private:
 
     core::Memory& mem_;
     AddressSpace as_;
-    Maxwell3D m3d_;
-    Maxwell3D* active_m3d_ = &m3d_;
+    DrawState state_;
     std::unique_ptr<u8[]> host_mem_{new u8[kHostSize]{}};
     Renderer* renderer_ = nullptr;
 
