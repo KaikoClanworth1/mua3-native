@@ -49,16 +49,55 @@ u32 FPRSqrtEstimate32(State& s, u32 a) {
 u64 FPRSqrtEstimate64(State& s, u64 a) {
     return WithFp(s, [&](auto c, auto& f) { return FP::FPRSqrtEstimate<u64>(a, c, f); });
 }
+// FRECPS / FRSQRTS (2 - a*b and (3 - a*b) / 2, fused): Newton steps the game runs in its inner loops. With both
+// operands normal and a normal result, the host's fused multiply-add (MXCSR carries the guest rounding mode) gives
+// the same single rounding, and halving a normal result is exact. Anything else (NaN, infinity, zero, subnormal,
+// overflow) takes the exact soft-float path. Like the other native FP ops, the fast path leaves FPSR alone.
+namespace {
+template <typename U>
+bool Normal(U x) {
+    constexpr int kMant = sizeof(U) == 4 ? 23 : 52;
+    constexpr U kExpMask = sizeof(U) == 4 ? U(0xFF) : U(0x7FF);
+    const U e = (x >> kMant) & kExpMask;
+    return e != 0 && e != kExpMask;
+}
+} // namespace
 u32 FPRecipStepFused32(State& s, u32 a, u32 b) {
+    if (Normal(a) && Normal(b)) {
+        const u32 r = std::bit_cast<u32>(_mm_cvtss_f32(
+            _mm_fnmadd_ss(_mm_set_ss(std::bit_cast<float>(a)), _mm_set_ss(std::bit_cast<float>(b)), _mm_set_ss(2.0f))));
+        if (Normal(r))
+            return r;
+    }
     return WithFp(s, [&](auto c, auto& f) { return FP::FPRecipStepFused<u32>(a, b, c, f); });
 }
 u64 FPRecipStepFused64(State& s, u64 a, u64 b) {
+    if (Normal(a) && Normal(b)) {
+        const u64 r = std::bit_cast<u64>(_mm_cvtsd_f64(
+            _mm_fnmadd_sd(_mm_set_sd(std::bit_cast<double>(a)), _mm_set_sd(std::bit_cast<double>(b)), _mm_set_sd(2.0))));
+        if (Normal(r))
+            return r;
+    }
     return WithFp(s, [&](auto c, auto& f) { return FP::FPRecipStepFused<u64>(a, b, c, f); });
 }
 u32 FPRSqrtStepFused32(State& s, u32 a, u32 b) {
+    if (Normal(a) && Normal(b)) {
+        const float t = _mm_cvtss_f32(
+            _mm_fnmadd_ss(_mm_set_ss(std::bit_cast<float>(a)), _mm_set_ss(std::bit_cast<float>(b)), _mm_set_ss(3.0f)));
+        const u32 r = std::bit_cast<u32>(t * 0.5f);
+        if (Normal(std::bit_cast<u32>(t)) && Normal(r))
+            return r;
+    }
     return WithFp(s, [&](auto c, auto& f) { return FP::FPRSqrtStepFused<u32>(a, b, c, f); });
 }
 u64 FPRSqrtStepFused64(State& s, u64 a, u64 b) {
+    if (Normal(a) && Normal(b)) {
+        const double t = _mm_cvtsd_f64(
+            _mm_fnmadd_sd(_mm_set_sd(std::bit_cast<double>(a)), _mm_set_sd(std::bit_cast<double>(b)), _mm_set_sd(3.0)));
+        const u64 r = std::bit_cast<u64>(t * 0.5);
+        if (Normal(std::bit_cast<u64>(t)) && Normal(r))
+            return r;
+    }
     return WithFp(s, [&](auto c, auto& f) { return FP::FPRSqrtStepFused<u64>(a, b, c, f); });
 }
 u32 FPRecipExponent32(State& s, u32 a) {

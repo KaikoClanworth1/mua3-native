@@ -1183,7 +1183,7 @@ void D3D11Renderer::Dispatch(const ComputeLaunch& l) {
     }
     static common::U64Map<int> logged;
     const int nth = logged[key]++;
-    const bool log = nth < 2 || nth % 600 == 0;
+    const bool log = nth < 2; // (every 600th as well wrote ~10 lines a second from this thread)
     if (log)
         LOG_INFO("Renderer", "dispatch {:#x} cs {:016x} grid {}x{}x{} block {}x{}x{} shared {:#x}", prog, cs->hash, grid[0], grid[1],
                  grid[2], opt.block[0], opt.block[1], opt.block[2], opt.shared_bytes);

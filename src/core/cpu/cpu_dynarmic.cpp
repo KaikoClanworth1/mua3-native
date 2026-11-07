@@ -347,6 +347,9 @@ public:
     u64 Cntpct() { return cb_.cntpct(); }
     MonitorT& Monitor() { return monitor_; }
     DynarmicFactory& Factory() { return factory_; }
+    // Indirect calls and chained returns: a small per-thread cache in front of the shared table (whose ~64 MB of
+    // slots miss the CPU caches on nearly every lookup). Flushed whenever the table changes.
+    recomp::Fn CachedLookup(u64 pc);
 
 private:
     DynarmicFactory& factory_;
@@ -354,6 +357,13 @@ private:
     MonitorT& monitor_;
     CpuCallbacks cb_;
     u64 tpidr_el0_ = 0, tpidrro_el0_ = 0;
+    struct LookupEntry {
+        u64 pc;
+        recomp::Fn fn;
+    };
+    static constexpr u32 kLookupCache = 4096;
+    std::unique_ptr<LookupEntry[]> lookup_cache_;
+    u32 lookup_epoch_ = ~0u;
     std::unique_ptr<JitT> jit_;   // created on first need (EnsureJit)
     std::atomic<JitT*> jit_ptr_{nullptr}; // the same, for halt requests from other threads
     bool in_jit_ = false;
@@ -486,6 +496,7 @@ public:
         if (NativeMap* m = map_.load(std::memory_order_relaxed))
             if (NativeSlot* e = Find(m, pc)) {
                 e->fn.store(fn, std::memory_order_release);
+                map_epoch_.fetch_add(1, std::memory_order_acq_rel);
                 return;
             }
         if (fn)
@@ -506,6 +517,7 @@ public:
             m->slots[i].fn.store(fn, std::memory_order_relaxed);
         }
         NativeMap* old = map_.exchange(m, std::memory_order_acq_rel);
+        map_epoch_.fetch_add(1, std::memory_order_acq_rel);
         // Readers only hold a table for the duration of one Lookup: free replaced ones once they are 10 s old.
         const auto now = std::chrono::steady_clock::now();
         if (old)
@@ -522,6 +534,9 @@ public:
         const NativeSlot* e = Find(m, pc);
         return e ? e->fn.load(std::memory_order_acquire) : nullptr;
     }
+    // Bumped after every change to the table: per-thread lookup caches flush when it moves.
+    std::atomic<u32> map_epoch_{0};
+    u32 MapEpoch() const { return map_epoch_.load(std::memory_order_acquire); }
     std::atomic<u64> transitions_{0};
     std::atomic<u32> jit_cores_{0}; // guest threads that ever needed the JIT (since boot)
     bool TableReady() const { return table_ready_.load(std::memory_order_acquire); }
@@ -542,6 +557,31 @@ public:
     }
     // nvnDeviceGetProcAddress results (see recomp::Dispatch)
     std::atomic<bool> capture_names_{true};
+    // The game never asks for all 519 names, so capture stayed on for good and every indirect call paid for a
+    // memory check and string test. Once no new name has come for 20 s, only calls to the lookup functions already
+    // identified are checked.
+    std::atomic<bool> capture_narrowed_{false};
+    std::atomic<u32> proc_pc_count_{0};
+    u64 proc_pcs_[4]{};
+    std::atomic<s64> last_name_ms_{0};
+    static s64 NowMs() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
+    bool CaptureCandidate(u64 pc) {
+        if (!capture_narrowed_.load(std::memory_order_relaxed)) {
+            thread_local u32 calls = 0;
+            if ((++calls & 0xFFFF) == 0 && proc_pc_count_.load(std::memory_order_acquire) &&
+                NowMs() - last_name_ms_.load(std::memory_order_relaxed) > 20000 && !capture_narrowed_.exchange(true))
+                LOG_INFO("NVN", "{} NVN names resolved; name capture narrowed to the lookup functions", names_seen_);
+            return true;
+        }
+        const u32 n = proc_pc_count_.load(std::memory_order_acquire);
+        for (u32 i = 0; i < n; i++)
+            if (proc_pcs_[i] == pc)
+                return true;
+        return false;
+    }
     std::set<u64> proc_addr_pcs_; // lookup functions (nvnDeviceGetProcAddress and friends), once identified
     size_t names_seen_ = 0;
     std::set<std::string> unique_names_;
@@ -565,6 +605,10 @@ public:
                 if (c.size() < 4)
                     return false;
                 proc_addr_pcs_.insert(getproc_pc);
+                if (const u32 n = proc_pc_count_.load(std::memory_order_relaxed); n < 4) {
+                    proc_pcs_[n] = getproc_pc;
+                    proc_pc_count_.store(n + 1, std::memory_order_release);
+                }
                 apply = std::move(c);
                 name_candidates_.erase(getproc_pc);
                 LOG_INFO("NVN", "NVN name lookup function at {:#x}", getproc_pc);
@@ -572,7 +616,8 @@ public:
                 apply.emplace_back(ptr, name);
             }
             for (const auto& a : apply)
-                unique_names_.insert(a.second);
+                if (unique_names_.insert(a.second).second)
+                    last_name_ms_.store(NowMs(), std::memory_order_relaxed);
             names_seen_ = unique_names_.size();
             if (names_seen_ >= 519 && capture_names_) { // the game resolves 519 names (some of them twice)
                 capture_names_ = false;
@@ -858,6 +903,22 @@ recomp::Fn DynarmicCore::NativeAt(u64 pc) const {
     return factory_.Lookup(pc);
 }
 
+recomp::Fn DynarmicCore::CachedLookup(u64 pc) {
+    const u32 epoch = factory_.MapEpoch();
+    if (epoch != lookup_epoch_) [[unlikely]] {
+        if (!lookup_cache_)
+            lookup_cache_.reset(new LookupEntry[kLookupCache]);
+        std::fill_n(lookup_cache_.get(), kLookupCache, LookupEntry{0, nullptr});
+        lookup_epoch_ = epoch;
+    }
+    LookupEntry& e = lookup_cache_[(pc * 0x9E3779B97F4A7C15ull) >> 52]; // 4096 entries
+    if (e.pc == pc)
+        return e.fn;
+    const recomp::Fn fn = factory_.Lookup(pc);
+    e = {pc, fn};
+    return fn;
+}
+
 void DynarmicCore::RunNativeChain(recomp::Fn fn) {
     auto& s = st_;
     const u64 pc = s.pc;
@@ -896,7 +957,7 @@ void DynarmicCore::RunNativeChain(recomp::Fn fn) {
             factory_.DisableNative(at);
             break;
         }
-        if (native_halt_ || !(fn = factory_.Lookup(s.pc)))
+        if (native_halt_ || !(fn = CachedLookup(s.pc)))
             break;
     }
     if (guest_mxcsr_ != host_mxcsr_)
@@ -1055,7 +1116,7 @@ void Dispatch(State& s) {
         f.Census(s.pc);
     // While the game resolves its NVN entry points, nvnDeviceGetProcAddress(device, "nvnFoo") calls arrive here:
     // remember which driver function each name maps to (host NVN implementations replace them).
-    if (f.capture_names_) [[unlikely]] {
+    if (f.capture_names_.load(std::memory_order_relaxed) && f.CaptureCandidate(s.pc)) [[unlikely]] {
         const u64 str = s.x[1];
         if (f.GuestValid(str, 64) && Rd<u8>(s, str) == 'n' &&
             Rd<u8>(s, str + 1) == 'v' && Rd<u8>(s, str + 2) == 'n') {
@@ -1072,7 +1133,7 @@ void Dispatch(State& s) {
             }
         }
     }
-    if (auto fn = f.Lookup(s.pc))
+    if (auto fn = CoreOf(s).CachedLookup(s.pc))
         fn(s);
 }
 } // namespace recomp

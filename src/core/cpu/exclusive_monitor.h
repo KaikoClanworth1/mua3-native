@@ -1,78 +1,63 @@
 #pragma once
-// Global exclusive monitor for recompiled LDXR/STXR (same semantics as dynarmic's, without its x64 spin lock, which
-// is generated at run time with Xbyak): each core holds at most one reservation (address + the value it read); a
-// store-exclusive succeeds if the core still holds a reservation on that address, and clears every core's
-// reservation on it. The store itself is a compare-and-swap against the value read, as on dynarmic's fastmem path.
+// Exclusive monitor for recompiled LDXR/STXR. Each core holds at most one reservation: the address and the value it
+// read. A store-exclusive succeeds if the core still holds a reservation on that address and memory still holds the
+// value it read: the store itself is a compare-and-swap against that value, as on dynarmic's fastmem path.
+//
+// There is no global lock and no clearing of other cores' reservations (dynarmic's monitor does both under a spin
+// lock, which every guest mutex paid for). Another core's successful store changes the value, so this core's
+// compare-and-swap fails as it would on ARM. The one difference: a store that writes back the very value it read,
+// or an A-B-A sequence between our load and store, does not fail ours.
 #include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
-#include <thread>
+#include <memory>
 #include <type_traits>
-#include <vector>
 
 namespace cpu {
 
 class NativeExclusiveMonitor {
 public:
     using Vector = std::array<std::uint64_t, 2>;
-    explicit NativeExclusiveMonitor(size_t processors)
-        : addresses_(processors, kInvalid), values_(processors) {}
+    explicit NativeExclusiveMonitor(size_t processors) : count_(processors), slots_(new Slot[processors]) {}
 
     template <typename T, typename Function>
     T ReadAndMark(size_t processor, std::uint64_t address, Function op) {
         static_assert(std::is_trivially_copyable_v<T>);
-        Lock();
-        addresses_[processor] = address;
+        Slot& s = slots_[processor];
+        s.address.store(address, std::memory_order_relaxed);
         const T value = op();
-        values_[processor] = {};
-        std::memcpy(values_[processor].data(), &value, sizeof(T));
-        Unlock();
+        s.value = {};
+        std::memcpy(s.value.data(), &value, sizeof(T));
         return value;
     }
 
     template <typename T, typename Function>
     bool DoExclusiveOperation(size_t processor, std::uint64_t address, Function op) {
         static_assert(std::is_trivially_copyable_v<T>);
-        Lock();
-        if (addresses_[processor] != address) {
-            Unlock();
+        Slot& s = slots_[processor];
+        if (s.address.load(std::memory_order_relaxed) != address)
             return false;
-        }
-        for (auto& a : addresses_)
-            if (a == address)
-                a = kInvalid;
+        s.address.store(kInvalid, std::memory_order_relaxed);
         T saved;
-        std::memcpy(&saved, values_[processor].data(), sizeof(T));
-        const bool result = op(saved);
-        Unlock();
-        return result;
+        std::memcpy(&saved, s.value.data(), sizeof(T));
+        return op(saved);
     }
 
-    void ClearProcessor(size_t processor) {
-        Lock();
-        addresses_[processor] = kInvalid;
-        Unlock();
-    }
+    void ClearProcessor(size_t processor) { slots_[processor].address.store(kInvalid, std::memory_order_relaxed); }
     void Clear() {
-        Lock();
-        for (auto& a : addresses_)
-            a = kInvalid;
-        Unlock();
+        for (size_t i = 0; i < count_; i++)
+            slots_[i].address.store(kInvalid, std::memory_order_relaxed);
     }
 
 private:
     static constexpr std::uint64_t kInvalid = 0xDEADDEADDEADDEADull;
-    void Lock() {
-        for (int spins = 0; lock_.exchange(true, std::memory_order_acquire); spins++)
-            if (spins > 64)
-                std::this_thread::yield();
-    }
-    void Unlock() { lock_.store(false, std::memory_order_release); }
-
-    std::atomic<bool> lock_{false};
-    std::vector<std::uint64_t> addresses_;
-    std::vector<Vector> values_;
+    struct alignas(64) Slot { // one cache line per core: cores never share a line
+        std::atomic<std::uint64_t> address{kInvalid};
+        Vector value{};
+    };
+    size_t count_;
+    std::unique_ptr<Slot[]> slots_;
 };
 
 } // namespace cpu
