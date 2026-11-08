@@ -3,6 +3,7 @@
 #include "gpu/shader/maxwell_isa.h"
 
 #include <chrono>
+#include <emmintrin.h>
 #include <unordered_set>
 #include <set>
 
@@ -683,12 +684,29 @@ void D3D11Renderer::FlushGpuBuf(GpuBuf& b) {
 D3D11Renderer::GpuBuf* D3D11Renderer::ComputeBuffer(u64 addr, u32 size) {
     GpuBuf* e = nullptr;
     for (auto& b : gbufs_)
-        if (b->addr == addr)
+        if (b->addr == addr && !b->retired)
             e = b.get();
-    // Another resident buffer overlapping this one: land its results and re-upload both from guest memory.
+    // A window inside a larger resident buffer is served by that buffer (the caller binds it with the buffer's own
+    // base and size, and the kernel's address lookup lands in the right place). Overlapping windows used to land each
+    // other's results on the CPU at every switch: tens of blocking copy-backs per frame in effect-heavy fights.
+    if (!e || size > e->size) {
+        GpuBuf* best = nullptr;
+        for (auto& b : gbufs_)
+            if (!b->retired && b->addr <= addr && addr + size <= b->addr + b->size && (!best || b->size > best->size))
+                best = b.get();
+        if (best) {
+            e = best;
+            addr = e->addr;
+            size = e->size;
+        }
+    }
+    // Another resident buffer overlapping this one: land its results and re-upload both from guest memory. One that
+    // lies entirely inside this range is retired: from now on its windows are served by this buffer.
     for (auto& b : gbufs_) {
-        if (b.get() == e || b->addr >= addr + size || addr >= b->addr + b->size)
+        if (b->retired || b.get() == e || b->addr >= addr + size || addr >= b->addr + b->size)
             continue;
+        if (addr <= b->addr && b->addr + b->size <= addr + size)
+            b->retired = true;
         static bool warned = false;
         if (!warned) {
             warned = true;
@@ -802,26 +820,48 @@ void D3D11Renderer::ApplyReadback(GpuBuf& b, const u8* now, u32 size, u32 serial
     CollectCpuWrites(b.cpu_ranges, b.cpu_pages);
     u8* old = b.snapshot.data();
     u32 lo = ~0u, hi = 0;
+    // Runs of changed 32-bit words are written back; words are compared four at a time (SSE2), and unchanged pages
+    // are skipped with one memcmp. (A memcmp call per word cost the GPU thread ~10% in fights.)
+    u32 run = ~0u;
+    auto flush = [&](u32 end) {
+        g.WriteGpu(b.addr + run, now + run, end - run);
+        std::memcpy(old + run, now + run, end - run);
+        lo = std::min(lo, run);
+        hi = std::max(hi, end);
+        run = ~0u;
+    };
+    auto word = [&](u32 off, bool same) {
+        if (!same) {
+            if (run == ~0u)
+                run = off;
+        } else if (run != ~0u) {
+            flush(off);
+        }
+    };
     for (u32 page = 0; page * 0x1000u < size; page++) {
         const u32 pbeg = page * 0x1000u, pend = std::min(size, pbeg + 0x1000u);
         if (page < b.page_serial.size() && b.page_serial[page] > serial)
             continue; // re-uploaded from guest memory after this copy was taken: guest data is newer
         if (std::memcmp(now + pbeg, old + pbeg, pend - pbeg) == 0)
             continue;
-        for (u32 off = pbeg; off < pend;) {
-            if (std::memcmp(now + off, old + off, 4) == 0) {
-                off += 4;
+        u32 off = pbeg;
+        for (; off + 16 <= pend; off += 16) {
+            const __m128i x = _mm_loadu_si128(reinterpret_cast<const __m128i*>(now + off));
+            const __m128i y = _mm_loadu_si128(reinterpret_cast<const __m128i*>(old + off));
+            const int eq = _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(x, y))); // bit i: word i unchanged
+            if (eq == 0xF && run == ~0u)
                 continue;
-            }
-            u32 end = off + 4;
-            while (end < pend && std::memcmp(now + end, old + end, 4) != 0)
-                end += 4;
-            g.WriteGpu(b.addr + off, now + off, end - off);
-            std::memcpy(old + off, now + off, end - off);
-            lo = std::min(lo, off);
-            hi = std::max(hi, end);
-            off = end;
+            for (int w = 0; w < 4; w++)
+                word(off + 4u * w, (eq >> w) & 1);
         }
+        for (; off + 4 <= pend; off += 4) {
+            u32 p, q;
+            std::memcpy(&p, now + off, 4);
+            std::memcpy(&q, old + off, 4);
+            word(off, p == q);
+        }
+        if (run != ~0u) // (runs end at page boundaries, as before)
+            flush(off);
     }
     if (lo < hi) {
         textures_->Invalidate(b.addr + lo, hi - lo);
@@ -873,7 +913,7 @@ void D3D11Renderer::SyncGuest(u64 gpu_va, u64 size, int site) {
 D3D11Renderer::GpuBuf* D3D11Renderer::ResidentBuffer(u64 addr, u64 size) {
     for (auto& bp : gbufs_) {
         GpuBuf& b = *bp;
-        if (!b.gpu_written || addr < b.addr || addr + size > b.addr + b.size)
+        if (b.retired || !b.gpu_written || addr < b.addr || addr + size > b.addr + b.size)
             continue;
         if (ComputeBuffer(b.addr, b.size) != &b) // picks up CPU writes; never reallocates (size fits)
             return nullptr;
@@ -940,7 +980,7 @@ ID3D11ShaderResourceView* D3D11Renderer::ComputeBufferSrv(u64 gpu_va, u64 size, 
         return nullptr;
     for (auto& bp : gbufs_) {
         GpuBuf& b = *bp;
-        if (!b.gpu_written || gpu_va < b.addr || gpu_va + size > b.addr + b.size)
+        if (b.retired || !b.gpu_written || gpu_va < b.addr || gpu_va + size > b.addr + b.size)
             continue;
         const u64 off = gpu_va - b.addr;
         if (off % bpb)
@@ -1238,10 +1278,10 @@ void D3D11Renderer::Dispatch(const ComputeLaunch& l) {
                 continue;
             uavs[i] = w->uav.Get();
             win[i] = w;
-            win_size[i] = size;
-            drv.gmem[i][0] = u32(a);
-            drv.gmem[i][1] = u32(a >> 32);
-            drv.gmem[i][2] = size;
+            win_size[i] = w->size; // (the buffer may be a larger one containing this window: its own range)
+            drv.gmem[i][0] = u32(w->addr);
+            drv.gmem[i][1] = u32(w->addr >> 32);
+            drv.gmem[i][2] = w->size;
             if (log)
                 LOG_INFO("Renderer", "  gmem window {}: {:#x} size {:#x}", i, a, size);
         }
@@ -1280,10 +1320,10 @@ void D3D11Renderer::Dispatch(const ComputeLaunch& l) {
         const u32 i = next_window++;
         uavs[i] = gw->uav.Get();
         win[i] = gw;
-        win_size[i] = u32(size);
-        drv.gmem[i][0] = u32(a);
-        drv.gmem[i][1] = u32(a >> 32);
-        drv.gmem[i][2] = u32(size);
+        win_size[i] = gw->size;
+        drv.gmem[i][0] = u32(gw->addr);
+        drv.gmem[i][1] = u32(gw->addr >> 32);
+        drv.gmem[i][2] = gw->size;
         drv.image[k][0] = u32(a);
         drv.image[k][1] = u32(a >> 32);
         drv.image[k][2] = w | (hgt << 16);

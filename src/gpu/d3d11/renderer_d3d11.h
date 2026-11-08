@@ -170,6 +170,7 @@ private:
         u32 serial = 0;             // bumped by every upload from guest memory
         std::vector<u32> page_serial; // per 4 KiB page: serial of its last upload
         bool stale = false;         // an overlapping buffer was written: re-upload everything
+        bool retired = false;       // lies inside a larger buffer that now serves its windows
         bool gpu_written = false;
         common::U64Map<ComPtr<ID3D11ShaderResourceView>> srvs; // typed views for texel buffers
         u64 last_use = 0;

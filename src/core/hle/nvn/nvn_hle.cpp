@@ -857,9 +857,18 @@ void CommandBufferEndRecording(State& s) {
     auto& slot = rec.handles[handle];
     auto& open = rec.open[cb];
     if (!open.empty() || !slot) {
-        std::vector<Command> list = ExactList(open.size());
-        std::move(open.begin(), open.end(), std::back_inserter(list));
-        slot = Publish(std::move(list));
+        if (open.capacity() <= open.size() * 2 + 256) {
+            // The recording buffer is not much larger than its contents: it becomes the list (moving ~5,000
+            // commands of ~280 bytes each cost the game's render thread ~6%), and the command buffer records into
+            // recycled storage next time.
+            const size_t next = std::max<size_t>(open.size(), 1024);
+            slot = Publish(std::move(open));
+            open = ExactList(next);
+        } else {
+            std::vector<Command> list = ExactList(open.size());
+            std::move(open.begin(), open.end(), std::back_inserter(list));
+            slot = Publish(std::move(list));
+        }
     }
     open.clear();
     Touch(rec, handle);

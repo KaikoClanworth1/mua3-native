@@ -97,6 +97,20 @@ u32 BucketCount(u32 n) {
 
 class VirtualRomfs {
 public:
+    // The image is saved next to the executable (romfs_index.bin) and reused while the RomFS folder's modification
+    // time is unchanged: scanning its 410 folders and 18,700 files took ~13 s of every launch on a hard disk. Each
+    // file's real size is checked at its first read; a mismatch deletes the saved index (rebuilt next launch).
+    static constexpr const char* kIndexFile = "romfs_index.bin";
+    bool Open(const fs::path& root) {
+        root_ = root;
+        if (Load(root))
+            return true;
+        if (!Build(root))
+            return false;
+        Save(root);
+        return true;
+    }
+
     bool Build(const fs::path& root) {
         root_ = root;
         struct Dir {
@@ -231,6 +245,95 @@ public:
 
     u64 Size() const { return size_; }
 
+    static std::string U8(const fs::path& p) {
+        const auto s = p.u8string();
+        return std::string(s.begin(), s.end());
+    }
+    static u64 RootStamp(const fs::path& root) {
+        WIN32_FILE_ATTRIBUTE_DATA a{};
+        if (!GetFileAttributesExW(root.c_str(), GetFileExInfoStandard, &a))
+            return 0;
+        return (u64(a.ftLastWriteTime.dwHighDateTime) << 32) | a.ftLastWriteTime.dwLowDateTime;
+    }
+    static constexpr u32 kIndexMagic = 0x58444652, kIndexVersion = 1; // 'RFDX'
+    void Save(const fs::path& root) const {
+        std::string out;
+        auto put = [&](const void* p, size_t n) { out.append(static_cast<const char*>(p), n); };
+        auto put64 = [&](u64 v) { put(&v, 8); };
+        const std::string rootu8 = U8(root);
+        const u32 hdr[2] = {kIndexMagic, kIndexVersion};
+        put(hdr, 8);
+        put64(RootStamp(root));
+        put64(rootu8.size());
+        put(rootu8.data(), rootu8.size());
+        put64(data_off_);
+        put64(size_);
+        put64(meta_.size());
+        put(meta_.data(), meta_.size());
+        put64(extents_.size());
+        for (const Extent& e : extents_) {
+            put64(e.off);
+            put64(e.size);
+            const std::string rel = U8(e.host.lexically_relative(root));
+            put64(rel.size());
+            put(rel.data(), rel.size());
+        }
+        const fs::path tmp = fs::path(kIndexFile).concat(".tmp");
+        {
+            std::ofstream f(tmp, std::ios::binary);
+            f.write(out.data(), std::streamsize(out.size()));
+            if (!f)
+                return;
+        }
+        std::error_code ec;
+        fs::rename(tmp, kIndexFile, ec);
+    }
+    bool Load(const fs::path& root) {
+        const auto data = common::ReadFile(kIndexFile);
+        size_t pos = 0;
+        auto get = [&](void* p, size_t n) {
+            if (pos + n > data.size())
+                return false;
+            std::memcpy(p, data.data() + pos, n);
+            pos += n;
+            return true;
+        };
+        u64 v = 0;
+        auto get64 = [&]() { return get(&v, 8) ? v : ~0ull; };
+        u32 hdr[2]{};
+        if (data.empty() || !get(hdr, 8) || hdr[0] != kIndexMagic || hdr[1] != kIndexVersion)
+            return false;
+        const u64 stamp = get64();
+        if (!stamp || stamp != RootStamp(root))
+            return false;
+        const u64 rl = get64();
+        if (rl > 4096 || pos + rl > data.size() || std::string(reinterpret_cast<const char*>(&data[pos]), rl) != U8(root))
+            return false;
+        pos += rl;
+        data_off_ = get64();
+        size_ = get64();
+        const u64 ms = get64();
+        if (ms > data.size() - pos)
+            return false;
+        meta_.assign(data.begin() + pos, data.begin() + pos + ms);
+        pos += ms;
+        const u64 n = get64();
+        if (n > data.size())
+            return false;
+        extents_.clear();
+        extents_.reserve(size_t(n));
+        for (u64 i = 0; i < n; i++) {
+            const u64 off = get64(), size = get64(), len = get64();
+            if (len > data.size() - pos)
+                return false;
+            const std::string rel(reinterpret_cast<const char*>(&data[pos]), len);
+            pos += len;
+            extents_.emplace_back(off, size, root / fs::u8path(rel));
+        }
+        LOG_INFO("fs", "Virtual RomFS: {} files from {} ({:.2f} GB)", extents_.size(), kIndexFile, double(size_) / (1 << 30));
+        return !extents_.empty();
+    }
+
     void Read(u64 off, u8* dst, size_t size) const {
         while (size) {
             if (off < data_off_) {
@@ -249,8 +352,18 @@ public:
             const Extent& e = *std::prev(it);
             if (rel == e.off && e.host.extension() == ".mp4")
                 video::OnMovieRead(e.host, 0);
-            if (!e.logged.exchange(true))
+            if (!e.logged.exchange(true)) {
                 LOG_INFO("romfs", "open {} ({} bytes)", e.host.lexically_relative(root_).generic_string(), e.size);
+                WIN32_FILE_ATTRIBUTE_DATA a{};
+                const bool found = GetFileAttributesExW(e.host.c_str(), GetFileExInfoStandard, &a) != 0;
+                const u64 real = (u64(a.nFileSizeHigh) << 32) | a.nFileSizeLow;
+                if (!found || real != e.size) { // the files changed under a saved index: rebuild it next launch
+                    LOG_ERROR("fs", "RomFS file {} is {} bytes, the index says {}: {} removed, restart the game",
+                              e.host.string(), found ? real : 0, e.size, kIndexFile);
+                    std::error_code ec;
+                    fs::remove(kIndexFile, ec);
+                }
+            }
             if (rel >= e.off + e.size) { // padding between files
                 const u64 next = it == extents_.end() ? rel + size : it->off;
                 const size_t n = size_t(std::min<u64>(size, next - rel));
@@ -281,7 +394,7 @@ private:
 std::shared_ptr<VirtualRomfs> GetRomfs() {
     static std::shared_ptr<VirtualRomfs> romfs = [] {
         auto r = std::make_shared<VirtualRomfs>();
-        if (!r->Build(core::Sys().Cfg().game_dir / "romfs"))
+        if (!r->Open(core::Sys().Cfg().game_dir / "romfs"))
             LOG_ERROR("fs", "RomFS folder is empty: {}", (core::Sys().Cfg().game_dir / "romfs").string());
         return r;
     }();

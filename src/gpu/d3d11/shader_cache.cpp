@@ -29,6 +29,7 @@ const char* StageTarget(shader::Stage st) {
 
 
 ShaderCache::ShaderCache(ID3D11Device* dev) : dev_(dev) {
+    LOG_INFO("Shader", "opening the shader cache");
     std::error_code ec;
     fs::create_directories(dump_dir_, ec);
     fs::create_directories(cache_dir_, ec);
@@ -317,6 +318,10 @@ void ShaderCache::OpenPack() {
     }
     size_t entries = 0, pos = 0;
     if (pack_) {
+        // One sequential read of the whole pack: walking its entry headers through page faults read a 200 MB pack
+        // from a hard disk in small pieces (24 s at launch, and the prewarm then faulted the bytecode in again).
+        WIN32_MEMORY_RANGE_ENTRY range{const_cast<u8*>(pack_), pack_size_};
+        PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
         u32 magic = 0, version = 0;
         std::memcpy(&magic, pack_, 4);
         std::memcpy(&version, pack_ + 4, 4);
