@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -46,6 +47,14 @@ struct HostShader {
     bool is_variant = false; // vertex shader re-declared for integer vertex attributes (info.hlsl is final)
     bool translated = false;
     bool no_cache = false; // built from a debug override: never read or write the bytecode cache
+    // First seen this launch: the worker writes the program to shader_dump and the pack (disk I/O stays off the GPU
+    // thread; the game data and logs share a hard disk).
+    bool persist = false;
+    // Integer variant: built by a worker from `base`'s HLSL (re-translating the base when only its bytecode was
+    // cached takes tens of milliseconds); `key` = ShaderCache::VariantKey fields; `record`: append to variants.txt.
+    HostShader* base = nullptr;
+    std::array<u32, 6> key{};
+    bool record = false;
 };
 
 // Translates and compiles shaders on background threads so the game never stalls on FXC.
@@ -119,6 +128,9 @@ private:
     bool HasFailed(u64 hash) const;
     void MarkFailed(u64 hash);
     void EnsureHlsl(HostShader& base);
+    void BuildVariantSource(HostShader& s); // worker: the variant's HLSL from its base's
+    void AppendLine(const fs::path& file, std::string line); // any thread: appended by a background writer
+    std::mutex hlsl_mutex_; // a base's HLSL (EnsureHlsl writes it; variants built on several workers copy it)
 
     ID3D11Device* dev_;
     common::U64Map<std::unique_ptr<HostShader>> shaders_;
@@ -150,7 +162,7 @@ private:
     bool stop_ = false;
 
     HostShader* Queue(shader::Stage stage, u64 hash, const u8* code, size_t size, const shader::TranslateOptions* opt,
-                      bool prewarm);
+                      bool prewarm, bool persist = false);
     std::vector<std::pair<u64, VariantKey>> prewarm_variants_; // waiting for their base shader
     std::chrono::steady_clock::time_point prewarm_start_;
     bool prewarm_reported_ = true;

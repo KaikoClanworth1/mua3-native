@@ -86,6 +86,27 @@ void ShaderCache::Worker(bool slow, bool urgent_only) {
 
 bool ShaderCache::Build(HostShader& s, bool slow) {
     const char* tag = StageTag(s.stage);
+    if (s.persist) { // first seen this launch (Get): keep the program for the next launch's prewarm
+        s.persist = false;
+        const std::span<const u8> code(s.code.data(), s.code.size());
+        common::WriteFile(dump_dir_ / fmt::format("{:016x}.{}.bin", s.hash, tag), code);
+        PackPut(PackKind(PackProgram + StageIndex(s.stage)), s.hash, code);
+        if (s.stage == shader::Stage::Compute) { // launch shape and constant buffer 1, so Prewarm rebuilds it exactly
+            std::vector<u8> o(16 + s.cbuf1.size());
+            const u32 shape[4] = {s.opt.block[0], s.opt.block[1], s.opt.block[2], s.opt.shared_bytes};
+            std::memcpy(o.data(), shape, 16);
+            if (!s.cbuf1.empty())
+                std::memcpy(o.data() + 16, s.cbuf1.data(), s.cbuf1.size());
+            common::WriteFile(dump_dir_ / fmt::format("{:016x}.cs.opt", s.hash), std::span(o.data(), o.size()));
+            PackPut(PackOpt, s.hash, std::span(o.data(), o.size()));
+        }
+    }
+    if (s.is_variant && !s.translated) {
+        const auto t0 = std::chrono::steady_clock::now();
+        BuildVariantSource(s);
+        s.translated = true;
+        translate_ns += u64((std::chrono::steady_clock::now() - t0).count());
+    }
     // Vertex and pixel shaders with cached bytecode: the renderer's view of them comes from the cache too.
     if (!s.is_variant && !s.translated && !s.no_cache && s.stage != shader::Stage::Compute &&
         HasBytecode(s) && LoadInfoFor(s, s.info)) {
@@ -414,10 +435,12 @@ void ShaderCache::MarkFailed(u64 hash) {
 }
 
 // A cached base shader skipped translation: its variants are rewritten from the HLSL, so translate it now.
-void ShaderCache::EnsureHlsl(HostShader& base) {
+void ShaderCache::EnsureHlsl(HostShader& base) { // (hlsl_mutex_ held)
     if (!base.info.hlsl.empty() || base.is_variant)
         return;
-    const auto code = common::ReadFile(dump_dir_ / fmt::format("{:016x}.{}.bin", base.hash, StageTag(base.stage)));
+    std::vector<u8> code;
+    if (!PackGet(PackKind(PackProgram + StageIndex(base.stage)), base.hash, code))
+        code = common::ReadFile(dump_dir_ / fmt::format("{:016x}.{}.bin", base.hash, StageTag(base.stage)));
     if (code.empty())
         return;
     shader::TranslateOptions opt = base.opt;
@@ -597,7 +620,7 @@ HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size, c
         hash ^= Hash64(shape, sizeof(shape)) * 0x9E3779B97F4A7C15ull;
     }
     if (ordered_.insert(hash).second) // first use this launch and never listed: the next Prewarm starts with it
-        std::ofstream(dump_dir_ / "order.txt", std::ios::app) << fmt::format("{:016x}\n", hash);
+        AppendLine(dump_dir_ / "order.txt", fmt::format("{:016x}\n", hash));
     auto it = shaders_.find(hash);
     if (it != shaders_.end()) {
         HostShader* found = it->second.get();
@@ -610,25 +633,15 @@ HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size, c
         }
         return found;
     }
-    common::WriteFile(dump_dir_ / fmt::format("{:016x}.{}.bin", hash, StageTag(stage)), std::span(code, size));
-    PackPut(PackKind(PackProgram + StageIndex(stage)), hash, std::span(code, size));
-    if (opt) { // compute launch shape and constant buffer 1, so Prewarm can rebuild the kernel exactly
-        std::vector<u8> o(16 + opt->cbuf1_size);
-        const u32 shape[4] = {opt->block[0], opt->block[1], opt->block[2], opt->shared_bytes};
-        std::memcpy(o.data(), shape, 16);
-        if (opt->cbuf1_size)
-            std::memcpy(o.data() + 16, opt->cbuf1, opt->cbuf1_size);
-        common::WriteFile(dump_dir_ / fmt::format("{:016x}.cs.opt", hash), std::span(o.data(), o.size()));
-        PackPut(PackOpt, hash, std::span(o.data(), o.size()));
-    }
     new_programs++;
-    return Queue(stage, hash, code, size, opt, false);
+    return Queue(stage, hash, code, size, opt, false, true); // (the worker writes it to the dump and the pack)
 }
 
 HostShader* ShaderCache::Queue(shader::Stage stage, u64 hash, const u8* code, size_t size,
-                               const shader::TranslateOptions* opt, bool prewarm) {
+                               const shader::TranslateOptions* opt, bool prewarm, bool persist) {
     auto s = std::make_unique<HostShader>();
     s->prewarm = prewarm;
+    s->persist = persist;
     s->stage = stage;
     s->hash = hash;
     s->code.assign(code, code + size);
@@ -673,23 +686,53 @@ HostShader* ShaderCache::GetVariant(HostShader* base, const VariantKey& v) {
     s->hash = key;
     s->is_variant = true;
     s->prewarm = replaying_; // replayed from variants.txt: part of the backlog until a draw asks for it
-    LOG_INFO("Shader", "variant {:016x} of {:016x} (tex uint {:#x} sint {:#x})", key, base->hash, v.tex_uint, v.tex_sint);
+    s->base = base;
+    s->key = {v.attr_uint, v.attr_sint, v.attr_scaled, v.attr_snorm10, v.tex_uint, v.tex_sint};
+    s->record = !replaying_; // newly seen (not replayed from the manifest): remember it for the next prewarm
     new_variants += !replaying_;
-    if (!replaying_) { // newly seen (not replayed from the manifest): remember it for the next prewarm
-        std::ofstream(dump_dir_ / "variants.txt", std::ios::app)
-            << fmt::format("{:016x} {:x} {:x} {:x} {:x} {:x} {:x}\n", base->hash, v.attr_uint, v.attr_sint,
-                           v.attr_scaled, v.attr_snorm10, v.tex_uint, v.tex_sint);
+    auto* raw = s.get();
+    shaders_[key] = std::move(s);
+    pending++;
+    {
+        std::lock_guard lk(mutex_);
+        if (replaying_)
+            queue_.push_back(raw);
+        else
+            queue_.push_front(raw);
     }
-    EnsureHlsl(*base);
-    s->info = base->info;
-    std::string& src = s->info.hlsl;
+    cv_.notify_all(); // all: urgent-only workers skip backlog items
+    return raw;
+}
+
+void ShaderCache::BuildVariantSource(HostShader& s) {
+    HostShader* base = s.base;
+    VariantKey v;
+    v.attr_uint = s.key[0], v.attr_sint = s.key[1], v.attr_scaled = s.key[2], v.attr_snorm10 = s.key[3];
+    v.tex_uint = s.key[4], v.tex_sint = s.key[5];
+    LOG_INFO("Shader", "variant {:016x} of {:016x} (tex uint {:#x} sint {:#x})", s.hash, base->hash, v.tex_uint, v.tex_sint);
+    if (s.record)
+        AppendLine(dump_dir_ / "variants.txt", fmt::format("{:016x} {:x} {:x} {:x} {:x} {:x} {:x}\n", base->hash, v.attr_uint,
+                                                           v.attr_sint, v.attr_scaled, v.attr_snorm10, v.tex_uint, v.tex_sint));
     // Debug overrides of the base shader apply to its variants too.
     const fs::path override_path = fs::path("shader_override") /
         fmt::format("{:016x}.{}.hlsl", base->hash, base->stage == shader::Stage::Vertex ? "vs" : "ps");
-    if (overrides_ && fs::exists(override_path)) {
+    const bool overridden = overrides_ && fs::exists(override_path);
+    {
+        std::lock_guard lk(hlsl_mutex_);
+        // Its bytecode is cached: Compile loads that, so only the base's resource layout is needed (re-translating
+        // a base that was itself loaded from the cache costs tens of milliseconds the draw would wait for).
+        if (!overridden && HasBytecode(s)) {
+            s.info = base->info;
+            return;
+        }
+        EnsureHlsl(*base);
+        s.info = base->info;
+    }
+    std::string& src = s.info.hlsl;
+    if (overridden) {
         const auto text = common::ReadFile(override_path);
         src.assign(text.begin(), text.end());
-        s->no_cache = true;
+        s.no_cache = true;
     }
     // Integer vertex attributes: integer inputs (the input assembler hands the integers through unchanged).
     const size_t vsin = src.find("struct VSIn {");
@@ -750,18 +793,36 @@ HostShader* ShaderCache::GetVariant(HostShader* base, const VariantKey& v) {
             at = q + 9;
         }
     }
-    auto* raw = s.get();
-    shaders_[key] = std::move(s);
-    pending++;
+}
+
+// Small appends (order.txt, variants.txt) from the GPU thread, written by a background thread.
+void ShaderCache::AppendLine(const fs::path& file, std::string line) {
+    struct Appender {
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::deque<std::pair<fs::path, std::string>> lines;
+        Appender() {
+            std::thread([this] {
+                SetThreadDescription(GetCurrentThread(), L"ShaderManifest");
+                for (;;) {
+                    std::pair<fs::path, std::string> one;
+                    {
+                        std::unique_lock lk(mutex);
+                        cv.wait(lk, [&] { return !lines.empty(); });
+                        one = std::move(lines.front());
+                        lines.pop_front();
+                    }
+                    std::ofstream(one.first, std::ios::app) << one.second;
+                }
+            }).detach();
+        }
+    };
+    static Appender a;
     {
-        std::lock_guard lk(mutex_);
-        if (replaying_)
-            queue_.push_back(raw);
-        else
-            queue_.push_front(raw);
+        std::lock_guard lk(a.mutex);
+        a.lines.emplace_back(file, std::move(line));
     }
-    cv_.notify_all(); // all: urgent-only workers skip backlog items
-    return raw;
+    a.cv.notify_one();
 }
 
 bool CompileShaderFile(const char* in_path, const char* out_path, const char* target) {

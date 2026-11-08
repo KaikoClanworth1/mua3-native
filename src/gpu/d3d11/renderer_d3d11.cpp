@@ -2484,6 +2484,7 @@ void D3D11Renderer::Draw() {
 // and integer variants seen for the first time, driver shader objects created, texture uploads, and (MUA3_PROFILE)
 // the draw sections. Little of that in a long frame means the time went elsewhere (guest code, NVN layer).
 static u64 g_hitch_prof[kProfCount];
+constexpr s64 kShaderWaitBudgetNs = 30'000'000;
 void D3D11Renderer::ReportHitch() {
     static auto last = std::chrono::steady_clock::now();
     static u64 uploads = 0, realize_ns = 0, realized = 0;
@@ -2499,7 +2500,7 @@ void D3D11Renderer::ReportHitch() {
                 prof += fmt::format(" {} {:.1f}", kProfNames[i], double(g_prof_ns[i] - g_hitch_prof[i]) / 1e6);
         LOG_WARN("Hitch", "frame {:.1f} ms: shader wait {:.1f} ms, new programs {} variants {}, driver shaders {} "
                           "({:.1f} ms), texture uploads {}, compiles pending {}{}{}",
-                 ms, double(150'000'000 - shader_wait_ns_) / 1e6, sc.new_programs - programs, sc.new_variants - variants,
+                 ms, double(kShaderWaitBudgetNs - shader_wait_ns_) / 1e6, sc.new_programs - programs, sc.new_variants - variants,
                  sc.realized - realized, double(sc.realize_ns - realize_ns) / 1e6, textures_->uploads - uploads,
                  sc.pending.load(), prof.empty() ? "" : " | ms:", prof);
     }
@@ -2518,7 +2519,9 @@ void D3D11Renderer::Present(const PresentInfo& p) {
     ReportHitch();
     common::g_last_present_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(),
                                     std::memory_order_relaxed);
-    shader_wait_ns_ = 150'000'000; // a cold cache stutters rather than showing holes
+    // Per frame, draws may wait this long for shaders the game just asked for: a bytecode cache hit makes it, a real
+    // compile (FXC, tens to hundreds of ms) leaves the draw out for a frame or two instead of freezing the game.
+    shader_wait_ns_ = kShaderWaitBudgetNs;
     if (g_profile && frame_counter_ % 150 == 0) {
         std::string line;
         for (int i = 0; i < kProfCount; i++)
