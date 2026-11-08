@@ -60,13 +60,14 @@ target_link_libraries(mua3 PRIVATE nxcore platform dbghelp)
 # copy does not lock the build's PDB).
 target_link_options(mua3 PRIVATE /INCREMENTAL:NO /PDBALTPATH:mua3.pdb)
 
-add_executable(MUA3Launcher WIN32 launcher/launcher.cpp)
+add_executable(MUA3Launcher WIN32 launcher/launcher.cpp launcher/game_builder.cpp)
 target_link_libraries(MUA3Launcher PRIVATE nxloader platform windowscodecs)
 
 # Executable icon: build/mua3.ico, made from your installed game's icon by scripts/make_icon.ps1 (game data, so it is
 # generated locally and never committed). Without it the executables keep the default icon.
+option(MUA3_GAME_ICON "Embed build/mua3.ico (made from your game) in the executables" ON)
 set(MUA3_ICON "${CMAKE_BINARY_DIR}/mua3.ico")
-if(EXISTS "${MUA3_ICON}")
+if(MUA3_GAME_ICON AND EXISTS "${MUA3_ICON}")
     file(WRITE "${CMAKE_BINARY_DIR}/mua3_icon.rc" "1 ICON \"${MUA3_ICON}\"\n")
     target_sources(mua3 PRIVATE "${CMAKE_BINARY_DIR}/mua3_icon.rc")
     target_sources(MUA3Launcher PRIVATE "${CMAKE_BINARY_DIR}/mua3_icon.rc")

@@ -24,9 +24,24 @@ distributed here.
 The story has been played through several chapters. Known issues: occasional missing or black UI/effect panels,
 the frame rate is limited by the render thread in large fights, a few shaders fail to translate.
 
-## Building
+## Playing (release download)
 
-Requirements: Windows 10/11 x64, Visual Studio 2022 or 2026 with "Desktop development with C++", CMake 3.24+,
+1. Download `MUA3Native-v…-win64.zip` from [Releases](https://github.com/KaikoClanworth1/mua3-native/releases) and
+   unzip it anywhere (about 25 GB free is needed for the game and the build).
+2. Run `MUA3Launcher.exe` → **Install**: choose your `prod.keys`, add the base game, the 4.0.1 update and any DLC
+   (`.nsp` / `.xci`), install.
+3. **Step 5, Build the game**: if asked, install Microsoft's free
+   [Build Tools for Visual Studio 2026](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio)
+   with "Desktop development with C++". Then press **Build the game**: the launcher unpacks the game's code from
+   your install, translates it to C++ and compiles your own `mua3.exe` (about an hour on 8 cores, ~5 GB).
+4. **Play**.
+
+The release contains only this project's code (the launcher, the recompiler and the port's libraries); the game is
+built from your copy on your PC.
+
+## Building from source
+
+Requirements: Windows 10/11 x64, Visual Studio 2026 with "Desktop development with C++", CMake 3.24+,
 Python 3, Git (with Git Bash), about 30 GB free for the build and 18 GB for the game data.
 
 ```bash
@@ -65,7 +80,7 @@ src/
   platform/  SDL3 window, D3D11 swap chain, input, XAudio2 / SDL audio
   launcher/  the ImGui launcher (installer, settings)
   tools/     recomp (AArch64 -> C++), nsodump, nxextract (CLI installer), threadprof, shadertool, ...
-scripts/     fetch-deps.sh, recomp_libbuild.py, bench.ps1, make_icon.ps1
+scripts/     fetch-deps.sh, recomp_libbuild.py, make_release.ps1 (the release package), bench.ps1, make_icon.ps1
 ```
 
 ## Legal

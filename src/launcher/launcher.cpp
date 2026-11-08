@@ -12,6 +12,7 @@
 #include <imgui.h>
 
 #include "core/config.h"
+#include "launcher/game_builder.h"
 #include "loader/installer.h"
 #include "platform/platform.h"
 
@@ -282,6 +283,12 @@ struct LauncherState {
     // install: what the user picked (pre-filled from the Isos folder and keys folder)
     std::vector<loader::DumpInfo> picked;
     fs::path keys_file;
+    // build: mua3.exe made from the install (game_builder)
+    builder::Progress build;
+    std::thread build_worker;
+    builder::Toolchain toolchain;
+    double toolchain_checked = -100;
+    int build_jobs = 0;
     // launcher.ini
     bool show_console = false;
     bool close_on_play = true;
@@ -404,7 +411,11 @@ std::pair<int, int> RenderSize(const core::Config& c) {
 void PlayTab(LauncherState& st) {
     ImGui::Spacing();
     if (!st.installed) {
-        ImGui::TextWrapped("The game data hasn't been installed yet. Go to the Install tab to decrypt your dumps.");
+        ImGui::TextWrapped("The game data hasn't been installed yet. Go to the Install tab to install your copy.");
+        return;
+    }
+    if (!fs::exists(builder::DefaultPaths(st.cfg.game_dir).out_exe)) {
+        ImGui::TextWrapped("The game hasn't been built yet. Go to the Install tab, step 5, to build it from your install.");
         return;
     }
     const auto& c = st.cfg;
@@ -452,6 +463,86 @@ void StepTitle(int n, const char* text, bool done) {
     ImGui::TextColored(done ? ImVec4(0.3f, 0.85f, 0.4f, 1) : ImVec4(0.95f, 0.75f, 0.3f, 1), done ? "  %d  " : "  %d  ", n);
     ImGui::SameLine();
     ImGui::TextUnformatted(text);
+}
+
+// Step 5: build mua3.exe from the installed game (game_builder): the C++ tools, then translate, compile and link.
+void BuildStep(LauncherState& st) {
+    const builder::Paths paths = builder::DefaultPaths(st.cfg.game_dir);
+    const bool building = st.build.running;
+    const bool built = builder::GameBuilt(paths);
+    StepTitle(5, built ? "Game built. Build again after updating this launcher." : "Build the game from your install", built);
+    ImGui::Indent(S(44));
+    if (!fs::exists(paths.sdk_dir)) {
+        ImGui::TextDisabled("This copy of the launcher has no sdk folder (a developer build): build mua3 with CMake.");
+        ImGui::Unindent(S(44));
+        return;
+    }
+    if (!building && ImGui::GetTime() - st.toolchain_checked > 10) { // vswhere is quick; refresh now and then
+        st.toolchain = builder::FindToolchain();
+        st.toolchain_checked = ImGui::GetTime();
+    }
+    if (st.build_jobs <= 0)
+        st.build_jobs = builder::DefaultJobs();
+    if (!st.toolchain.ok) {
+        ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.3f, 1), "%s", st.toolchain.problem.c_str());
+        ImGui::TextWrapped("The game is compiled on your PC with Microsoft's free C++ compiler. Install \"Build Tools for "
+                           "Visual Studio 2026\" with the \"Desktop development with C++\" workload, then come back here.");
+        if (ImGui::Button("Get the Build Tools", S(240, 34)))
+            ShellExecuteW(nullptr, L"open", L"https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio",
+                          nullptr, nullptr, SW_SHOWNORMAL);
+        ImGui::Unindent(S(44));
+        return;
+    }
+    ImGui::TextDisabled("Microsoft C++ %s found. The first build takes about an hour (8 cores) and needs ~5 GB.",
+                        st.toolchain.version.c_str());
+    if (building) {
+        const int done = st.build.done, total = st.build.total;
+        ImGui::Text("%s", st.build.GetStage().c_str());
+        if (total > 0)
+            ImGui::ProgressBar(float(done) / float(total), ImVec2(-S(20), 0), fmt::format("{} / {}", done, total).c_str());
+        else
+            ImGui::ProgressBar(-1.0f * float(ImGui::GetTime()), ImVec2(-S(20), 0), "working...");
+        if (ImGui::Button("Stop", S(120, 34)))
+            st.build.cancel = true;
+        ImGui::SameLine();
+        ImGui::TextDisabled("(finished parts are kept: building again carries on)");
+    } else {
+        ImGui::SetNextItemWidth(S(240));
+        ImGui::SliderInt("Compiler jobs", &st.build_jobs, 1, std::max(1, int(std::thread::hardware_concurrency())));
+        Help("How many parts compile at once. Each needs about 2.5 GB of memory. Fewer jobs leave the PC more usable "
+             "while it builds.");
+        ImGui::BeginDisabled(!st.installed);
+        if (ImGui::Button(built ? "Build again" : "Build the game", S(260, 44))) {
+            if (st.build_worker.joinable())
+                st.build_worker.join();
+            st.build.cancel = false;
+            {
+                std::lock_guard lk(st.build.mutex);
+                st.build.error.clear();
+                st.build.log.clear();
+            }
+            st.build.running = true;
+            const int jobs = st.build_jobs;
+            st.build_worker = std::thread([&st, paths, jobs] { builder::BuildGame(paths, jobs, st.build); });
+        }
+        ImGui::EndDisabled();
+        if (st.build.finished) {
+            const std::string err = st.build.GetError();
+            if (st.build.ok)
+                ImGui::TextColored(ImVec4(0.3f, 0.85f, 0.4f, 1), "%s Go to Play.", st.build.GetStage().c_str());
+            else if (!err.empty())
+                ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.3f, 1), "%s", err.c_str());
+        }
+    }
+    if (building || st.build.finished) {
+        ImGui::BeginChild("buildlog", ImVec2(0, S(110)), ImGuiChildFlags_Borders);
+        for (auto& line : st.build.Tail(30))
+            ImGui::TextUnformatted(line.c_str());
+        if (building)
+            ImGui::SetScrollHereY(1.0f);
+        ImGui::EndChild();
+    }
+    ImGui::Unindent(S(44));
 }
 
 void InstallTab(LauncherState& st) {
@@ -606,6 +697,7 @@ void InstallTab(LauncherState& st) {
             ImGui::TextWrapped("%s", st.install_result.c_str());
     }
     ImGui::Unindent(S(44));
+    BuildStep(st);
 }
 
 void DisplaySettings(LauncherState& st) {
@@ -903,6 +995,23 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     }
     LauncherState st;
     st.cfg.Load(kIni);
+    {
+        int argc = 0;
+        wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        bool build = false;
+        int jobs = builder::DefaultJobs();
+        for (int i = 1; i < argc; i++) {
+            if (std::wstring(argv[i]) == L"--build-game")
+                build = true;
+            else if (std::wstring(argv[i]) == L"--jobs" && i + 1 < argc)
+                jobs = std::max(1, _wtoi(argv[++i]));
+        }
+        LocalFree(argv);
+        if (build) { // unattended build (scripts, tests): progress in build_game/build.log
+            builder::Progress prog;
+            return builder::BuildGame(builder::DefaultPaths(st.cfg.game_dir), jobs, prog) ? 0 : 1;
+        }
+    }
     st.cfg.docked = true; // the PC build always runs as docked (1080p)
     st.LoadPrefs();
     st.Refresh();
@@ -999,6 +1108,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     st.progress.cancel = true;
     if (st.worker.joinable())
         st.worker.join();
+    st.build.cancel = true;
+    if (st.build_worker.joinable())
+        st.build_worker.join();
     display.Shutdown();
     return 0;
 }
