@@ -4,6 +4,7 @@
 
 #include <d3d11.h>
 #include <shellapi.h>
+#include <shobjidl.h>
 #include <wincodec.h>
 #include <windows.h>
 
@@ -143,6 +144,61 @@ void Help(const char* text) {
     }
 }
 
+HWND g_hwnd = nullptr; // the launcher window: owner of the file dialogs
+
+// Windows file dialogs, run on their own single-threaded COM apartment (the dialog needs one; the main thread's COM
+// is already set up for WIC). They block the launcher until closed, like any modal dialog.
+std::vector<fs::path> RunFileDialog(bool folder, bool multi, const wchar_t* title,
+                                    std::vector<std::pair<std::wstring, std::wstring>> filters, const fs::path& start) {
+    std::vector<fs::path> out;
+    std::thread([&] {
+        if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)))
+            return;
+        IFileOpenDialog* dlg = nullptr;
+        if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) {
+            DWORD opts = 0;
+            dlg->GetOptions(&opts);
+            opts |= FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | (folder ? FOS_PICKFOLDERS : FOS_FILEMUSTEXIST) |
+                    (multi ? FOS_ALLOWMULTISELECT : 0);
+            dlg->SetOptions(opts);
+            dlg->SetTitle(title);
+            std::vector<COMDLG_FILTERSPEC> spec;
+            for (auto& f : filters)
+                spec.push_back({f.first.c_str(), f.second.c_str()});
+            if (!spec.empty())
+                dlg->SetFileTypes(UINT(spec.size()), spec.data());
+            IShellItem* dir = nullptr;
+            std::error_code ec;
+            if (!start.empty() && fs::is_directory(start, ec) &&
+                SUCCEEDED(SHCreateItemFromParsingName(fs::absolute(start).wstring().c_str(), nullptr, IID_PPV_ARGS(&dir)))) {
+                dlg->SetFolder(dir);
+                dir->Release();
+            }
+            if (SUCCEEDED(dlg->Show(g_hwnd))) {
+                IShellItemArray* items = nullptr;
+                if (SUCCEEDED(dlg->GetResults(&items))) {
+                    DWORD n = 0;
+                    items->GetCount(&n);
+                    for (DWORD i = 0; i < n; i++) {
+                        IShellItem* it = nullptr;
+                        PWSTR path = nullptr;
+                        if (SUCCEEDED(items->GetItemAt(i, &it)) && SUCCEEDED(it->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+                            out.emplace_back(path);
+                            CoTaskMemFree(path);
+                        }
+                        if (it)
+                            it->Release();
+                    }
+                    items->Release();
+                }
+            }
+            dlg->Release();
+        }
+        CoUninitialize();
+    }).join();
+    return out;
+}
+
 void OpenFolder(const fs::path& p) {
     std::error_code ec;
     fs::create_directories(p, ec);
@@ -215,8 +271,7 @@ int RecommendedRate(float refresh) {
 
 struct LauncherState {
     core::Config cfg;
-    loader::DumpSummary dumps;
-    bool keys_ok = false, title_keys = false, installed = false;
+    bool installed = false;
     loader::InstallProgress progress;
     std::thread worker;
     std::atomic<bool> installing{false};
@@ -224,6 +279,9 @@ struct LauncherState {
     std::string status;
     Texture icon;
     std::vector<Monitor> monitors;
+    // install: what the user picked (pre-filled from the Isos folder and keys folder)
+    std::vector<loader::DumpInfo> picked;
+    fs::path keys_file;
     // launcher.ini
     bool show_console = false;
     bool close_on_play = true;
@@ -231,10 +289,33 @@ struct LauncherState {
     int muted_volume = -1; // volume to restore when unmuting
 
     void Refresh() {
-        dumps = loader::ScanDumps(cfg.isos_dir);
-        keys_ok = fs::exists(cfg.keys_dir / "prod.keys");
-        title_keys = fs::exists(cfg.keys_dir / "title.keys");
         installed = loader::IsInstalled(cfg.game_dir);
+    }
+    // First start of the Install tab: whatever is already in the Isos and keys folders.
+    void Prefill() {
+        if (keys_file.empty() && fs::exists(cfg.keys_dir / "prod.keys"))
+            keys_file = cfg.keys_dir / "prod.keys";
+        if (picked.empty()) {
+            std::error_code ec;
+            for (auto& e : fs::directory_iterator(cfg.isos_dir, ec))
+                AddDump(e.path());
+        }
+    }
+    void AddDump(const fs::path& path) {
+        auto ext = path.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        if (ext != ".nsp" && ext != ".xci")
+            return;
+        std::error_code ec;
+        for (auto& d : picked)
+            if (fs::equivalent(d.path, path, ec))
+                return;
+        picked.push_back(loader::ClassifyDump(path));
+        // base game first, then the update, then DLC (by file name)
+        std::stable_sort(picked.begin(), picked.end(), [](const loader::DumpInfo& a, const loader::DumpInfo& b) {
+            auto rank = [](const loader::DumpInfo& d) { return d.base ? 0 : d.update ? 1 : d.dlc ? 2 : 3; };
+            return rank(a) != rank(b) ? rank(a) < rank(b) : a.path.filename() < b.path.filename();
+        });
     }
     void LoadPrefs() {
         std::ifstream f(kLauncherIni);
@@ -357,39 +438,149 @@ void PlayTab(LauncherState& st) {
     }
 }
 
-void InstallTab(LauncherState& st) {
-    ImGui::Spacing();
-    bool changed = false;
-    changed |= PathInput("Dumps folder (NSP/XCI)", st.cfg.isos_dir);
-    changed |= PathInput("Keys folder", st.cfg.keys_dir);
-    changed |= PathInput("Install folder", st.cfg.game_dir);
-    if (changed)
-        st.Refresh();
-    ImGui::Spacing();
-    auto check = [](bool ok, const char* text) {
-        ImGui::TextColored(ok ? ImVec4(0.3f, 0.85f, 0.4f, 1) : ImVec4(0.95f, 0.35f, 0.3f, 1), ok ? "  OK  " : "  --  ");
-        ImGui::SameLine();
-        ImGui::TextUnformatted(text);
-    };
-    check(st.keys_ok, "prod.keys (from your own console, Lockpick_RCM)");
-    check(st.dumps.has_base, "Base game dump");
-    check(st.dumps.has_update, "Update (v4.0.1, the last one, recommended)");
-    check(st.dumps.dlc_count > 0, fmt::format("DLC ({} found)", st.dumps.dlc_count).c_str());
-    ImGui::BeginChild("dumps", ImVec2(0, S(110)), ImGuiChildFlags_Borders);
-    for (auto& l : st.dumps.lines)
-        ImGui::TextUnformatted(l.c_str());
-    ImGui::EndChild();
+std::string FreeSpace(const fs::path& p) {
+    std::error_code ec;
+    fs::path probe = fs::absolute(p, ec);
+    while (!probe.empty() && !fs::exists(probe, ec) && probe != probe.parent_path())
+        probe = probe.parent_path();
+    const auto sp = fs::space(probe, ec);
+    return ec ? std::string("?") : fmt::format("{:.1f} GB free", double(sp.available) / (1ull << 30));
+}
 
-    if (st.installing) {
+void StepTitle(int n, const char* text, bool done) {
+    ImGui::Spacing();
+    ImGui::TextColored(done ? ImVec4(0.3f, 0.85f, 0.4f, 1) : ImVec4(0.95f, 0.75f, 0.3f, 1), done ? "  %d  " : "  %d  ", n);
+    ImGui::SameLine();
+    ImGui::TextUnformatted(text);
+}
+
+void InstallTab(LauncherState& st) {
+    st.Prefill();
+    const bool busy = st.installing;
+    ImGui::BeginDisabled(busy);
+
+    // 1. keys
+    const bool keys_ok = !st.keys_file.empty() && fs::exists(st.keys_file);
+    StepTitle(1, "Your console keys (prod.keys)", keys_ok);
+    ImGui::Indent(S(44));
+    ImGui::TextDisabled("%s", keys_ok ? st.keys_file.string().c_str() : "Not chosen yet. Dump them from your own Switch with Lockpick_RCM.");
+    if (ImGui::Button("Choose prod.keys...", S(220, 34))) {
+        auto f = RunFileDialog(false, false, L"Choose your prod.keys", {{L"Switch keys (*.keys)", L"*.keys"}, {L"All files", L"*.*"}},
+                               st.keys_file.empty() ? st.cfg.keys_dir : st.keys_file.parent_path());
+        if (!f.empty())
+            st.keys_file = f[0];
+    }
+    ImGui::Unindent(S(44));
+
+    // 2. game files
+    bool has_base = false, has_update = false;
+    int dlc = 0, other = 0;
+    for (auto& d : st.picked) {
+        has_base |= d.base;
+        has_update |= d.update;
+        dlc += d.dlc;
+        other += !d.ours;
+    }
+    StepTitle(2, "Game files: the base game, the update and any DLC packs (.nsp / .xci)", has_base);
+    ImGui::Indent(S(44));
+    if (ImGui::Button("Add files...", S(160, 34))) {
+        auto files = RunFileDialog(false, true, L"Choose the base game, update and DLC files",
+                                   {{L"Switch games (*.nsp; *.xci)", L"*.nsp;*.xci"}, {L"All files", L"*.*"}},
+                                   st.picked.empty() ? st.cfg.isos_dir : st.picked.back().path.parent_path());
+        for (auto& f : files)
+            st.AddDump(f);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Add a folder...", S(160, 34))) {
+        auto dirs = RunFileDialog(true, false, L"Choose a folder with your game files", {}, st.cfg.isos_dir);
+        std::error_code ec;
+        if (!dirs.empty())
+            for (auto& e : fs::directory_iterator(dirs[0], ec))
+                st.AddDump(e.path());
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear", S(100, 34)))
+        st.picked.clear();
+    if (ImGui::BeginTable("dumps", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
+                          ImVec2(0, S(150)))) {
+        ImGui::TableSetupColumn("What", ImGuiTableColumnFlags_WidthFixed, S(150));
+        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, S(90));
+        ImGui::TableSetupColumn("File", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, S(40));
+        ImGui::TableHeadersRow();
+        int remove = -1;
+        for (int k = 0; k < int(st.picked.size()); k++) {
+            const auto& d = st.picked[k];
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            const ImVec4 col = !d.ours ? ImVec4(0.95f, 0.35f, 0.3f, 1) : d.kind == "unknown" ? ImVec4(0.95f, 0.75f, 0.3f, 1)
+                                                                                           : ImVec4(0.85f, 0.85f, 0.9f, 1);
+            ImGui::TextColored(col, "%s", d.kind.c_str());
+            ImGui::TableNextColumn();
+            if (d.size >= (100ull << 20))
+                ImGui::Text("%.2f GB", double(d.size) / (1ull << 30));
+            else
+                ImGui::Text("%.1f MB", double(d.size) / (1ull << 20));
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(d.path.filename().string().c_str());
+            ImGui::SetItemTooltip("%s", d.path.string().c_str());
+            ImGui::TableNextColumn();
+            ImGui::PushID(k);
+            if (ImGui::SmallButton(" x "))
+                remove = k;
+            ImGui::PopID();
+        }
+        if (remove >= 0)
+            st.picked.erase(st.picked.begin() + remove);
+        ImGui::EndTable();
+    }
+    auto check = [](bool ok, bool optional, const std::string& text) {
+        ImGui::TextColored(ok ? ImVec4(0.3f, 0.85f, 0.4f, 1) : optional ? ImVec4(0.6f, 0.6f, 0.65f, 1) : ImVec4(0.95f, 0.35f, 0.3f, 1),
+                           ok ? "OK" : optional ? "--" : "!!");
+        ImGui::SameLine();
+        ImGui::TextUnformatted(text.c_str());
+    };
+    check(has_base, false, "Base game");
+    ImGui::SameLine(S(260));
+    check(has_update, true, "Update (4.0.1 recommended)");
+    ImGui::SameLine(S(560));
+    check(dlc > 0, true, fmt::format("DLC packs: {}", dlc));
+    if (other)
+        ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.3f, 1), "%d file(s) are not Marvel Ultimate Alliance 3: remove them.", other);
+    ImGui::Unindent(S(44));
+
+    // 3. destination
+    const bool dest_ok = !st.cfg.game_dir.empty();
+    StepTitle(3, "Install folder", dest_ok);
+    ImGui::Indent(S(44));
+    ImGui::TextDisabled("%s   (%s, the game needs about 18 GB)", fs::absolute(st.cfg.game_dir).string().c_str(),
+                        FreeSpace(st.cfg.game_dir).c_str());
+    if (ImGui::Button("Choose folder...", S(200, 34))) {
+        auto dirs = RunFileDialog(true, false, L"Choose where to install the game data", {}, st.cfg.game_dir.parent_path());
+        if (!dirs.empty())
+            st.cfg.game_dir = dirs[0] / "game";
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(a \"game\" folder is made inside the one you choose)");
+    ImGui::Unindent(S(44));
+    ImGui::EndDisabled();
+
+    // 4. install
+    StepTitle(4, st.installed ? "Installed. Reinstall if you add an update or DLC later." : "Install", st.installed);
+    ImGui::Indent(S(44));
+    if (busy) {
         const u64 t = st.progress.bytes_total, d = st.progress.bytes_done;
         const float f = t ? float(double(d) / double(t)) : 0.0f;
         ImGui::Text("%s", st.progress.Stage().c_str());
-        ImGui::ProgressBar(f, ImVec2(-1, 0), fmt::format("{:.2f} / {:.2f} GB", d / 1073741824.0, t / 1073741824.0).c_str());
-        if (ImGui::Button("Cancel"))
+        ImGui::ProgressBar(f, ImVec2(-S(20), 0), fmt::format("{:.2f} / {:.2f} GB", d / 1073741824.0, t / 1073741824.0).c_str());
+        if (ImGui::Button("Cancel", S(120, 34)))
             st.progress.cancel = true;
     } else {
-        ImGui::BeginDisabled(!st.keys_ok || (!st.dumps.has_base && !st.dumps.has_update));
-        if (ImGui::Button(st.installed ? "Reinstall game data" : "Install game data", S(260, 40))) {
+        ImGui::BeginDisabled(!keys_ok || !has_base || other > 0 || !dest_ok);
+        if (ImGui::Button(st.installed ? "Reinstall game data" : "Install game data", S(260, 44))) {
+            if (st.keys_file.filename() == "prod.keys")
+                st.cfg.keys_dir = st.keys_file.parent_path();
+            st.cfg.isos_dir = st.picked.front().path.parent_path();
             st.cfg.Save(kIni);
             st.installing = true;
             st.install_result.clear();
@@ -398,11 +589,14 @@ void InstallTab(LauncherState& st) {
             st.progress.bytes_total = 0;
             if (st.worker.joinable())
                 st.worker.join();
-            st.worker = std::thread([&st] {
-                loader::InstallOptions o{st.cfg.isos_dir, st.cfg.keys_dir, st.cfg.game_dir, true};
+            loader::InstallOptions o{st.cfg.isos_dir, st.cfg.keys_dir, st.cfg.game_dir, true};
+            for (auto& d : st.picked)
+                o.files.push_back(d.path);
+            o.keys_file = st.keys_file;
+            st.worker = std::thread([&st, o] {
                 std::string err;
                 const bool ok = loader::InstallGame(o, st.progress, err);
-                st.install_result = ok ? "Install complete." : "Install failed: " + err;
+                st.install_result = ok ? "Install complete. Go to Play." : "Install failed: " + err;
                 st.installing = false;
                 st.Refresh();
             });
@@ -411,6 +605,7 @@ void InstallTab(LauncherState& st) {
         if (!st.install_result.empty())
             ImGui::TextWrapped("%s", st.install_result.c_str());
     }
+    ImGui::Unindent(S(44));
 }
 
 void DisplaySettings(LauncherState& st) {
@@ -725,6 +920,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     // Size everything for the monitor the window opened on (or the user's override), then grow the window to
     // match and keep it on screen.
     SDL_Window* win = display.Window();
+    g_hwnd = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(win), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
     const float content = SDL_GetDisplayContentScale(SDL_GetDisplayForWindow(win));
     g_ui = st.ui_scale_pct > 0 ? st.ui_scale_pct / 100.0f : (content > 0 ? content : 1.0f);
     g_ui = std::clamp(g_ui, 1.0f, 3.0f);
@@ -750,20 +946,22 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus);
         Header(st);
         if (ImGui::BeginTabBar("tabs")) {
-            if (ImGui::BeginTabItem("Play")) {
-                PlayTab(st);
-                ImGui::EndTabItem();
-            }
-            if (ImGui::BeginTabItem("Install")) {
-                InstallTab(st);
-                ImGui::EndTabItem();
-            }
             static const std::string want_tab = std::getenv("MUA3_LAUNCHER_TAB") ? std::getenv("MUA3_LAUNCHER_TAB") : "";
             static int tab_frames = 0;
             auto flag = [&](const char* name) {
                 return want_tab == name && tab_frames < 3 ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
             };
             tab_frames++;
+            if (ImGui::BeginTabItem("Play")) {
+                PlayTab(st);
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Install", nullptr, flag("Install"))) {
+                ImGui::BeginChild("install", ImVec2(0, -S(40)));
+                InstallTab(st);
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
             if (ImGui::BeginTabItem("Settings", nullptr, flag("Settings"))) {
                 ImGui::BeginChild("settings", ImVec2(0, -S(40)));
                 SettingsTab(st);

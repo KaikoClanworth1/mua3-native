@@ -118,52 +118,64 @@ u64 RomfsBytes(const StoragePtr& romfs) {
 
 } // namespace
 
+DumpInfo ClassifyDump(const fs::path& path) {
+    DumpInfo d;
+    d.path = path;
+    std::error_code ec;
+    d.size = fs::file_size(path, ec);
+    const std::string name = path.filename().string();
+    auto ext = path.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    std::string tid = TitleIdFromName(name);
+    if (ext == ".nsp") {
+        // Ticket names inside the (unencrypted) PFS0 start with the title id.
+        if (auto c = OpenContainer(path))
+            for (auto& f : c->entries)
+                if (EndsWith(f.name, ".tik") && f.name.size() >= 16) {
+                    tid = f.name.substr(0, 16);
+                } else if (EndsWith(f.name, ".cnmt.xml") && f.size < 0x10000) {
+                    auto xml = c->storage->ReadBytes(f.offset, size_t(f.size));
+                    const std::string x(xml.begin(), xml.end());
+                    const auto p = x.find("<Id>0x");
+                    if (p != std::string::npos && p + 22 <= x.size())
+                        tid = x.substr(p + 6, 16);
+                }
+    }
+    std::transform(tid.begin(), tid.end(), tid.begin(), ::toupper);
+    d.title_id = tid;
+    d.kind = "unknown";
+    if (tid.size() == 16) {
+        d.ours = tid.compare(0, 12, "010060700AC5") == 0;
+        const std::string low = tid.substr(12);
+        if (!d.ours)
+            d.kind = "other game";
+        else if (low == "0000")
+            d.kind = "base game", d.base = true;
+        else if (low == "0800")
+            d.kind = "update", d.update = true;
+        else
+            d.kind = "DLC", d.dlc = true;
+    }
+    if (ext == ".xci" && tid.empty())
+        d.kind = "cartridge (base game)", d.base = true;
+    return d;
+}
+
 DumpSummary ScanDumps(const fs::path& isos_dir) {
     DumpSummary s;
     std::error_code ec;
     for (auto& e : fs::directory_iterator(isos_dir, ec)) {
         if (!e.is_regular_file())
             continue;
-        const std::string name = e.path().filename().string();
         auto ext = e.path().extension().string();
         std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
         if (ext != ".nsp" && ext != ".xci")
             continue;
-        std::string tid = TitleIdFromName(name);
-        if (ext == ".nsp") {
-            // Ticket names inside the (unencrypted) PFS0 start with the title id.
-            if (auto c = OpenContainer(e.path()))
-                for (auto& f : c->entries)
-                    if (EndsWith(f.name, ".tik") && f.name.size() >= 16) {
-                        tid = f.name.substr(0, 16);
-                    } else if (EndsWith(f.name, ".cnmt.xml") && f.size < 0x10000) {
-                        auto xml = c->storage->ReadBytes(f.offset, size_t(f.size));
-                        const std::string x(xml.begin(), xml.end());
-                        const auto p = x.find("<Id>0x");
-                        if (p != std::string::npos && p + 22 <= x.size())
-                            tid = x.substr(p + 6, 16);
-                    }
-        }
-        std::transform(tid.begin(), tid.end(), tid.begin(), ::toupper);
-        std::string kind = "unknown";
-        if (tid.size() == 16) {
-            const std::string low = tid.substr(12);
-            if (low == "0000") {
-                kind = "base game";
-                s.has_base = true;
-            } else if (low == "0800") {
-                kind = "update";
-                s.has_update = true;
-            } else {
-                kind = "DLC";
-                s.dlc_count++;
-            }
-        }
-        if (ext == ".xci" && tid.empty()) {
-            kind = "cartridge (base game)";
-            s.has_base = true;
-        }
-        s.lines.push_back(fmt::format("{:<22} {:>9.2f} MB  {}", kind, double(e.file_size()) / (1 << 20), name));
+        const DumpInfo d = ClassifyDump(e.path());
+        s.has_base |= d.base;
+        s.has_update |= d.update;
+        s.dlc_count += d.dlc;
+        s.lines.push_back(fmt::format("{:<22} {:>9.2f} MB  {}", d.kind, double(d.size) / (1 << 20), e.path().filename().string()));
     }
     return s;
 }
@@ -175,20 +187,32 @@ bool IsInstalled(const fs::path& out) {
 bool InstallGame(const InstallOptions& opts, InstallProgress& prog, std::string& error) {
     crypto::KeySet keys;
     prog.SetStage("Loading keys");
-    if (!keys.LoadProdKeys(opts.keys_dir / "prod.keys")) {
-        error = "Could not read " + (opts.keys_dir / "prod.keys").string();
+    const fs::path prod = opts.keys_file.empty() ? opts.keys_dir / "prod.keys" : opts.keys_file;
+    if (!keys.LoadProdKeys(prod)) {
+        error = "Could not read " + prod.string();
         return false;
     }
-    keys.LoadTitleKeys(opts.keys_dir / "title.keys");
+    keys.LoadTitleKeys(prod.parent_path() / "title.keys");
 
     prog.SetStage("Scanning dumps");
     std::vector<Container> containers;
     std::error_code ec;
-    for (auto& e : fs::directory_iterator(opts.isos_dir, ec)) {
-        if (!e.is_regular_file())
-            continue;
-        if (auto c = OpenContainer(e.path()))
+    if (!opts.files.empty()) {
+        for (const fs::path& p : opts.files) {
+            auto c = OpenContainer(p);
+            if (!c) {
+                error = "Not a readable .nsp/.xci: " + p.string();
+                return false;
+            }
             containers.push_back(std::move(*c));
+        }
+    } else {
+        for (auto& e : fs::directory_iterator(opts.isos_dir, ec)) {
+            if (!e.is_regular_file())
+                continue;
+            if (auto c = OpenContainer(e.path()))
+                containers.push_back(std::move(*c));
+        }
     }
     if (containers.empty()) {
         error = "No .nsp/.xci files found in " + opts.isos_dir.string();

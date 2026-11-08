@@ -1,5 +1,5 @@
 // Command-line installer: decrypts the dumps in Isos/ into the game data folder.
-//   nxextract [isos_dir] [keys_dir] [output_dir] [--no-romfs] [--scan]
+//   nxextract [isos_dir] [keys_dir] [output_dir] [--no-romfs] [--scan] [--file <dump>]... [--keys-file <prod.keys>]
 #include <chrono>
 #include <thread>
 
@@ -20,6 +20,10 @@ int main(int argc, char** argv) {
             scan_only = true;
         else if (a == "--debug")
             common::SetLogLevel(common::LogLevel::Debug);
+        else if (a == "--file" && i + 1 < argc) // install exactly these dumps (repeat it) instead of isos_dir
+            o.files.push_back(fs::u8path(argv[++i]));
+        else if (a == "--keys-file" && i + 1 < argc)
+            o.keys_file = fs::u8path(argv[++i]);
         else if (pos == 0)
             o.isos_dir = fs::u8path(a), pos++;
         else if (pos == 1)
@@ -28,9 +32,16 @@ int main(int argc, char** argv) {
             o.output_dir = fs::u8path(a), pos++;
     }
 
-    auto summary = loader::ScanDumps(o.isos_dir);
-    for (auto& l : summary.lines)
-        fmt::print("  {}\n", l);
+    if (o.files.empty()) {
+        auto summary = loader::ScanDumps(o.isos_dir);
+        for (auto& l : summary.lines)
+            fmt::print("  {}\n", l);
+    } else {
+        for (auto& f : o.files) {
+            const auto d = loader::ClassifyDump(f);
+            fmt::print("  {:<22} {:>9.2f} MB  {}\n", d.kind, double(d.size) / (1 << 20), f.filename().string());
+        }
+    }
     if (scan_only)
         return 0;
 
