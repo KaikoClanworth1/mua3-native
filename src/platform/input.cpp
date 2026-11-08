@@ -1,6 +1,9 @@
 #include <windows.h>
 #include <Xinput.h>
 
+#include <algorithm>
+#include <cmath>
+
 #include <SDL3/SDL.h>
 
 #include "core/hle/hid.h"
@@ -14,10 +17,18 @@ using namespace hle::hid;
 
 namespace {
 
-s32 Axis(int v, int deadzone) {
-    if (std::abs(v) < deadzone)
-        return 0;
-    return std::clamp(v, -32767, 32767);
+// A stick with a radial deadzone, rescaled so the travel past the deadzone covers the whole range. (Clipping each
+// axis at the deadzone made the game see ~27% deflection the moment a stick left it: the camera started fast, with
+// no fine control.) `scale` = sensitivity (camera_speed / 100).
+void Stick(int x, int y, int deadzone, double scale, s32& ox, s32& oy) {
+    const double m = std::sqrt(double(x) * x + double(y) * y);
+    if (m <= deadzone) {
+        ox = oy = 0;
+        return;
+    }
+    const double mag = std::min(1.0, (m - deadzone) / (32767.0 - deadzone)) * scale;
+    ox = s32(std::clamp(x / m * mag * 32767.0, -32767.0, 32767.0));
+    oy = s32(std::clamp(y / m * mag * 32767.0, -32767.0, 32767.0));
 }
 
 void AddStickDirections(PadInput& p) {
@@ -60,8 +71,9 @@ void ReadKeyboard(PadInput& p) {
 
 } // namespace
 
-bool Input::Init(core::InputBackend backend) {
+bool Input::Init(core::InputBackend backend, int camera_speed) {
     backend_ = backend;
+    camera_speed_ = camera_speed;
     LOG_INFO("Input", "Input backend: {}", backend == core::InputBackend::XInput ? "XInput" : "SDL");
     return true;
 }
@@ -91,10 +103,8 @@ void Input::Update(bool focused) {
                     p.buttons |= m.b;
             if (g.bLeftTrigger > 64) p.buttons |= ZL;
             if (g.bRightTrigger > 64) p.buttons |= ZR;
-            p.lx = Axis(g.sThumbLX, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE);
-            p.ly = Axis(g.sThumbLY, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE);
-            p.rx = Axis(g.sThumbRX, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE);
-            p.ry = Axis(g.sThumbRY, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE);
+            Stick(g.sThumbLX, g.sThumbLY, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE, 1.0, p.lx, p.ly);
+            Stick(g.sThumbRX, g.sThumbRY, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE, camera_speed_ / 100.0, p.rx, p.ry);
             device_name_ = fmt::format("XInput controller {}", i + 1);
             break;
         }
@@ -133,10 +143,10 @@ void Input::Update(bool focused) {
                     p.buttons |= m.b;
             if (SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 8000) p.buttons |= ZL;
             if (SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 8000) p.buttons |= ZR;
-            p.lx = Axis(SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_LEFTX), 7000);
-            p.ly = -Axis(SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_LEFTY), 7000);
-            p.rx = Axis(SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_RIGHTX), 7000);
-            p.ry = -Axis(SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_RIGHTY), 7000);
+            Stick(SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_LEFTX), -SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_LEFTY), 7000,
+                  1.0, p.lx, p.ly);
+            Stick(SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_RIGHTX), -SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_RIGHTY), 7000,
+                  camera_speed_ / 100.0, p.rx, p.ry);
         }
     }
     if (focused)

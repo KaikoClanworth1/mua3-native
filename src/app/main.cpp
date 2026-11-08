@@ -156,7 +156,7 @@ u64 ParseButtons(const std::string& btns);
 
 // Test aid: external control channel. Each line of mua3_cmd.txt is executed then the file is deleted:
 //   press <BUTTON>[+BUTTON...] [hold_ms]     tap buttons on player 1
-//   stick <lx> <ly> [hold_ms]                tilt player 1's left stick
+//   stick <lx> <ly> [hold_ms]                tilt player 1's left stick (rstick: the right stick)
 //   shot <path.bmp>                          save the next presented game frame
 void PollCommandFile(platform::Input* input) {
     static auto last = std::chrono::steady_clock::now();
@@ -188,14 +188,14 @@ void PollCommandFile(platform::Input* input) {
                 hle::hid::SetPad(0, hle::hid::PadInput{true});
                 std::this_thread::sleep_for(std::chrono::milliseconds(250));
                 g_script_active = false;
-            } else if (cmd == "stick") { // stick <lx> <ly> [hold_ms]: tilt the left stick (-32767..32767, +y up)
+            } else if (cmd == "stick" || cmd == "rstick") { // [r]stick <x> <y> [hold_ms]: tilt the left (right) stick
                 int lx = 0, ly = 0, ms = 1000;
                 std::string c;
                 std::istringstream(line) >> c >> lx >> ly >> ms;
                 g_script_active = true;
                 hle::hid::PadInput in{true};
-                in.lx = lx;
-                in.ly = ly;
+                (cmd == "stick" ? in.lx : in.rx) = lx;
+                (cmd == "stick" ? in.ly : in.ry) = ly;
                 hle::hid::SetPad(0, in);
                 std::this_thread::sleep_for(std::chrono::milliseconds(ms));
                 hle::hid::SetPad(0, hle::hid::PadInput{true});
@@ -578,7 +578,7 @@ int main(int argc, char** argv) {
         io.Fonts->AddFontDefault(&fc);
     }
     platform::Input input;
-    input.Init(cfg.input);
+    input.Init(cfg.input, cfg.camera_speed);
     platform::Audio().Init(cfg.audio, cfg.volume);
     hle::SetAudioOutput([](const s16* pcm, size_t frames) { platform::Audio().Push(pcm, frames); },
                         [] { return platform::Audio().Queued(); });

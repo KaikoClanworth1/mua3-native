@@ -333,7 +333,8 @@ public:
             return it->second.Get();
         ComPtr<Obj> o;
         create(&d, &o);
-        map[k] = o;
+        if (o) // (a failed creation is retried next time rather than remembered)
+            map[k] = o;
         return o.Get();
     }
     common::U64Map<ComPtr<ID3D11BlendState>> blend;
@@ -2557,6 +2558,21 @@ void D3D11Renderer::Present(const PresentInfo& p) {
     frame_counter_++;
     shaders_->Tick();
     ReportHitch();
+    // D3D11 allows 4,096 live state objects of each kind and gets very slow near that limit: draws whose depth bias
+    // changes every frame make a new rasterizer state each time (a 3 s freeze and then failed creations, in an
+    // ultimate move). Past 1,024 the caches start over; objects still bound stay alive in the context until replaced.
+    if (g_dc && (g_dc->blend.size() > 1024 || g_dc->depth.size() > 1024 || g_dc->raster.size() > 1024)) {
+        LOG_INFO("Renderer", "state object caches flushed ({} blend, {} depth-stencil, {} rasterizer)", g_dc->blend.size(),
+                 g_dc->depth.size(), g_dc->raster.size());
+        g_dc->blend.clear();
+        g_dc->depth.clear();
+        g_dc->raster.clear();
+        g_seen.blend = g_seen.depth = g_seen.raster = ~0u; // recomputed (and recreated) at the next draw
+        g_seen.blend_obj = nullptr;
+        g_seen.depth_obj = nullptr;
+        g_seen.raster_obj = nullptr;
+        InvalidatePipe();
+    }
     common::g_last_present_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(),
                                     std::memory_order_relaxed);
     // Per frame, draws may wait this long for shaders the game just asked for: a bytecode cache hit makes it, a real

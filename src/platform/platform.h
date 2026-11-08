@@ -68,12 +68,13 @@ private:
 // Polls the selected backend and feeds HID.
 class Input {
 public:
-    bool Init(core::InputBackend backend);
+    bool Init(core::InputBackend backend, int camera_speed = 100);
     void Update(bool window_focused);
     std::string DeviceName() const { return device_name_; }
 
 private:
     core::InputBackend backend_{};
+    int camera_speed_ = 100;
     std::string device_name_ = "Keyboard";
     struct SDL_Gamepad* pad_ = nullptr;
 };

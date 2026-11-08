@@ -28,6 +28,7 @@ struct Config {
     AudioBackend audio = AudioBackend::XAudio2;
     int volume = 100;
     InputBackend input = InputBackend::XInput;
+    int camera_speed = 100; // right stick (camera) sensitivity in percent
     bool docked = true;
     int language = 1; // 1 = American English
     int log_level = 2; // 0 trace .. 4 error

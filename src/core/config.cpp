@@ -58,6 +58,8 @@ bool Config::Load(const fs::path& ini) {
     int a = int(audio), in = int(input);
     get_i("audio_backend", a);
     get_i("input_backend", in);
+    get_i("camera_speed", camera_speed);
+    camera_speed = std::clamp(camera_speed, 10, 200);
     audio = AudioBackend(std::clamp(a, 0, 2));
     input = InputBackend(std::clamp(in, 0, 1));
     get_i("volume", volume);
@@ -81,7 +83,7 @@ bool Config::Save(const fs::path& ini) const {
       << "\nborderless=" << borderless << "\nvsync=" << vsync << "\nresolution_scale=" << resolution_scale
       << "\nfps_limit=" << fps_limit << "\nfps_target=" << fps_target << "\nswap_interval=" << swap_interval << "\nshow_fps=" << show_fps << "\nshow_debug_overlay=" << show_debug_overlay
       << "\n[audio]\naudio_backend=" << int(audio) << "\nvolume=" << volume << "\n[input]\ninput_backend="
-      << int(input) << "\n[system]\ndocked=" << docked << "\nlanguage=" << language << "\nlog_level=" << log_level
+      << int(input) << "\ncamera_speed=" << camera_speed << "\n[system]\ndocked=" << docked << "\nlanguage=" << language << "\nlog_level=" << log_level
       << "\n";
     return bool(f);
 }
