@@ -733,17 +733,42 @@ struct Emitter {
     BlockShape sh;
     bool is_call = false;
     std::set<u64>* called = nullptr; // generated functions this shard calls directly (for its declarations)
-    // Block-local register promotion: the guest registers, SP and NZCV a block touches live in locals (MSVC
-    // cannot keep s.x[] in host registers across the volatile memory accesses); they are loaded at the block's
-    // start and written back before anything that observes the State (calls, SVCs, returns, jumps).
+    // Function-wide register promotion: the guest registers, SP, NZCV and the instruction count a function touches
+    // live in locals for the whole function (MSVC cannot keep s.x[] in host registers: guest stores may alias the
+    // State). They are loaded once on entry, stay in locals across the function's own gotos, and are written back
+    // (@FLUSH@) before anything that leaves the function or lets other code see the State (calls, Dispatch, SVCs,
+    // returns), then reloaded (@RELOAD@ after SVCs, @RELOADC@ after guest calls) where control returns into the
+    // function. The placeholders are expanded once the whole function is emitted (Expand): a write-back stores only
+    // the locals that may have changed since the last sync, a call reload skips the callee-saved registers.
     std::set<int> used_regs, dirty_regs;
     bool sp_used = false, sp_dirty = false, nz_used = false, nz_dirty = false;
+    // Write-back is limited to what may differ from the State: a forward dataflow over the function's own gotos
+    // tracks, per block, the locals possibly written since the last sync (entry, resume point or reload). Masks:
+    // bit r = x_r (0..30), kSpBit = x_sp, kNzBit = nzcv. Every write-back site and goto edge records the writes since
+    // the block start (or since a reload inside the block); the masks are resolved once the function is emitted.
+    static constexpr int kSpBit = 31, kNzBit = 32;
+    struct SyncPoint {
+        u64 block;
+        u64 writes;
+        bool synced; // a reload happened earlier in the block: the block's incoming dirt does not reach here
+    };
+    std::vector<SyncPoint> flush_sites;               // "@F<n>@"
+    std::vector<std::pair<SyncPoint, u64>> edges;     // goto edges: (from, target)
+    u64 cw = 0;                                       // writes since block start / last reload in this block
+    bool csynced = false;
+    std::unordered_map<u64, u64> dirty_in;            // resolved: may-be-unsynced locals at block entry
+    void BeginBlock(u64 pc) {
+        cur = pc;
+        cw = 0;
+        csynced = false;
+    }
     std::string R(int r) {
         used_regs.insert(r);
         return "x_" + std::to_string(r);
     }
     std::string RW(int r) {
         dirty_regs.insert(r);
+        cw |= 1ull << r;
         return R(r);
     }
     std::string SpR() {
@@ -752,6 +777,7 @@ struct Emitter {
     }
     std::string SpW() {
         sp_dirty = true;
+        cw |= 1ull << kSpBit;
         return SpR();
     }
     std::string NzR() {
@@ -760,29 +786,95 @@ struct Emitter {
     }
     std::string NzW() {
         nz_dirty = true;
+        cw |= 1ull << kNzBit;
         return NzR();
     }
-    std::string FlushText(const std::string& pad) const {
+    // A write-back site of the current block at this point.
+    std::string FlushMark() {
+        flush_sites.push_back({cur, cw, csynced});
+        return "@F" + std::to_string(flush_sites.size() - 1) + "@";
+    }
+    std::string FlushText(const std::string&) { return FlushMark(); }
+    void Flush(const std::string& pad) { o << pad << FlushMark() << "\n"; }
+    void Edge(u64 target) { edges.push_back({{cur, cw, csynced}, target}); }
+    // A call returned into the function and reloaded: nothing is dirty on the way to the return block.
+    void EdgeAfterReload(u64 target) { edges.push_back({{cur, 0, true}, target}); }
+    void Resolve() {
+        dirty_in.clear();
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (const auto& [sp, to] : edges) {
+                u64 m = sp.writes | (sp.synced ? 0 : dirty_in[sp.block]);
+                u64& d = dirty_in[to];
+                if ((d | m) != d) {
+                    d |= m;
+                    changed = true;
+                }
+            }
+        }
+    }
+    std::string ExpandFlush(u64 mask) const {
         std::string t;
         for (int r : dirty_regs)
-            t += pad + "s.x[" + std::to_string(r) + "] = x_" + std::to_string(r) + ";\n";
-        if (sp_dirty)
-            t += pad + "s.sp = x_sp;\n";
-        if (nz_dirty)
-            t += pad + "s.nzcv = nzcv;\n";
-        return t;
+            if (mask >> r & 1)
+                t += "s.x[" + std::to_string(r) + "] = x_" + std::to_string(r) + "; ";
+        if (sp_dirty && (mask >> kSpBit & 1))
+            t += "s.sp = x_sp; ";
+        if (nz_dirty && (mask >> kNzBit & 1))
+            t += "s.nzcv = nzcv; ";
+        return t + "s.icount = ic;";
     }
-    std::string LoadText(bool declare) const {
+    // after_call would skip x19-x29 and SP (AAPCS64 callee-saved), but a BL target is not always an ABI function
+    // (machine-outlined code may write them), so calls reload everything too until callees are summarised.
+    static constexpr bool kTrustCalleeSaved = false;
+    std::string ExpandLoad(bool declare, bool after_call = false) const {
+        after_call = after_call && kTrustCalleeSaved;
         std::string t;
         for (int r : used_regs)
-            t += (declare ? "  u64 x_" : "  x_") + std::to_string(r) + " = s.x[" + std::to_string(r) + "];\n";
-        if (sp_used)
-            t += std::string(declare ? "  u64 x_sp" : "  x_sp") + " = s.sp;\n";
+            if (!after_call || r < 19 || r > 29)
+                t += (declare ? "u64 x_" : "x_") + std::to_string(r) + " = s.x[" + std::to_string(r) + "]; ";
+        if (sp_used && !after_call)
+            t += std::string(declare ? "u64 x_sp" : "x_sp") + " = s.sp; ";
         if (nz_used)
-            t += std::string(declare ? "  u32 nzcv" : "  nzcv") + " = s.nzcv;\n";
-        return t;
+            t += std::string(declare ? "u32 nzcv" : "nzcv") + " = s.nzcv; ";
+        return t + (declare ? "u64 ic = s.icount;" : "ic = s.icount;");
     }
-    void Flush(const std::string& pad) { o << FlushText(pad); }
+    // The function's declarations and entry loads, and its body with the placeholders expanded.
+    std::string Declarations() const { return "  " + ExpandLoad(true) + "\n"; }
+    std::string Expand(std::string body) {
+        Resolve();
+        const std::string reload = ExpandLoad(false), reload_call = ExpandLoad(false, true);
+        std::string outp;
+        outp.reserve(body.size() + body.size() / 4);
+        size_t at = 0;
+        for (;;) {
+            const size_t p = body.find('@', at);
+            if (p == std::string::npos)
+                break;
+            outp.append(body, at, p - at);
+            if (body.compare(p, 2, "@F") == 0 && p + 2 < body.size() && std::isdigit(u8(body[p + 2]))) {
+                size_t q = p + 2;
+                size_t n = 0;
+                while (std::isdigit(u8(body[q])))
+                    n = n * 10 + size_t(body[q++] - '0');
+                const SyncPoint& sp = flush_sites.at(n);
+                auto it = dirty_in.find(sp.block);
+                outp += ExpandFlush(sp.writes | (sp.synced || it == dirty_in.end() ? 0 : it->second));
+                at = q + 1; // closing '@'
+            } else if (body.compare(p, 9, "@RELOADC@") == 0) {
+                outp += reload_call;
+                at = p + 9;
+            } else if (body.compare(p, 8, "@RELOAD@") == 0) {
+                outp += reload;
+                at = p + 8;
+            } else {
+                outp += '@';
+                at = p + 1;
+            }
+        }
+        outp.append(body, at, std::string::npos);
+        return outp;
+    }
 
     std::string Fn(u64 pc) const {
         if (called)
@@ -862,6 +954,8 @@ struct Emitter {
             // (the handler reads and writes the State: write the locals back first, reload them after)
             o << "\n" << FlushText("  ") << "  Svc(s, " << A(0) << "); if (*s.halt || s.pc != " << Hex(sh.setpc_imm.value_or(0))
               << ") return;\n@RELOAD@";
+            cw = 0; // everything was reloaded
+            csynced = true;
             return;
         case Op::A64DataCacheOperationRaised:
         case Op::A64InstructionCacheOperationRaised:
@@ -877,11 +971,19 @@ struct Emitter {
         case Op::A64GetTPIDRRO: o << "u64 " << Def(in) << " = s.tpidrro;\n"; return;
         case Op::A64SetTPIDR: o << "s.tpidr = " << A(0) << ";\n"; return;
         case Op::A64ClearExclusive: o << "ClearExclusive(s);\n"; return;
-        case Op::A64ReadMemory8: o << "u8 " << Def(in) << " = Rd<u8>(s, " << A(1) << ");\n"; return;
-        case Op::A64ReadMemory16: o << "u16 " << Def(in) << " = Rd<u16>(s, " << A(1) << ");\n"; return;
-        case Op::A64ReadMemory32: o << "u32 " << Def(in) << " = Rd<u32>(s, " << A(1) << ");\n"; return;
-        case Op::A64ReadMemory64: o << "u64 " << Def(in) << " = Rd<u64>(s, " << A(1) << ");\n"; return;
-        case Op::A64ReadMemory128: o << "V128 " << Def(in) << " = Rd128(s, " << A(1) << ");\n"; return;
+        case Op::A64ReadMemory8:
+        case Op::A64ReadMemory16:
+        case Op::A64ReadMemory32:
+        case Op::A64ReadMemory64: {
+            static const char* ty[] = {"u8", "u16", "u32", "u64"};
+            const char* t = ty[int(op) - int(Op::A64ReadMemory8)];
+            o << t << " " << Def(in) << " = " << (ordered(2) ? "RdOrdered<" : "Rd<") << t << ">(s, " << A(1) << ");\n";
+            return;
+        }
+        case Op::A64ReadMemory128:
+            o << "V128 " << Def(in) << " = Rd128(s, " << A(1) << ");" << (ordered(2) ? " _ReadWriteBarrier();" : "")
+              << "\n";
+            return;
         case Op::A64ExclusiveReadMemory8: o << "u8 " << Def(in) << " = ExRead8(s, " << A(1) << ");\n"; return;
         case Op::A64ExclusiveReadMemory16: o << "u16 " << Def(in) << " = ExRead16(s, " << A(1) << ");\n"; return;
         case Op::A64ExclusiveReadMemory32: o << "u32 " << Def(in) << " = ExRead32(s, " << A(1) << ");\n"; return;
@@ -956,29 +1058,34 @@ struct Emitter {
 
     void Jump(u64 t, int depth) {
         const std::string pad(depth * 2, ' ');
-        Flush(pad);
         if (is_call && !sh.has_svc) {
+            Flush(pad);
             const u64 ret = sh.ret_loc;
             o << pad << "s.pc = " << Hex(t) << "; ";
             if (gen_index.count(t))
                 o << Fn(t) << "(s);";
             else
                 o << "Dispatch(s);";
-            if (blockset.count(ret))
-                o << " if (s.pc != " << Hex(ret) << ") return; goto b_" << std::hex << ret << std::dec << ";\n";
-            else
+            if (blockset.count(ret)) {
+                o << " if (s.pc != " << Hex(ret) << ") return; @RELOADC@ goto b_" << std::hex << ret << std::dec << ";\n";
+                EdgeAfterReload(ret);
+            } else
                 o << " return;\n";
             return;
         }
         if (blockset.count(t) && (t == f.entry || !g_entries.count(t))) {
             if (t <= cur) {
-                // a halt request leaves at back edges: the loop head must be a resume point to come back to
-                o << pad << "if (*s.halt) { s.pc = " << Hex(t) << "; return; }\n";
+                // a halt request leaves at back edges: the loop head must be a resume point to come back to.
+                // Guest memory accesses are not volatile: the compiler barrier makes every loop iteration read
+                // memory again (wait loops on a flag another thread sets).
+                o << pad << "_ReadWriteBarrier(); if (*s.halt) { " << FlushMark() << " s.pc = " << Hex(t) << "; return; }\n";
                 halt_targets.insert(t);
             }
             o << pad << "goto b_" << std::hex << t << std::dec << ";\n";
+            Edge(t);
             return;
         }
+        Flush(pad);
         o << pad << "s.pc = " << Hex(t) << "; ";
         if (gen_index.count(t))
             o << "return " << Fn(t) << "(s);\n";
@@ -1013,10 +1120,11 @@ struct Emitter {
             } else if (is_call) {
                 Flush(pad);
                 o << pad << "Dispatch(s);";
-                if (blockset.count(sh.ret_loc))
-                    o << " if (s.pc != " << Hex(sh.ret_loc) << ") return; goto b_" << std::hex << sh.ret_loc
+                if (blockset.count(sh.ret_loc)) {
+                    o << " if (s.pc != " << Hex(sh.ret_loc) << ") return; @RELOADC@ goto b_" << std::hex << sh.ret_loc
                       << std::dec << ";\n";
-                else
+                    EdgeAfterReload(sh.ret_loc);
+                } else
                     o << " return;\n";
             } else if (boost::get<IR::Term::PopRSBHint>(&t)) {
                 Flush(pad);
@@ -1024,7 +1132,7 @@ struct Emitter {
             } else {
                 // Register branch: a local jump table target, a tail call or unknown code. The block's own
                 // jump table targets when it has one, else every block of a function of reasonable size.
-                Flush(pad);
+                // (locals stay live into the local targets: write them back only on the way to Dispatch)
                 // Only the block's own jump table targets when it has one: a switch over every block makes each of
                 // them a successor of every register branch, which costs MSVC's optimizer ~16% of guest speed.
                 // Targets outside this function are resume points elsewhere and reached through Dispatch.
@@ -1039,11 +1147,15 @@ struct Emitter {
                 std::sort(local.begin(), local.end());
                 local.erase(std::unique(local.begin(), local.end()), local.end());
                 if (!local.empty()) {
-                    o << pad << "switch (s.pc) {\n";
-                    for (u64 b : local)
+                    // (these gotos can close loops too: same barrier as at back edges)
+                    o << pad << "_ReadWriteBarrier();\n" << pad << "switch (s.pc) {\n";
+                    for (u64 b : local) {
                         o << pad << "case " << Hex(b) << ": goto b_" << std::hex << b << std::dec << ";\n";
+                        Edge(b);
+                    }
                     o << pad << "default: break;\n" << pad << "}\n";
                 }
+                Flush(pad);
                 o << pad << "Dispatch(s); return;\n";
             }
         } else if (auto* in = boost::get<IR::Term::Interpret>(&t)) {
@@ -1065,46 +1177,36 @@ struct Emitter {
             BlockBody(pc, bi);
             out << o.str();
         } catch (const std::exception& e) {
-            out << "b_" << std::hex << pc << std::dec << ": { s.pc = " << Hex(pc) << "; return; } // " << e.what()
+            BeginBlock(pc);
+            out << "b_" << std::hex << pc << std::dec << ": { " << FlushMark() << " s.pc = " << Hex(pc) << "; return; } // " << e.what()
                 << " in " << cur_op << "\n";
             g_emit_failures++;
             g_blocks[pc].supported = false;
         }
     }
     void BlockBody(u64 pc, const BlockInfo& bi) {
-        cur = pc;
+        BeginBlock(pc);
         cur_bi = &bi;
         o << "b_" << std::hex << pc << std::dec << ": {\n";
         if (bi.untranslatable) {
-            o << "  s.pc = " << Hex(pc) << "; Undefined(s); return;\n}\n";
+            o << "  " << FlushMark() << " s.pc = " << Hex(pc) << "; Undefined(s); return;\n}\n";
             return;
         }
         if (!bi.supported) {
-            o << "  s.pc = " << Hex(pc) << "; return;\n}\n";
+            o << "  " << FlushMark() << " s.pc = " << Hex(pc) << "; return;\n}\n";
             return;
         }
         IR::Block b = TranslateAt(pc);
         sh = Shape(b);
         is_call = sh.has_push_rsb && !sh.has_svc;
         names.clear();
-        used_regs.clear();
-        dirty_regs.clear();
-        sp_used = sp_dirty = nz_used = nz_dirty = false;
-        const std::string head = o.str();
-        o.str("");
-        o.clear();
-        o << "  s.icount += " << b.CycleCount() << ";\n";
+        o << "  ic += " << b.CycleCount() << ";\n";
         for (const auto& in : b) {
             o << "  ";
             Inst(in);
         }
         Term(b.GetTerminal(), 1);
-        std::string body = o.str();
-        for (size_t at; (at = body.find("@RELOAD@")) != std::string::npos;)
-            body.replace(at, 8, LoadText(false));
-        o.str("");
-        o.clear();
-        o << head << LoadText(true) << body << "}\n";
+        o << "}\n";
     }
 };
 
@@ -1484,7 +1586,8 @@ int main(int argc, char** argv) {
             cur << "#pragma optimize(\"\", off)\n";
         cur << "void f_" << std::hex << f.entry << std::dec << "(State& s) {\n  if (!ok_" << std::hex << f.entry << std::dec
             << " || reinterpret_cast<u64>(_AddressOfReturnAddress()) < s.stack_limit) return;\n"
-               "  bool cbit = false;\n";
+               "  bool cbit = false;\n"
+            << em.Declarations();
         // Resume points: call-return blocks (the JIT can come back into this function after a callee it ran) and the
         // blocks after SVCs (a thread halted inside an SVC continues there).
         std::vector<u64> resume;
@@ -1511,7 +1614,7 @@ int main(int argc, char** argv) {
             }
             cur << std::dec << "  default: return;\n  }\n";
         }
-        cur << body.str() << "}\n\n";
+        cur << em.Expand(body.str()) << "}\n\n";
         if (noopt)
             cur << "#pragma optimize(\"\", on)\n";
         }

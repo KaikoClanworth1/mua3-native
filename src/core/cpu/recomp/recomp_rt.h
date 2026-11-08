@@ -140,13 +140,27 @@ struct Table {
 const Table& GetTable();
 
 // ---- memory
+// Plain accesses: the compiler may combine and reorder them like any C++ memory access, as ARM hardware may for
+// plain loads and stores. What keeps other threads' writes visible: generated code puts a compiler barrier
+// (_ReadWriteBarrier) at every loop back edge, calls are opaque, DMB is a fence, and acquire loads / release
+// stores (LDAR, STLR) use RdOrdered / WrOrdered.
 template <typename T>
 RC_INLINE T Rd(State& s, u64 a) {
-    return *reinterpret_cast<volatile T*>(s.mem + a);
+    T v;
+    std::memcpy(&v, s.mem + a, sizeof(T));
+    return v;
 }
 template <typename T>
 RC_INLINE void Wr(State& s, u64 a, T v) {
-    *reinterpret_cast<volatile T*>(s.mem + a) = v;
+    std::memcpy(s.mem + a, &v, sizeof(T));
+}
+// Acquire load (LDAR, LDAPR, LDAXR's ordered forms): x86 loads are acquire already; the compiler must not move later
+// accesses above it.
+template <typename T>
+RC_INLINE T RdOrdered(State& s, u64 a) {
+    const T v = *reinterpret_cast<volatile T*>(s.mem + a);
+    _ReadWriteBarrier();
+    return v;
 }
 RC_INLINE V128 Rd128(State& s, u64 a) { return {Rd<u64>(s, a), Rd<u64>(s, a + 8)}; }
 RC_INLINE void Wr128(State& s, u64 a, V128 v) {
