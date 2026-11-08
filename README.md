@@ -1,61 +1,79 @@
 # MUA3 Native
 
-A private native Windows port of *Marvel Ultimate Alliance 3: The Black Order* (Switch), built from your own dumps.
+A native Windows port of *Marvel Ultimate Alliance 3: The Black Order* (Nintendo Switch), made by **static
+recompilation**: the game's AArch64 code is translated to C++ and compiled for x64 ahead of time, the Switch OS
+services it calls are implemented natively, and its NVN graphics calls are rendered with Direct3D 11. No emulator
+runs at play time.
 
-The game's AArch64 code currently runs on the **dynarmic** JIT with high-level emulation (HLE) of the Switch OS
-services. The plan is to replace that piece by piece with native code (static recompilation and native
-re-implementations of hot functions, NVN on D3D11, etc.) until no emulation is left.
+**This repository contains no game code, data or keys.** You need your own copy of the game, dumped from your own
+Switch along with that console's keys. The recompiled game is built on your PC from your dump; it is never
+distributed here.
 
 ## Status
 
 | Area | State |
 |---|---|
-| Dump install (NSP/XCI → ExeFS + RomFS, update merged via BKTR, DLC) | working |
-| Boot: rtld → nnSdk → `nnMain` → title screen → title menu | working |
-| Kernel HLE (threads, sync, memory, IPC/CMIF, domains) | working |
-| Services: sm, fs (virtual RomFS over loose files, host saves), am, hid, nvdrv, vi, audren, time, acc, set… | working for boot |
-| Input: XInput / SDL3 gamepads, keyboard | working |
-| Window: SDL3 + D3D11 swapchain, ImGui overlay (F1) | working |
-| GPU: GPFIFO processed for fences/semaphores/DMA; **no rendering yet** | next milestone |
-| Audio: renderer protocol answered, XAudio2/SDL output ready; **no mixing yet** | pending |
-| Movies (nnMedia / nvdec) | pending |
+| Installer: NSP/XCI base game, update (BKTR merge) and DLC, from the launcher | working |
+| Game code: statically recompiled (104,176 functions, 99.998% of the code), no JIT | working |
+| OS services: kernel, IPC, fs (RomFS over loose files, saves), hid, am, nvdrv, vi, audren, time, set, ... | working |
+| Rendering: NVN command stream replayed on D3D11, shaders translated to HLSL, cached | working, some effects missing |
+| Resolution: native 1080p, 1440p, 4K (internal resolution scales with the display) | working |
+| Frame rate: 30 (original), 60, or higher (experimental, patched timing) | working |
+| Audio (XAudio2 or SDL3), movies (Media Foundation), XInput / SDL3 gamepads, keyboard | working |
+
+The story has been played through several chapters. Known issues: occasional missing or black UI/effect panels,
+the frame rate is limited by the render thread in large fights, a few shaders fail to translate.
+
+## Building
+
+Requirements: Windows 10/11 x64, Visual Studio 2022 or 2026 with "Desktop development with C++", CMake 3.24+,
+Python 3, Git (with Git Bash), about 30 GB free for the build and 18 GB for the game data.
+
+```bash
+scripts/fetch-deps.sh                                   # dynarmic, SDL3, Dear ImGui, Boost headers into external/
+cmake -S . -B build -G "Visual Studio 18 2026" -A x64   # or "Visual Studio 17 2022"
+cmake --build build --config RelWithDebInfo --target MUA3Launcher nsodump recomp
+```
+
+1. **Install the game data.** Run `build\bin\RelWithDebInfo\MUA3Launcher.exe` → **Install**: choose your
+   `prod.keys`, add the base game, the 4.0.1 update and any DLC (`.nsp` / `.xci`), choose a folder, install.
+2. **Recompile the game code** from your installed copy (the long step: about an hour on 8 threads):
+   ```bash
+   build\bin\RelWithDebInfo\nsodump.exe game\exefs build\recomp_work\nso
+   python scripts\recomp_libbuild.py 8        # number of parallel compiler jobs
+   ```
+   This generates C++ from your NSOs into `build\recomp_full` and compiles `build\recomp_full\nxrecomp_full.lib`.
+3. **Build the game:** `cmake --build build --config RelWithDebInfo --target mua3`
+4. Copy `mua3.exe` next to the launcher (or run the launcher from the build folder) and press **Play**.
+
+Optional: `scripts\make_icon.ps1` makes the executables' icon from your installed game (rebuild afterwards).
+
+## Using it
+
+Settings live in `mua3.ini` and are edited in the launcher: presets (Recommended = the original 30 fps, Smooth = 60,
+High refresh), resolution, camera speed, language, audio. Keys: F11 fullscreen, F12 screenshot, F1 debug overlay.
+Keyboard: WASD move, L/K/I/J = A/B/X/Y, Q/E = L/R, 1/3 = ZL/ZR, Enter = +, Tab = −. Logs go to `mua3.log`.
 
 ## Layout
 
 ```
-Isos/      your dumps (base NSP/XCI, update, DLC)        (not in git)
-keys/      prod.keys (+ title.keys) from your console     (not in git)
-game/      installed data: exefs/, romfs/, control/, aoc/ (not in git)
-save/      save data                                       (not in git)
 src/
-  loader/    NCA/PFS0/HFS0/BKTR/RomFS/NSO + installer
+  loader/    NCA / PFS0 / HFS0 / BKTR / RomFS / NSO, the installer
   crypto/    AES (CNG), key files
-  core/      memory, kernel (SVCs), CPU interface, HLE services
-  gpu/       GPU address space + command processor
-  platform/  SDL3 window, D3D11, input, XAudio2/SDL audio
-  launcher/  ImGui launcher
-  tools/     nxextract (CLI installer), nsodump
+  core/      memory, kernel (SVCs), CPU runtime for the recompiled code, HLE services, NVN layer
+  gpu/       D3D11 renderer, shader translator (Maxwell -> HLSL / DXBC), texture and shader caches
+  platform/  SDL3 window, D3D11 swap chain, input, XAudio2 / SDL audio
+  launcher/  the ImGui launcher (installer, settings)
+  tools/     recomp (AArch64 -> C++), nsodump, nxextract (CLI installer), threadprof, shadertool, ...
+scripts/     fetch-deps.sh, recomp_libbuild.py, bench.ps1, make_icon.ps1
 ```
 
-## Build
+## Legal
 
-Requirements: Visual Studio 2026 (MSVC), CMake 3.24+, Git, curl.
+*Marvel Ultimate Alliance 3: The Black Order* is © MARVEL, © Nintendo, developed by KOEI TECMO GAMES. This is an
+unofficial fan project, not affiliated with or endorsed by them. It contains no copyrighted game material; use it
+only with a game you own, dumped from your own console.
 
-```bash
-scripts/fetch-deps.sh
-cmake -S . -B build -G "Visual Studio 18 2026" -A x64
-cmake --build build --config RelWithDebInfo
-```
-
-Outputs land in `build/bin/RelWithDebInfo/`: `MUA3Launcher.exe`, `mua3.exe`, `nxextract.exe`, `nsodump.exe`.
-
-## Run
-
-1. Put `prod.keys` in `keys/` and the dumps in `Isos/`.
-2. Start `MUA3Launcher.exe` → **Install** (≈17 GB is extracted to `game/`) → **Play**.
-
-Settings are stored in `mua3.ini` in the project folder. Runtime flags for development:
-`mua3.exe --debug | --trace | --headless | --watch N (thread dumps) | --autopress N (tap A every 3 s)`.
-Logs go to `mua3.log`.
-
-Keyboard: WASD move, L/K/I/J = A/B/X/Y, Q/E = L/R, 1/3 = ZL/ZR, Enter = +, Tab = −, F11 fullscreen, F1 overlay.
+Third-party code: [dynarmic](https://github.com/azahar-emu/dynarmic) (0BSD; its A64 decoder and IR are used by the
+recompiler), [SDL3](https://github.com/libsdl-org/SDL) (zlib), [Dear ImGui](https://github.com/ocornut/imgui) (MIT),
+[Boost](https://www.boost.org) (BSL-1.0).

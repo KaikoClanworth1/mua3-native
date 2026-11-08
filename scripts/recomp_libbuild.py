@@ -8,16 +8,37 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-# Work dir with nso/ (nsodump output), prof1.txt/prof2.txt (MUA3_RECOMP_PROFILE), noopt.txt/skip.txt
-S = os.environ.get('MUA3_RECOMP_WORK', os.path.dirname(os.path.abspath(__file__)))
-P = r'D:\Switch Recomp\MUA 3'
+P = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the repository
+# Work dir with nso/ (nsodump output), optional prof*.txt / missing*.txt (coverage from game runs), noopt.txt/skip.txt
+S = os.environ.get('MUA3_RECOMP_WORK') or os.path.join(P, 'build', 'recomp_work')
 GEN = os.path.join(P, 'build', 'recomp_full')
 OBJ = os.path.join(P, 'build', 'recomp_full_obj')
-VC = os.environ.get('MUA3_VCVARS', r'G:\Programs\Visual Studios\18\Community\VC\Auxiliary\Build\vcvars64.bat')
+
+
+def find_vcvars():
+    """vcvars64.bat: MUA3_VCVARS, else the newest Visual Studio with C++ (vswhere)."""
+    if os.environ.get('MUA3_VCVARS'):
+        return os.environ['MUA3_VCVARS']
+    vswhere = os.path.join(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'),
+                           'Microsoft Visual Studio', 'Installer', 'vswhere.exe')
+    if os.path.exists(vswhere):
+        out = subprocess.run([vswhere, '-latest', '-products', '*', '-requires',
+                              'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', '-property', 'installationPath'],
+                             capture_output=True, text=True).stdout.strip()
+        if out:
+            return os.path.join(out, 'VC', 'Auxiliary', 'Build', 'vcvars64.bat')
+    sys.exit('Visual Studio with C++ not found: set MUA3_VCVARS to vcvars64.bat')
+
+
+VC = find_vcvars()
 NOOPT = os.path.join(S, 'noopt.txt')
 SKIP = os.path.join(S, 'skip.txt')
+os.makedirs(S, exist_ok=True)
 open(SKIP, 'a').close()
+open(NOOPT, 'a').close()
 NSO = os.path.join(S, 'nso')
+if not os.path.exists(os.path.join(NSO, 'main.bin')):
+    sys.exit(f'{NSO} has no main.bin: run  build\\bin\\RelWithDebInfo\\nsodump.exe game\\exefs {NSO}  first')
 FLAGS = '/c /nologo /O2 /Ob3 /GS- /EHsc /MT /std:c++20 /permissive- /bigobj /utf-8 /DNDEBUG'
 JOBS = int(sys.argv[1]) if len(sys.argv) > 1 else 8
 
