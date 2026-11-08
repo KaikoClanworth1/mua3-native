@@ -5,6 +5,8 @@
 #include <array>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
+#include <thread>
 #include <bit>
 #include <set>
 #include <tuple>
@@ -544,6 +546,12 @@ struct Recording {
     std::mutex mutex;
     std::unordered_map<u64, std::vector<Command>> open;    // command buffer -> commands since BeginRecording
     std::unordered_map<u64, CommandList> handles;          // command handle -> finished list (shared with replays)
+    // Least-recently-used order of `handles` (recorded by EndRecording, or run by a submit, nested lists included):
+    // (handle, stamp) entries, stale once the handle was used again. A full map evicts its oldest entries one at a
+    // time; clearing it whole freed thousands of lists at once on the game's render thread (~1 s freezes).
+    std::deque<std::pair<u64, u64>> lru;
+    std::unordered_map<u64, u64> stamp;
+    u64 clock = 0;
     u64 submits = 0, cmds = 0, draws = 0, indirect = 0, dispatches = 0, unknown = 0;
     std::atomic<u64> recorded{0};
     u64 begins = 0, ends = 0, empty_ends = 0; // diagnostics
@@ -556,6 +564,67 @@ struct Recording {
 Recording& Rec() {
     static Recording r;
     return r;
+}
+// Lists evicted from the handle map are freed here, off the game's render thread: a list can hold tens of thousands
+// of commands, each with its own small vectors. Normal priority on purpose: a low-priority thread preempted inside the
+// heap lock stalls every thread that allocates (an idle-priority version froze the game for ~0.8 s).
+void Reclaim(CommandList&& list) {
+    struct Reclaimer {
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::deque<CommandList> lists;
+        Reclaimer() {
+            std::thread([this] {
+                for (;;) {
+                    CommandList one;
+                    {
+                        std::unique_lock lk(mutex);
+                        cv.wait(lk, [&] { return !lists.empty(); });
+                        one = std::move(lists.front());
+                        lists.pop_front();
+                    }
+                    one.reset(); // last owner unless a replay still holds it
+                }
+            }).detach();
+        }
+    };
+    static Reclaimer r;
+    {
+        std::lock_guard lk(r.mutex);
+        r.lists.push_back(std::move(list));
+    }
+    r.cv.notify_one();
+}
+constexpr size_t kMaxHandles = 512; // a frame runs ~one new list plus the static ones it calls: "unrecorded handles" in the stream log stays 0
+void Touch(Recording& rec, u64 h) {
+    const u64 t = ++rec.clock;
+    rec.stamp[h] = t;
+    rec.lru.emplace_back(h, t);
+    if (rec.lru.size() > 8 * rec.stamp.size() + 4096) { // mostly stale entries: rebuild in stamp order
+        std::vector<std::pair<u64, u64>> live;
+        live.reserve(rec.stamp.size());
+        for (const auto& [k, v] : rec.stamp)
+            live.emplace_back(v, k);
+        std::sort(live.begin(), live.end());
+        rec.lru.clear();
+        for (const auto& [v, k] : live)
+            rec.lru.emplace_back(k, v);
+    }
+}
+void EvictOldHandles(Recording& rec) {
+    while (rec.handles.size() > kMaxHandles && !rec.lru.empty()) {
+        const auto [h, t] = rec.lru.front();
+        rec.lru.pop_front();
+        auto st = rec.stamp.find(h);
+        if (st == rec.stamp.end() || st->second != t)
+            continue; // used again later
+        rec.stamp.erase(st);
+        if (auto it = rec.handles.find(h); it != rec.handles.end()) {
+            if (it->second)
+                Reclaim(std::move(it->second));
+            rec.handles.erase(it);
+        }
+    }
 }
 std::atomic<std::function<void(std::vector<ReplaySpan>&&)>*> g_sink{nullptr};
 extern "C" __declspec(dllimport) void* __stdcall GetCurrentThread();
@@ -779,8 +848,6 @@ void CommandBufferEndRecording(State& s) {
         return;
     auto& rec = Rec();
     std::lock_guard lk(rec.mutex);
-    if (rec.handles.size() > 4096) // handles are submitted soon after recording; drop stale ones
-        rec.handles.clear();
     rec.ends++;
     rec.empty_ends += rec.open[cb].empty();
     // Handles identify command memory, which the game reuses: an empty recording must not hide a real one that
@@ -795,6 +862,8 @@ void CommandBufferEndRecording(State& s) {
         slot = Publish(std::move(list));
     }
     open.clear();
+    Touch(rec, handle);
+    EvictOldHandles(rec); // (never the handle just recorded: it is the newest)
 }
 
 // ---- draw resolution (front half of the native replay): walks one submitted frame in order, tracking bound state,
@@ -1050,6 +1119,7 @@ void QueueSubmitCommands(State& s) {
             rec.unknown++;
             continue;
         }
+        Touch(rec, h);
         for (const Command& c : *it->second) {
             rec.cmds++;
             if (c.fn >= 0) {

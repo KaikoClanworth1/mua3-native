@@ -576,7 +576,10 @@ void ShaderCache::Realize(HostShader* s) {
     if (s->created.load(std::memory_order_acquire))
         return;
     std::string err;
-    if (!CreateObject(*s, s->dxbc, err)) {
+    const auto r0 = std::chrono::steady_clock::now();
+    const bool made = CreateObject(*s, s->dxbc, err);
+    realize_ns += u64((std::chrono::steady_clock::now() - r0).count());
+    if (!made) {
         LOG_ERROR("Shader", "{} {:016x}: {}", StageTag(s->stage), s->hash, err);
         s->ok = false;
         s->state = HostShader::Failed;
@@ -618,6 +621,7 @@ HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size, c
         common::WriteFile(dump_dir_ / fmt::format("{:016x}.cs.opt", hash), std::span(o.data(), o.size()));
         PackPut(PackOpt, hash, std::span(o.data(), o.size()));
     }
+    new_programs++;
     return Queue(stage, hash, code, size, opt, false);
 }
 
@@ -670,6 +674,7 @@ HostShader* ShaderCache::GetVariant(HostShader* base, const VariantKey& v) {
     s->is_variant = true;
     s->prewarm = replaying_; // replayed from variants.txt: part of the backlog until a draw asks for it
     LOG_INFO("Shader", "variant {:016x} of {:016x} (tex uint {:#x} sint {:#x})", key, base->hash, v.tex_uint, v.tex_sint);
+    new_variants += !replaying_;
     if (!replaying_) { // newly seen (not replayed from the manifest): remember it for the next prewarm
         std::ofstream(dump_dir_ / "variants.txt", std::ios::app)
             << fmt::format("{:016x} {:x} {:x} {:x} {:x} {:x} {:x}\n", base->hash, v.attr_uint, v.attr_sint,

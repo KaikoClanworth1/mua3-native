@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -27,6 +28,9 @@ using f64 = double;
 namespace fs = std::filesystem;
 
 namespace common {
+
+// steady_clock time of the last presented frame (freeze watchdog, MUA3_FREEZE_MS)
+inline std::atomic<long long> g_last_present_ns{0};
 
 enum class LogLevel { Trace, Debug, Info, Warn, Error, Fatal };
 

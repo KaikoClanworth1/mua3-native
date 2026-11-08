@@ -2,7 +2,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
+#include <thread>
 #include <fstream>
 #include <mutex>
 
@@ -12,8 +15,16 @@
 namespace common {
 
 static std::atomic<LogLevel> g_level{LogLevel::Info};
-static std::mutex g_log_mutex;
+static std::mutex g_log_mutex; // the writer (stderr and the log file)
 static FILE* g_log_file = nullptr;
+// Lines are queued and written by a background thread: a write to a busy hard disk (or a paused console) can block
+// for most of a second, and every thread that logs (the renderer, the game's NVN thread) used to wait behind it.
+// Errors and worse are written at once, after everything queued before them, so a crash leaves them on disk.
+static std::mutex g_queue_mutex;
+static std::condition_variable g_queue_cv;
+static std::string g_queue;      // lines not yet written
+static u64 g_dropped = 0;        // lines dropped while the queue was full
+constexpr size_t kMaxQueued = 64u << 20;
 static const auto g_start = std::chrono::steady_clock::now();
 
 void SetLogLevel(LogLevel level) { g_level = level; }
@@ -26,27 +37,67 @@ void SetLogFile(const fs::path& path) {
     g_log_file = _wfopen(path.c_str(), L"w");
 }
 
+// Writes everything queued so far.
+static void FlushLog() {
+    std::lock_guard wl(g_log_mutex);
+    std::string text;
+    u64 dropped;
+    {
+        std::lock_guard lk(g_queue_mutex);
+        text.swap(g_queue);
+        dropped = std::exchange(g_dropped, 0);
+    }
+    if (dropped)
+        text += fmt::format("[log] {} lines dropped (writer behind)\n", dropped);
+    if (text.empty())
+        return;
+    std::fwrite(text.data(), 1, text.size(), stderr);
+    if (g_log_file) {
+        std::fwrite(text.data(), 1, text.size(), g_log_file);
+        std::fflush(g_log_file);
+    }
+}
+
+static void StartLogWriter() {
+    static const bool started = [] {
+        std::thread([] {
+            SetThreadDescription(GetCurrentThread(), L"LogWriter");
+            for (;;) {
+                {
+                    std::unique_lock lk(g_queue_mutex);
+                    g_queue_cv.wait(lk, [] { return !g_queue.empty() || g_dropped; });
+                }
+                FlushLog();
+                Sleep(20); // gather a batch
+            }
+        }).detach();
+        std::atexit(FlushLog);
+        return true;
+    }();
+    (void)started;
+}
+
 void LogRaw(LogLevel level, const char* category, std::string_view message) {
     static const char* names[] = {"TRACE", "DEBUG", "INFO ", "WARN ", "ERROR", "FATAL"};
     const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count();
     const std::string line = fmt::format("[{:9.4f}] [{}] [{}:{}] {}\n", t, names[int(level)], category,
                                          GetCurrentThreadId(), message);
-    std::lock_guard lk(g_log_mutex);
-    std::fwrite(line.data(), 1, line.size(), stderr);
-    if (g_log_file) {
-        std::fwrite(line.data(), 1, line.size(), g_log_file);
-        if (level >= LogLevel::Warn)
-            std::fflush(g_log_file);
+    StartLogWriter();
+    {
+        std::lock_guard lk(g_queue_mutex);
+        if (g_queue.size() + line.size() <= kMaxQueued)
+            g_queue += line;
+        else
+            g_dropped++;
     }
+    if (level >= LogLevel::Error)
+        FlushLog();
+    else
+        g_queue_cv.notify_one();
 }
 
 void Panic(std::string_view message) {
-    LogRaw(LogLevel::Fatal, "Panic", message);
-    {
-        std::lock_guard lk(g_log_mutex);
-        if (g_log_file)
-            std::fflush(g_log_file);
-    }
+    LogRaw(LogLevel::Fatal, "Panic", message); // (written at once)
     if (IsDebuggerPresent())
         __debugbreak();
     std::fflush(stderr);

@@ -1,6 +1,8 @@
 #include "core/kernel/kernel.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <memory>
 #include <random>
 #include <windows.h>
@@ -51,6 +53,7 @@ Kernel::Kernel(core::Memory& mem) : mem_(mem) {
     g_kernel = this;
     cpus_ = cpu::CreateDynarmicFactory(mem, 256);
     services_ = std::make_unique<hle::ServiceManager>(*this);
+    StartFreezeWatch();
     LARGE_INTEGER f, c;
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&c);
@@ -274,16 +277,40 @@ void Kernel::InstallTrace(u64 addr, std::string name, HookFn fn) {
 }
 
 void Kernel::HandleSvc(Thread* t, u32 imm) {
+    // Stall trace (MUA3_STALL_MS=<ms>): SVCs and HLE hooks that hold a guest thread longer than that, with their
+    // arguments and caller, to find what a game freeze waits on.
+    static const s64 stall_ns = [] {
+        const char* e = std::getenv("MUA3_STALL_MS");
+        return e ? s64(std::atoll(e)) * 1'000'000 : 0;
+    }();
+    const auto t0 = stall_ns ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    u64 a[4]{}, lr = 0;
+    if (stall_ns) {
+        for (int i = 0; i < 4; i++)
+            a[i] = t->cpu->Reg(i);
+        lr = t->cpu->Reg(30);
+    }
+    auto report = [&](const std::string& what) {
+        const s64 ns = (std::chrono::steady_clock::now() - t0).count();
+        if (ns >= stall_ns && imm != 0x0B) // SleepThread is deliberate
+            LOG_WARN("Stall", "{} ({}) {} took {:.1f} ms: x0 {:#x} x1 {:#x} x2 {:#x} x3 {:#x} -> {:#x}, caller {}", t->id,
+                     t->name, what, double(ns) / 1e6, a[0], a[1], a[2], a[3], t->cpu->Reg(0),
+                     core::Sys().Symbolize(lr));
+    };
     if (imm >= 0x1000) {
         const u32 idx = imm - 0x1000;
         if (idx < hooks.size()) {
             hooks[idx].second(t);
+            if (stall_ns)
+                report("hook " + hooks[idx].first);
             return;
         }
     }
     t->current_svc = imm;
     SvcDispatch(t, imm);
     t->current_svc = 0;
+    if (stall_ns)
+        report(fmt::format("svc {:#x}", imm));
 }
 
 void Kernel::DumpThreadState(Thread* t, bool error) {
@@ -313,10 +340,14 @@ void Kernel::DumpThreadState(Thread* t, bool error) {
 }
 
 // Samples the host thread backing a guest thread (for hangs outside guest code).
-static void DumpHostStack(Thread* t) {
+static void DumpHostStack(Thread* t, const char* why = "not in guest code", int depth = 20) {
     static bool sym_init = [] {
         SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
-        return SymInitialize(GetCurrentProcess(), nullptr, TRUE) != FALSE;
+        char exe[MAX_PATH]{}; // the pdb sits next to the exe, which is not the working directory
+        GetModuleFileNameA(nullptr, exe, MAX_PATH);
+        std::string dir(exe);
+        dir = dir.substr(0, dir.find_last_of("\\/"));
+        return SymInitialize(GetCurrentProcess(), dir.c_str(), TRUE) != FALSE;
     }();
     HANDLE h = (HANDLE)t->host_handle;
     if (!h || SuspendThread(h) == DWORD(-1)) {
@@ -326,7 +357,6 @@ static void DumpHostStack(Thread* t) {
     CONTEXT ctx{};
     ctx.ContextFlags = CONTEXT_FULL;
     GetThreadContext(h, &ctx);
-    std::string s = fmt::format("Thread {} ({}) not in guest code; host stack:\n", t->id, t->name);
     STACKFRAME64 frame{};
     frame.AddrPC.Offset = ctx.Rip;
     frame.AddrPC.Mode = AddrModeFlat;
@@ -334,22 +364,70 @@ static void DumpHostStack(Thread* t) {
     frame.AddrFrame.Mode = AddrModeFlat;
     frame.AddrStack.Offset = ctx.Rsp;
     frame.AddrStack.Mode = AddrModeFlat;
-    for (int i = 0; i < 20; i++) {
-        if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, GetCurrentProcess(), h, &frame, &ctx, nullptr,
-                         SymFunctionTableAccess64, SymGetModuleBase64, nullptr) || !frame.AddrPC.Offset)
-            break;
+    // Walk while suspended, name the frames after resuming: the thread may hold the heap or loader lock.
+    u64 pcs[64];
+    int n = 0;
+    while (n < std::min(depth, 64) &&
+           StackWalk64(IMAGE_FILE_MACHINE_AMD64, GetCurrentProcess(), h, &frame, &ctx, nullptr, SymFunctionTableAccess64,
+                       SymGetModuleBase64, nullptr) && frame.AddrPC.Offset)
+        pcs[n++] = frame.AddrPC.Offset;
+    ResumeThread(h);
+    std::string s = fmt::format("Thread {} ({}) {}; host stack:\n", t->id, t->name, why);
+    for (int i = 0; i < n; i++) {
         alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256]{};
         auto* sym = reinterpret_cast<SYMBOL_INFO*>(buf);
         sym->SizeOfStruct = sizeof(SYMBOL_INFO);
         sym->MaxNameLen = 255;
         DWORD64 disp = 0;
-        if (sym_init && SymFromAddr(GetCurrentProcess(), frame.AddrPC.Offset, &disp, sym))
-            s += fmt::format("    {}+{:#x}\n", sym->Name, disp);
+        HMODULE mod = nullptr;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCSTR>(pcs[i]), &mod))
+            GetModuleFileNameA(mod, name, MAX_PATH);
+        const char* base = std::max(std::strrchr(name, '\\'),std::strrchr(name, '/'));
+        base = base ? base + 1 : name;
+        if (sym_init && SymFromAddr(GetCurrentProcess(), pcs[i], &disp, sym))
+            s += fmt::format("    {}!{}+{:#x}\n", base, sym->Name, disp);
         else
-            s += fmt::format("    {:#x} (jit?)\n", frame.AddrPC.Offset);
+            s += fmt::format("    {}+{:#x}\n", base, mod ? pcs[i] - u64(mod) : pcs[i]);
     }
-    ResumeThread(h);
     LOG_INFO("Kernel", "{}", s);
+}
+
+// Freeze watchdog (MUA3_FREEZE_MS=<ms>): when no frame was presented for that long, the host stacks of the guest
+// threads that are running (not parked in an SVC) say what holds the game up. A few samples per freeze.
+void Kernel::StartFreezeWatch() {
+    const char* e = std::getenv("MUA3_FREEZE_MS");
+    if (!e)
+        return;
+    const s64 limit = s64(std::atoll(e)) * 1'000'000;
+    std::thread([this, limit] {
+        SetThreadDescription(GetCurrentThread(), L"FreezeWatch");
+        long long reported = 0;
+        int samples = 0;
+        for (;;) {
+            Sleep(50);
+            const long long last = common::g_last_present_ns.load(std::memory_order_relaxed);
+            const long long now = std::chrono::steady_clock::now().time_since_epoch().count();
+            if (!last || now - last < limit)
+                continue;
+            if (last != reported)
+                reported = last, samples = 0;
+            if (samples >= 8)
+                continue;
+            samples++;
+            LOG_WARN("Freeze", "no frame for {:.0f} ms (sample {})", double(now - last) / 1e6, samples);
+            std::vector<ThreadPtr> ts;
+            {
+                std::lock_guard lk(threads_mutex_);
+                ts = threads_;
+            }
+            for (auto& t : ts)
+                if (t->state == Thread::State::Running && !t->current_svc)
+                    DumpHostStack(t.get(), "running", 48);
+            Sleep(100);
+        }
+    }).detach();
 }
 
 void Kernel::DumpAllThreads(bool host_stacks) {

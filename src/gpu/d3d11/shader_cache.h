@@ -83,6 +83,8 @@ public:
     // Creates the D3D object of a Ready shader whose bytecode was only loaded (created == false). GPU thread.
     void Realize(HostShader* s);
     std::atomic<u32> frame{0}; // Tick count, for HostShader::last_used
+    u32 new_programs = 0, new_variants = 0; // first seen by a draw (not replayed by Prewarm): GPU thread
+    u64 realize_ns = 0; // GPU thread time in Realize (driver shader creation)
     u32 realized = 0, released = 0, live_objects = 0; // driver objects created by draws / released as unused / now
 
 private:

@@ -2480,10 +2480,44 @@ void D3D11Renderer::Draw() {
     // Texture bindings stay in place: binding a surface as an output later unbinds it (and resets the cache).
 }
 
+// A frame far longer than usual (a stutter) logs what this thread did during it: waits for shader compiles, programs
+// and integer variants seen for the first time, driver shader objects created, texture uploads, and (MUA3_PROFILE)
+// the draw sections. Little of that in a long frame means the time went elsewhere (guest code, NVN layer).
+static u64 g_hitch_prof[kProfCount];
+void D3D11Renderer::ReportHitch() {
+    static auto last = std::chrono::steady_clock::now();
+    static u64 uploads = 0, realize_ns = 0, realized = 0;
+    static u32 programs = 0, variants = 0;
+    const auto now = std::chrono::steady_clock::now();
+    const double ms = double((now - last).count()) / 1e6;
+    last = now;
+    ShaderCache& sc = *shaders_;
+    if (ms > 50 && frame_counter_ > 300) {
+        std::string prof;
+        if (g_profile)
+            for (int i = 0; i < kProfCount; i++)
+                prof += fmt::format(" {} {:.1f}", kProfNames[i], double(g_prof_ns[i] - g_hitch_prof[i]) / 1e6);
+        LOG_WARN("Hitch", "frame {:.1f} ms: shader wait {:.1f} ms, new programs {} variants {}, driver shaders {} "
+                          "({:.1f} ms), texture uploads {}, compiles pending {}{}{}",
+                 ms, double(150'000'000 - shader_wait_ns_) / 1e6, sc.new_programs - programs, sc.new_variants - variants,
+                 sc.realized - realized, double(sc.realize_ns - realize_ns) / 1e6, textures_->uploads - uploads,
+                 sc.pending.load(), prof.empty() ? "" : " | ms:", prof);
+    }
+    uploads = textures_->uploads;
+    realize_ns = sc.realize_ns;
+    realized = sc.realized;
+    programs = sc.new_programs;
+    variants = sc.new_variants;
+    std::memcpy(g_hitch_prof, g_prof_ns, sizeof(g_prof_ns));
+}
+
 void D3D11Renderer::Present(const PresentInfo& p) {
     std::lock_guard ctx_lock(ContextMutex());
     frame_counter_++;
     shaders_->Tick();
+    ReportHitch();
+    common::g_last_present_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                                    std::memory_order_relaxed);
     shader_wait_ns_ = 150'000'000; // a cold cache stutters rather than showing holes
     if (g_profile && frame_counter_ % 150 == 0) {
         std::string line;
@@ -2513,6 +2547,7 @@ void D3D11Renderer::Present(const PresentInfo& p) {
         last_uploads = textures_->uploads;
         g_prof_tex_get_ns = g_prof_tex_samp_ns = g_prof_tex_calls = 0;
         std::memset(g_prof_ns, 0, sizeof(g_prof_ns));
+        std::memset(g_hitch_prof, 0, sizeof(g_hitch_prof));
         g_prof_vb_bytes = g_prof_cb_bytes = g_prof_ib_count = g_prof_draws = 0;
     }
     // Copy this frame's compute results back (applied to guest memory once the copies land, a frame or so later;

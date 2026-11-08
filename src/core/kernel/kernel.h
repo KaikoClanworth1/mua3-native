@@ -197,6 +197,7 @@ public:
     void DumpThreadRegs(u32 thread_id); // registers + backtrace of one guest thread (debug command)
     // Logs where every guest thread is (running threads are briefly interrupted).
     void DumpAllThreads(bool host_stacks = false);
+    void StartFreezeWatch();
 
     u64 program_id = 0x010060700AC50000ull;
     u64 random_entropy[4]{};
