@@ -562,7 +562,10 @@ int main(int argc, char** argv) {
     }
 
     platform::Display display;
-    if (!display.Init(cfg, "Marvel Ultimate Alliance 3: The Black Order")) {
+    const bool display_ok = display.Init(cfg, "Marvel Ultimate Alliance 3: The Black Order");
+    if (display_ok)
+        display.SetIcon(cfg.game_dir / "control" / "icon_AmericanEnglish.dat");
+    if (!display_ok) {
         MessageBoxA(nullptr, "Failed to create the D3D11 window.", "MUA3 Native", MB_ICONERROR);
         return 1;
     }

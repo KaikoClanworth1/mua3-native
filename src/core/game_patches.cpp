@@ -12,7 +12,7 @@ namespace core {
 
 namespace {
 
-// MUA3 v3.0.0 main NSO (build id e853c44fdf18b88f...), loaded at a module base the patches are relative to.
+// MUA3 main NSO of the last update (display version 4.0.1, v524288; build id e853c44fdf18b88f...), loaded at a module base the patches are relative to.
 constexpr u8 kMainBuildId[8] = {0xe8, 0x53, 0xc4, 0x4f, 0xdf, 0x18, 0xb8, 0x8f};
 
 // Frame rate. KTGL keeps a timing block (pointer at main+0x2188a00) whose +0x60 is the present interval: its

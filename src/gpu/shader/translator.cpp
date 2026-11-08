@@ -2790,7 +2790,7 @@ bool Translator::Run() {
             src += "    default: break;\n    }\n    return o;\n}\n";
             if (!res_.images.empty()) {
                 // drv_image[k]: x/y base address, z width | height << 16, w depth | mode << 16 | bh << 24 | bd << 28.
-                // Modes: 1 RGBA16F, 2 RGBA32 raw, 3 RGBA8 UNORM, 4 R32 raw, 5 RG16F, 6 RG32 raw.
+                // Modes: 1 RGBA16F, 2 RGBA32 raw, 3 RGBA8 UNORM, 4 R32 raw, 5 RG16F, 6 RG32 raw, 7 R11G11B10F.
                 src += R"HLSL(uint GobOffset(uint x, uint y) {
     return ((x % 64u) / 32u) * 256u + ((y % 8u) / 2u) * 64u + ((x % 32u) / 16u) * 32u + (y % 2u) * 16u + (x % 16u);
 }
@@ -2813,6 +2813,10 @@ void ImageStore(uint k, uint x, uint y, uint z, uint4 v, uint mask) {
     else if (mode == 3u) { uint4 b = uint4(saturate(asfloat(v)) * 255.0f + 0.5f); t.x = b.x | (b.y << 8) | (b.z << 16) | (b.w << 24); }
     else if (mode == 5u) t.x = f32tof16(asfloat(v.x)) | (f32tof16(asfloat(v.y)) << 16);
     else if (mode == 6u) n = 2u;
+    else if (mode == 7u) { // half floats without sign and low mantissa bits: 11, 11 and 10 bits
+        uint3 hf = f32tof16(max(asfloat(v.xyz), 0.0f));
+        t.x = ((hf.x >> 4) & 0x7FFu) | (((hf.y >> 4) & 0x7FFu) << 11) | (((hf.z >> 5) & 0x3FFu) << 22);
+    }
     uint lo = im.x + off, hi = im.y + (lo < im.x ? 1u : 0u);
     GmemStore(lo, hi, t.x);
     if (n > 1u) GmemStore(lo + 4u, hi, t.y);

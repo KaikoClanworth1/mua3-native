@@ -1,4 +1,5 @@
 // appletOE: application proxy and its sub-interfaces.
+#include <array>
 #include <deque>
 
 #include "core/hle/service.h"
@@ -204,14 +205,30 @@ public:
         });
         Reg(20, "EnsureSaveData", [](Request& r) { r.Push<u64>(0); });
         Reg(21, "GetDesiredLanguage", [](Request& r) {
+            // The game's language: the configured system language (mua3.ini [system] language, set's numbering)
+            // when the game supports it (its NACP: English, Japanese, French, German, Italian, Spanish, Korean,
+            // Chinese), else American English.
+            static const char* codes[] = {"ja", "en-US", "fr", "de", "it", "es", "zh-CN", "ko", "", "", "", "zh-TW",
+                                          "en-GB", "fr-CA", "es-419", "zh-CN", "zh-TW"};
+            const int lang = core::Sys().Cfg().language;
+            const char* c = lang >= 0 && lang < 17 && codes[lang][0] ? codes[lang] : "en-US";
             u64 v = 0;
-            std::memcpy(&v, "en-US", 5);
+            std::memcpy(&v, c, std::strlen(c));
             r.Push<u64>(v);
         });
         Ok(22, "SetTerminateResult");
         Reg(23, "GetDisplayVersion", [](Request& r) {
-            char ver[0x10] = "3.0.0";
-            r.PushRaw(ver, sizeof(ver));
+            // The installed version (control.nacp's display version, e.g. "4.0.1" with the last update).
+            static const std::array<char, 0x10> ver = [] {
+                std::array<char, 0x10> v{};
+                const auto nacp = common::ReadFile(core::Sys().Cfg().game_dir / "control" / "control.nacp");
+                if (nacp.size() >= 0x3070 && nacp[0x3060])
+                    std::memcpy(v.data(), nacp.data() + 0x3060, 0x0F);
+                else
+                    std::memcpy(v.data(), "1.0.0", 5);
+                return v;
+            }();
+            r.PushRaw(ver.data(), ver.size());
         });
         Reg(25, "ExtendSaveData", [](Request& r) { r.Push<u64>(0); });
         Reg(26, "GetSaveDataSize", [](Request& r) {

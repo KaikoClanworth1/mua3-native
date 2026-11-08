@@ -1298,7 +1298,7 @@ void D3D11Renderer::Dispatch(const ComputeLaunch& l) {
         g.ReadGpu(tic_base + u64(h & 0xFFFFF) * 32, tic.w.data(), 32);
         const u32 fmt = tic.Format(), rt = tic.RType();
         const u32 mode = fmt == 0x03 ? 1u : fmt == 0x01 ? 2u : (fmt == 0x08 && rt == 2) ? 3u : fmt == 0x0F ? 4u
-                       : fmt == 0x0C && rt == 7 ? 5u : fmt == 0x04 ? 6u : 0u;
+                       : fmt == 0x0C && rt == 7 ? 5u : fmt == 0x04 ? 6u : fmt == 0x21 ? 7u : 0u;
         const u32 bpb = mode == 2 ? 16 : (mode == 1 || mode == 6) ? 8 : 4;
         const u32 w = tic.Width(), hgt = tic.Type() == 0 ? 1 : tic.Height(), dep = tic.Type() == 2 ? tic.Depth() : 1;
         // Same small-image block shrinking as the texture cache's level 0.

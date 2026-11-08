@@ -258,6 +258,41 @@ struct LauncherState {
     const Monitor* Primary() const { return monitors.empty() ? nullptr : &monitors[0]; }
 };
 
+// ---- presets: one click for the common setups; anything else shows as Custom.
+enum class Preset { Recommended, Smooth, HighRefresh, Custom };
+int HighRefreshRate(const LauncherState& st) {
+    const Monitor* mon = st.Primary();
+    return mon ? RecommendedRate(mon->refresh) : 60;
+}
+Preset CurrentPreset(const LauncherState& st) {
+    const auto& c = st.cfg;
+    if (c.resolution_scale != 0 || !c.vsync || c.fps_limit != 0 || c.swap_interval != 0)
+        return Preset::Custom;
+    if (c.fps_target == 30)
+        return Preset::Recommended;
+    if (c.fps_target == 60)
+        return Preset::Smooth;
+    if (c.fps_target == HighRefreshRate(st))
+        return Preset::HighRefresh;
+    return Preset::Custom;
+}
+const char* PresetName(const LauncherState& st) {
+    switch (CurrentPreset(st)) {
+    case Preset::Recommended: return "Recommended";
+    case Preset::Smooth: return "Smooth";
+    case Preset::HighRefresh: return "High refresh";
+    default: return "Custom";
+    }
+}
+void ApplyPreset(LauncherState& st, Preset p) {
+    auto& c = st.cfg;
+    c.resolution_scale = 0; // sharp at the display's resolution
+    c.vsync = true;
+    c.fps_limit = 0;
+    c.swap_interval = 0;
+    c.fps_target = p == Preset::Recommended ? 30 : p == Preset::Smooth ? 60 : HighRefreshRate(st);
+}
+
 void Header(LauncherState& st) {
     if (st.icon.srv) {
         ImGui::Image((ImTextureID)st.icon.srv, S(112, 112));
@@ -277,7 +312,7 @@ void Header(LauncherState& st) {
 
 // Internal render size the game will use for these settings (mirrors main.cpp's auto scale).
 std::pair<int, int> RenderSize(const core::Config& c) {
-    const int base_h = c.docked ? 1080 : 720, base_w = c.docked ? 1920 : 1280;
+    const int base_h = 1080, base_w = 1920; // docked output (handheld mode is not offered)
     int scale = c.resolution_scale;
     if (scale <= 0)
         scale = (c.height + base_h - 1) / base_h;
@@ -296,8 +331,8 @@ void PlayTab(LauncherState& st) {
     const auto [rw, rh] = RenderSize(c);
     ImGui::Text("Display: %d x %d %s   |   renders at %d x %d", c.width, c.height, c.fullscreen ? "fullscreen" : "window",
                 rw, rh);
-    ImGui::Text("Frame rate: %d fps%s   |   %s mode", c.fps_target, c.fps_target > 60 ? " (experimental)" : "",
-                c.docked ? "Docked" : "Handheld");
+    ImGui::Text("Frame rate: %d fps%s   |   Preset: %s", c.fps_target, c.fps_target > 60 ? " (experimental)" : "",
+                PresetName(st));
     const char* audio[] = {"XAudio2", "SDL", "None"};
     const char* input[] = {"XInput", "SDL"};
     ImGui::Text("Audio: %s, %d%%   |   Input: %s", audio[int(c.audio)], c.volume, input[int(c.input)]);
@@ -309,6 +344,7 @@ void PlayTab(LauncherState& st) {
     ImGui::EndChild();
     ImGui::Spacing();
     if (ImGui::Button("  PLAY  ", S(220, 56))) {
+        st.cfg.docked = true;
         st.cfg.Save(kIni);
         std::string err;
         if (LaunchGame(st.show_console, err)) {
@@ -337,7 +373,7 @@ void InstallTab(LauncherState& st) {
     };
     check(st.keys_ok, "prod.keys (from your own console, Lockpick_RCM)");
     check(st.dumps.has_base, "Base game dump");
-    check(st.dumps.has_update, "Update (v3.0.0 recommended)");
+    check(st.dumps.has_update, "Update (v4.0.1, the last one, recommended)");
     check(st.dumps.dlc_count > 0, fmt::format("DLC ({} found)", st.dumps.dlc_count).c_str());
     ImGui::BeginChild("dumps", ImVec2(0, S(110)), ImGuiChildFlags_Borders);
     for (auto& l : st.dumps.lines)
@@ -440,13 +476,12 @@ void DisplaySettings(LauncherState& st) {
     const std::string label = scale <= 0 ? fmt::format("Auto ({} x {})", rw, rh) : fmt::format("{}x ({} x {})", scale, rw, rh);
     if (ImGui::SliderInt("Internal resolution", &scale, 0, 4, label.c_str()))
         c.resolution_scale = scale;
-    Help("The game draws at 1080p (docked). Auto renders at the smallest multiple that covers your display, so "
+    Help("The game draws at 1080p. Auto renders at the smallest multiple that covers your display, so "
          "1440p and 4K screens get a sharp image instead of an upscaled 1080p one. Higher is sharper and slower.");
 }
 
-void PerformanceSettings(LauncherState& st) {
+void FrameRateSettings(LauncherState& st) {
     auto& c = st.cfg;
-    const Monitor* mon = st.Primary();
     int cur = 1;
     for (int i = 0; i < int(std::size(kRates)); i++)
         if (c.fps_target == kRates[i])
@@ -454,48 +489,87 @@ void PerformanceSettings(LauncherState& st) {
     std::vector<std::string> names;
     for (int r : kRates)
         names.push_back(r == 30 ? "30 (original)" : r <= 60 ? std::to_string(r) : fmt::format("{} (experimental)", r));
-    if (ImGui::BeginCombo("Game frame rate", names[cur].c_str())) {
+    if (ImGui::BeginCombo("Frame rate", names[cur].c_str())) {
         for (int i = 0; i < int(std::size(kRates)); i++)
             if (ImGui::Selectable(names[i].c_str(), i == cur))
                 c.fps_target = kRates[i];
         ImGui::EndCombo();
     }
-    Help("The game's engine supports 60 fps natively. Rates above 60 change its timing and may run faster in places. "
-         "For smooth motion pick a rate that divides your monitor's refresh rate (60 on 60/120 Hz, 72 on 144 Hz).");
-    if (mon) {
-        const int rec = RecommendedRate(mon->refresh);
-        ImGui::SameLine();
-        if (c.fps_target != rec && ImGui::SmallButton(fmt::format("Use {} for {:.0f} Hz", rec, mon->refresh).c_str()))
-            c.fps_target = rec;
-    }
-    ImGui::SliderInt("FPS limit", &c.fps_limit, 0, 240, c.fps_limit <= 0 ? "Off" : "%d");
-    Help("Caps how fast frames are presented when the game is not limiting itself. 0 = off.");
-    ImGui::Checkbox("VSync", &c.vsync);
-    ImGui::SameLine();
+    Help("30 is the game as it shipped. 60 is smoother and fully supported by the engine. Above 60 changes the game's "
+         "timing and may run faster in places. For smooth motion pick a rate that divides your monitor's refresh rate.");
     ImGui::Checkbox("Show FPS", &c.show_fps);
-    ImGui::SameLine();
-    ImGui::Checkbox("Debug overlay (F1)", &c.show_debug_overlay);
-    if (ImGui::TreeNode("Advanced")) {
-        int si = c.swap_interval;
-        const char* sis[] = {"Game decides", "Every frame (1)", "Every 2nd vblank (2)"};
-        if (ImGui::Combo("Present interval", &si, sis, 3))
-            c.swap_interval = si;
-        Help("Overrides the interval the game asks for. Leave on 'Game decides' unless testing.");
-        ImGui::TreePop();
-    }
 }
+
+// Languages the game ships (its control data), in set's numbering (mua3.ini [system] language).
+constexpr std::pair<int, const char*> kLanguages[] = {
+    {1, "English (US)"}, {12, "English (UK)"}, {2, "French"},  {13, "French (Canada)"}, {3, "German"},
+    {4, "Italian"},      {5, "Spanish"},       {14, "Spanish (Latin America)"},         {0, "Japanese"},
+    {7, "Korean"},       {15, "Chinese (Simplified)"},         {16, "Chinese (Traditional)"},
+};
 
 void SettingsTab(LauncherState& st) {
     auto& c = st.cfg;
     ImGui::Spacing();
-    if (ImGui::CollapsingHeader("Display", ImGuiTreeNodeFlags_DefaultOpen))
+    // ---- preset
+    ImGui::TextUnformatted("Preset");
+    const Preset cur = CurrentPreset(st);
+    struct Choice {
+        Preset p;
+        const char* name;
+        std::string text;
+    };
+    const Choice choices[] = {
+        {Preset::Recommended, "Recommended", "The game as it shipped: 30 fps, VSync, sharp image at your display's resolution."},
+        {Preset::Smooth, "Smooth", "60 fps. The engine supports it; motion is twice as smooth."},
+        {Preset::HighRefresh, "High refresh", fmt::format("{} fps, matched to your monitor (experimental above 60).", HighRefreshRate(st))},
+    };
+    for (const Choice& ch : choices) {
+        const bool on = cur == ch.p;
+        if (on)
+            ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+        if (ImGui::Button(ch.name, S(170, 40)))
+            ApplyPreset(st, ch.p);
+        if (on)
+            ImGui::PopStyleColor();
+        ImGui::SetItemTooltip("%s", ch.text.c_str());
+        ImGui::SameLine();
+    }
+    ImGui::NewLine();
+    ImGui::TextDisabled("%s", cur == Preset::Custom ? "Custom: your own settings below."
+                              : cur == Preset::Recommended ? choices[0].text.c_str()
+                              : cur == Preset::Smooth ? choices[1].text.c_str() : choices[2].text.c_str());
+    ImGui::Separator();
+
+    if (ImGui::CollapsingHeader("Display", ImGuiTreeNodeFlags_DefaultOpen)) {
         DisplaySettings(st);
-    if (ImGui::CollapsingHeader("Performance", ImGuiTreeNodeFlags_DefaultOpen))
-        PerformanceSettings(st);
+        FrameRateSettings(st);
+    }
+    if (ImGui::CollapsingHeader("Controls", ImGuiTreeNodeFlags_DefaultOpen)) {
+        int i = int(c.input);
+        const char* names[] = {"XInput (Xbox controllers)", "SDL3 (PlayStation, Switch Pro, generic)"};
+        if (ImGui::Combo("Controller", &i, names, 2))
+            c.input = core::InputBackend(i);
+        ImGui::SliderInt("Camera speed", &c.camera_speed, 10, 200, "%d%%");
+        Help("How fast the right stick turns the camera. 100% is the game's own speed; lower it for finer control.");
+        ImGui::TextDisabled("Keyboard: WASD move, L/K/I/J = A/B/X/Y, Q/E = L/R, 1/3 = ZL/ZR, Enter = +, Tab = -");
+    }
+    if (ImGui::CollapsingHeader("Game", ImGuiTreeNodeFlags_DefaultOpen)) {
+        int sel = 0;
+        for (int k = 0; k < int(std::size(kLanguages)); k++)
+            if (kLanguages[k].first == c.language)
+                sel = k;
+        if (ImGui::BeginCombo("Language", kLanguages[sel].second)) {
+            for (int k = 0; k < int(std::size(kLanguages)); k++)
+                if (ImGui::Selectable(kLanguages[k].second, k == sel))
+                    c.language = kLanguages[k].first;
+            ImGui::EndCombo();
+        }
+        Help("Text and voice language of the game. Takes effect the next time the game starts.");
+    }
     if (ImGui::CollapsingHeader("Audio", ImGuiTreeNodeFlags_DefaultOpen)) {
         int a = int(c.audio);
         const char* names[] = {"XAudio2", "SDL3", "Disabled"};
-        if (ImGui::Combo("Audio backend", &a, names, 3))
+        if (ImGui::Combo("Audio output", &a, names, 3))
             c.audio = core::AudioBackend(a);
         ImGui::SliderInt("Volume", &c.volume, 0, 100, "%d%%");
         bool muted = c.volume == 0 && st.muted_volume > 0;
@@ -508,50 +582,46 @@ void SettingsTab(LauncherState& st) {
             st.SavePrefs();
         }
     }
-    if (ImGui::CollapsingHeader("Input", ImGuiTreeNodeFlags_DefaultOpen)) {
-        int i = int(c.input);
-        const char* names[] = {"XInput (Xbox controllers)", "SDL3 (PlayStation, Switch Pro, generic)"};
-        if (ImGui::Combo("Controller backend", &i, names, 2))
-            c.input = core::InputBackend(i);
-        ImGui::TextDisabled("Keyboard: WASD move, L/K/I/J = A/B/X/Y, Q/E = L/R, 1/3 = ZL/ZR, Enter = +, Tab = -");
-    }
-    if (ImGui::CollapsingHeader("System")) {
-        ImGui::Checkbox("Docked mode (1080p)", &c.docked);
-        Help("Docked renders at 1080p, handheld at 720p.");
-        const char* langs[] = {"Japanese", "English (US)", "French", "German", "Italian", "Spanish", "Chinese",
-                               "Korean", "Dutch", "Portuguese", "Russian", "Taiwanese", "English (UK)",
-                               "French (Canada)", "Spanish (Latin America)", "Chinese (Simplified)",
-                               "Chinese (Traditional)"};
-        ImGui::Combo("Language", &c.language, langs, 17);
+    if (ImGui::CollapsingHeader("Advanced")) {
+        ImGui::Checkbox("VSync", &c.vsync);
+        ImGui::SameLine();
+        ImGui::Checkbox("Debug overlay (F1)", &c.show_debug_overlay);
+        ImGui::SliderInt("FPS limit", &c.fps_limit, 0, 240, c.fps_limit <= 0 ? "Off" : "%d");
+        Help("Caps how fast frames are presented when the game is not limiting itself. 0 = off.");
+        int si = c.swap_interval;
+        const char* sis[] = {"Game decides", "Every frame (1)", "Every 2nd vblank (2)"};
+        if (ImGui::Combo("Present interval", &si, sis, 3))
+            c.swap_interval = si;
         const char* levels[] = {"Trace", "Debug", "Info", "Warning", "Error"};
         ImGui::Combo("Log level", &c.log_level, levels, 5);
         PathInput("Save folder", c.save_dir);
-    }
-    if (ImGui::CollapsingHeader("Launcher")) {
         const int pcts[] = {0, 100, 125, 150, 175, 200, 250};
-        int cur = 0;
-        for (int i = 0; i < 7; i++)
-            if (st.ui_scale_pct == pcts[i])
-                cur = i;
-        const char* names[] = {"Auto (follow Windows)", "100%", "125%", "150%", "175%", "200%", "250%"};
-        if (ImGui::Combo("Launcher size", &cur, names, 7)) {
-            st.ui_scale_pct = pcts[cur];
+        int ui = 0;
+        for (int k = 0; k < 7; k++)
+            if (st.ui_scale_pct == pcts[k])
+                ui = k;
+        const char* sizes[] = {"Auto (follow Windows)", "100%", "125%", "150%", "175%", "200%", "250%"};
+        if (ImGui::Combo("Launcher size", &ui, sizes, 7)) {
+            st.ui_scale_pct = pcts[ui];
             st.SavePrefs();
             st.status = "Launcher size changes on the next start.";
         }
     }
     ImGui::Spacing();
-    if (ImGui::Button("Save settings", S(200, 36)))
+    if (ImGui::Button("Save settings", S(200, 36))) {
+        c.docked = true;
         st.status = c.Save(kIni) ? "Settings saved." : "Could not write mua3.ini";
+    }
     ImGui::SameLine();
-    if (ImGui::Button("Reset to defaults", S(200, 36))) {
-        auto paths = std::make_tuple(c.game_dir, c.isos_dir, c.keys_dir, c.save_dir);
+    if (ImGui::Button("Reset to Recommended", S(240, 36))) {
+        auto keep = std::make_tuple(c.game_dir, c.isos_dir, c.keys_dir, c.save_dir, c.language, c.volume, c.input);
         c = core::Config{};
-        std::tie(c.game_dir, c.isos_dir, c.keys_dir, c.save_dir) = paths;
-        if (const Monitor* mon = st.Primary()) { // sensible defaults for this machine
+        std::tie(c.game_dir, c.isos_dir, c.keys_dir, c.save_dir, c.language, c.volume, c.input) = keep;
+        if (const Monitor* mon = st.Primary()) { // sensible window size for this machine
             c.width = std::min(mon->w, 1920);
             c.height = std::min(mon->h, 1080);
         }
+        ApplyPreset(st, Preset::Recommended);
     }
 }
 
@@ -638,6 +708,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     }
     LauncherState st;
     st.cfg.Load(kIni);
+    st.cfg.docked = true; // the PC build always runs as docked (1080p)
     st.LoadPrefs();
     st.Refresh();
 
@@ -646,8 +717,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     wcfg.height = 720;
     wcfg.vsync = true;
     platform::Display display;
-    if (!display.Init(wcfg, "MUA3 Launcher"))
+    if (!display.Init(wcfg, "Marvel Ultimate Alliance 3 Launcher"))
         return 1;
+    display.SetIcon(st.cfg.game_dir / "control" / "icon_AmericanEnglish.dat");
     st.monitors = ListMonitors();
 
     // Size everything for the monitor the window opened on (or the user's override), then grow the window to

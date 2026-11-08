@@ -19,6 +19,8 @@ namespace platform {
 class Display {
 public:
     bool Init(const core::Config& cfg, const char* title);
+    // Window (and taskbar) icon from an image file: the game's own icon from its installed control data.
+    void SetIcon(const fs::path& image);
     void Shutdown();
     // Returns false when the window was closed.
     bool PumpEvents();

@@ -63,6 +63,15 @@ target_link_options(mua3 PRIVATE /INCREMENTAL:NO /PDBALTPATH:mua3.pdb)
 add_executable(MUA3Launcher WIN32 launcher/launcher.cpp)
 target_link_libraries(MUA3Launcher PRIVATE nxloader platform windowscodecs)
 
+# Executable icon: build/mua3.ico, made from your installed game's icon by scripts/make_icon.ps1 (game data, so it is
+# generated locally and never committed). Without it the executables keep the default icon.
+set(MUA3_ICON "${CMAKE_BINARY_DIR}/mua3.ico")
+if(EXISTS "${MUA3_ICON}")
+    file(WRITE "${CMAKE_BINARY_DIR}/mua3_icon.rc" "1 ICON \"${MUA3_ICON}\"\n")
+    target_sources(mua3 PRIVATE "${CMAKE_BINARY_DIR}/mua3_icon.rc")
+    target_sources(MUA3Launcher PRIVATE "${CMAKE_BINARY_DIR}/mua3_icon.rc")
+endif()
+
 add_executable(shadertool tools/shadertool.cpp)
 target_link_libraries(shadertool PRIVATE nxcore d3dcompiler)
 

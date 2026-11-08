@@ -1,7 +1,11 @@
 #include <algorithm>
+#include <chrono>
+#include <ctime>
 #include <cstdlib>
 #include <d3d11.h>
 #include <dxgi1_2.h>
+
+#include <wincodec.h>
 
 #include <SDL3/SDL.h>
 #include <imgui.h>
@@ -12,6 +16,7 @@
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "windowscodecs.lib")
 
 namespace platform {
 
@@ -21,6 +26,39 @@ static void SafeRelease(T*& p) {
         p->Release();
         p = nullptr;
     }
+}
+
+void Display::SetIcon(const fs::path& image) {
+    if (!window_ || !fs::exists(image))
+        return;
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    IWICImagingFactory* wic = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))))
+        return;
+    IWICBitmapDecoder* dec = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICBitmapScaler* scaler = nullptr;
+    IWICFormatConverter* conv = nullptr;
+    constexpr UINT kSize = 64; // window icons are drawn small; SDL hands Windows this one bitmap
+    if (SUCCEEDED(wic->CreateDecoderFromFilename(image.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &dec)) &&
+        SUCCEEDED(dec->GetFrame(0, &frame)) && SUCCEEDED(wic->CreateBitmapScaler(&scaler)) &&
+        SUCCEEDED(scaler->Initialize(frame, kSize, kSize, WICBitmapInterpolationModeHighQualityCubic)) &&
+        SUCCEEDED(wic->CreateFormatConverter(&conv)) &&
+        SUCCEEDED(conv->Initialize(scaler, GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0,
+                                   WICBitmapPaletteTypeCustom))) {
+        std::vector<u8> px(size_t(kSize) * kSize * 4);
+        if (SUCCEEDED(conv->CopyPixels(nullptr, kSize * 4, UINT(px.size()), px.data()))) {
+            if (SDL_Surface* s = SDL_CreateSurfaceFrom(int(kSize), int(kSize), SDL_PIXELFORMAT_RGBA32, px.data(), int(kSize * 4))) {
+                SDL_SetWindowIcon(window_, s); // (SDL copies the pixels)
+                SDL_DestroySurface(s);
+            }
+        }
+    }
+    if (conv) conv->Release();
+    if (scaler) scaler->Release();
+    if (frame) frame->Release();
+    if (dec) dec->Release();
+    wic->Release();
 }
 
 bool Display::Init(const core::Config& cfg, const char* title) {
@@ -149,6 +187,16 @@ bool Display::PumpEvents() {
         case SDL_EVENT_KEY_DOWN:
             if ((e.key.key == SDLK_RETURN && (e.key.mod & SDL_KMOD_ALT)) || e.key.key == SDLK_F11)
                 ToggleFullscreen();
+            if (e.key.key == SDLK_F12 && !e.key.repeat) { // screenshot of the window as shown
+                std::error_code ec;
+                fs::create_directories("screenshots", ec);
+                const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+                std::tm tm{};
+                localtime_s(&tm, &now);
+                char name[64];
+                std::strftime(name, sizeof(name), "screenshots/mua3_%Y%m%d_%H%M%S.bmp", &tm);
+                capture_path = name;
+            }
             break;
         default: break;
         }
