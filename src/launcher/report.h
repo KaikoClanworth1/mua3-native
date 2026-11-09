@@ -1,6 +1,7 @@
 // "Report a problem": a zip of what is needed to look into a crash or a bug, made on the player's PC for them to
 // attach to an issue: their description, system and version information, settings, install info, logs, the newest
-// crash files and the game build log. Never keys, saves or game files.
+// crash files, the game build log and (if they agree) their save, so the problem can be reached again. Never keys or
+// game files.
 #pragma once
 #include <optional>
 #include <string>
@@ -24,7 +25,8 @@ struct Item {
     std::string name; // in the zip
     u64 size = 0;
 };
-std::vector<Item> Collect(const fs::path& game_dir, const fs::path& build_dir);
+// `save_dir` empty: no save files.
+std::vector<Item> Collect(const fs::path& game_dir, const fs::path& build_dir, const fs::path& save_dir);
 
 struct Result {
     bool ok = false;
@@ -33,7 +35,7 @@ struct Result {
 };
 // `about` = the description typed by the player; `extra` = lines the launcher adds (displays, C++ tools, settings).
 Result Create(const std::string& about, const std::vector<std::string>& extra, const fs::path& game_dir,
-              const fs::path& build_dir);
+              const fs::path& build_dir, const fs::path& save_dir);
 
 // The system summary that starts report.txt (Windows, CPU, memory, GPU and driver).
 std::string SystemInfo();

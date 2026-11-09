@@ -334,6 +334,7 @@ struct LauncherState {
     std::optional<report::Crash> crash; // the newest crash, when not reported/dismissed yet
     u64 crash_seen = 0;                // launcher.ini: newest crash time already reported or dismissed
     char about[4096] = {};
+    bool report_save = true; // include the save (to reach the problem again)
     report::Result last_report;
     // launcher.ini
     bool show_console = false;
@@ -465,13 +466,16 @@ void ReportWindow(LauncherState& st) {
     ImGui::TextWrapped("What happened? What were you doing (chapter, character, menu, button), and what did you see?");
     ImGui::InputTextMultiline("##about", st.about, sizeof(st.about), ImVec2(-1, S(150)));
     const builder::Paths paths = builder::DefaultPaths(st.cfg.game_dir);
-    const auto items = report::Collect(st.cfg.game_dir, paths.work_dir);
+    ImGui::Checkbox("Include my save, so the problem can be reached again from the same point", &st.report_save);
+    const fs::path save = st.report_save ? st.cfg.save_dir : fs::path();
+    const auto items = report::Collect(st.cfg.game_dir, paths.work_dir, save);
     u64 total = 0;
     for (auto& it : items)
         total += it.size;
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
     ImGui::TextWrapped("Included (%zu files, %.1f MB): your text, system and version info, settings, logs, crash files, "
-                       "the build log. Never your keys, saves or game files.", items.size() + 1, total / 1048576.0);
+                       "the build log%s. Never your keys or game files.", items.size() + 1, total / 1048576.0,
+                       st.report_save ? ", your save" : "");
     ImGui::PopStyleColor();
     if (ImGui::TreeNode("Files")) {
         for (auto& it : items)
@@ -486,7 +490,7 @@ void ReportWindow(LauncherState& st) {
         extra.push_back("C++ tools: " + (tc.ok ? "MSVC " + tc.version : tc.problem));
         for (auto& m : st.monitors)
             extra.push_back(fmt::format("Display {}: {} x {} @ {:.0f} Hz, {:.0f}% scale", m.name, m.w, m.h, m.refresh, m.scale * 100));
-        st.last_report = report::Create(st.about, extra, st.cfg.game_dir, paths.work_dir);
+        st.last_report = report::Create(st.about, extra, st.cfg.game_dir, paths.work_dir, save);
         if (st.last_report.ok && st.crash) {
             st.crash_seen = st.crash->time;
             st.crash.reset();
@@ -1247,7 +1251,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             CancelTestDialog();
         if (frame == 5 && std::getenv("MUA3_LAUNCHER_TEST_REPORT")) { // test: write a problem report and exit
             const auto r = report::Create("Test report (automated).", {"test line"}, st.cfg.game_dir,
-                                          builder::DefaultPaths(st.cfg.game_dir).work_dir);
+                                          builder::DefaultPaths(st.cfg.game_dir).work_dir, st.cfg.save_dir);
             LOG_INFO("Launcher", "test report {}: {}", r.ok ? "ok" : "failed", r.ok ? r.zip.string() : r.error);
             break;
         }

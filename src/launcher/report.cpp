@@ -199,7 +199,7 @@ std::string SystemInfo() {
     return s;
 }
 
-std::vector<Item> Collect(const fs::path& game_dir, const fs::path& build_dir) {
+std::vector<Item> Collect(const fs::path& game_dir, const fs::path& build_dir, const fs::path& save_dir) {
     std::vector<Item> items;
     std::error_code ec;
     auto add = [&](const fs::path& p, const std::string& name) {
@@ -227,11 +227,16 @@ std::vector<Item> Collect(const fs::path& game_dir, const fs::path& build_dir) {
     add("launcher.ini", "settings/launcher.ini");
     add(game_dir / "install.json", "settings/install.json");
     add(build_dir / "build.log", "build/build.log");
+    // the save (a few hundred KB): lets the problem be reached again from the same point
+    if (!save_dir.empty() && fs::is_directory(save_dir, ec))
+        for (auto it = fs::recursive_directory_iterator(save_dir, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec))
+            if (it->is_regular_file(ec) && it->file_size(ec) < (64ull << 20))
+                add(it->path(), "save/" + it->path().lexically_relative(save_dir).generic_string());
     return items;
 }
 
 Result Create(const std::string& about, const std::vector<std::string>& extra, const fs::path& game_dir,
-              const fs::path& build_dir) {
+              const fs::path& build_dir, const fs::path& save_dir) {
     Result r;
     std::error_code ec;
     fs::create_directories("reports", ec);
@@ -250,7 +255,7 @@ Result Create(const std::string& about, const std::vector<std::string>& extra, c
     for (auto& l : extra)
         text += l + "\n";
     zip.Add("report.txt", std::vector<u8>(text.begin(), text.end()));
-    for (const Item& it : Collect(game_dir, build_dir))
+    for (const Item& it : Collect(game_dir, build_dir, save_dir))
         zip.Add(it.name, ReadShared(it.path, 64ull << 20));
     zip.Finish();
     r.ok = zip.ok();
