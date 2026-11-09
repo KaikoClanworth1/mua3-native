@@ -38,7 +38,7 @@ struct Texture {
 Texture LoadImageTexture(ID3D11Device* dev, const fs::path& path) {
     Texture t;
     IWICImagingFactory* wic = nullptr;
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED); // (already done by wWinMain)
     if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))))
         return t;
     IWICBitmapDecoder* dec = nullptr;
@@ -147,14 +147,14 @@ void Help(const char* text) {
 
 HWND g_hwnd = nullptr; // the launcher window: owner of the file dialogs
 
-// Windows file dialogs, run on their own single-threaded COM apartment (the dialog needs one; the main thread's COM
-// is already set up for WIC). They block the launcher until closed, like any modal dialog.
+// Windows file dialogs, modal, on the launcher's own (single-threaded COM, see wWinMain) UI thread. (Run on a helper
+// thread while the UI thread waited, the dialog's messages to its owner window could never be answered: the launcher
+// froze, "not responding", as soon as Add files was pressed.)
 std::vector<fs::path> RunFileDialog(bool folder, bool multi, const wchar_t* title,
                                     std::vector<std::pair<std::wstring, std::wstring>> filters, const fs::path& start) {
     std::vector<fs::path> out;
-    std::thread([&] {
-        if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)))
-            return;
+    LOG_INFO("Launcher", "file dialog: {}", fs::path(title).string());
+    {
         IFileOpenDialog* dlg = nullptr;
         if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) {
             DWORD opts = 0;
@@ -195,9 +195,43 @@ std::vector<fs::path> RunFileDialog(bool folder, bool multi, const wchar_t* titl
             }
             dlg->Release();
         }
-        CoUninitialize();
-    }).join();
+    }
+    LOG_INFO("Launcher", "file dialog: {} chosen", out.size());
     return out;
+}
+
+// Test hook (MUA3_LAUNCHER_TEST_DIALOG): moves this process's file dialog off screen when it appears and cancels it.
+void CancelTestDialog() {
+    std::thread([] {
+        struct Find {
+            DWORD pid;
+            HWND h;
+        };
+        for (int k = 0; k < 1000; k++) {
+            Sleep(10);
+            Find f{GetCurrentProcessId(), nullptr};
+            EnumWindows(
+                [](HWND h, LPARAM lp) -> BOOL {
+                    auto* f = reinterpret_cast<Find*>(lp);
+                    DWORD p = 0;
+                    GetWindowThreadProcessId(h, &p);
+                    char cls[32]{};
+                    GetClassNameA(h, cls, sizeof(cls));
+                    if (p == f->pid && std::strcmp(cls, "#32770") == 0) {
+                        f->h = h;
+                        return FALSE;
+                    }
+                    return TRUE;
+                },
+                reinterpret_cast<LPARAM>(&f));
+            if (f.h) {
+                SetWindowPos(f.h, nullptr, -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                Sleep(1500);
+                PostMessageW(f.h, WM_COMMAND, IDCANCEL, 0);
+                return;
+            }
+        }
+    }).detach();
 }
 
 void OpenFolder(const fs::path& p) {
@@ -982,6 +1016,8 @@ void AboutTab() {
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+    // The UI thread is a single-threaded COM apartment: the shell's file dialogs need one (WIC works in it too).
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     // Run from the executable's folder unless a config already exists in the current one.
     if (!fs::exists(kIni)) {
         wchar_t exe[MAX_PATH];
@@ -1096,7 +1132,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 
     // Automation (MUA3_HEADLESS + MUA3_LAUNCHER_SHOT=<file.bmp>[, MUA3_LAUNCHER_TAB=<tab>]): save a frame, exit.
     const char* shot = std::getenv("MUA3_LAUNCHER_SHOT");
+    // Test (MUA3_LAUNCHER_TEST_DIALOG=1): open the "Add files" dialog, move it off screen and cancel it, then exit
+    // with 0 (a hang here is the bug this guards against).
+    const bool test_dialog = std::getenv("MUA3_LAUNCHER_TEST_DIALOG") != nullptr;
     for (int frame = 0; display.PumpEvents(); frame++) {
+        if (test_dialog && frame == 10)
+            CancelTestDialog();
+        if (test_dialog && frame == 12) {
+            const auto files = RunFileDialog(false, true, L"test", {{L"Switch games (*.nsp; *.xci)", L"*.nsp;*.xci"}}, ".");
+            LOG_INFO("Launcher", "test dialog closed ({} files)", files.size());
+            break;
+        }
         if (shot && frame == 20)
             display.capture_path = fs::u8path(shot);
         if (shot && frame == 22)
