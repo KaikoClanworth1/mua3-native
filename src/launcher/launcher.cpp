@@ -1,5 +1,6 @@
 // MUA3 Launcher: install from dumps, configure, and start the game.
 #include <fstream>
+#include <optional>
 #include <thread>
 
 #include <d3d11.h>
@@ -12,7 +13,9 @@
 #include <imgui.h>
 
 #include "core/config.h"
+#include "common/crash.h"
 #include "launcher/game_builder.h"
+#include "launcher/report.h"
 #include "loader/installer.h"
 #include "platform/platform.h"
 
@@ -108,6 +111,9 @@ void ApplyTheme() {
     c[ImGuiCol_SliderGrabActive] = red_hi;
     c[ImGuiCol_PlotHistogram] = red;
     c[ImGuiCol_Separator] = ImVec4(0.25f, 0.25f, 0.30f, 1.0f);
+    c[ImGuiCol_TitleBg] = red_lo;
+    c[ImGuiCol_TitleBgActive] = red;
+    c[ImGuiCol_PopupBg] = ImVec4(0.09f, 0.09f, 0.11f, 1.0f);
     s.ScaleAllSizes(g_ui);
 }
 
@@ -323,6 +329,12 @@ struct LauncherState {
     builder::Toolchain toolchain;
     double toolchain_checked = -100;
     int build_jobs = 0;
+    // problem report
+    bool open_report = false;          // open the form this frame
+    std::optional<report::Crash> crash; // the newest crash, when not reported/dismissed yet
+    u64 crash_seen = 0;                // launcher.ini: newest crash time already reported or dismissed
+    char about[4096] = {};
+    report::Result last_report;
     // launcher.ini
     bool show_console = false;
     bool close_on_play = true;
@@ -370,12 +382,13 @@ struct LauncherState {
             else if (k == "close_on_play") close_on_play = v != 0;
             else if (k == "ui_scale") ui_scale_pct = v;
             else if (k == "muted_volume") muted_volume = v;
+            else if (k == "crash_seen") crash_seen = std::strtoull(line.c_str() + eq + 1, nullptr, 10);
         }
     }
     void SavePrefs() const {
         std::ofstream f(kLauncherIni);
         f << "show_console=" << show_console << "\nclose_on_play=" << close_on_play << "\nui_scale=" << ui_scale_pct
-          << "\nmuted_volume=" << muted_volume << "\n";
+          << "\nmuted_volume=" << muted_volume << "\ncrash_seen=" << crash_seen << "\n";
     }
     const Monitor* Primary() const { return monitors.empty() ? nullptr : &monitors[0]; }
 };
@@ -426,10 +439,77 @@ void Header(LauncherState& st) {
     ImGui::SetWindowFontScale(1.1f);
     ImGui::TextColored(ImVec4(0.9f, 0.2f, 0.25f, 1), "The Black Order");
     ImGui::SetWindowFontScale(1.0f);
-    ImGui::TextDisabled("Native Windows build  |  D3D11  |  XAudio2/SDL  |  XInput/SDL");
+    ImGui::TextDisabled("Native Windows build %s  |  D3D11  |  XAudio2/SDL  |  XInput/SDL", common::Version());
     ImGui::Text("Game data: %s", st.installed ? "installed" : "not installed");
     ImGui::EndGroup();
+    ImGui::SameLine(ImGui::GetWindowWidth() - S(230));
+    if (ImGui::Button("Report a problem", S(210, 36)))
+        st.open_report = true;
     ImGui::Separator();
+}
+
+// "Report a problem": what happened, then a zip of logs, crash files and system information.
+void ReportWindow(LauncherState& st) {
+    if (st.open_report) {
+        ImGui::OpenPopup("Report a problem");
+        st.open_report = false;
+        st.last_report = {};
+    }
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + vp->Size.y * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(std::min(vp->Size.x - S(40), S(760)), std::min(vp->Size.y - S(40), S(600))), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal("Report a problem", nullptr, ImGuiWindowFlags_NoSavedSettings))
+        return;
+    if (st.crash)
+        ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.35f, 1), "Newest crash: %s", st.crash->headline.c_str());
+    ImGui::TextWrapped("What happened? What were you doing (chapter, character, menu, button), and what did you see?");
+    ImGui::InputTextMultiline("##about", st.about, sizeof(st.about), ImVec2(-1, S(150)));
+    const builder::Paths paths = builder::DefaultPaths(st.cfg.game_dir);
+    const auto items = report::Collect(st.cfg.game_dir, paths.work_dir);
+    u64 total = 0;
+    for (auto& it : items)
+        total += it.size;
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextWrapped("Included (%zu files, %.1f MB): your text, system and version info, settings, logs, crash files, "
+                       "the build log. Never your keys, saves or game files.", items.size() + 1, total / 1048576.0);
+    ImGui::PopStyleColor();
+    if (ImGui::TreeNode("Files")) {
+        for (auto& it : items)
+            ImGui::BulletText("%s  (%.1f KB)", it.name.c_str(), it.size / 1024.0);
+        ImGui::TreePop();
+    }
+    ImGui::Spacing();
+    if (ImGui::Button("Create report", S(200, 40))) {
+        std::vector<std::string> extra;
+        extra.push_back(fmt::format("Game built: {}", builder::GameBuilt(paths) ? "yes" : "no"));
+        const auto tc = builder::FindToolchain();
+        extra.push_back("C++ tools: " + (tc.ok ? "MSVC " + tc.version : tc.problem));
+        for (auto& m : st.monitors)
+            extra.push_back(fmt::format("Display {}: {} x {} @ {:.0f} Hz, {:.0f}% scale", m.name, m.w, m.h, m.refresh, m.scale * 100));
+        st.last_report = report::Create(st.about, extra, st.cfg.game_dir, paths.work_dir);
+        if (st.last_report.ok && st.crash) {
+            st.crash_seen = st.crash->time;
+            st.crash.reset();
+            st.SavePrefs();
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Close", S(120, 40)))
+        ImGui::CloseCurrentPopup();
+    if (st.last_report.ok) {
+        ImGui::TextColored(ImVec4(0.3f, 0.85f, 0.4f, 1), "Saved: %s", st.last_report.zip.string().c_str());
+        ImGui::TextWrapped("Attach this zip to a new issue on GitHub (or send it to whoever asked for it).");
+        if (ImGui::Button("Show the file", S(180, 34)))
+            ShellExecuteW(nullptr, L"open", L"explorer.exe", (L"/select,\"" + st.last_report.zip.wstring() + L"\"").c_str(),
+                          nullptr, SW_SHOWNORMAL);
+        ImGui::SameLine();
+        if (ImGui::Button("Open GitHub issues", S(220, 34)))
+            ShellExecuteW(nullptr, L"open", L"https://github.com/KaikoClanworth1/mua3-native/issues/new", nullptr, nullptr,
+                          SW_SHOWNORMAL);
+    } else if (!st.last_report.error.empty()) {
+        ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.3f, 1), "%s", st.last_report.error.c_str());
+    }
+    ImGui::EndPopup();
 }
 
 // Internal render size the game will use for these settings (mirrors main.cpp's auto scale).
@@ -444,6 +524,23 @@ std::pair<int, int> RenderSize(const core::Config& c) {
 
 void PlayTab(LauncherState& st) {
     ImGui::Spacing();
+    if (st.crash) {
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.30f, 0.08f, 0.08f, 1));
+        ImGui::BeginChild("crash", ImVec2(0, S(96)), ImGuiChildFlags_Borders);
+        ImGui::TextColored(ImVec4(1, 0.6f, 0.5f, 1), "The game closed unexpectedly.");
+        ImGui::TextDisabled("%s", st.crash->headline.c_str());
+        if (ImGui::Button("Report a problem", S(200, 32)))
+            st.open_report = true;
+        ImGui::SameLine();
+        if (ImGui::Button("Dismiss", S(120, 32))) {
+            st.crash_seen = st.crash->time;
+            st.crash.reset();
+            st.SavePrefs();
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+    }
     if (!st.installed) {
         ImGui::TextWrapped("The game data hasn't been installed yet. Go to the Install tab to install your copy.");
         return;
@@ -1029,6 +1126,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 break;
             }
     }
+    common::RotateLog("launcher", 3);
+    common::SetLogFile("launcher.log");
+    common::InstallCrashHandler("launcher");
+    LOG_INFO("Launcher", "MUA3 Native launcher {} in {}", common::Version(), fs::current_path().string());
     LauncherState st;
     st.cfg.Load(kIni);
     {
@@ -1041,6 +1142,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 build = true;
             else if (std::wstring(argv[i]) == L"--jobs" && i + 1 < argc)
                 jobs = std::max(1, _wtoi(argv[++i]));
+            else if (std::wstring(argv[i]) == L"--crash-report") // started by the game after a crash
+                st.open_report = true;
         }
         LocalFree(argv);
         if (build) { // unattended build (scripts, tests): progress in build_game/build.log
@@ -1050,6 +1153,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     }
     st.cfg.docked = true; // the PC build always runs as docked (1080p)
     st.LoadPrefs();
+    st.crash = report::NewestCrash();
+    if (st.crash && st.crash->time <= st.crash_seen)
+        st.crash.reset();
     st.Refresh();
 
     core::Config wcfg;
@@ -1123,6 +1229,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             }
             ImGui::EndTabBar();
         }
+        ReportWindow(st);
         if (!st.status.empty()) {
             ImGui::SetCursorPosY(ImGui::GetWindowHeight() - S(34));
             ImGui::TextDisabled("%s", st.status.c_str());
@@ -1138,6 +1245,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     for (int frame = 0; display.PumpEvents(); frame++) {
         if (test_dialog && frame == 10)
             CancelTestDialog();
+        if (frame == 5 && std::getenv("MUA3_LAUNCHER_TEST_REPORT")) { // test: write a problem report and exit
+            const auto r = report::Create("Test report (automated).", {"test line"}, st.cfg.game_dir,
+                                          builder::DefaultPaths(st.cfg.game_dir).work_dir);
+            LOG_INFO("Launcher", "test report {}: {}", r.ok ? "ok" : "failed", r.ok ? r.zip.string() : r.error);
+            break;
+        }
         if (test_dialog && frame == 12) {
             const auto files = RunFileDialog(false, true, L"test", {{L"Switch games (*.nsp; *.xci)", L"*.nsp;*.xci"}}, ".");
             LOG_INFO("Launcher", "test dialog closed ({} files)", files.size());

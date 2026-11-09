@@ -1,5 +1,6 @@
 add_library(nxloader STATIC
     common/common.cpp
+    common/crash.cpp
     common/profiler.cpp
     crypto/crypto.cpp
     loader/storage.cpp
@@ -7,6 +8,13 @@ add_library(nxloader STATIC
     loader/installer.cpp
 )
 target_include_directories(nxloader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+# Version shown in the launcher, logs, crash files and problem reports: git describe at configure time.
+execute_process(COMMAND git describe --tags --always --dirty WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+                OUTPUT_VARIABLE MUA3_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(NOT MUA3_VERSION)
+    set(MUA3_VERSION "dev")
+endif()
+set_source_files_properties(common/crash.cpp PROPERTIES COMPILE_DEFINITIONS "MUA3_VERSION=\"${MUA3_VERSION}\"")
 target_link_libraries(nxloader PUBLIC fmt::fmt bcrypt)
 
 add_executable(nxextract tools/nxextract.cpp)
@@ -60,7 +68,7 @@ target_link_libraries(mua3 PRIVATE nxcore platform dbghelp)
 # copy does not lock the build's PDB).
 target_link_options(mua3 PRIVATE /INCREMENTAL:NO /PDBALTPATH:mua3.pdb)
 
-add_executable(MUA3Launcher WIN32 launcher/launcher.cpp launcher/game_builder.cpp)
+add_executable(MUA3Launcher WIN32 launcher/launcher.cpp launcher/game_builder.cpp launcher/report.cpp)
 target_link_libraries(MUA3Launcher PRIVATE nxloader platform windowscodecs)
 
 # Executable icon: build/mua3.ico, made from your installed game's icon by scripts/make_icon.ps1 (game data, so it is

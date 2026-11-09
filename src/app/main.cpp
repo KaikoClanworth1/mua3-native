@@ -15,6 +15,7 @@
 #include <timeapi.h>
 #include <dbghelp.h>
 
+#include "common/crash.h"
 #include "common/profiler.h"
 #include "core/config.h"
 #include "core/kernel/kernel.h"
@@ -205,6 +206,9 @@ void PollCommandFile(platform::Input* input) {
                 g_renderer->RequestFrameShot(fs::u8path(arg));
             } else if (cmd == "shotui" && g_display) { // the window as shown, overlay included
                 g_display->capture_path = fs::u8path(arg);
+            } else if (cmd == "crash") { // test aid: an access violation (exercises the crash files and report)
+                LOG_WARN("Main", "crash requested by the test channel");
+                *static_cast<volatile int*>(nullptr) = 1;
             } else if (cmd == "dump") {
                 core::Sys().Kern().DumpAllThreads(arg == "host");
             } else if (cmd == "pixel" && g_renderer) { // pixel <surface gpu va hex> <x> <y>
@@ -354,6 +358,25 @@ static std::string HostStack() {
     return stack;
 }
 
+// After a crash: the launcher opens its "Report a problem" form (not in automated test runs).
+static void OpenProblemReport(const fs::path& summary) {
+    if (std::getenv("MUA3_HEADLESS"))
+        return;
+    wchar_t exe[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    const fs::path launcher = fs::path(exe).parent_path() / "MUA3Launcher.exe";
+    if (!fs::exists(launcher))
+        return;
+    std::error_code ec;
+    std::wstring cmd = L"\"" + launcher.wstring() + L"\" --crash-report \"" + fs::absolute(summary, ec).wstring() + L"\"";
+    STARTUPINFOW si{sizeof(si)};
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, DETACHED_PROCESS, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+}
+
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
     static std::atomic<bool> once{false};
     if (once.exchange(true))
@@ -385,6 +408,7 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
         LOG_ERROR("Crash", "  #{} {:#x} {}+{:#x} {}:{}", i, f.AddrPC.Offset, has_sym ? sym->Name : "?", disp,
                   has_line ? line.FileName : "", has_line ? line.LineNumber : 0);
     }
+    OpenProblemReport(common::WriteCrashReport("mua3", ep, "unhandled exception"));
     std::fflush(nullptr);
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -471,8 +495,9 @@ static void StartGpuSampler() {
 
 int main(int argc, char** argv) {
     SetUnhandledExceptionFilter(CrashFilter);
-    std::signal(SIGABRT, [](int) {
+    std::signal(SIGABRT, [](int) { // fatal stops (Panic, std::terminate) end here
         LOG_ERROR("Crash", "abort(){}", HostStack());
+        OpenProblemReport(common::WriteCrashReport("mua3", nullptr, "the game stopped (fatal error, see mua3.log)"));
         std::fflush(nullptr);
     });
     // C++ throws, logged where they happen (the first few): one escaping a thread kills the process with little
@@ -520,7 +545,9 @@ int main(int argc, char** argv) {
             input_script = fs::u8path(argv[++i]);
     }
     common::SetLogLevel(common::LogLevel(std::clamp(cfg.log_level, 0, 5)));
+    common::RotateLog("mua3", 5); // the previous run's log goes to logs/
     common::SetLogFile("mua3.log");
+    LOG_INFO("Main", "MUA3 Native {}", common::Version());
     timeBeginPeriod(1);
     StartAllocTrace(); // MUA3_TRACE_VALLOC (diagnostic)
     // The exe names its PDB without a path (/PDBALTPATH): let in-process symbol lookups (profilers, stack dumps)
