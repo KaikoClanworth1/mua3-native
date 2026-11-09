@@ -63,8 +63,8 @@ if ($bad) { throw "game material in the package: $($bad.FullName -join ', ')" }
 $size = (Get-ChildItem $out -Recurse -File | Measure-Object Length -Sum).Sum
 "packaged $out ($([math]::Round($size / 1MB)) MB, $((Get-ChildItem $out -Recurse -File).Count) files)"
 if ($Zip) {
-    $zip = "$out.zip"
-    Remove-Item $zip -ErrorAction SilentlyContinue
-    Compress-Archive -Path $out -DestinationPath $zip -CompressionLevel Optimal
-    "zip $zip ($([math]::Round((Get-Item $zip).Length / 1MB)) MB)"
+    $zipPath = "$out.zip"
+    Remove-Item $zipPath -ErrorAction SilentlyContinue
+    Compress-Archive -Path $out -DestinationPath $zipPath -CompressionLevel Optimal
+    "zip $zipPath ($([math]::Round((Get-Item $zipPath).Length / 1MB)) MB)"
 }
