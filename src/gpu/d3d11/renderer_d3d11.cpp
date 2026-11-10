@@ -215,6 +215,7 @@ static const char* const kProfNames[kProfCount] = {"shaders", "state", "index", 
 static u64 g_prof_ns[kProfCount], g_prof_vb_bytes, g_prof_cb_bytes, g_prof_ib_count, g_prof_draws;
 static u64 g_prof_rb_waits, g_prof_rb_wait_ns, g_prof_rb_queued, g_prof_rb_bytes; // compute result copy-backs
 static u64 g_prof_resident; // draws reading compute output from the resident copy
+static u64 g_prof_rb_pages, g_prof_rb_changed_pages; // copy-back pages compared / found changed
 static u64 g_prof_rb_site[12]; // waits by consumer: 0 compute, 1 texture, 2/3 culling-gs, 4 index, 5 vertex, 6 cbuf, 7 geometry
 static u64 g_prof_tex_get_ns, g_prof_tex_samp_ns, g_prof_tex_calls;
 static u64 g_prof_last = 0;
@@ -663,6 +664,10 @@ void D3D11Renderer::Reupload(GpuBuf& b, bool all, u32 from) {
         g.ReadGpuPartial(b.addr + off, b.snapshot.data() + off, n);
         const D3D11_BOX box{off, 0, 0, off + n, 1, 1};
         ctx_->UpdateSubresource(b.buf.Get(), 0, &box, b.snapshot.data() + off, n, n);
+        if (b.prev && off + n <= b.prev_capacity) // (prev follows guest memory)
+            ctx_->UpdateSubresource(b.prev.Get(), 0, &box, b.snapshot.data() + off, n, n);
+        else
+            b.diff_full = true;
         for (u32 p = off >> 12; p <= (off + n - 1) >> 12 && p < b.page_serial.size(); p++)
             b.page_serial[p] = b.serial;
     }
@@ -676,6 +681,12 @@ void D3D11Renderer::FlushGpuBuf(GpuBuf& b) {
         QueueReadback(b);
     if (b.in_flight) { // blocks until the GPU has run everything queued before the copy
         const u64 t0 = g_profile ? ProfNow() : 0;
+        if (g_profile && sync_site_ == 1) { // which textures make the GPU thread wait (first few per buffer)
+            static common::U64Map<int> logged;
+            if (logged[b.addr]++ < 3)
+                LOG_INFO("Profile", "texture lookup waits on compute buffer {:#x}+{:#x} (texture at {:#x})", b.addr, b.size,
+                         sync_va_);
+        }
         PollReadbacks(true, &b);
         if (g_profile)
             g_prof_rb_waits++, g_prof_rb_wait_ns += ProfNow() - t0, g_prof_rb_site[sync_site_]++;
@@ -743,6 +754,7 @@ D3D11Renderer::GpuBuf* D3D11Renderer::ComputeBuffer(u64 addr, u32 size) {
             FlushGpuBuf(*e);
             sync_site_ = 0;
             std::erase_if(gbufs_, [&](auto& b) { return b.get() == e; });
+            active_stale_ = true;
             e = nullptr;
         }
     }
@@ -764,6 +776,7 @@ D3D11Renderer::GpuBuf* D3D11Renderer::ComputeBuffer(u64 addr, u32 size) {
         nb->stale = true;
         e = nb.get();
         gbufs_.push_back(std::move(nb));
+        active_stale_ = true;
     }
     e->last_use = frame_counter_;
     if (size > e->size) {
@@ -790,6 +803,135 @@ D3D11Renderer::GpuBuf* D3D11Renderer::ComputeBuffer(u64 addr, u32 size) {
     return e;
 }
 
+// Copy-backs compare on the CPU only the pages a kernel pass flagged as changed since the last copy-back (ST010
+// copies back ~12 MB a frame of which ~20 KB change; comparing all of it with the snapshot was ~8% of the GPU
+// thread). MUA3_RB_GPUDIFF=0 compares everything as before.
+static const bool g_rb_gpudiff = [] {
+    const char* e = std::getenv("MUA3_RB_GPUDIFF");
+    return !(e && *e == '0');
+}();
+
+ComPtr<ID3D11Buffer> D3D11Renderer::DiffPages(GpuBuf& b, u32& pages) {
+    pages = (b.size + 0xFFF) >> 12;
+    if (!g_rb_gpudiff || b.size < (64u << 10))
+        return nullptr;
+    auto raw_srv = [&](ID3D11Buffer* buf, u32 bytes, ComPtr<ID3D11ShaderResourceView>& out) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = DXGI_FORMAT_R32_TYPELESS;
+        sv.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+        sv.BufferEx = {0, bytes / 4, D3D11_BUFFEREX_SRV_FLAG_RAW};
+        out.Reset();
+        return SUCCEEDED(dev_->CreateShaderResourceView(buf, &sv, &out));
+    };
+    if (!diff_cs_) {
+        // One group per page: 256 threads compare 16 bytes each.
+        static const char* src =
+            "ByteAddressBuffer a : register(t0); ByteAddressBuffer b : register(t1); RWByteAddressBuffer m : register(u0);"
+            "cbuffer c : register(b0) { uint pages; uint per_row; uint size; uint pad; };"
+            "groupshared uint changed;"
+            "[numthreads(256,1,1)] void main(uint3 g : SV_GroupID, uint t : SV_GroupIndex) {"
+            "  uint page = g.y * per_row + g.x; if (t == 0) changed = 0; GroupMemoryBarrierWithGroupSync();"
+            "  uint off = page * 4096 + t * 16;"
+            "  if (page < pages && off < size) { uint4 x = a.Load4(off), y = b.Load4(off); if (any(x != y)) InterlockedOr(changed, 1); }"
+            "  GroupMemoryBarrierWithGroupSync(); if (t == 0 && page < pages) m.Store(page * 4, changed); }";
+        ComPtr<ID3DBlob> code, err;
+        if (FAILED(D3DCompile(src, std::strlen(src), nullptr, nullptr, nullptr, "main", "cs_5_0", 0, 0, &code, &err)) ||
+            FAILED(dev_->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &diff_cs_))) {
+            static bool warned = false;
+            if (!warned)
+                LOG_WARN("Renderer", "copy-back diff shader failed: {}", err ? static_cast<const char*>(err->GetBufferPointer()) : "");
+            warned = true;
+            return nullptr;
+        }
+        D3D11_BUFFER_DESC cd{16, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0};
+        if (FAILED(dev_->CreateBuffer(&cd, nullptr, &diff_cb_))) {
+            diff_cs_.Reset();
+            return nullptr;
+        }
+    }
+    // prev: same capacity as the buffer (a new or grown buffer starts over with a full compare)
+    if (!b.prev || b.prev_capacity != b.capacity) {
+        D3D11_BUFFER_DESC bd{b.capacity, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0,
+                             D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
+        b.prev.Reset();
+        b.prev_capacity = 0;
+        if (FAILED(dev_->CreateBuffer(&bd, nullptr, &b.prev)) || !raw_srv(b.prev.Get(), b.capacity, b.prev_srv)) {
+            b.prev.Reset();
+            return nullptr;
+        }
+        b.prev_capacity = b.capacity;
+        b.diff_full = true;
+    }
+    if (b.buf_srv_of != b.buf.Get()) { // (the buffer object changes when it grows)
+        if (!raw_srv(b.buf.Get(), b.capacity, b.buf_srv))
+            return nullptr;
+        b.buf_srv_of = b.buf.Get();
+    }
+    ComPtr<ID3D11Buffer> staging;
+    if (!b.diff_full) {
+        if (diff_mask_pages_ < pages) {
+            const u32 want = std::max<u32>(pages, 4096);
+            D3D11_BUFFER_DESC md{want * 4, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0,
+                                 D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
+            diff_mask_.Reset();
+            diff_mask_uav_.Reset();
+            diff_mask_pages_ = 0;
+            D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+            ud.Format = DXGI_FORMAT_R32_TYPELESS;
+            ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+            ud.Buffer = {0, want, D3D11_BUFFER_UAV_FLAG_RAW};
+            if (FAILED(dev_->CreateBuffer(&md, nullptr, &diff_mask_)) ||
+                FAILED(dev_->CreateUnorderedAccessView(diff_mask_.Get(), &ud, &diff_mask_uav_))) {
+                b.diff_full = true; // (prev was not brought up to date)
+                return nullptr;
+            }
+            diff_mask_pages_ = want;
+        }
+        for (size_t k = 0; k < mask_pool_.size(); k++) {
+            D3D11_BUFFER_DESC d;
+            mask_pool_[k]->GetDesc(&d);
+            if (d.ByteWidth >= pages * 4) {
+                staging = std::move(mask_pool_[k]);
+                mask_pool_.erase(mask_pool_.begin() + k);
+                break;
+            }
+        }
+        if (!staging) {
+            D3D11_BUFFER_DESC sd{std::max<u32>(pages, 1024) * 4, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0};
+            if (FAILED(dev_->CreateBuffer(&sd, nullptr, &staging)))
+                staging.Reset();
+        }
+        if (staging) {
+            const u32 per_row = std::min<u32>(pages, 65535), rows = (pages + per_row - 1) / per_row;
+            D3D11_MAPPED_SUBRESOURCE mp;
+            if (SUCCEEDED(ctx_->Map(diff_cb_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mp))) {
+                const u32 c[4] = {pages, per_row, b.size, 0};
+                std::memcpy(mp.pData, c, sizeof(c));
+                ctx_->Unmap(diff_cb_.Get(), 0);
+            }
+            ID3D11UnorderedAccessView* no_uav[shader::kGmemWindows]{};
+            ctx_->CSSetUnorderedAccessViews(0, shader::kGmemWindows, no_uav, nullptr);
+            ID3D11ShaderResourceView* srvs[2] = {b.buf_srv.Get(), b.prev_srv.Get()};
+            ctx_->CSSetShader(diff_cs_.Get(), nullptr, 0);
+            ctx_->CSSetShaderResources(0, 2, srvs);
+            ctx_->CSSetUnorderedAccessViews(0, 1, diff_mask_uav_.GetAddressOf(), nullptr);
+            ctx_->CSSetConstantBuffers(0, 1, diff_cb_.GetAddressOf());
+            ctx_->Dispatch(per_row, rows, 1);
+            ID3D11ShaderResourceView* no_srv[2]{};
+            ctx_->CSSetShaderResources(0, 2, no_srv);
+            ctx_->CSSetUnorderedAccessViews(0, 1, no_uav, nullptr);
+            const D3D11_BOX mbox{0, 0, 0, pages * 4, 1, 1};
+            ctx_->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, diff_mask_.Get(), 0, &mbox);
+        }
+    }
+    // prev = what guest memory holds once this copy-back is applied (a copy-back without flags compares everything,
+    // so prev is in step again after it)
+    const D3D11_BOX box{0, 0, 0, b.size, 1, 1};
+    ctx_->CopySubresourceRegion(b.prev.Get(), 0, 0, 0, 0, b.buf.Get(), 0, &box);
+    b.diff_full = false;
+    return staging;
+}
+
 void D3D11Renderer::QueueReadback(GpuBuf& b) {
     Readback rb{&b, nullptr, b.size, b.serial};
     for (size_t k = 0; k < staging_pool_.size(); k++) {
@@ -806,17 +948,22 @@ void D3D11Renderer::QueueReadback(GpuBuf& b) {
         if (FAILED(dev_->CreateBuffer(&sd, nullptr, &rb.staging)))
             return;
     }
+    // (the page flags are copied first: when the data copy has landed, they have too)
+    rb.mask = DiffPages(b, rb.pages);
     const D3D11_BOX box{0, 0, 0, b.size, 1, 1};
     ctx_->CopySubresourceRegion(rb.staging.Get(), 0, 0, 0, 0, b.buf.Get(), 0, &box);
     b.in_flight++;
     b.gpu_dirty = false;
+    active_stale_ = true;
     g_prof_rb_queued++, g_prof_rb_bytes += b.size;
     readbacks_.push_back(std::move(rb));
 }
 
-void D3D11Renderer::ApplyReadback(GpuBuf& b, const u8* now, u32 size, u32 serial) {
+void D3D11Renderer::ApplyReadback(GpuBuf& b, const u8* now, u32 size, u32 serial, const u32* mask, u32 pages) {
     auto& g = G();
     size = std::min<u32>(size, u32(b.snapshot.size()));
+    if (b.apply_full)
+        mask = nullptr;
     // CPU writes made meanwhile survive (only words the kernels changed are written); those pages re-upload later.
     CollectCpuWrites(b.cpu_ranges, b.cpu_pages);
     u8* old = b.snapshot.data();
@@ -843,8 +990,14 @@ void D3D11Renderer::ApplyReadback(GpuBuf& b, const u8* now, u32 size, u32 serial
         const u32 pbeg = page * 0x1000u, pend = std::min(size, pbeg + 0x1000u);
         if (page < b.page_serial.size() && b.page_serial[page] > serial)
             continue; // re-uploaded from guest memory after this copy was taken: guest data is newer
+        if (mask && page < pages && !mask[page] && (page >= b.mask_acc.size() || !b.mask_acc[page]))
+            continue; // the kernels left it as it was at the last copy-back
+        if (g_profile)
+            g_prof_rb_pages++;
         if (std::memcmp(now + pbeg, old + pbeg, pend - pbeg) == 0)
             continue;
+        if (g_profile)
+            g_prof_rb_changed_pages++;
         u32 off = pbeg;
         for (; off + 16 <= pend; off += 16) {
             const __m128i x = _mm_loadu_si128(reinterpret_cast<const __m128i*>(now + off));
@@ -864,6 +1017,8 @@ void D3D11Renderer::ApplyReadback(GpuBuf& b, const u8* now, u32 size, u32 serial
         if (run != ~0u) // (runs end at page boundaries, as before)
             flush(off);
     }
+    b.mask_acc.clear();
+    b.apply_full = false;
     if (lo < hi) {
         textures_->Invalidate(b.addr + lo, hi - lo);
         for (auto& r : b.cpu_ranges) // our own writes dirtied the pages
@@ -883,17 +1038,41 @@ void D3D11Renderer::PollReadbacks(bool wait, const GpuBuf* until) {
         bool superseded = false;
         for (size_t i = 1; i < readbacks_.size() && !superseded; i++)
             superseded = readbacks_[i].b == rb.b;
-        if (!superseded) {
-            D3D11_MAPPED_SUBRESOURCE mp;
+        if (superseded) {
+            // its changed pages still have to be compared when the newer copy is applied
+            D3D11_MAPPED_SUBRESOURCE mm;
+            if (!rb.mask || rb.b->apply_full)
+                rb.b->apply_full = true;
+            else if (SUCCEEDED(ctx_->Map(rb.mask.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mm))) {
+                auto& acc = rb.b->mask_acc;
+                if (acc.size() < rb.pages)
+                    acc.resize(rb.pages, 0);
+                const u32* f = static_cast<const u32*>(mm.pData);
+                for (u32 p = 0; p < rb.pages; p++)
+                    acc[p] |= f[p];
+                ctx_->Unmap(rb.mask.Get(), 0);
+            } else
+                rb.b->apply_full = true;
+        } else {
+            D3D11_MAPPED_SUBRESOURCE mp, mm;
             const HRESULT hr = ctx_->Map(rb.staging.Get(), 0, D3D11_MAP_READ, need ? 0 : D3D11_MAP_FLAG_DO_NOT_WAIT, &mp);
             if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
                 break;
             if (SUCCEEDED(hr)) {
-                ApplyReadback(*rb.b, static_cast<const u8*>(mp.pData), rb.size, rb.serial);
+                // (the flags were copied before the data: ready; without them every page is compared)
+                const bool masked = rb.mask && SUCCEEDED(ctx_->Map(rb.mask.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mm));
+                ApplyReadback(*rb.b, static_cast<const u8*>(mp.pData), rb.size, rb.serial,
+                              masked ? static_cast<const u32*>(mm.pData) : nullptr, rb.pages);
+                if (masked)
+                    ctx_->Unmap(rb.mask.Get(), 0);
                 ctx_->Unmap(rb.staging.Get(), 0);
-            }
+            } else
+                rb.b->apply_full = true; // (lost: prev already moved past it)
         }
+        if (rb.mask)
+            mask_pool_.push_back(std::move(rb.mask));
         rb.b->in_flight--;
+        active_stale_ = true;
         staging_pool_.push_back(std::move(rb.staging));
         readbacks_.pop_front();
         if (need)
@@ -905,9 +1084,30 @@ void D3D11Renderer::SyncGuest(u64 gpu_va, u64 size, int site) {
     if (!gpu_dirty_any_ && readbacks_.empty())
         return;
     sync_site_ = site;
-    for (auto& b : gbufs_)
-        if ((b->in_flight || b->gpu_dirty) && gpu_va < b->addr + b->size && b->addr < gpu_va + size)
-            FlushGpuBuf(*b);
+    sync_va_ = gpu_va;
+    // Only buffers with results in flight or not yet copied can need landing: a list of those, rebuilt when that
+    // changes, instead of every resident buffer on each texture / constant / index lookup.
+    if (active_stale_ || in_sync_) {
+        active_.clear();
+        for (auto& b : gbufs_)
+            if (b->in_flight || b->gpu_dirty)
+                active_.push_back(b.get());
+        active_stale_ = false;
+    }
+    if (in_sync_) { // (re-entered: use a list of its own)
+        const std::vector<GpuBuf*> list = active_;
+        for (GpuBuf* b : list)
+            if ((b->in_flight || b->gpu_dirty) && gpu_va < b->addr + b->size && b->addr < gpu_va + size)
+                FlushGpuBuf(*b);
+    } else {
+        in_sync_ = true;
+        for (size_t i = 0; i < active_.size(); i++) { // (FlushGpuBuf only marks the list stale, never rebuilds it)
+            GpuBuf* b = active_[i];
+            if ((b->in_flight || b->gpu_dirty) && gpu_va < b->addr + b->size && b->addr < gpu_va + size)
+                FlushGpuBuf(*b);
+        }
+        in_sync_ = false;
+    }
     sync_site_ = 0;
 }
 
@@ -1462,6 +1662,7 @@ void D3D11Renderer::Dispatch(const ComputeLaunch& l) {
         w->gpu_written = true;
         w->gpu_dirty = true;
         gpu_dirty_any_ = true;
+        active_stale_ = true;
     }
 }
 
@@ -1482,7 +1683,25 @@ void D3D11Renderer::EmulateCullingGs() {
     if (!tris)
         return;
     const size_t bytes = size_t(tris) * 12;
-    // The emulated program keeps every triangle, so the list is the draw's own indices (as u32).
+    // The emulated program keeps every triangle, so the list is the draw's own indices (as u32). Indexed draws only
+    // remember where those indices are: the draw that consumes the list reads them from there (copying and comparing
+    // every list cost the GPU thread ~7% in fights). MUA3_CULL_COPY=1 writes the lists as before.
+    static const bool copy_lists = std::getenv("MUA3_CULL_COPY") != nullptr;
+    if (dr.indexed && !copy_lists && trace_draws_ <= 0) {
+        const u32 fmt = m.index_format;
+        const u32 isz = fmt == 0 ? 1 : fmt == 1 ? 2 : 4;
+        u32 counter = 0;
+        SyncGuest(counter_va, 4, 3);
+        g.ReadGpu(counter_va, &counter, 4);
+        const u64 list = list_va + u64(counter) * 4;
+        if (cull_lists_.size() > 65536)
+            cull_lists_.clear(), cull_src_.clear();
+        cull_lists_[list] = tris * 3;
+        cull_src_[list] = {m.index_addr + u64(dr.first) * isz, isz, tris * 3};
+        counter += tris * 3;
+        g.WriteGpu(counter_va, &counter, 4);
+        return;
+    }
     static thread_local std::vector<u32> out;
     const u8* src = nullptr;
     if (dr.indexed) {
@@ -1517,8 +1736,9 @@ void D3D11Renderer::EmulateCullingGs() {
     if (!cur || std::memcmp(cur, src, bytes) != 0)
         g.WriteGpu(list_va + u64(counter) * 4, src, bytes);
     if (cull_lists_.size() > 65536)
-        cull_lists_.clear();
+        cull_lists_.clear(), cull_src_.clear();
     cull_lists_[list_va + u64(counter) * 4] = tris * 3;
+    cull_src_.erase(list_va + u64(counter) * 4);
     counter += tris * 3;
     g.WriteGpu(counter_va, &counter, 4);
 }
@@ -1957,7 +2177,12 @@ void D3D11Renderer::Draw() {
             const u32 fmt = m.index_format;
             index_size = fmt == 0 ? 1 : fmt == 1 ? 2 : 4;
             const bool strip = dr.topology == 3 || dr.topology == 5;
-            const u64 ia = m.index_addr + u64(dr.first) * index_size;
+            u64 ia = m.index_addr + u64(dr.first) * index_size;
+            if (index_size == 4 && !cull_src_.empty()) // a culling list (EmulateCullingGs): its source indices
+                if (auto cs = cull_src_.find(ia); cs != cull_src_.end() && cs->second.count == dr.count) {
+                    ia = cs->second.addr;
+                    index_size = cs->second.index_size;
+                }
             GpuBuf* gb = index_size > 1 && !strip ? ResidentBuffer(ia, u64(dr.count) * index_size) : nullptr;
             if (gb && (ia - gb->addr) % index_size == 0) {
                 // compute-written indices (the culling list): drawn from the resident copy; the vertex range is
@@ -1985,9 +2210,15 @@ void D3D11Renderer::Draw() {
         if (dr.indexed) {
             const u32 fmt = m.index_format;
             index_size = fmt == 0 ? 1 : fmt == 1 ? 2 : 4;
+            u64 ia = m.index_addr + u64(dr.first) * index_size;
+            if (index_size == 4 && !cull_src_.empty()) // a culling list: its source indices (as above)
+                if (auto cs = cull_src_.find(ia); cs != cull_src_.end() && cs->second.count == dr.count) {
+                    ia = cs->second.addr;
+                    index_size = cs->second.index_size;
+                }
             std::vector<u8> raw(size_t(dr.count) * index_size);
-            SyncGuest(m.index_addr + u64(dr.first) * index_size, raw.size(), 4);
-            g.ReadGpu(m.index_addr + u64(dr.first) * index_size, raw.data(), raw.size());
+            SyncGuest(ia, raw.size(), 4);
+            g.ReadGpu(ia, raw.data(), raw.size());
             indices.resize(dr.count);
             for (u32 i = 0; i < dr.count; i++)
                 indices[i] = index_size == 1 ? raw[i] : index_size == 2 ? common::Read<u16>(&raw[i * 2])
@@ -2368,21 +2599,26 @@ void D3D11Renderer::Draw() {
                     raws[i] = sh.raw;
                 continue;
             }
-            tmp.resize(size);
-            g.ReadGpu(b.address, tmp.data(), size);
-            cbs[i] = dc.Constant(stage_index * 32 + i, tmp.data(), size);
+            // Contiguous guest memory is uploaded straight from its host copy (no staging copy per upload).
+            const u8* data = src;
+            if (!data || trace_draw_) {
+                tmp.resize(size);
+                g.ReadGpu(b.address, tmp.data(), size);
+                data = tmp.data();
+            }
+            cbs[i] = dc.Constant(stage_index * 32 + i, data, size);
             sh.addr = b.address;
-            sh.data.assign(tmp.begin(), tmp.begin() + size);
+            sh.data.assign(data, data + size);
             sh.buf = cbs[i];
             sh.raw = nullptr;
             g_prof_cb_bytes += size;
             if (trace_draw_ && !is_vs && size >= 13 * 16) {
-                const float* f = reinterpret_cast<const float*>(tmp.data());
+                const float* f = reinterpret_cast<const float*>(data);
                 LOG_INFO("Renderer", "TRACE upload ps c{} {:#x}@{:#x} size {:#x} dyn {} rows10-12.w {:g} {:g} {:g}", i, b.size, b.address, size,
                          (s->info.cbuf_dyn_mask >> i) & 1, f[10 * 4 + 3], f[11 * 4 + 3], f[12 * 4 + 3]);
             }
             if (dyn) {
-                ID3D11ShaderResourceView* raw = dc.RawBuffer(stage_index * 32 + i, tmp.data(), size);
+                ID3D11ShaderResourceView* raw = dc.RawBuffer(stage_index * 32 + i, data, size);
                 sh.raw = raw;
                 raws[i] = raw;
             }
@@ -2592,6 +2828,9 @@ void D3D11Renderer::Present(const PresentInfo& p) {
                  g_prof_rb_queued / 150.0, g_prof_rb_bytes / 150 / 1048576.0, g_prof_rb_waits / 150.0, g_prof_rb_wait_ns / 150e6,
                  g_prof_resident / 150.0);
         g_prof_resident = 0;
+        LOG_INFO("Profile", "  copy-back pages: {:.0f} compared/frame, {:.0f} changed", g_prof_rb_pages / 150.0,
+                 g_prof_rb_changed_pages / 150.0);
+        g_prof_rb_pages = g_prof_rb_changed_pages = 0;
         LOG_INFO("Profile", "  waits by consumer: compute {} texture {} cull-index {} cull-counter {} index {} vertex {} cbuf {} geometry {}",
                  g_prof_rb_site[0], g_prof_rb_site[1], g_prof_rb_site[2], g_prof_rb_site[3], g_prof_rb_site[4], g_prof_rb_site[5],
                  g_prof_rb_site[6], g_prof_rb_site[7]);
@@ -2619,6 +2858,7 @@ void D3D11Renderer::Present(const PresentInfo& p) {
     }
     PollReadbacks(false);
     std::erase_if(gbufs_, [&](auto& b) { return !b->in_flight && frame_counter_ - b->last_use > 600; });
+    active_stale_ = true;
     for (auto* cache : {&index_cache_, &vertex_cache_})
         std::erase_if(*cache, [&](auto& kv) {
             const u64 idle = frame_counter_ - kv.second.last_use;

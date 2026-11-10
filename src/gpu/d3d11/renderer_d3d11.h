@@ -79,6 +79,12 @@ public:
         return it == cull_lists_.end() ? 0 : it->second;
     }
     std::unordered_map<u64, u32> cull_lists_; // culling list start -> indices written there (EmulateCullingGs)
+    struct CullSource {
+        u64 addr;       // the culling draw's own indices (the list is those, as u32)
+        u32 index_size; // bytes per source index
+        u32 count;
+    };
+    std::unordered_map<u64, CullSource> cull_src_; // culling list start -> where its indices really are
     void ReportHitch();
     s64 shader_wait_ns_ = 0; // per frame: how long draws may still wait for shaders the game just asked for
     void SyncRegion(u64 gpu_va, u64 size) override {
@@ -105,6 +111,7 @@ public:
     // Before reading guest memory on the host: lands pending compute results overlapping the range.
     void SyncGuest(u64 gpu_va, u64 size, int site = 0); // site: which consumer asked (profile)
     int sync_site_ = 0;
+    u64 sync_va_ = 0; // (profile) address of the last SyncGuest
 
     void DumpSurface(Surface* s, const fs::path& path);
     // Saves the next presented frame (debug / automation).
@@ -172,16 +179,37 @@ private:
         bool stale = false;         // an overlapping buffer was written: re-upload everything
         bool retired = false;       // lies inside a larger buffer that now serves its windows
         bool gpu_written = false;
+        // MUA3_RB_GPUDIFF: GPU copy of what guest memory holds (as of the last copy-back plus re-uploads), so a
+        // kernel pass can flag the 4 KiB pages that changed and copy-backs compare only those on the CPU.
+        ComPtr<ID3D11Buffer> prev;
+        ComPtr<ID3D11ShaderResourceView> buf_srv, prev_srv; // raw views
+        ID3D11Buffer* buf_srv_of = nullptr; // the buffer buf_srv views
+        u32 prev_capacity = 0;
+        bool diff_full = true;          // the next copy-back compares every page (prev is not in step)
+        std::vector<u32> mask_acc;      // flags of superseded copy-backs, still to be compared
+        bool apply_full = false;        // a superseded copy-back's flags were not available: compare everything
         common::U64Map<ComPtr<ID3D11ShaderResourceView>> srvs; // typed views for texel buffers
         u64 last_use = 0;
     };
     std::vector<std::unique_ptr<GpuBuf>> gbufs_;
+    std::vector<GpuBuf*> active_; // (SyncGuest) buffers with results in flight or not copied back yet
+    bool active_stale_ = true;    // set by anything that changes which buffers those are, or frees one
+    bool in_sync_ = false;
     struct Readback {
         GpuBuf* b;
         ComPtr<ID3D11Buffer> staging;
         u32 size;
         u32 serial; // buffer's upload serial when the copy was taken
+        ComPtr<ID3D11Buffer> mask; // staging: u32 per page, nonzero = changed (MUA3_RB_GPUDIFF), null = compare all
+        u32 pages = 0;
     };
+    std::vector<ComPtr<ID3D11Buffer>> mask_pool_;
+    ComPtr<ID3D11ComputeShader> diff_cs_;
+    ComPtr<ID3D11Buffer> diff_mask_, diff_cb_;
+    ComPtr<ID3D11UnorderedAccessView> diff_mask_uav_;
+    u32 diff_mask_pages_ = 0;
+    // Flags the pages of `b` that differ from b.prev into a staging buffer, then brings prev up to date. Null if off.
+    ComPtr<ID3D11Buffer> DiffPages(GpuBuf& b, u32& pages);
     std::deque<Readback> readbacks_;
     std::vector<ComPtr<ID3D11Buffer>> staging_pool_;
     GpuBuf* ComputeBuffer(u64 addr, u32 size);
@@ -196,7 +224,7 @@ private:
     void Reupload(GpuBuf& b, bool all, u32 from = 0); // all && from: only the new tail [from, size)
     // Applies finished readbacks in order; `wait` blocks for all of them, `until` for those of one buffer.
     void PollReadbacks(bool wait, const GpuBuf* until = nullptr);
-    void ApplyReadback(GpuBuf& b, const u8* now, u32 size, u32 serial);
+    void ApplyReadback(GpuBuf& b, const u8* now, u32 size, u32 serial, const u32* mask = nullptr, u32 pages = 0);
     void QueueReadback(GpuBuf& b);
     void FlushGpuBuf(GpuBuf& b); // results of `b` into guest memory now (blocking)
     bool gpu_dirty_any_ = false;

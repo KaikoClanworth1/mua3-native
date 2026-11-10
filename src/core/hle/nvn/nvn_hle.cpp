@@ -279,8 +279,8 @@ void EnsureTexture(State& s, u64 tex) {
              d.format, d.pool, d.offset);
 }
 void TextureInitialize(State& s) {
+    BumpTexGen(s.x[0]); // (before the global counter: the registration fast path reads them in the other order)
     g_texture_generation.fetch_add(1, std::memory_order_release);
-    BumpTexGen(s.x[0]);
     u64 tex, ok;
     if (!Through(s, kTextureInitialize, tex, ok) || !(ok & 1))
         return;
@@ -295,8 +295,8 @@ void TextureInitialize(State& s) {
                  o.textures.size(), o.buffers.size(), o.pools.size(), o.texture_ids.size(), o.sampler_ids.size());
 }
 void TextureFinalize(State& s) {
+    BumpTexGen(s.x[0]); // (before the global counter: the registration fast path reads them in the other order)
     g_texture_generation.fetch_add(1, std::memory_order_release);
-    BumpTexGen(s.x[0]);
     u64 tex, r;
     if (!Through(s, kTextureFinalize, tex, r))
         return;
@@ -307,6 +307,7 @@ void TextureFinalize(State& s) {
 
 // NVNboolean nvnTexturePoolInitialize(NVNtexturePool*, const NVNmemoryPool*, ptrdiff_t offset, int numDescriptors)
 void ForgetPoolBase(u64 pool) {
+    g_texture_generation.fetch_add(1, std::memory_order_release); // (drops the registration fast-path entries)
     auto& t = TG();
     std::lock_guard lk(t.mutex);
     t.pool_base.erase(pool);
@@ -350,15 +351,57 @@ void TexturePoolRegisterTexture(State& s) {
     // again gets a new descriptor (its generation).
     static const bool cache = std::getenv("MUA3_NVN_NO_REGCACHE") == nullptr;
     u64 key = 0, desc_va = 0, generation = 0;
+    // Per-thread fast path in front of the shared cache: the exact (pool, texture, view words) seen before with the
+    // texture generation unchanged since (any texture Initialize/Finalize or pool re-initialization bumps the
+    // global counter; then the texture's own generation is checked once under the lock). No lock, no map lookups.
+    struct FastReg {
+        u64 pool = 0, words[6]{}, base = 0, global_gen = 0, tex_gen = 0;
+        u8 bytes[32]{};
+        bool valid = false;
+    };
+    constexpr u32 kFastRegs = 2048;
+    thread_local std::unique_ptr<FastReg[]> fast_regs;
+    FastReg* fr = nullptr;
+    u64 words[6] = {tex, 0, 0, 0, 0, 0};
+    u64 snap_gen = 0;
+    auto remember = [&](const u8* bytes) {
+        if (!fr || !desc_va)
+            return;
+        fr->pool = s.x[0];
+        std::memcpy(fr->words, words, sizeof(words));
+        fr->base = desc_va - u64(id) * 32;
+        fr->global_gen = snap_gen;
+        fr->tex_gen = generation;
+        std::memcpy(fr->bytes, bytes, sizeof(fr->bytes));
+        fr->valid = true;
+    };
     if (cache) {
         g_reg_calls.fetch_add(1, std::memory_order_relaxed);
-        u64 words[6] = {tex, 0, 0, 0, 0, 0};
         if (view)
             for (u32 k = 0; k < 5; k++)
                 words[1 + k] = recomp::Rd<u64>(s, view + k * 8);
         key = 0xcbf29ce484222325ull;
-        for (const u8* b = reinterpret_cast<const u8*>(words); b < reinterpret_cast<const u8*>(words + 6); b++)
-            key = (key ^ *b) * 0x100000001b3ull;
+        for (u64 w : words) {
+            key = (key ^ w) * 0x100000001b3ull;
+            key ^= key >> 29;
+        }
+        if (!fast_regs)
+            fast_regs.reset(new FastReg[kFastRegs]);
+        fr = &fast_regs[(key ^ (s.x[0] * 0x9E3779B97F4A7C15ull) >> 40) & (kFastRegs - 1)];
+        if (fr->valid && fr->pool == s.x[0] && std::memcmp(fr->words, words, sizeof(words)) == 0) {
+            const u64 now_gen = g_texture_generation.load(std::memory_order_acquire);
+            bool ok = fr->global_gen == now_gen;
+            if (!ok && GetTexGen(tex) == fr->tex_gen) { // something else changed: this texture did not
+                fr->global_gen = now_gen;
+                ok = true;
+            }
+            if (ok && gpu::G().WriteGpu(fr->base + u64(id) * 32, fr->bytes, sizeof(fr->bytes))) {
+                g_reg_hits.fetch_add(1, std::memory_order_relaxed);
+                return Return(s, 0);
+            }
+            fr->valid = false;
+        }
+        snap_gen = g_texture_generation.load(std::memory_order_acquire); // (before this texture's generation is read)
         auto& t = TG();
         std::unique_lock lk(t.mutex);
         if (auto g = t.gen.find(tex); g != t.gen.end())
@@ -384,6 +427,7 @@ void TexturePoolRegisterTexture(State& s) {
             if (auto it = t.tics.find(key); it != t.tics.end() && it->second.generation == generation &&
                 gpu::G().WriteGpu(desc_va, it->second.bytes, sizeof(it->second.bytes))) {
                 g_reg_hits.fetch_add(1, std::memory_order_relaxed);
+                remember(it->second.bytes);
                 return Return(s, 0);
             }
     }
@@ -399,6 +443,7 @@ void TexturePoolRegisterTexture(State& s) {
             if (t.tics.size() > 1 << 16)
                 t.tics.clear();
             t.tics[key] = d;
+            remember(d.bytes);
         }
     }
     static const bool learn_va = std::getenv("MUA3_NVN_LEARN") != nullptr;
