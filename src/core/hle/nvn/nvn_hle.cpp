@@ -241,7 +241,7 @@ u64 GetTexGen(u64 tex) {
     auto it = t.gen.find(tex);
     return it == t.gen.end() ? 0 : it->second;
 }
-std::atomic<u64> g_reg_calls{0}, g_reg_hits{0}, g_list_grows{0};
+std::atomic<u64> g_reg_calls{0}, g_reg_hits{0}, g_list_grows{0}, g_list_new{0}, g_list_new_big{0}; // lists ExactList allocated (>= 512 KB)
 TextureDesc DescribeTexture(State& s, u64 tex) {
     TextureDesc d;
     d.pool = Get(s, "nvnTextureGetMemoryPool", tex);
@@ -563,8 +563,12 @@ std::vector<Command> ExactList(size_t want) {
             p.free.pop_back();
         }
     }
-    if (v.capacity() < want)
+    if (v.capacity() < want) {
         v.reserve(want);
+        g_list_new.fetch_add(1, std::memory_order_relaxed);
+        if (want * sizeof(Command) >= (512u << 10)) // (allocations this size are fresh pages from the OS)
+            g_list_new_big.fetch_add(1, std::memory_order_relaxed);
+    }
     return v;
 }
 enum class Kind { Command, Setter };
@@ -902,11 +906,16 @@ void CommandBufferEndRecording(State& s) {
     auto& slot = rec.handles[handle];
     auto& open = rec.open[cb];
     if (!open.empty() || !slot) {
+        // The list this handle had (last frame's, thousands of commands) is destroyed on the reclaim thread: here, on
+        // the game's render thread, that was the frame's critical path.
+        if (slot)
+            Reclaim(std::move(slot));
         if (open.capacity() <= open.size() * 2 + 256) {
             // The recording buffer is not much larger than its contents: it becomes the list (moving ~5,000
             // commands of ~280 bytes each cost the game's render thread ~6%), and the command buffer records into
             // recycled storage next time.
-            const size_t next = std::max<size_t>(open.size(), 1024);
+            // (with headroom: a recording that outgrows its buffer reallocates megabytes on this thread)
+            const size_t next = std::max<size_t>(open.size() + open.size() / 4 + 256, 1024);
             slot = Publish(std::move(open));
             open = ExactList(next);
         } else {
@@ -1387,9 +1396,9 @@ void QueuePresentTexture(State& s) {
             for (auto& [ns, w] : v)
                 g_through_calls[w].store(0);
         }
-        LOG_INFO("NVN", "Presenting: {:.1f} fps (native) gpu busy {:.0f}% (draw {:.0f}%) | frame ms p50 {:.2f} p99 {:.2f} max {:.2f} | reg {}/{} cached, {} list grows | driver:{}",
+        LOG_INFO("NVN", "Presenting: {:.1f} fps (native) gpu busy {:.0f}% (draw {:.0f}%) | frame ms p50 {:.2f} p99 {:.2f} max {:.2f} | reg {}/{} cached, {} list grows, {} new lists ({} large) | driver:{}",
                  q.presents / secs, g.busy_ns.exchange(0) / (secs * 1e7), g.draw_ns.exchange(0) / (secs * 1e7),
-                 p50, p99, worst, g_reg_hits.exchange(0), g_reg_calls.exchange(0), g_list_grows.exchange(0), drv);
+                 p50, p99, worst, g_reg_hits.exchange(0), g_reg_calls.exchange(0), g_list_grows.exchange(0), g_list_new.exchange(0), g_list_new_big.exchange(0), drv);
         q.presents = 0;
         q.fps_t0 = now;
     }
