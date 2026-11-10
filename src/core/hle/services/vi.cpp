@@ -115,12 +115,11 @@ BufferQueue& Queue() {
 
 void PaceFrame(BufferQueue& q, u32 swap_interval) {
     // With its frame rate unlocked (fps_target, see game_patches.cpp) the game's own limiter paces it; a second
-    // independent 60 Hz pacer here would drift against it and hold back a frame now and then (judder).
+    // independent pacer at the same rate would drift against it and hold back a frame now and then (judder). A
+    // lower FPS limit still caps it.
     const auto& cfg = core::Sys().Cfg();
-    if (cfg.fps_target > 30 && cfg.swap_interval == 0)
-        return;
     const int limit = cfg.fps_limit;
-    if (limit <= 0)
+    if (limit <= 0 || (cfg.fps_target > 30 && cfg.swap_interval == 0 && limit >= cfg.fps_target))
         return;
     using namespace std::chrono;
     const auto period = duration_cast<steady_clock::duration>(duration<double>(std::max<u32>(swap_interval, 1) / double(limit)));

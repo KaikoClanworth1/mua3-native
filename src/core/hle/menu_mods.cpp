@@ -25,7 +25,9 @@
 #include "core/hle/menu_mods.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
+#include <span>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -34,6 +36,8 @@
 #include "core/cpu/recomp/recomp_rt.h"
 #include "core/kernel/kernel.h"
 #include "core/memory.h"
+#include "core/hle/menu_graphics.h"
+#include "core/hle/menu_guest.h"
 #include "core/hle/menu_label.h"
 #include "core/system.h"
 
@@ -75,9 +79,37 @@ u64 g_text = 0; // our UTF-16 strings in guest memory
 
 std::mutex g_mutex;
 std::unordered_map<u64, u32> g_borrowed; // menu object -> slot shown as QUIT GAME (absent: none)
+std::unordered_map<u64, u32> g_title_borrowed; // title menu object -> slot shown as GRAPHICS
 std::atomic<bool> g_quit_pending{false}; // our dialog is up: its callback decides about the desktop
 
-enum Hook { kHRefresh, kHState, kHAppearance, kHSystem, kHExecute, kHQuit, kHShop, kHNotice, kHookCount };
+// the title menu (vtable main+0x210ee80; 16 slots, 11-15 = the SYSTEM submenu: SAVE, LOAD, OPTIONS, TIPS, GALLERY)
+constexpr u64 kTitleVtable = 0x210ee80;
+constexpr u64 kTitleRefresh = 0x7214d0;    // vfunc +0x448 (this)
+constexpr u64 kTitleState = 0x721720;      // vfunc +0x460 (this, slot) -> 0 shown, 1 grey, 2 hidden
+constexpr u64 kTitleAppearance = 0x721890; // vfunc +0x480 (this, slot, state)
+constexpr u64 kTitleIsSystem = 0x7e4080;   // vfunc +0x490 (this, slot)
+constexpr u64 kTitleExecute = 0x720c10;    // vfunc +0x4a8 (this, slot)
+constexpr u64 kTitleUpdate = 0x71f760;     // vfunc +0x3f0 (this): every frame, places the items at their panes
+constexpr u64 kTitleTexOff = 0x1a3d290, kTitleTexOn = 0x1a3d2d0;       // u32[16] label textures per slot
+constexpr u64 kTitleSysCursor = 0x1a3d27c, kTitleSysText = 0x1a3d23c; // u32[5] position panes per system position
+constexpr u64 kPane = 0x5f39d0;            // (layout, pane index) -> pane
+constexpr u32 kTitleOptions = 13, kTitleSystemPositions = 5;
+constexpr u32 kTitleBorrowable[] = {7, 6, 4}; // LAB, HERO, INFINITY: hidden on the title screen (they have labels)
+// 10_title_menu_parts textures: GText_MAIN_MENU(_on), used by no item, drawn as GRAPHICS
+constexpr u32 kTexMainMenu = 28, kTexMainMenuOn = 29;
+// 10_title_menu_02 panes: the SYSTEM submenu's 4th / 5th positions, and the unused 12th main-list position, which is
+// moved one step below the 5th for the 6th item
+constexpr u32 kCursorSub4 = 45, kCursorSub5 = 46, kCursorSpare = 39; // Null_cursor_sub_04/05_pos, Null_cursor_12_pos
+constexpr u32 kTextSub4 = 66, kTextSub5 = 67, kTextSpare = 62;       // Null_GText_sub_04/05_pos, Null_GText_12_pos
+// pane object: +0xd0 parent, +0xe0 world transform, +0xe8 local transform (translation at +0x30), +0x104 flags,
+// +0x110 colour (RGBA8; the title menu applies a position pane's alpha to the item drawn there)
+constexpr u64 kPaneParent = 0xd0, kPaneWorld = 0xe0, kPaneLocal = 0xe8, kPaneFlags = 0x104, kPaneColor = 0x110;
+constexpr u32 kPaneDirty = 0x10;
+
+enum Hook {
+    kHRefresh, kHState, kHAppearance, kHSystem, kHExecute, kHQuit, kHShop, kHNotice,
+    kHTRefresh, kHTState, kHTAppearance, kHTSystem, kHTExecute, kHTUpdate, kHookCount
+};
 thread_local u32 t_system_style = ~0u; // SetItemAppearance of the borrowed slot is running
 cpu::FunctionOverride g_hooks[kHookCount];
 
@@ -91,53 +123,11 @@ u32 Borrowed(u64 menu) {
     return it == g_borrowed.end() ? ~0u : it->second;
 }
 
-// Calls guest code from a host function with the guest calling convention and returns x0; the guest registers are
-// restored afterwards. `h` = run that overridden function's own recompiled code.
-constexpr u64 kHostReturn = 0xFFFF'FFFF'FFFF'F000ull;
 u64 Call(State& s, u64 pc, std::initializer_list<u64> args, const cpu::FunctionOverride* h = nullptr) {
-    State saved;
-    std::memcpy(&saved, &s, sizeof(State));
-    int i = 0;
-    for (u64 a : args)
-        s.x[i++] = a;
-    s.x[30] = kHostReturn;
-    s.pc = pc;
-    if (const auto fn = h ? h->original.load(std::memory_order_acquire) : nullptr) {
-        if (h->direct)
-            *h->ok = 1;
-        fn(s);
-        if (h->direct)
-            *h->ok = 0;
-    }
-    while (s.pc != kHostReturn) { // tail jumps and exits to other functions
-        const u64 at = s.pc;
-        recomp::Dispatch(s);
-        if (s.pc == at)
-            break;
-    }
-    const bool done = s.pc == kHostReturn;
-    const u64 r = s.x[0];
-    const u64 icount = s.icount;
-    std::memcpy(&s, &saved, sizeof(State));
-    s.icount = icount;
-    if (!done)
-        LOG_ERROR("Menu", "guest call to {} did not return (stopped at {:#x})", core::Sys().Symbolize(pc), saved.pc);
-    return r;
+    return GuestCall(s, pc, args, h);
 }
-// Runs the overridden function itself for the caller (arguments and return address as they are).
-void Original(State& s, Hook h) {
-    const cpu::FunctionOverride& o = g_hooks[h];
-    if (o.direct)
-        *o.ok = 1;
-    o.original.load(std::memory_order_acquire)(s);
-    if (o.direct)
-        *o.ok = 0;
-}
-void Return(State& s, u64 v) {
-    s.x[0] = v;
-    s.pc = s.x[30];
-    s.icount++;
-}
+void Original(State& s, Hook h) { RunOriginal(s, g_hooks[h]); }
+void Return(State& s, u64 v) { GuestReturn(s, v); }
 bool IsMenu(u64 obj) { return obj && R64(obj) == g_main + kMenuVtable; }
 
 // ---- messages (the game's style; every character exists in that language's game text, so its font has it)
@@ -319,6 +309,125 @@ void ShopOrNotice(State& s) {
     Return(s, 0);
 }
 
+// ---- the title menu's SYSTEM submenu ends with GRAPHICS: a hidden main-list slot is shown there, last, with the
+// GRAPHICS label, and opens the OPTIONS screen as the GRAPHICS page (menu_graphics.cpp).
+u32 TitleBorrowed(u64 menu) {
+    std::lock_guard lk(g_mutex);
+    auto it = g_title_borrowed.find(menu);
+    return it == g_title_borrowed.end() ? ~0u : it->second;
+}
+bool IsTitle(u64 obj) { return obj && R64(obj) == g_main + kTitleVtable; }
+
+void TitleRefresh(State& s) {
+    const u64 menu = s.x[0];
+    u32 borrow = ~0u;
+    if (IsTitle(menu))
+        for (u32 slot : kTitleBorrowable)
+            if (Call(s, g_main + kTitleState, {menu, slot}, &g_hooks[kHTState]) == kHidden) {
+                borrow = slot;
+                break;
+            }
+    {
+        std::lock_guard lk(g_mutex);
+        if (borrow != ~0u)
+            g_title_borrowed[menu] = borrow;
+        else
+            g_title_borrowed.erase(menu);
+    }
+    Original(s, kHTRefresh);
+    if (borrow == ~0u)
+        return;
+    // the borrowed slot (listed first, in slot order) goes last; positions are by list index: the game's 5, then the
+    // spare panes
+    const u64 begin = R64(menu + 0xe0), end = R64(menu + 0xe8);
+    const u32 n = u32((end - begin) / kEntrySize);
+    for (u32 k = 0; k + 1 < n; k++) {
+        if (R32(begin + k * kEntrySize) != borrow)
+            continue;
+        u8 e[kEntrySize], rest[kEntrySize * 16];
+        const u32 tail = std::min(n - k - 1, 16u);
+        g_mem->ReadBlock(begin + k * kEntrySize, e, kEntrySize);
+        g_mem->ReadBlock(begin + (k + 1) * kEntrySize, rest, tail * kEntrySize);
+        g_mem->WriteBlock(begin + k * kEntrySize, rest, tail * kEntrySize);
+        g_mem->WriteBlock(begin + (k + tail) * kEntrySize, e, kEntrySize);
+        break;
+    }
+    for (u32 i = 0; i < n; i++) {
+        const bool spare = i >= kTitleSystemPositions;
+        W32(begin + i * kEntrySize + 4, spare ? kCursorSpare : R32(g_main + kTitleSysCursor + 4 * i));
+        W32(begin + i * kEntrySize + 8, spare ? kTextSpare : R32(g_main + kTitleSysText + 4 * i));
+    }
+}
+
+void TitleState(State& s) {
+    if (TitleBorrowed(s.x[0]) == u32(s.x[1]))
+        return Return(s, 0);
+    Original(s, kHTState);
+}
+void TitleIsSystem(State& s) {
+    if (TitleBorrowed(s.x[0]) == u32(s.x[1]))
+        return Return(s, 1);
+    Original(s, kHTSystem);
+}
+// SetItemAppearance(this, slot, state): the borrowed slot wears the GRAPHICS label.
+void TitleAppearance(State& s) {
+    const u32 slot = u32(s.x[1]);
+    if (slot >= 16 || TitleBorrowed(s.x[0]) != slot)
+        return Original(s, kHTAppearance);
+    const u64 off = g_main + kTitleTexOff + 4 * slot, on = g_main + kTitleTexOn + 4 * slot;
+    const u32 saved[2] = {R32(off), R32(on)};
+    W32(off, kTexMainMenu);
+    W32(on, kTexMainMenuOn);
+    Original(s, kHTAppearance);
+    W32(off, saved[0]);
+    W32(on, saved[1]);
+}
+// Execute(this, slot): GRAPHICS opens the OPTIONS screen as the GRAPHICS page.
+void TitleExecute(State& s) {
+    if (TitleBorrowed(s.x[0]) != u32(s.x[1]))
+        return Original(s, kHTExecute);
+    LOG_INFO("Menu", "GRAPHICS chosen in the title menu");
+    graphics::OpenNext();
+    s.x[1] = kTitleOptions;
+    Original(s, kHTExecute);
+}
+
+// Every frame: the spare position panes go one step below the SYSTEM submenu's last position (the step from its
+// 4th to its 5th), following the submenu's animations.
+float F32(u64 a) { return std::bit_cast<float>(R32(a)); }
+void PlaceSpare(State& s, u64 layout, u32 sub4, u32 sub5, u32 spare) {
+    const u64 a = Call(s, g_main + kPane, {layout, sub4}), b = Call(s, g_main + kPane, {layout, sub5}),
+              p = Call(s, g_main + kPane, {layout, spare});
+    if (!a || !b || !p)
+        return;
+    auto world = [&](u64 pane, int k) {
+        const u64 m = R64(pane + (R64(pane + kPaneParent) ? kPaneWorld : kPaneLocal));
+        return m ? F32(m + 0x30 + 4 * k) : 0.0f;
+    };
+    const u64 parent = R64(p + kPaneParent), local = R64(p + kPaneLocal);
+    if (!local)
+        return;
+    for (int k = 0; k < 2; k++) {
+        const float want = 2 * world(b, k) - world(a, k);
+        W32(local + 0x30 + 4 * k, std::bit_cast<u32>(want - (parent ? world(parent, k) : 0.0f)));
+    }
+    W32(p + kPaneFlags, R32(p + kPaneFlags) | kPaneDirty);
+    // the items take their colour (alpha: fading in and out with their list) from their position pane; the spare
+    // pane belongs to the main list, which fades out while the submenu shows
+    W32(p + kPaneColor, R32(b + kPaneColor));
+}
+void TitleUpdate(State& s) {
+    const u64 menu = s.x[0];
+    if (IsTitle(menu) && TitleBorrowed(menu) != ~0u) {
+        const u64 anims = R64(menu + 0xa0), layout = anims ? R64(anims + 8) : 0;
+        if (layout) {
+            PlaceSpare(s, layout, kCursorSub4, kCursorSub5, kCursorSpare);
+            PlaceSpare(s, layout, kTextSub4, kTextSub5, kTextSpare);
+        }
+    }
+    Original(s, kHTUpdate);
+}
+
 // ---- the title menu's QUIT GAME label: GText_DLC / GText_DLC_on (the "Nintendo eShop" label) of every
 // language's 10_title_menu_parts pack are replaced, as the game reads them, by labels drawn in the same style.
 struct Overlay {
@@ -346,9 +455,23 @@ const QuitLabel kQuitLabels[] = {
     {"smp", L"退出游戏", L"Microsoft YaHei", true},
 };
 
-void BuildTitleLabels() {
+// GRAPHICS: the game's own word for its graphics option (cut from the Switch version), in every language
+const QuitLabel kGraphicsLabels[] = {
+    {"eng", L"GRAPHICS", L"Segoe UI Black", false},
+    {"fra", L"AFFICHAGE", L"Segoe UI Black", false},
+    {"ger", L"GRAFIK", L"Segoe UI Black", false},
+    {"ita", L"GRAFICA", L"Segoe UI Black", false},
+    {"esp", L"GR\u00c1FICOS", L"Segoe UI Black", false},
+    {"jpn", L"\u30b0\u30e9\u30d5\u30a3\u30c3\u30af", L"Yu Gothic", true},
+    {"kor", L"\uadf8\ub798\ud53d", L"Malgun Gothic", true},
+    {"chn", L"\u756b\u9762", L"Microsoft JhengHei", true},
+    {"smp", L"\u753b\u9762", L"Microsoft YaHei", true},
+};
+
+void BuildTitleLabels(const QuitLabel* labels, size_t count, const char* texture) {
     const fs::path dir = core::Sys().Cfg().game_dir / "romfs" / "UI" / "screenlayout" / "10_title_menu_parts";
-    for (const QuitLabel& l : kQuitLabels) {
+    const std::string off = texture, on = off + "_on";
+    for (const QuitLabel& l : std::span(labels, count)) {
         const std::string name = std::string("10_title_menu_parts_") + l.lang + ".kslt";
         const auto d = common::ReadFile(dir / name);
         auto u32at = [&](size_t o) { u32 v = 0; if (o + 4 <= d.size()) std::memcpy(&v, &d[o], 4); return v; };
@@ -361,7 +484,7 @@ void BuildTitleLabels() {
             const size_t e = std::find(d.begin() + p, d.end(), u8(0)) - d.begin();
             const std::string tex(d.begin() + p, d.begin() + e);
             p = e + 1;
-            if (tex != "GText_DLC" && tex != "GText_DLC_on")
+            if (tex != off && tex != on)
                 continue;
             const size_t at = u32at(offs + 0x14 * i);
             if (at + 0x48 > d.size())
@@ -370,12 +493,12 @@ void BuildTitleLabels() {
             std::memcpy(&w, &d[at + 4], 2);
             std::memcpy(&h, &d[at + 6], 2);
             const u32 size = u32at(at + 0x1c);
-            const bool on = tex == "GText_DLC_on";
+            const bool sel = tex == on;
             // the game's label metrics (TEAM / TEAM_on): capitals 24 px of 44 from y 7, 34 px of 60 from y 12
-            const LabelStyle st{w, h, on ? h * 34 / 60 : h * 24 / 44, on ? 14 : 9, on ? h * 12 / 60 : h * 7 / 44, on};
+            const LabelStyle st{w, h, sel ? h * 34 / 60 : h * 24 / 44, sel ? 14 : 9, sel ? h * 12 / 60 : h * 7 / 44, sel};
             auto px = RenderLabel(st, l.text, l.face, l.cjk);
             if (px.size() != size) {
-                LOG_WARN("Menu", "QUIT GAME label for {} not drawn ({} {}x{})", l.lang, tex, w, h);
+                LOG_WARN("Menu", "{} label for {} not drawn ({} {}x{})", texture, l.lang, tex, w, h);
                 continue;
             }
             g_overlays.push_back({name, at + 0x48, std::move(px)});
@@ -406,6 +529,9 @@ void Install(core::Memory& mem, kernel::Kernel& kernel, u64 main_base) {
         {kExecuteItem, 0xd10283ff}, {kIsSystemItem, 0x51001828}, {kQuitCallback, 0x34000040}, {kShowDialog, 0xf81d0ff5},
         {kGetString, 0x2a0103e8},   {kTexOff, 13},               {kTexGrey, ~0u},
         {kTexOn, 14},               {kStartShop, 0xf81e0ff3},   {kShopOrNotice, 0xd101c3ff},
+        {kTitleRefresh, 0xd10203ff}, {kTitleState, 0xa9bc5ff8}, {kTitleAppearance, 0xfc1c0fe8},
+        {kTitleIsSystem, 0x51002c28}, {kTitleExecute, 0xd10243ff}, {kTitleUpdate, 0xd102c3ff},
+        {kTitleTexOff + 4 * kTitleOptions, 36}, {kTitleSysCursor, 42}, {kTitleSysText, 63},
     };
     for (auto [off, word] : kExpect)
         if (!mem.IsValid(main_base + off, 4) || mem.Read<u32>(main_base + off) != word) {
@@ -428,21 +554,27 @@ void Install(core::Memory& mem, kernel::Kernel& kernel, u64 main_base) {
     const std::pair<u64, void (*)(State&)> hooks[kHookCount] = {
         {kRefresh, Refresh},         {kGetItemState, GetItemState}, {kSetItemAppearance, SetItemAppearance},
         {kIsSystemItem, IsSystemItem}, {kExecuteItem, ExecuteItem}, {kQuitCallback, QuitCallback},
-        {kStartShop, StartShop},     {kShopOrNotice, ShopOrNotice},
+        {kStartShop, StartShop},     {kShopOrNotice, ShopOrNotice}, {kTitleRefresh, TitleRefresh},
+        {kTitleState, TitleState},   {kTitleAppearance, TitleAppearance}, {kTitleIsSystem, TitleIsSystem},
+        {kTitleExecute, TitleExecute}, {kTitleUpdate, TitleUpdate},
     };
     // QUIT GAME in the pause menu too (MUA3_PAUSE_QUIT=1): the title screen's is the default
     const char* pause = std::getenv("MUA3_PAUSE_QUIT");
     const bool pause_quit = pause && pause[0] == '1';
     for (int i = 0; i < kHookCount; i++) {
-        if (!pause_quit && i != kHQuit && i != kHShop && i != kHNotice)
+        if (!pause_quit && i < kHQuit)
             continue;
         g_hooks[i].pc = main_base + hooks[i].first;
         g_hooks[i].host = hooks[i].second;
         g_hooks[i].direct = i == kHExecute || i == kHShop || i == kHNotice; // also called with BL
         kernel.Cpus().Override(g_hooks[i]);
     }
-    BuildTitleLabels();
-    LOG_INFO("Menu", "menu extensions installed: QUIT GAME on the title screen ({} label textures){}", g_overlays.size(),
+    BuildTitleLabels(kQuitLabels, std::size(kQuitLabels), "GText_DLC");
+    BuildTitleLabels(kGraphicsLabels, std::size(kGraphicsLabels), "GText_MAIN_MENU");
+    graphics::Install(mem, kernel, main_base);
+    if (const char* e = std::getenv("MUA3_GRAPHICS_TEST"); e && e[0] == '1')
+        graphics::OpenNext(); // test aid: the first OPTIONS screen opened shows the GRAPHICS page
+    LOG_INFO("Menu", "menu extensions installed: QUIT GAME and GRAPHICS on the title screen ({} label textures){}", g_overlays.size(),
              pause_quit ? " and in the pause menu" : "");
 }
 

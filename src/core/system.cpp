@@ -74,6 +74,17 @@ u64 FindSymbol(const std::string& name) {
     return it == g_symbol_by_name.end() ? 0 : it->second;
 }
 
+void System::UpdateConfig(const std::function<void(Config&, bool running)>& fn) {
+    std::lock_guard lk(config_mutex_);
+    fn(cfg_, true);
+    config_generation_.fetch_add(1, std::memory_order_acq_rel);
+    Config disk;
+    disk.Load("mua3.ini");
+    fn(disk, false);
+    if (!disk.Save("mua3.ini"))
+        LOG_WARN("System", "could not save mua3.ini");
+}
+
 System::System(const Config& cfg) : cfg_(cfg) {
     g_system = this;
     memory_ = std::make_unique<Memory>();

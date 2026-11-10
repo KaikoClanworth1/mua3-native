@@ -1,5 +1,7 @@
 #include "core/hle/nvn/nvn_hle.h"
 
+#include "core/hle/frame_limit.h"
+
 #include <algorithm>
 #include <intrin.h>
 #include <array>
@@ -1362,6 +1364,7 @@ void QueuePresentTexture(State& s) {
         auto& g = gpu::G();
         g.QueuePresent({g.As().Translate(t.gpu), t.width, t.height, t.width * 4, 1});
     }
+    hle::LimitFrameRate(); // mua3.ini fps_limit below the game's own rate (a compare otherwise)
     TimelineEvent("present", index);
     const u64 released = HostFence(0); // after the present
     std::lock_guard lk(q.mutex);

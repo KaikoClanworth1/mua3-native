@@ -168,3 +168,56 @@ characters the game's fonts already contain); OKAY closes the game cleanly, CANC
 
 With `MUA3_PAUSE_QUIT=1` the pause menu also gets a QUIT GAME (a borrowed slot, as above; the game's own label).
 The SYSTEM submenu's QUIT GAME still returns to the title screen. `MUA3_MENU_MODS=0` turns all extensions off.
+
+## The OPTIONS screen
+
+Screen 0x5f (opened by main+0x6da8d0 and the menu's vfunc +0x3d0), class vtable main+0x2121e40. Layouts
+`09_option_BG` (title, `Null_list_01..08_pos` for 8 visible rows, scroll bar, `option_info` description),
+`09_option_tub_menu` (5 tabs: `Window_tab_0N`, `Window_tab_ON_0N`, `tab_name_0N` = panes 1+3N..3+3N; L/R icons
+16-19; animations `tab_0N_ON/OFF` = 2+2N / 3+2N) and `09_option_parts` (one instance per visible row).
+
+Everything a tab shows is data, per tab (INTERFACE, CAMERA, CONTROLS, SOUND, OTHER = 0-4):
+
+| what | where |
+|---|---|
+| row count | u16[5] at main+0x1a634b2 (6, 6, 3, 4, 2) |
+| row types | u32 arrays: tab 0 main+0x1a634bc, 1 +0x1a634d4, 2 +0x1a634ec, 3 main+0x19f4530, 4 main+0x19f78b8 (shared constant data: do not write). 0 button (A opens a screen), 1 two choices, 2 arrows, 3 gauge |
+| rows | GOT entries main+0x218bd30 + 8*tab: `{u32 label hash, u32 description hash, u64 choices}`, choices = u32 array of label hashes (system string table) |
+| values | GOT entries (tab 0 +0x218bd10, 1 +0x218bd18, 2 +0x218bd20, 3 +0x218bd28, 4 +0x218bd08): one byte per row (type 1: 0 = first choice; type 2: the choice index) |
+
+| function | main+ | what |
+|---|---|---|
+| vfunc +0x3f8 | 0x7c5050 | open: the game's settings into the value bytes, tab 0, rows laid out (0x7c5900) |
+| vfunc +0x400 | 0x7c6050 | close: 0x7c60a0 copies the value bytes back into the game's settings |
+| vfunc +0x1b8 / +0x1c0 | 0x7c8480 / 0x7c9400 | left / right on a row: steps its byte (arrows wrap at ChoiceCount) |
+| vfunc +0x1e8 / +0x1f0 | 0x7c81e0 / 0x7c8320 | L / R: tab |
+| vfunc +0x228 | 0x7c7c10 | A on a row (button rows: tab 2 rows 1-2, tab 4 row 1) |
+| vfunc +0x230 | 0x7c7e40 | B: close |
+| | 0x7c91f0 | ChoiceCount(this, row) of an arrow row (tab 0 rows 1-4 from a table, tab 3 gauges 10, tab 1 row 5 the players) |
+
+Special cases by (tab, row): tab 0 row 1 is the language selector (0x7c7b00); tab 1 row 1 is greyed out when row
+0's value is 1 (0x7c8e90); tabs 1 and 4 refresh the next row after a change.
+
+## GRAPHICS
+
+The title screen's SYSTEM submenu (SAVE, LOAD, OPTIONS, TIPS, GALLERY; title menu class vtable main+0x210ee80,
+16 slots, 11-15 = the submenu) ends with **GRAPHICS**:
+
+- **Item**: a main-list slot hidden on the title screen (MENU SELECT, LAB, HERO or INFINITY) is shown in the
+  submenu (GetItemState vfunc +0x460 and IsSystemItem +0x490 hooked) and moved to its end (Refresh +0x448). The
+  submenu has 5 position panes (`Null_cursor_sub_0N_pos` / `Null_GText_sub_0N_pos`, tables main+0x1a3d27c /
+  0x1a3d23c by list index); the 6th entry uses the unused 12th main-list positions (`Null_cursor_12_pos`,
+  `Null_GText_12_pos`), which the per-frame vfunc +0x3f0 (main+0x71f760) moves one step below the 5th (pane object:
+  +0xd0 parent, +0xe0 world / +0xe8 local transform with the translation at +0x30, +0x104 flags, 0x10 = dirty).
+- **Label**: the unused `GText_MAIN_MENU(_on)` textures, drawn as the game's own word for graphics in each
+  language (GRAPHICS, AFFICHAGE, GRAFIK, ...); SetItemAppearance (+0x480) uses them for the slot.
+- **Page**: Execute (+0x4a8) opens OPTIONS the game's way, flagged to show the GRAPHICS page
+  (`menu_graphics.cpp`): tab 2's row count, row types, row table and value bytes are replaced while it is open, the
+  tab is named GRAPHICS, the other tabs and L/R are hidden, L/R and A do nothing, our text comes from a GetString
+  hook (hashes 0xFE00xxxx). Closing puts the tab back and skips the store, so the game's own settings are untouched.
+- **Settings**: DISPLAY MODE, RESOLUTION, RENDER SCALE, FRAME RATE, FPS LIMIT, VSYNC, SHOW FPS, ANTI-ALIASING
+  (mua3.ini [video], the launcher's choices). Every change goes through `core::System::UpdateConfig`: the running
+  config (FPS limit, show FPS, VSync, window mode and size: the main loop applies them) and mua3.ini (also render
+  scale and frame rate, which apply after a restart).
+
+`MUA3_GRAPHICS_TEST=1` (test aid) opens the first OPTIONS screen as the GRAPHICS page.

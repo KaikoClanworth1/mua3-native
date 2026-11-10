@@ -48,6 +48,30 @@ struct Stats {
 float g_ui = 1.0f;
 ImVec2 UiVec(float x, float y) { return ImVec2(x * g_ui, y * g_ui); }
 
+// Settings changed in the game's GRAPHICS page (core::System::UpdateConfig): the window mode and size, and the
+// overlay's FPS counter. The frame limiter reads the running config itself.
+// Hidden test instances keep their window as it is.
+void ApplyGameSettings(const core::Config& n, core::Config& cfg, platform::Display& display, bool keep_window) {
+    cfg.show_fps = n.show_fps;
+    cfg.fps_limit = n.fps_limit;
+    cfg.vsync = n.vsync;
+    LOG_INFO("Main", "settings from the game: {} {}x{}, fps limit {}, show fps {}", n.fullscreen ? "fullscreen" : "window",
+             n.width, n.height, n.fps_limit, n.show_fps);
+    if (keep_window)
+        return;
+    SDL_Window* w = display.Window();
+    const bool fullscreen = (SDL_GetWindowFlags(w) & SDL_WINDOW_FULLSCREEN) != 0;
+    if (n.fullscreen != fullscreen)
+        display.ToggleFullscreen();
+    if (!n.fullscreen && (n.width != cfg.width || n.height != cfg.height || n.fullscreen != cfg.fullscreen)) {
+        SDL_SetWindowSize(w, n.width, n.height);
+        SDL_SetWindowPosition(w, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+    }
+    cfg.width = n.width;
+    cfg.height = n.height;
+    cfg.fullscreen = n.fullscreen;
+}
+
 void DrawOverlay(const core::Config& cfg, platform::Input& input, bool& show) {
     if (ImGui::IsKeyPressed(ImGuiKey_F1))
         show = !show;
@@ -679,7 +703,12 @@ int main(int argc, char** argv) {
         }).detach();
     // MUA3_HEADLESS=1 (automated test runs): hidden window, physical controllers ignored (only mua3_cmd.txt drives).
     const bool test_instance = std::getenv("MUA3_HEADLESS") != nullptr;
+    u32 settings_generation = sys.ConfigGeneration();
     while (display.PumpEvents() && !sys.ExitRequested()) {
+        if (const u32 g = sys.ConfigGeneration(); g != settings_generation) {
+            settings_generation = g;
+            ApplyGameSettings(sys.CfgSnapshot(), cfg, display, test_instance);
+        }
         if (autopress_after == 0 && !g_script_active && !test_instance) // the test aids drive player 1 themselves
             input.Update(display.Focused());
         PollCommandFile(&input);
