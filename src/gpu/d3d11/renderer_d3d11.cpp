@@ -1094,7 +1094,7 @@ void D3D11Renderer::PollReadbacks(bool wait, const GpuBuf* until) {
         if (rb.done)
             query_pool_.push_back(std::move(rb.done));
         rb.b->in_flight--;
-        // (finished buffers leave the active list at the next SyncGuest)
+        active_prune_ = true; // (finished buffers leave the active list at the next SyncGuest)
         staging_pool_.push_back(std::move(rb.staging));
         readbacks_.pop_front();
         if (need)
@@ -1117,15 +1117,25 @@ void D3D11Renderer::SyncGuest(u64 gpu_va, u64 size, int site) {
                 active_.push_back(b.get());
         }
         active_stale_ = false;
-    } else if (!in_sync_) { // drop the ones whose results have landed
+        active_prune_ = true; // (recomputes the bounds below)
+    }
+    if (active_prune_ && !in_sync_) { // copy-backs landed: drop the finished buffers, recompute the bounds
         size_t n = 0;
+        active_lo_ = ~0ull, active_hi_ = 0;
         for (GpuBuf* b : active_) {
-            if (b->in_flight || b->gpu_dirty)
+            if (b->in_flight || b->gpu_dirty) {
                 active_[n++] = b;
-            else
+                active_lo_ = std::min(active_lo_, b->addr);
+                active_hi_ = std::max(active_hi_, b->addr + b->size);
+            } else
                 b->listed = false;
         }
         active_.resize(n);
+        active_prune_ = false;
+    }
+    if (gpu_va >= active_hi_ || gpu_va + size <= active_lo_) { // (most lookups: nowhere near a compute buffer)
+        sync_site_ = 0;
+        return;
     }
     if (in_sync_) { // (re-entered: use a list of its own)
         const std::vector<GpuBuf*> list = active_;

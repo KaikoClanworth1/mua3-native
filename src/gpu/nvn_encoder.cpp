@@ -242,7 +242,8 @@ private:
     }
 
     void Encode(const ReplayCommand& c) {
-        const std::string_view n = c.name.substr(c.name.find("CommandBuffer") == 3 ? 16 : 0);
+        // (a prefix test: searching each command's name for "CommandBuffer" was ~2.5% of the GPU thread)
+        const std::string_view n = c.name.substr(c.name.substr(0, 16) == "nvnCommandBuffer" ? 16 : 0);
         const u64* x = c.x;
         if (n == "BindProgram")
             BindProgram(c);

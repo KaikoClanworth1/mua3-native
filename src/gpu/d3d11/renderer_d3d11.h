@@ -195,11 +195,15 @@ private:
     std::vector<std::unique_ptr<GpuBuf>> gbufs_;
     std::vector<GpuBuf*> active_; // (SyncGuest) buffers with results in flight or not copied back yet (a superset)
     bool active_stale_ = true;    // a buffer was freed: rebuild the list
+    bool active_prune_ = false;   // copy-backs landed since the list was last pruned
+    u64 active_lo_ = ~0ull, active_hi_ = 0; // address range the listed buffers cover (a superset)
     void MarkActive(GpuBuf& b) {  // b got results in flight or not yet copied back
         if (!b.listed) {
             b.listed = true;
             active_.push_back(&b);
         }
+        active_lo_ = std::min(active_lo_, b.addr);
+        active_hi_ = std::max(active_hi_, b.addr + b.size);
     }
     bool in_sync_ = false;
     struct Readback {
