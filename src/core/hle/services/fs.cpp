@@ -6,6 +6,7 @@
 
 #include <windows.h>
 
+#include "core/hle/menu_mods.h"
 #include "core/hle/service.h"
 #include "core/hle/video_output.h"
 #include "core/system.h"
@@ -373,6 +374,7 @@ public:
             }
             const size_t n = size_t(std::min<u64>(size, e.off + e.size - rel));
             HostRead(e.host, rel - e.off, dst, n);
+            hle::menu::PatchRomfsRead(e.host, rel - e.off, dst, n);
             dst += n, off += n, size -= n;
         }
     }

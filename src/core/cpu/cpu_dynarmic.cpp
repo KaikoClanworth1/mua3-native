@@ -24,6 +24,11 @@
 #include "core/memory.h"
 #include "core/system.h"
 
+namespace recomp { // recomp_ic.cpp
+void IcClear();
+void IcCheck();
+} // namespace recomp
+
 namespace cpu {
 
 namespace {
@@ -410,9 +415,43 @@ public:
                     resumes += native_.emplace(t.resumes[i].pc, t.funcs[t.resumes[i].func].fn).second;
             LOG_INFO("Recomp", "{} of {} recompiled functions enabled, {} resume points{}", ok, t.num_funcs, resumes,
                      native_enabled_ ? "" : " (MUA3_RECOMP=0)");
+            recomp::IcCheck(); // library shards and table from one generation
             Publish();
             table_ready_ = true;
+            auto pending = std::move(pending_overrides_);
+            lk.unlock();
+            for (cpu::FunctionOverride* o : pending)
+                ApplyOverride(*o);
         });
+    }
+    // ---- host functions standing in for guest functions (FunctionOverride)
+    void Override(FunctionOverride& o) override {
+        {
+            std::unique_lock lk(native_mutex_);
+            if (!table_ready_) {
+                pending_overrides_.push_back(&o);
+                return;
+            }
+        }
+        ApplyOverride(o);
+    }
+    void ApplyOverride(FunctionOverride& o) { // the table is ready; native_mutex_ not held
+        const auto& t = recomp::GetTable();
+        for (u32 i = 0; i < t.num_funcs; i++) {
+            if (t.funcs[i].entry != o.pc)
+                continue;
+            if (!t.funcs[i].fn || !*t.ok[i])
+                break;
+            o.ok = t.ok[i];
+            o.original.store(t.funcs[i].fn, std::memory_order_release);
+            std::unique_lock lk(native_mutex_);
+            native_[o.pc] = o.host;
+            SetSlot(o.pc, o.host);
+            if (o.direct)
+                *t.ok[i] = 0; // direct calls return at once (pc unchanged) and reach the host through the table
+            return;
+        }
+        LOG_WARN("Recomp", "no recompiled function at {:#x}: host override not applied", o.pc);
     }
     bool Verify(const recomp::Table& t, u32 i) {
         const auto& f = t.funcs[i];
@@ -497,6 +536,7 @@ public:
             if (NativeSlot* e = Find(m, pc)) {
                 e->fn.store(fn, std::memory_order_release);
                 map_epoch_.fetch_add(1, std::memory_order_acq_rel);
+                recomp::IcClear(); // inline caches (recomp_ic.cpp) must not keep the old target
                 return;
             }
         if (fn)
@@ -518,6 +558,7 @@ public:
         }
         NativeMap* old = map_.exchange(m, std::memory_order_acq_rel);
         map_epoch_.fetch_add(1, std::memory_order_acq_rel);
+        recomp::IcClear(); // inline caches (recomp_ic.cpp) must not keep old targets
         // Readers only hold a table for the duration of one Lookup: free replaced ones once they are 10 s old.
         const auto now = std::chrono::steady_clock::now();
         if (old)
@@ -774,6 +815,7 @@ private:
     bool native_enabled_ = true;
     std::atomic<bool> table_ready_{false};
     std::once_flag table_once_;
+    std::vector<cpu::FunctionOverride*> pending_overrides_; // native_mutex_
     std::shared_mutex native_mutex_;
     std::atomic<NativeMap*> map_{nullptr};
     std::deque<std::pair<std::chrono::steady_clock::time_point, NativeMap*>> retired_;
@@ -1135,5 +1177,12 @@ void Dispatch(State& s) {
     }
     if (auto fn = CoreOf(s).CachedLookup(s.pc))
         fn(s);
+}
+// Inline caches (recomp_ic.cpp): what Dispatch would run, when a call site may remember it.
+Fn IcResolve(State& s) {
+    auto& f = CoreOf(s).Factory();
+    if (f.census_ || (f.capture_names_.load(std::memory_order_relaxed) && f.CaptureCandidate(s.pc))) [[unlikely]]
+        return nullptr;
+    return CoreOf(s).CachedLookup(s.pc);
 }
 } // namespace recomp

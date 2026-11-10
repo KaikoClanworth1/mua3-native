@@ -7,6 +7,9 @@
 namespace core {
 class Memory;
 }
+namespace recomp {
+struct State;
+}
 
 namespace cpu {
 
@@ -52,12 +55,29 @@ public:
 };
 
 // Created once per process; owns the exclusive monitor shared by all cores.
+// A host function standing in for a recompiled guest function (game code extensions, e.g. hle/menu_mods.cpp).
+// It is called with the guest registers (recompiled-code calling convention: arguments in s.x, result in s.x[0],
+// return with s.pc = s.x[30]). Indirect calls and tail jumps to `pc` reach `host`; with `direct`, direct calls from
+// recompiled code too: the function's own native code then refuses to run (its enable flag is 0), so `original`
+// must be called with `*ok` set to 1 for the duration (CallOriginal in menu_mods.cpp).
+struct FunctionOverride {
+    u64 pc = 0;
+    void (*host)(recomp::State&) = nullptr;
+    bool direct = false;
+    // Filled when the override is applied (recompiled code is verified lazily, before the first guest instruction).
+    std::atomic<void (*)(recomp::State&)> original{nullptr};
+    u8* ok = nullptr;
+};
+
 class CoreFactory {
 public:
     virtual ~CoreFactory() = default;
     virtual std::unique_ptr<Core> Create(CpuCallbacks cb, size_t slot) = 0;
     // Invalidate translated code in every live core (after code patching / module load).
     virtual void InvalidateAll(u64 addr, u64 size) = 0;
+    // Registers `o` (kept alive by the caller); applied once the native function table is ready. A pc that is not
+    // a recompiled function entry is logged and left alone (o.original stays null).
+    virtual void Override(FunctionOverride& o) {}
 };
 
 std::unique_ptr<CoreFactory> CreateDynarmicFactory(core::Memory& memory, size_t max_cores);

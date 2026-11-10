@@ -679,7 +679,7 @@ int main(int argc, char** argv) {
         }).detach();
     // MUA3_HEADLESS=1 (automated test runs): hidden window, physical controllers ignored (only mua3_cmd.txt drives).
     const bool test_instance = std::getenv("MUA3_HEADLESS") != nullptr;
-    while (display.PumpEvents()) {
+    while (display.PumpEvents() && !sys.ExitRequested()) {
         if (autopress_after == 0 && !g_script_active && !test_instance) // the test aids drive player 1 themselves
             input.Update(display.Focused());
         PollCommandFile(&input);
@@ -714,7 +714,7 @@ int main(int argc, char** argv) {
             next_dump += std::chrono::seconds(watch_seconds);
         }
     }
-    LOG_INFO("Main", "Window closed, exiting");
+    LOG_INFO("Main", "{}", sys.ExitRequested() ? "Quit Game chosen in the game menu, exiting" : "Window closed, exiting");
     platform::Audio().Shutdown();
     display.Shutdown();
     std::fflush(stderr);

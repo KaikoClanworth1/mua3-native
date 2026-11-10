@@ -7,6 +7,8 @@
 #include <map>
 
 #include "core/game_patches.h"
+#include "core/hle/menu_mods.h"
+#include "core/hle/native_trace.h"
 #include "core/hle/service.h"
 #include "core/kernel/kernel.h"
 #include "core/memory.h"
@@ -158,6 +160,10 @@ bool System::Load(std::string& error) {
     for (auto& mod : modules_)
         LoadSymbols(*memory_, mod);
     InstallTraces();
+    for (auto& mod : modules_)
+        if (mod.name == "main")
+            hle::menu::Install(*memory_, *kernel_, mod.base);
+    hle::trace::Install(*kernel_, modules_);
 
     // Main thread stack
     const u64 stack_size = common::AlignUp(main_stack_size_, 0x1000);

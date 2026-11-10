@@ -36,6 +36,9 @@ public:
     Memory& Mem() { return *memory_; }
     kernel::Kernel& Kern() { return *kernel_; }
     const Config& Cfg() const { return cfg_; }
+    // The game asked to close (e.g. the pause menu's Quit Game): the main loop shuts down as for a closed window.
+    void RequestExit() { exit_requested_.store(true, std::memory_order_release); }
+    bool ExitRequested() const { return exit_requested_.load(std::memory_order_acquire); }
 
 private:
     Config cfg_;
@@ -44,6 +47,7 @@ private:
     std::vector<LoadedModule> modules_;
     std::vector<std::shared_ptr<std::atomic<u64>>> trace_counters_;
     std::atomic<bool> trace_armed_{true};
+    std::atomic<bool> exit_requested_{false};
     u64 main_stack_top_ = 0;
     u32 main_stack_size_ = 0x100000;
     s32 main_prio_ = 44;
