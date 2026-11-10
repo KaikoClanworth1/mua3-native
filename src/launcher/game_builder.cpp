@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <functional>
 #include <fstream>
+#include <optional>
 #include <thread>
 
 #include <windows.h>
@@ -301,7 +304,7 @@ bool BuildGame(const Paths& p, int jobs, Progress& prog) {
             args += " --missing " + Q(l);
     }
     args += " --all 1 --sweep 1 --noopt " + Q(p.sdk_dir / "recomp" / "noopt.txt") + " --skip " +
-            Q(p.sdk_dir / "recomp" / "skip.txt");
+            Q(p.sdk_dir / "recomp" / "skip.txt") + " --nogm " + Q(p.sdk_dir / "recomp" / "nogm.txt");
     if (const int rc = Run(W(args), nullptr, log, BELOW_NORMAL_PRIORITY_CLASS, &prog.cancel); rc != 0)
         return fail(prog.cancel ? "Cancelled." : fmt::format("recomp.exe failed (code {}); see {}", rc, log.string()));
 
@@ -320,15 +323,72 @@ bool BuildGame(const Paths& p, int jobs, Progress& prog) {
     prog.total = int(shards.size());
     stage(fmt::format("Compiling the game ({} parts, {} at a time)", shards.size(), jobs));
     const u64 header_time = MTime(p.sdk_dir / "include" / "core" / "cpu" / "recomp" / "recomp_rt.h");
-    std::atomic<size_t> next{0};
+    // Big functions (300 KB .. 1 MB of C++) come in files of their own, recomp_<shard>_<entry>.cpp: MSVC compiles them
+    // with no optimisation at all unless told to (/d2OptimizeHugeFunctions), and with it one such file needs about
+    // 5 GB per MB of C++. They start first (largest first, not left as stragglers), and together they stay within half
+    // the RAM free now; the ordinary parts run alongside as before.
+    auto is_big = [](const fs::path& f) { return f.stem().string().find('_', 7) != std::string::npos; };
+    std::vector<size_t> order(shards.size());
+    std::vector<u64> need(shards.size(), 0); // estimated bytes, big files only
+    for (size_t i = 0; i < shards.size(); i++) {
+        order[i] = i;
+        if (is_big(shards[i]))
+            need[i] = std::max<u64>(1ull << 30, u64(double(fs::file_size(shards[i], ec)) * 5.0 * 1024.0));
+    }
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return need[a] > need[b]; });
+    MEMORYSTATUSEX ms{sizeof(ms)};
+    GlobalMemoryStatusEx(&ms);
+    const u64 budget = ms.ullAvailPhys / 2;
+    const int big_total = int(std::count_if(shards.begin(), shards.end(), is_big));
+    std::atomic<int> big_done{0};
+    if (big_total)
+        note(fmt::format("{} large functions to optimise, within {:.1f} GB of memory", big_total, budget / double(1ull << 30)));
+    std::mutex sched_mutex;
+    std::condition_variable sched_cv;
+    std::vector<bool> taken(shards.size(), false);
+    u64 reserved = 0; // memory of the big files compiling now
     std::atomic<bool> broken{false};
     std::string broken_why;
     std::mutex broken_mutex;
+    // the next part to compile: the first one not taken whose memory fits (one big file always may start alone)
+    auto take = [&]() -> std::optional<size_t> {
+        std::unique_lock lk(sched_mutex);
+        for (;;) {
+            if (broken || prog.cancel)
+                return std::nullopt;
+            bool left = false;
+            for (size_t i : order) {
+                if (taken[i])
+                    continue;
+                left = true;
+                if (need[i] && reserved && reserved + need[i] > budget)
+                    continue;
+                taken[i] = true;
+                reserved += need[i];
+                return i;
+            }
+            if (!left)
+                return std::nullopt;
+            sched_cv.wait(lk);
+        }
+    };
+    auto release = [&](size_t i) {
+        {
+            std::lock_guard lk(sched_mutex);
+            reserved -= need[i];
+        }
+        sched_cv.notify_all();
+    };
     auto worker = [&] {
         for (;;) {
-            const size_t i = next++;
-            if (i >= shards.size() || broken || prog.cancel)
+            const auto next = take();
+            if (!next)
                 return;
+            const size_t i = *next;
+            struct Release {
+                std::function<void()> f;
+                ~Release() { f(); }
+            } rel{[&, i] { release(i); }};
             const fs::path& src = shards[i];
             const fs::path o = obj / src.filename().replace_extension(".obj");
             if (fs::exists(o) && MTime(o) > MTime(src) && MTime(o) > header_time && fs::file_size(o, ec) > 0) {
@@ -339,7 +399,20 @@ bool BuildGame(const Paths& p, int jobs, Progress& prog) {
             fs::remove(shard_log, ec);
             const std::string base = Q(cl) + " " + kCompileFlags + " /I " + Q(p.sdk_dir / "include") + " /I " + Q(gen) +
                                      " /Fo" + Q(o) + " " + Q(src);
-            int rc = Run(W(base), &env, shard_log, BELOW_NORMAL_PRIORITY_CLASS, &prog.cancel);
+            int rc;
+            if (need[i]) {
+                rc = Run(W(base + " /d2OptimizeHugeFunctions"), &env, shard_log, BELOW_NORMAL_PRIORITY_CLASS, &prog.cancel);
+                if (rc != 0 && !prog.cancel) { // out of memory (C1002 / C1060) or a crash: as before, unoptimised
+                    std::ifstream in(shard_log);
+                    const std::string text{std::istreambuf_iterator<char>(in), {}};
+                    if (rc != 2 || text.find("C1002") != std::string::npos || text.find("C1060") != std::string::npos) {
+                        note(fmt::format("{}: not enough memory to optimise it, compiling it as before", src.filename().string()));
+                        rc = Run(W(base), &env, shard_log, BELOW_NORMAL_PRIORITY_CLASS, &prog.cancel);
+                    }
+                }
+            } else {
+                rc = Run(W(base), &env, shard_log, BELOW_NORMAL_PRIORITY_CLASS, &prog.cancel);
+            }
             if (rc != 0 && rc != 2 && !prog.cancel) { // the optimizer crashed: this part without optimisation
                 note(fmt::format("{}: compiler error {:#x}, retrying without optimisation", src.filename().string(), u32(rc)));
                 std::string slow = base;
@@ -358,7 +431,10 @@ bool BuildGame(const Paths& p, int jobs, Progress& prog) {
             }
             fs::remove(shard_log, ec);
             const int d = ++prog.done;
-            note(fmt::format("compiled {} ({}/{})", src.filename().string(), d, shards.size()));
+            if (need[i])
+                note(fmt::format("optimising large functions ({}/{})", ++big_done, big_total));
+            else
+                note(fmt::format("compiled {} ({}/{})", src.filename().string(), d, shards.size()));
         }
     };
     std::vector<std::thread> pool;

@@ -11,6 +11,7 @@
 #include <type_traits>
 #include <cmath>
 #include <immintrin.h>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <intrin.h>
@@ -28,9 +29,34 @@ using u64 = std::uint64_t;
 using s32 = std::int32_t;
 using s64 = std::int64_t;
 
-struct V128 {
-    u64 lo, hi;
+// One 128-bit guest vector register. Generated code and the helpers below work on `m`, so MSVC keeps values in xmm
+// registers (a struct of two u64 is split into general registers, and every SIMD op then pays the moves between
+// them). The lo / hi view (same 16 bytes, lane 0 lowest) stays for runtime code; new code uses Lo() / Hi() / Make().
+#pragma warning(push)
+#pragma warning(disable : 4201) // nameless struct in a union
+struct alignas(16) V128 {
+    union {
+        struct {
+            u64 lo, hi;
+        };
+        __m128i m;
+    };
 };
+#pragma warning(pop)
+static_assert(sizeof(V128) == 16 && alignof(V128) == 16);
+__forceinline u64 Lo(const V128& v) { return u64(_mm_cvtsi128_si64(v.m)); }
+__forceinline u64 Hi(const V128& v) { return u64(_mm_extract_epi64(v.m, 1)); }
+__forceinline V128 FromM(__m128i x) {
+    V128 r;
+    r.m = x;
+    return r;
+}
+__forceinline V128 Make(u64 lo, u64 hi) { return FromM(_mm_set_epi64x(s64(hi), s64(lo))); }
+// S / D register views (A64GetS / GetD / SetS / SetD): the low 32 / 64 bits, the rest zero
+__forceinline V128 VZ32(const V128& v) {
+    return FromM(_mm_castps_si128(_mm_move_ss(_mm_setzero_ps(), _mm_castsi128_ps(v.m))));
+}
+__forceinline V128 VZ64(const V128& v) { return FromM(_mm_move_epi64(v.m)); }
 
 // Guest register file for native code. Lives in the owning cpu::Core; copied from/to dynarmic at transitions.
 struct State {
@@ -48,6 +74,12 @@ struct State {
     void* core;               // owning core (runtime callbacks)
     u64 stack_limit;          // host stack floor: functions refuse to run below it (deep guest recursion)
 };
+// The layout is shared with the runtime, HLE and the generated library: keep these fixed.
+static_assert(offsetof(State, sp) == 248 && offsetof(State, pc) == 256 && offsetof(State, nzcv) == 264);
+static_assert(offsetof(State, fpcr) == 268 && offsetof(State, fpsr) == 272 && offsetof(State, v) == 288);
+static_assert(offsetof(State, tpidr) == 800 && offsetof(State, mem) == 816 && offsetof(State, halt) == 824);
+static_assert(offsetof(State, icount) == 832 && offsetof(State, core) == 840 && offsetof(State, stack_limit) == 848);
+static_assert(sizeof(State) == 864);
 
 using Fn = void (*)(State&);
 
@@ -154,6 +186,32 @@ template <typename T>
 RC_INLINE void Wr(State& s, u64 a, T v) {
     std::memcpy(s.mem + a, &v, sizeof(T));
 }
+// Same accesses on the fastmem base cached in a local (generated code: `u8* const gm = s.mem;`): a guest store may
+// alias the State, so code that reads s.mem has to reload it after every store; the local cannot change.
+template <typename T>
+RC_INLINE T Rd(u8* m, u64 a) {
+    T v;
+    std::memcpy(&v, m + a, sizeof(T));
+    return v;
+}
+template <typename T>
+RC_INLINE void Wr(u8* m, u64 a, T v) {
+    std::memcpy(m + a, &v, sizeof(T));
+}
+template <typename T>
+RC_INLINE T RdOrdered(u8* m, u64 a) {
+    const T v = *reinterpret_cast<volatile T*>(m + a);
+    _ReadWriteBarrier();
+    return v;
+}
+RC_INLINE V128 Rd128(u8* m, u64 a) { return FromM(_mm_loadu_si128(reinterpret_cast<const __m128i*>(m + a))); }
+RC_INLINE void Wr128(u8* m, u64 a, V128 v) { _mm_storeu_si128(reinterpret_cast<__m128i*>(m + a), v.m); }
+RC_INLINE void WrOrdered(u8* m, u64 a, u8 v) { _InterlockedExchange8(reinterpret_cast<volatile char*>(m + a), char(v)); }
+RC_INLINE void WrOrdered(u8* m, u64 a, u16 v) { _InterlockedExchange16(reinterpret_cast<volatile short*>(m + a), short(v)); }
+RC_INLINE void WrOrdered(u8* m, u64 a, u32 v) { _InterlockedExchange(reinterpret_cast<volatile long*>(m + a), long(v)); }
+RC_INLINE void WrOrdered(u8* m, u64 a, u64 v) {
+    _InterlockedExchange64(reinterpret_cast<volatile long long*>(m + a), (long long)v);
+}
 // Acquire load (LDAR, LDAPR, LDAXR's ordered forms): x86 loads are acquire already; the compiler must not move later
 // accesses above it.
 template <typename T>
@@ -162,11 +220,8 @@ RC_INLINE T RdOrdered(State& s, u64 a) {
     _ReadWriteBarrier();
     return v;
 }
-RC_INLINE V128 Rd128(State& s, u64 a) { return {Rd<u64>(s, a), Rd<u64>(s, a + 8)}; }
-RC_INLINE void Wr128(State& s, u64 a, V128 v) {
-    Wr<u64>(s, a, v.lo);
-    Wr<u64>(s, a + 8, v.hi);
-}
+RC_INLINE V128 Rd128(State& s, u64 a) { return Rd128(s.mem, a); }
+RC_INLINE void Wr128(State& s, u64 a, V128 v) { Wr128(s.mem, a, v); }
 // Release stores (STLR): a locked exchange also orders them against later loads, as ARM's RCsc LDAR requires.
 RC_INLINE void WrOrdered(State& s, u64 a, u8 v) { _InterlockedExchange8(reinterpret_cast<volatile char*>(s.mem + a), char(v)); }
 RC_INLINE void WrOrdered(State& s, u64 a, u16 v) { _InterlockedExchange16(reinterpret_cast<volatile short*>(s.mem + a), short(v)); }
@@ -216,7 +271,7 @@ RC_INLINE u32 NZOf(T r) {
 namespace op {
 
 RC_INLINE u64 Pack2x32To1x64(u32 lo, u32 hi) { return u64(lo) | (u64(hi) << 32); }
-RC_INLINE V128 Pack2x64To1x128(u64 lo, u64 hi) { return {lo, hi}; }
+RC_INLINE V128 Pack2x64To1x128(u64 lo, u64 hi) { return Make(lo, hi); }
 RC_INLINE u32 LeastSignificantWord(u64 a) { return u32(a); }
 RC_INLINE u16 LeastSignificantHalf(u32 a) { return u16(a); }
 RC_INLINE u8 LeastSignificantByte(u32 a) { return u8(a); }
@@ -297,7 +352,7 @@ RC_INLINE u32 ZeroExtendHalfToWord(u16 a) { return a; }
 RC_INLINE u64 ZeroExtendByteToLong(u8 a) { return a; }
 RC_INLINE u64 ZeroExtendHalfToLong(u16 a) { return a; }
 RC_INLINE u64 ZeroExtendWordToLong(u32 a) { return a; }
-RC_INLINE V128 ZeroExtendLongToQuad(u64 a) { return {a, 0}; }
+RC_INLINE V128 ZeroExtendLongToQuad(u64 a) { return FromM(_mm_cvtsi64_si128(s64(a))); }
 RC_INLINE u32 ByteReverseWord(u32 a) { return _byteswap_ulong(a); }
 RC_INLINE u16 ByteReverseHalf(u16 a) { return _byteswap_ushort(a); }
 RC_INLINE u64 ByteReverseDual(u64 a) { return _byteswap_uint64(a); }
@@ -344,28 +399,75 @@ RC_INLINE V128 SetElem(V128 v, u8 i, T x) {
     std::memcpy(reinterpret_cast<u8*>(&v) + i * sizeof(T), &x, sizeof(T));
     return v;
 }
-RC_INLINE u8 VectorGetElement8(V128 v, u8 i) { return GetElem<u8>(v, i); }
-RC_INLINE u16 VectorGetElement16(V128 v, u8 i) { return GetElem<u16>(v, i); }
-RC_INLINE u32 VectorGetElement32(V128 v, u8 i) { return GetElem<u32>(v, i); }
-RC_INLINE u64 VectorGetElement64(V128 v, u8 i) { return GetElem<u64>(v, i); }
-RC_INLINE V128 VectorSetElement8(V128 v, u8 i, u8 x) { return SetElem(v, i, x); }
-RC_INLINE V128 VectorSetElement16(V128 v, u8 i, u16 x) { return SetElem(v, i, x); }
-RC_INLINE V128 VectorSetElement32(V128 v, u8 i, u32 x) { return SetElem(v, i, x); }
-RC_INLINE V128 VectorSetElement64(V128 v, u8 i, u64 x) { return SetElem(v, i, x); }
-RC_INLINE V128 VectorZeroUpper(V128 v) { return {v.lo, 0}; }
-RC_INLINE V128 ZeroVector() { return {0, 0}; }
-RC_INLINE V128 VectorAnd(V128 a, V128 b) { return {a.lo & b.lo, a.hi & b.hi}; }
-RC_INLINE V128 VectorAndNot(V128 a, V128 b) { return {a.lo & ~b.lo, a.hi & ~b.hi}; }
-RC_INLINE V128 VectorOr(V128 a, V128 b) { return {a.lo | b.lo, a.hi | b.hi}; }
-RC_INLINE V128 VectorEor(V128 a, V128 b) { return {a.lo ^ b.lo, a.hi ^ b.hi}; }
-RC_INLINE V128 VectorNot(V128 a) { return {~a.lo, ~a.hi}; }
-RC_INLINE V128 VectorBroadcast8(u8 a) { const u64 x = 0x0101010101010101ull * a; return {x, x}; }
-RC_INLINE V128 VectorBroadcast16(u16 a) { const u64 x = 0x0001000100010001ull * a; return {x, x}; }
-RC_INLINE V128 VectorBroadcast32(u32 a) { const u64 x = 0x0000000100000001ull * a; return {x, x}; }
-RC_INLINE V128 VectorBroadcast64(u64 a) { return {a, a}; }
-RC_INLINE V128 VectorBroadcastLower8(u8 a) { return {0x0101010101010101ull * a, 0}; }
-RC_INLINE V128 VectorBroadcastLower16(u16 a) { return {0x0001000100010001ull * a, 0}; }
-RC_INLINE V128 VectorBroadcastLower32(u32 a) { return {0x0000000100000001ull * a, 0}; }
+#define RC_LANES16(X) X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(9) X(10) X(11) X(12) X(13) X(14) X(15)
+#define RC_LANES8(X) X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7)
+#define RC_LANES4(X) X(0) X(1) X(2) X(3)
+RC_INLINE u8 VectorGetElement8(V128 v, u8 i) {
+    switch (i & 15) {
+#define C(k) case k: return u8(_mm_extract_epi8(v.m, k));
+        RC_LANES16(C)
+#undef C
+    }
+    return 0;
+}
+RC_INLINE u16 VectorGetElement16(V128 v, u8 i) {
+    switch (i & 7) {
+#define C(k) case k: return u16(_mm_extract_epi16(v.m, k));
+        RC_LANES8(C)
+#undef C
+    }
+    return 0;
+}
+RC_INLINE u32 VectorGetElement32(V128 v, u8 i) {
+    switch (i & 3) {
+    case 0: return u32(_mm_cvtsi128_si32(v.m));
+    case 1: return u32(_mm_extract_epi32(v.m, 1));
+    case 2: return u32(_mm_extract_epi32(v.m, 2));
+    default: return u32(_mm_extract_epi32(v.m, 3));
+    }
+}
+RC_INLINE u64 VectorGetElement64(V128 v, u8 i) { return (i & 1) ? Hi(v) : Lo(v); }
+RC_INLINE V128 VectorSetElement8(V128 v, u8 i, u8 x) {
+    switch (i & 15) {
+#define C(k) case k: return FromM(_mm_insert_epi8(v.m, x, k));
+        RC_LANES16(C)
+#undef C
+    }
+    return v;
+}
+RC_INLINE V128 VectorSetElement16(V128 v, u8 i, u16 x) {
+    switch (i & 7) {
+#define C(k) case k: return FromM(_mm_insert_epi16(v.m, x, k));
+        RC_LANES8(C)
+#undef C
+    }
+    return v;
+}
+RC_INLINE V128 VectorSetElement32(V128 v, u8 i, u32 x) {
+    switch (i & 3) {
+#define C(k) case k: return FromM(_mm_insert_epi32(v.m, int(x), k));
+        RC_LANES4(C)
+#undef C
+    }
+    return v;
+}
+RC_INLINE V128 VectorSetElement64(V128 v, u8 i, u64 x) {
+    return FromM((i & 1) ? _mm_insert_epi64(v.m, s64(x), 1) : _mm_insert_epi64(v.m, s64(x), 0));
+}
+RC_INLINE V128 VectorZeroUpper(V128 v) { return FromM(_mm_move_epi64(v.m)); }
+RC_INLINE V128 ZeroVector() { return FromM(_mm_setzero_si128()); }
+RC_INLINE V128 VectorAnd(V128 a, V128 b) { return FromM(_mm_and_si128(a.m, b.m)); }
+RC_INLINE V128 VectorAndNot(V128 a, V128 b) { return FromM(_mm_andnot_si128(b.m, a.m)); }
+RC_INLINE V128 VectorOr(V128 a, V128 b) { return FromM(_mm_or_si128(a.m, b.m)); }
+RC_INLINE V128 VectorEor(V128 a, V128 b) { return FromM(_mm_xor_si128(a.m, b.m)); }
+RC_INLINE V128 VectorNot(V128 a) { return FromM(_mm_xor_si128(a.m, _mm_set1_epi32(-1))); }
+RC_INLINE V128 VectorBroadcast8(u8 a) { return FromM(_mm_set1_epi8(char(a))); }
+RC_INLINE V128 VectorBroadcast16(u16 a) { return FromM(_mm_set1_epi16(short(a))); }
+RC_INLINE V128 VectorBroadcast32(u32 a) { return FromM(_mm_set1_epi32(int(a))); }
+RC_INLINE V128 VectorBroadcast64(u64 a) { return FromM(_mm_set1_epi64x(s64(a))); }
+RC_INLINE V128 VectorBroadcastLower8(u8 a) { return FromM(_mm_move_epi64(_mm_set1_epi8(char(a)))); }
+RC_INLINE V128 VectorBroadcastLower16(u16 a) { return FromM(_mm_move_epi64(_mm_set1_epi16(short(a)))); }
+RC_INLINE V128 VectorBroadcastLower32(u32 a) { return FromM(_mm_move_epi64(_mm_set1_epi32(int(a)))); }
 
 // ---- scalar floating point on the host FPU (MXCSR mirrors FPCR rounding/flush-to-zero while native code runs)
 RC_INLINE float F(u32 a) { return std::bit_cast<float>(a); }
@@ -495,14 +597,10 @@ RC_INLINE u64 FPFixedS64ToDouble(u64 a, u8 f, u8) { return B(FixedToFP<double>(s
 RC_INLINE u32 FPFixedS64ToSingle(u64 a, u8 f, u8) { return B(FixedToFP<float>(s64(a), f)); }
 
 // ---- SIMD (lane order: element 0 = least significant)
-RC_INLINE __m128 PS(V128 v) { return _mm_castsi128_ps(_mm_set_epi64x(s64(v.hi), s64(v.lo))); }
-RC_INLINE __m128d PD(V128 v) { return _mm_castsi128_pd(_mm_set_epi64x(s64(v.hi), s64(v.lo))); }
-RC_INLINE __m128i PI(V128 v) { return _mm_set_epi64x(s64(v.hi), s64(v.lo)); }
-RC_INLINE V128 VI(__m128i x) {
-    V128 r;
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(&r), x);
-    return r;
-}
+RC_INLINE __m128 PS(V128 v) { return _mm_castsi128_ps(v.m); }
+RC_INLINE __m128d PD(V128 v) { return _mm_castsi128_pd(v.m); }
+RC_INLINE __m128i PI(V128 v) { return v.m; }
+RC_INLINE V128 VI(__m128i x) { return FromM(x); }
 RC_INLINE V128 VS(__m128 x) { return VI(_mm_castps_si128(x)); }
 RC_INLINE V128 VD(__m128d x) { return VI(_mm_castpd_si128(x)); }
 template <typename T, typename F>
@@ -532,13 +630,27 @@ RC_INLINE V128 FPVectorSqrt32(V128 a, bool) { return VS(_mm_sqrt_ps(PS(a))); }
 RC_INLINE V128 FPVectorSqrt64(V128 a, bool) { return VD(_mm_sqrt_pd(PD(a))); }
 RC_INLINE V128 FPVectorMulAdd32(V128 c, V128 a, V128 b, bool) { return VS(_mm_fmadd_ps(PS(a), PS(b), PS(c))); }
 RC_INLINE V128 FPVectorMulAdd64(V128 c, V128 a, V128 b, bool) { return VD(_mm_fmadd_pd(PD(a), PD(b), PD(c))); }
-RC_INLINE V128 FPVectorNeg32(V128 a) { return {a.lo ^ 0x8000000080000000ull, a.hi ^ 0x8000000080000000ull}; }
-RC_INLINE V128 FPVectorNeg64(V128 a) { return {a.lo ^ 0x8000000000000000ull, a.hi ^ 0x8000000000000000ull}; }
-RC_INLINE V128 FPVectorAbs32(V128 a) { return {a.lo & 0x7FFFFFFF7FFFFFFFull, a.hi & 0x7FFFFFFF7FFFFFFFull}; }
-RC_INLINE V128 FPVectorAbs64(V128 a) { return {a.lo & 0x7FFFFFFFFFFFFFFFull, a.hi & 0x7FFFFFFFFFFFFFFFull}; }
-RC_INLINE V128 FPVectorMax32(V128 a, V128 b, bool) { return Map2<u32>(a, b, FPMax32); }
+RC_INLINE V128 FPVectorNeg32(V128 a) { return FromM(_mm_xor_si128(a.m, _mm_set1_epi32(int(0x80000000u)))); }
+RC_INLINE V128 FPVectorNeg64(V128 a) { return FromM(_mm_xor_si128(a.m, _mm_set1_epi64x(s64(0x8000000000000000ull)))); }
+RC_INLINE V128 FPVectorAbs32(V128 a) { return FromM(_mm_and_si128(a.m, _mm_set1_epi32(0x7FFFFFFF))); }
+RC_INLINE V128 FPVectorAbs64(V128 a) { return FromM(_mm_and_si128(a.m, _mm_set1_epi64x(0x7FFFFFFFFFFFFFFFll))); }
+// FMAX / FMIN: maxps / minps give (x > y ? x : y) / (x < y ? x : y), right for every pair of non-NaN lanes but equal
+// ones (+0 / -0: max prefers +0 = a & b, min prefers -0 = a | b). A NaN in any lane takes the exact per-lane path.
+RC_INLINE V128 FPVectorMax32(V128 a, V128 b, bool) {
+    const __m128 x = PS(a), y = PS(b);
+    if (_mm_movemask_ps(_mm_cmpunord_ps(x, y)))
+        return Map2<u32>(a, b, FPMax32);
+    const __m128i eq = _mm_castps_si128(_mm_cmpeq_ps(x, y));
+    return VI(_mm_blendv_epi8(_mm_castps_si128(_mm_max_ps(x, y)), _mm_and_si128(a.m, b.m), eq));
+}
 RC_INLINE V128 FPVectorMax64(V128 a, V128 b, bool) { return Map2<u64>(a, b, FPMax64); }
-RC_INLINE V128 FPVectorMin32(V128 a, V128 b, bool) { return Map2<u32>(a, b, FPMin32); }
+RC_INLINE V128 FPVectorMin32(V128 a, V128 b, bool) {
+    const __m128 x = PS(a), y = PS(b);
+    if (_mm_movemask_ps(_mm_cmpunord_ps(x, y)))
+        return Map2<u32>(a, b, FPMin32);
+    const __m128i eq = _mm_castps_si128(_mm_cmpeq_ps(x, y));
+    return VI(_mm_blendv_epi8(_mm_castps_si128(_mm_min_ps(x, y)), _mm_or_si128(a.m, b.m), eq));
+}
 RC_INLINE V128 FPVectorMin64(V128 a, V128 b, bool) { return Map2<u64>(a, b, FPMin64); }
 RC_INLINE V128 FPVectorMaxNumeric32(V128 a, V128 b, bool) { return Map2<u32>(a, b, FPMaxNumeric32); }
 RC_INLINE V128 FPVectorMaxNumeric64(V128 a, V128 b, bool) { return Map2<u64>(a, b, FPMaxNumeric64); }
@@ -555,9 +667,10 @@ RC_INLINE V128 FPVectorGreaterEqual64(V128 a, V128 b, bool) { return VD(_mm_cmpg
 RC_INLINE V128 FPVectorPairedAdd32(V128 a, V128 b, bool) { return VS(_mm_hadd_ps(PS(a), PS(b))); }
 RC_INLINE V128 FPVectorPairedAdd64(V128 a, V128 b, bool) { return VD(_mm_hadd_pd(PD(a), PD(b))); }
 RC_INLINE V128 FPVectorPairedAddLower32(V128 a, V128 b, bool) {
-    return {u64(FPAdd32(u32(a.lo), u32(a.lo >> 32))) | (u64(FPAdd32(u32(b.lo), u32(b.lo >> 32))) << 32), 0};
+    const u64 x = Lo(a), y = Lo(b);
+    return Make(u64(FPAdd32(u32(x), u32(x >> 32))) | (u64(FPAdd32(u32(y), u32(y >> 32))) << 32), 0);
 }
-RC_INLINE V128 FPVectorPairedAddLower64(V128 a, V128 b, bool) { return {FPAdd64(a.lo, b.lo), 0}; }
+RC_INLINE V128 FPVectorPairedAddLower64(V128 a, V128 b, bool) { return Make(FPAdd64(Lo(a), Lo(b)), 0); }
 RC_INLINE V128 FPVectorFromSignedFixed32(V128 a, u8 f, u8, bool) {
     return Map1<u32>(a, [f](u32 x) { return B(FixedToFP<float>(s32(x), f)); });
 }
@@ -578,31 +691,37 @@ RC_INLINE V128 Bcast(T x) {
         r = SetElem<T>(r, i, x);
     return r;
 }
-RC_INLINE V128 VectorBroadcastElement8(V128 v, u8 i) { return Bcast(GetElem<u8>(v, i)); }
-RC_INLINE V128 VectorBroadcastElement16(V128 v, u8 i) { return Bcast(GetElem<u16>(v, i)); }
-RC_INLINE V128 VectorBroadcastElement32(V128 v, u8 i) { return Bcast(GetElem<u32>(v, i)); }
-RC_INLINE V128 VectorBroadcastElement64(V128 v, u8 i) { return Bcast(GetElem<u64>(v, i)); }
-RC_INLINE V128 VectorBroadcastElementLower8(V128 v, u8 i) { return {Bcast(GetElem<u8>(v, i)).lo, 0}; }
-RC_INLINE V128 VectorBroadcastElementLower16(V128 v, u8 i) { return {Bcast(GetElem<u16>(v, i)).lo, 0}; }
-RC_INLINE V128 VectorBroadcastElementLower32(V128 v, u8 i) { return {Bcast(GetElem<u32>(v, i)).lo, 0}; }
+RC_INLINE V128 VectorBroadcastElement8(V128 v, u8 i) { return VectorBroadcast8(VectorGetElement8(v, i)); }
+RC_INLINE V128 VectorBroadcastElement16(V128 v, u8 i) { return VectorBroadcast16(VectorGetElement16(v, i)); }
+RC_INLINE V128 VectorBroadcastElement32(V128 v, u8 i) {
+    switch (i & 3) {
+    case 0: return FromM(_mm_shuffle_epi32(v.m, 0x00));
+    case 1: return FromM(_mm_shuffle_epi32(v.m, 0x55));
+    case 2: return FromM(_mm_shuffle_epi32(v.m, 0xAA));
+    default: return FromM(_mm_shuffle_epi32(v.m, 0xFF));
+    }
+}
+RC_INLINE V128 VectorBroadcastElement64(V128 v, u8 i) { return FromM((i & 1) ? _mm_shuffle_epi32(v.m, 0xEE) : _mm_shuffle_epi32(v.m, 0x44)); }
+RC_INLINE V128 VectorBroadcastElementLower8(V128 v, u8 i) { return VectorZeroUpper(VectorBroadcastElement8(v, i)); }
+RC_INLINE V128 VectorBroadcastElementLower16(V128 v, u8 i) { return VectorZeroUpper(VectorBroadcastElement16(v, i)); }
+RC_INLINE V128 VectorBroadcastElementLower32(V128 v, u8 i) { return VectorZeroUpper(VectorBroadcastElement32(v, i)); }
 
 RC_INLINE V128 VectorAdd8(V128 a, V128 b) { return VI(_mm_add_epi8(PI(a), PI(b))); }
 RC_INLINE V128 VectorAdd16(V128 a, V128 b) { return VI(_mm_add_epi16(PI(a), PI(b))); }
 RC_INLINE V128 VectorAdd32(V128 a, V128 b) { return VI(_mm_add_epi32(PI(a), PI(b))); }
-RC_INLINE V128 VectorAdd64(V128 a, V128 b) { return {a.lo + b.lo, a.hi + b.hi}; }
+RC_INLINE V128 VectorAdd64(V128 a, V128 b) { return VI(_mm_add_epi64(PI(a), PI(b))); }
 RC_INLINE V128 VectorSub8(V128 a, V128 b) { return VI(_mm_sub_epi8(PI(a), PI(b))); }
 RC_INLINE V128 VectorSub16(V128 a, V128 b) { return VI(_mm_sub_epi16(PI(a), PI(b))); }
 RC_INLINE V128 VectorSub32(V128 a, V128 b) { return VI(_mm_sub_epi32(PI(a), PI(b))); }
-RC_INLINE V128 VectorSub64(V128 a, V128 b) { return {a.lo - b.lo, a.hi - b.hi}; }
+RC_INLINE V128 VectorSub64(V128 a, V128 b) { return VI(_mm_sub_epi64(PI(a), PI(b))); }
 RC_INLINE V128 VectorMultiply16(V128 a, V128 b) { return VI(_mm_mullo_epi16(PI(a), PI(b))); }
 RC_INLINE V128 VectorMultiply32(V128 a, V128 b) { return VI(_mm_mullo_epi32(PI(a), PI(b))); }
 RC_INLINE V128 VectorEqual8(V128 a, V128 b) { return VI(_mm_cmpeq_epi8(PI(a), PI(b))); }
 RC_INLINE V128 VectorEqual16(V128 a, V128 b) { return VI(_mm_cmpeq_epi16(PI(a), PI(b))); }
 RC_INLINE V128 VectorEqual32(V128 a, V128 b) { return VI(_mm_cmpeq_epi32(PI(a), PI(b))); }
-RC_INLINE V128 VectorEqual64(V128 a, V128 b) { return {a.lo == b.lo ? ~0ull : 0, a.hi == b.hi ? ~0ull : 0}; }
+RC_INLINE V128 VectorEqual64(V128 a, V128 b) { return VI(_mm_cmpeq_epi64(PI(a), PI(b))); }
 RC_INLINE V128 VectorEqual128(V128 a, V128 b) {
-    const u64 m = (a.lo == b.lo && a.hi == b.hi) ? ~0ull : 0;
-    return {m, m};
+    return VI(_mm_set1_epi32(_mm_movemask_epi8(_mm_cmpeq_epi8(a.m, b.m)) == 0xFFFF ? -1 : 0));
 }
 RC_INLINE V128 VectorGreaterS8(V128 a, V128 b) { return VI(_mm_cmpgt_epi8(PI(a), PI(b))); }
 RC_INLINE V128 VectorGreaterS16(V128 a, V128 b) { return VI(_mm_cmpgt_epi16(PI(a), PI(b))); }
@@ -635,16 +754,16 @@ RC_INLINE V128 Sar(V128 a, u8 s) {
     return Map1<T>(a, [s](T x) { return T(S(x) >> (s >= sizeof(T) * 8 ? sizeof(T) * 8 - 1 : s)); });
 }
 RC_INLINE V128 VectorLogicalShiftLeft8(V128 a, u8 s) { return Shl<u8>(a, s); }
-RC_INLINE V128 VectorLogicalShiftLeft16(V128 a, u8 s) { return Shl<u16>(a, s); }
-RC_INLINE V128 VectorLogicalShiftLeft32(V128 a, u8 s) { return Shl<u32>(a, s); }
-RC_INLINE V128 VectorLogicalShiftLeft64(V128 a, u8 s) { return Shl<u64>(a, s); }
+RC_INLINE V128 VectorLogicalShiftLeft16(V128 a, u8 s) { return VI(_mm_sll_epi16(a.m, _mm_cvtsi32_si128(s))); }
+RC_INLINE V128 VectorLogicalShiftLeft32(V128 a, u8 s) { return VI(_mm_sll_epi32(a.m, _mm_cvtsi32_si128(s))); }
+RC_INLINE V128 VectorLogicalShiftLeft64(V128 a, u8 s) { return VI(_mm_sll_epi64(a.m, _mm_cvtsi32_si128(s))); }
 RC_INLINE V128 VectorLogicalShiftRight8(V128 a, u8 s) { return Shr<u8>(a, s); }
-RC_INLINE V128 VectorLogicalShiftRight16(V128 a, u8 s) { return Shr<u16>(a, s); }
-RC_INLINE V128 VectorLogicalShiftRight32(V128 a, u8 s) { return Shr<u32>(a, s); }
-RC_INLINE V128 VectorLogicalShiftRight64(V128 a, u8 s) { return Shr<u64>(a, s); }
+RC_INLINE V128 VectorLogicalShiftRight16(V128 a, u8 s) { return VI(_mm_srl_epi16(a.m, _mm_cvtsi32_si128(s))); }
+RC_INLINE V128 VectorLogicalShiftRight32(V128 a, u8 s) { return VI(_mm_srl_epi32(a.m, _mm_cvtsi32_si128(s))); }
+RC_INLINE V128 VectorLogicalShiftRight64(V128 a, u8 s) { return VI(_mm_srl_epi64(a.m, _mm_cvtsi32_si128(s))); }
 RC_INLINE V128 VectorArithmeticShiftRight8(V128 a, u8 s) { return Sar<u8>(a, s); }
-RC_INLINE V128 VectorArithmeticShiftRight16(V128 a, u8 s) { return Sar<u16>(a, s); }
-RC_INLINE V128 VectorArithmeticShiftRight32(V128 a, u8 s) { return Sar<u32>(a, s); }
+RC_INLINE V128 VectorArithmeticShiftRight16(V128 a, u8 s) { return VI(_mm_sra_epi16(a.m, _mm_cvtsi32_si128(s))); }
+RC_INLINE V128 VectorArithmeticShiftRight32(V128 a, u8 s) { return VI(_mm_sra_epi32(a.m, _mm_cvtsi32_si128(s))); }
 RC_INLINE V128 VectorArithmeticShiftRight64(V128 a, u8 s) { return Sar<u64>(a, s); }
 
 // widen the lower half
@@ -655,13 +774,13 @@ RC_INLINE V128 Widen(V128 a) {
         r = SetElem<To>(r, i, To(GetElem<From>(a, i)));
     return r;
 }
-RC_INLINE V128 VectorSignExtend8(V128 a) { return Widen<int8_t, int16_t>(a); }
-RC_INLINE V128 VectorSignExtend16(V128 a) { return Widen<int16_t, int32_t>(a); }
-RC_INLINE V128 VectorSignExtend32(V128 a) { return Widen<int32_t, int64_t>(a); }
-RC_INLINE V128 VectorZeroExtend8(V128 a) { return Widen<u8, u16>(a); }
-RC_INLINE V128 VectorZeroExtend16(V128 a) { return Widen<u16, u32>(a); }
-RC_INLINE V128 VectorZeroExtend32(V128 a) { return Widen<u32, u64>(a); }
-RC_INLINE V128 VectorZeroExtend64(V128 a) { return {a.lo, 0}; }
+RC_INLINE V128 VectorSignExtend8(V128 a) { return VI(_mm_cvtepi8_epi16(a.m)); }
+RC_INLINE V128 VectorSignExtend16(V128 a) { return VI(_mm_cvtepi16_epi32(a.m)); }
+RC_INLINE V128 VectorSignExtend32(V128 a) { return VI(_mm_cvtepi32_epi64(a.m)); }
+RC_INLINE V128 VectorZeroExtend8(V128 a) { return VI(_mm_cvtepu8_epi16(a.m)); }
+RC_INLINE V128 VectorZeroExtend16(V128 a) { return VI(_mm_cvtepu16_epi32(a.m)); }
+RC_INLINE V128 VectorZeroExtend32(V128 a) { return VI(_mm_cvtepu32_epi64(a.m)); }
+RC_INLINE V128 VectorZeroExtend64(V128 a) { return VectorZeroUpper(a); }
 template <typename From, typename To>
 RC_INLINE V128 Narrow(V128 a) {
     V128 r{};
@@ -669,9 +788,14 @@ RC_INLINE V128 Narrow(V128 a) {
         r = SetElem<To>(r, i, To(GetElem<From>(a, i)));
     return r;
 }
-RC_INLINE V128 VectorNarrow16(V128 a) { return Narrow<u16, u8>(a); }
-RC_INLINE V128 VectorNarrow32(V128 a) { return Narrow<u32, u16>(a); }
-RC_INLINE V128 VectorNarrow64(V128 a) { return Narrow<u64, u32>(a); }
+// truncate every lane into the lower half (upper half zero: pshufb index bytes with the top bit set give 0)
+RC_INLINE V128 VectorNarrow16(V128 a) {
+    return VI(_mm_shuffle_epi8(a.m, _mm_set_epi64x(-1, 0x0E0C0A0806040200ll)));
+}
+RC_INLINE V128 VectorNarrow32(V128 a) {
+    return VI(_mm_shuffle_epi8(a.m, _mm_set_epi64x(-1, 0x0D0C090805040100ll)));
+}
+RC_INLINE V128 VectorNarrow64(V128 a) { return VI(_mm_move_epi64(_mm_shuffle_epi32(a.m, 0x08))); }
 
 template <typename T>
 RC_INLINE V128 InterleaveLower(V128 a, V128 b) {
@@ -693,30 +817,31 @@ RC_INLINE V128 InterleaveUpper(V128 a, V128 b) {
     }
     return r;
 }
-RC_INLINE V128 VectorInterleaveLower8(V128 a, V128 b) { return InterleaveLower<u8>(a, b); }
-RC_INLINE V128 VectorInterleaveLower16(V128 a, V128 b) { return InterleaveLower<u16>(a, b); }
-RC_INLINE V128 VectorInterleaveLower32(V128 a, V128 b) { return InterleaveLower<u32>(a, b); }
-RC_INLINE V128 VectorInterleaveLower64(V128 a, V128 b) { return InterleaveLower<u64>(a, b); }
-RC_INLINE V128 VectorInterleaveUpper8(V128 a, V128 b) { return InterleaveUpper<u8>(a, b); }
-RC_INLINE V128 VectorInterleaveUpper16(V128 a, V128 b) { return InterleaveUpper<u16>(a, b); }
-RC_INLINE V128 VectorInterleaveUpper32(V128 a, V128 b) { return InterleaveUpper<u32>(a, b); }
-RC_INLINE V128 VectorInterleaveUpper64(V128 a, V128 b) { return InterleaveUpper<u64>(a, b); }
+RC_INLINE V128 VectorInterleaveLower8(V128 a, V128 b) { return VI(_mm_unpacklo_epi8(a.m, b.m)); }
+RC_INLINE V128 VectorInterleaveLower16(V128 a, V128 b) { return VI(_mm_unpacklo_epi16(a.m, b.m)); }
+RC_INLINE V128 VectorInterleaveLower32(V128 a, V128 b) { return VI(_mm_unpacklo_epi32(a.m, b.m)); }
+RC_INLINE V128 VectorInterleaveLower64(V128 a, V128 b) { return VI(_mm_unpacklo_epi64(a.m, b.m)); }
+RC_INLINE V128 VectorInterleaveUpper8(V128 a, V128 b) { return VI(_mm_unpackhi_epi8(a.m, b.m)); }
+RC_INLINE V128 VectorInterleaveUpper16(V128 a, V128 b) { return VI(_mm_unpackhi_epi16(a.m, b.m)); }
+RC_INLINE V128 VectorInterleaveUpper32(V128 a, V128 b) { return VI(_mm_unpackhi_epi32(a.m, b.m)); }
+RC_INLINE V128 VectorInterleaveUpper64(V128 a, V128 b) { return VI(_mm_unpackhi_epi64(a.m, b.m)); }
 // EXT: (b:a) >> pos bits
 RC_INLINE V128 VectorExtract(V128 a, V128 b, u8 pos) {
-    u8 buf[32];
-    std::memcpy(buf, &a, 16);
-    std::memcpy(buf + 16, &b, 16);
-    V128 r;
-    std::memcpy(&r, buf + pos / 8, 16);
-    return r;
+    switch ((pos / 8) & 15) {
+#define C(k) case k: return VI(_mm_alignr_epi8(b.m, a.m, k));
+        RC_LANES16(C)
+#undef C
+    }
+    return a;
 }
 RC_INLINE V128 VectorExtractLower(V128 a, V128 b, u8 pos) {
-    u8 buf[16];
-    std::memcpy(buf, &a.lo, 8);
-    std::memcpy(buf + 8, &b.lo, 8);
-    V128 r{};
-    std::memcpy(&r.lo, buf + pos / 8, 8);
-    return r;
+    const __m128i t = _mm_unpacklo_epi64(a.m, b.m); // b.lo:a.lo
+    switch ((pos / 8) & 7) {
+#define C(k) case k: return VI(_mm_move_epi64(_mm_srli_si128(t, k)));
+        RC_LANES8(C)
+#undef C
+    }
+    return a;
 }
 
 // TBL/TBX: bytes indexing past the table take the default (zero for TBL, the destination for TBX)
@@ -768,12 +893,13 @@ RC_INLINE V128 VectorArithmeticVShift64(V128 a, V128 b) { return VShiftA<u64>(a,
 RC_INLINE V128 VectorRotateWholeVectorRight(V128 a, u8 bits) {
     if (bits == 0)
         return a;
+    const u64 lo = Lo(a), hi = Hi(a);
     if (bits == 64)
-        return {a.hi, a.lo};
+        return Make(hi, lo);
     if (bits < 64)
-        return {(a.lo >> bits) | (a.hi << (64 - bits)), (a.hi >> bits) | (a.lo << (64 - bits))};
+        return Make((lo >> bits) | (hi << (64 - bits)), (hi >> bits) | (lo << (64 - bits)));
     const u8 b2 = bits - 64;
-    return {(a.hi >> b2) | (a.lo << (64 - b2)), (a.lo >> b2) | (a.hi << (64 - b2))};
+    return Make((hi >> b2) | (lo << (64 - b2)), (lo >> b2) | (hi << (64 - b2)));
 }
 
 // ---- byte/element reversal, widening multiplies, reductions, transposes
@@ -1174,7 +1300,11 @@ extern std::atomic<u32> g_ic_epoch;
 void DispatchIc(State& s, u64& slot);
 RC_INLINE void CallIc(State& s, u64& slot) {
     const u64 c = u64(__iso_volatile_load64(reinterpret_cast<const __int64*>(&slot)));
-    const u64 key = ((s.pc ^ 0xFFFFFFFull) << 4) | (g_ic_epoch.load(std::memory_order_acquire) & 15);
+    // A volatile read, not g_ic_epoch.load(): MSVC leaves the std::atomic member call out of line in the huge
+    // generated functions (a real call, and caller-saved registers spilled, at every hit). Volatile accesses keep
+    // their order (slot first, then epoch), and x86 does not reorder loads with each other.
+    const u32 epoch = u32(__iso_volatile_load32(reinterpret_cast<const volatile int*>(&g_ic_epoch)));
+    const u64 key = ((s.pc ^ 0xFFFFFFFull) << 4) | (epoch & 15);
     if ((c >> 32) == key)
         reinterpret_cast<Fn>(reinterpret_cast<uintptr_t>(&__ImageBase) + u32(c))(s);
     else

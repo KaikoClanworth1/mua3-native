@@ -570,18 +570,18 @@ namespace {
 // through memory, not V128's members: works with V128 as two u64 or as one __m128i (16 bytes, low half first)
 static_assert(sizeof(V128) == 16);
 __m128i ToM(V128 a) { return _mm_loadu_si128(reinterpret_cast<const __m128i*>(&a)); }
-V128 FromM(__m128i x) {
+V128 VFromM(__m128i x) {
     V128 r;
     _mm_storeu_si128(reinterpret_cast<__m128i*>(&r), x);
     return r;
 }
 } // namespace
-V128 AESEncryptSingleRound(V128 a) { return FromM(_mm_aesenclast_si128(ToM(a), _mm_setzero_si128())); }
-V128 AESDecryptSingleRound(V128 a) { return FromM(_mm_aesdeclast_si128(ToM(a), _mm_setzero_si128())); }
+V128 AESEncryptSingleRound(V128 a) { return VFromM(_mm_aesenclast_si128(ToM(a), _mm_setzero_si128())); }
+V128 AESDecryptSingleRound(V128 a) { return VFromM(_mm_aesdeclast_si128(ToM(a), _mm_setzero_si128())); }
 V128 AESMixColumns(V128 a) {
     // aesdeclast undoes ShiftRows + SubBytes, aesenc redoes them and adds MixColumns
-    return FromM(_mm_aesenc_si128(_mm_aesdeclast_si128(ToM(a), _mm_setzero_si128()), _mm_setzero_si128()));
+    return VFromM(_mm_aesenc_si128(_mm_aesdeclast_si128(ToM(a), _mm_setzero_si128()), _mm_setzero_si128()));
 }
-V128 AESInverseMixColumns(V128 a) { return FromM(_mm_aesimc_si128(ToM(a))); }
+V128 AESInverseMixColumns(V128 a) { return VFromM(_mm_aesimc_si128(ToM(a))); }
 
 } // namespace recomp

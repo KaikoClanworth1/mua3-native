@@ -1,18 +1,25 @@
 """Compile build/recomp_full into a prebuilt static library (outside MSBuild, which loses all progress whenever one
 compiler dies). Objects are reused while newer than their source; MSVC internal crashes are bisected to a function,
 added to noopt.txt and the code regenerated (only changed shards are rewritten)."""
+import ctypes
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 P = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the repository
 # Work dir with nso/ (nsodump output), optional prof*.txt / missing*.txt (coverage from game runs), noopt.txt/skip.txt
 S = os.environ.get('MUA3_RECOMP_WORK') or os.path.join(P, 'build', 'recomp_work')
-GEN = os.path.join(P, 'build', 'recomp_full')
-OBJ = os.path.join(P, 'build', 'recomp_full_obj')
+# Overridable for a private build next to the shared one (other generator / runtime header under test):
+# MUA3_RECOMP_GEN / MUA3_RECOMP_OBJ output dirs, MUA3_RECOMP_EXE generator, MUA3_RECOMP_INC dir holding
+# core/cpu/recomp/recomp_rt.h (default src)
+GEN = os.environ.get('MUA3_RECOMP_GEN') or os.path.join(P, 'build', 'recomp_full')
+OBJ = os.environ.get('MUA3_RECOMP_OBJ') or os.path.join(P, 'build', 'recomp_full_obj')
+EXE = os.environ.get('MUA3_RECOMP_EXE') or os.path.join(P, r'build\bin\RelWithDebInfo\recomp.exe')
+INC = os.environ.get('MUA3_RECOMP_INC') or os.path.join(P, 'src')
 
 
 def find_vcvars():
@@ -33,13 +40,84 @@ def find_vcvars():
 VC = find_vcvars()
 NOOPT = os.path.join(S, 'noopt.txt')
 SKIP = os.path.join(S, 'skip.txt')
+# functions whose guest accesses keep reading s.mem (MSVC takes hours on a few with the cached base)
+NOGM = os.path.join(S, 'nogm.txt')
 os.makedirs(S, exist_ok=True)
 open(SKIP, 'a').close()
 open(NOOPT, 'a').close()
+open(NOGM, 'a').close()
 NSO = os.path.join(S, 'nso')
 if not os.path.exists(os.path.join(NSO, 'main.bin')):
     sys.exit(f'{NSO} has no main.bin: run  build\\bin\\RelWithDebInfo\\nsodump.exe game\\exefs {NSO}  first')
 FLAGS = '/c /nologo /O2 /Ob3 /GS- /EHsc /MT /std:c++20 /permissive- /bigobj /utf-8 /DNDEBUG'
+# Without it MSVC compiles functions above ~380 KB of C++ (warning C4883) with no optimisation at all (several of them
+# hot: 5% of the main thread). On a whole shard it can need over 20 GB, so the generator puts each big function in a
+# file of its own, recomp_<shard>_<entry>.cpp, and only those get it. One that takes longer than HUGE_LIMIT with it is
+# compiled again without it.
+HUGE = '/d2OptimizeHugeFunctions'
+HUGE_LIMIT = 60 * 60
+
+
+def is_big(name):
+    return re.fullmatch(r'recomp_[0-9a-f]+_[0-9a-f]+\.(cpp|obj)', os.path.basename(name)) is not None
+
+
+def free_ram():
+    class MS(ctypes.Structure):
+        _fields_ = [('len', ctypes.c_ulong), ('load', ctypes.c_ulong), ('total', ctypes.c_ulonglong),
+                    ('avail', ctypes.c_ulonglong), ('tpf', ctypes.c_ulonglong), ('apf', ctypes.c_ulonglong),
+                    ('tv', ctypes.c_ulonglong), ('av', ctypes.c_ulonglong), ('ave', ctypes.c_ulonglong)]
+    m = MS()
+    m.len = ctypes.sizeof(MS)
+    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+    return m.avail
+
+
+def need(n):
+    """estimated compiler memory: big-function files only (about 5 GB per MB of C++ with the flag), else 0"""
+    return max(1 << 30, int(os.path.getsize(os.path.join(GEN, n)) * 5 * 1024)) if is_big(n) else 0
+
+
+def compile_all(todo):
+    """cl over todo with JOBS workers; big-function files first (largest first) and together within half the RAM
+    free at the start (one may always run alone). Returns the exit codes in todo order."""
+    budget = free_ram() // 2
+    order = sorted(range(len(todo)), key=lambda i: -need(todo[i]))
+    req = [need(n) for n in todo]
+    rcs = [None] * len(todo)
+    lock = threading.Condition()
+    state = {'reserved': 0, 'next': list(order)}
+    nbig = sum(1 for r in req if r)
+    if nbig:
+        log(f'{nbig} big-function files, within {budget / 2**30:.1f} GB')
+
+    def take():
+        with lock:
+            while True:
+                if not state['next']:
+                    return None
+                for i in state['next']:
+                    if not req[i] or not state['reserved'] or state['reserved'] + req[i] <= budget:
+                        state['next'].remove(i)
+                        state['reserved'] += req[i]
+                        return i
+                lock.wait()
+
+    def work():
+        while (i := take()) is not None:
+            try:
+                rcs[i] = cl(os.path.join(GEN, todo[i]), os.path.join(OBJ, todo[i][:-4] + '.obj'))
+            finally:
+                with lock:
+                    state['reserved'] -= req[i]
+                    lock.notify_all()
+
+    ts = [threading.Thread(target=work) for _ in range(JOBS)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    return rcs
 JOBS = int(sys.argv[1]) if len(sys.argv) > 1 else 8
 
 
@@ -48,7 +126,7 @@ def log(*a):
 
 
 def generate():
-    cmd = [os.path.join(P, r'build\bin\RelWithDebInfo\recomp.exe'), GEN,
+    cmd = [EXE, GEN,
            os.path.join(NSO, 'rtld.bin'), '8000000', '19f0',  # process entry: the main thread starts here
            os.path.join(NSO, 'main.bin'), '8004000', '159d340', os.path.join(NSO, 'sdk.bin'), 'df54000', '51c600',
            os.path.join(NSO, 'subsdk0.bin'), 'cfc5000', '377110', os.path.join(NSO, 'subsdk1.bin'), 'd6e5000', '4ce300',
@@ -57,17 +135,39 @@ def generate():
            # recomp_missing.txt files from game runs (pcs the JIT had to run), renamed missing<N>.txt
            *[a for p in sorted(n for n in os.listdir(S) if re.fullmatch(r'missing\d+\.txt', n))
              for a in ('--missing', os.path.join(S, p))], '--all', '1', '--sweep', '1',
-           '--noopt', NOOPT, '--skip', SKIP]
+           '--noopt', NOOPT, '--skip', SKIP, '--nogm', NOGM]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, check=True)
 
 
-def cl(src, obj):
+def cl(src, obj, huge=None):
+    if huge is None:
+        huge = is_big(src)
     tag = os.path.basename(obj).replace('.obj', '')
     bat = os.path.join(S, f'cl_{tag}.bat')
-    open(bat, 'w').write(f'@call "{VC}" >nul 2>&1\ncl {FLAGS} /I "{P}\\src" /I "{GEN}" /Fo"{obj}" "{src}" >nul 2>&1\n'
+    flags = FLAGS + (' ' + HUGE if huge else '')
+    out = os.path.join(S, f'cl_{tag}.log') if huge else 'nul'
+    open(bat, 'w').write(f'@call "{VC}" >nul 2>&1\ncl {flags} /I "{INC}" /I "{GEN}" /Fo"{obj}" "{src}" >"{out}" 2>&1\n'
                          f'exit /b %ERRORLEVEL%\n')
-    rc = subprocess.run(['cmd', '/c', bat]).returncode
+    t0 = time.time()
+    p = subprocess.Popen(['cmd', '/c', bat])
+    try:
+        rc = p.wait(timeout=HUGE_LIMIT if huge else None)
+    except subprocess.TimeoutExpired:
+        subprocess.run(['taskkill', '/T', '/F', '/PID', str(p.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        p.wait()
+        log(f'{tag}: over {HUGE_LIMIT // 60} min with {HUGE}, compiling it again without')
+        os.remove(bat)
+        return cl(src, obj, huge=False)
     os.remove(bat)
+    if huge:
+        text = open(out, errors='replace').read() if os.path.exists(out) else ''
+        if os.path.exists(out):
+            os.remove(out)
+        if rc != 0 and (rc != 2 or 'C1002' in text or 'C1060' in text):  # out of memory / crash: as before
+            log(f'{tag}: {HUGE} failed (code {rc}), compiling it again without')
+            return cl(src, obj, huge=False)
+        if time.time() - t0 > 600:
+            log(f'{tag}: {(time.time() - t0) / 60:.0f} min')
     return rc  # 0 ok, 2 compile error, else compiler crash
 
 
@@ -75,7 +175,7 @@ def bisect(name):
     src = open(os.path.join(GEN, name)).read()
     head, body = src.split('namespace recomp {\n', 1)
     body = body.rsplit('}', 1)[0]
-    funcs = [f for f in re.split(r'\n(?=(?:#pragma optimize\("", off\)\n)?void f_)', body) if f.strip()]
+    funcs = [f for f in re.split(r'\n(?=(?:#pragma optimize\("", off\)\n)?(?:#define gm s\.mem\n)?void f_)', body) if f.strip()]
     probe = os.path.join(GEN, 'probe_' + name)  # same dir for the include; not matched by recomp_*.cpp
     pobj = os.path.join(S, 'probe_' + name + '.obj')
     try:
@@ -96,13 +196,12 @@ def bisect(name):
 os.makedirs(OBJ, exist_ok=True)
 generate()
 for attempt in range(10):
-    srcs = sorted(n for n in os.listdir(GEN) if re.fullmatch(r'recomp_([0-9a-f]+|table)\.cpp', n))
+    srcs = sorted(n for n in os.listdir(GEN) if re.fullmatch(r'recomp_([0-9a-f]+(_[0-9a-f]+)?|table)\.cpp', n))
     todo = [n for n in srcs if not os.path.exists(os.path.join(OBJ, n[:-4] + '.obj')) or
             os.path.getsize(os.path.join(OBJ, n[:-4] + '.obj')) == 0 or
             os.path.getmtime(os.path.join(OBJ, n[:-4] + '.obj')) < os.path.getmtime(os.path.join(GEN, n))]
     log(f'attempt {attempt}: compiling {len(todo)} of {len(srcs)}')
-    with ThreadPoolExecutor(JOBS) as ex:
-        rcs = list(ex.map(lambda n: cl(os.path.join(GEN, n), os.path.join(OBJ, n[:-4] + '.obj')), todo))
+    rcs = compile_all(todo)
     bad = [n for n, rc in zip(todo, rcs) if rc != 0 or os.path.getsize(os.path.join(OBJ, n[:-4] + '.obj')) == 0]
     errs = [n for n, rc in zip(todo, rcs) if rc == 2]
     if errs:

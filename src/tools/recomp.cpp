@@ -822,6 +822,10 @@ struct Emitter {
         bool synced; // a reload happened earlier in the block: the block's incoming dirt does not reach here
     };
     std::vector<SyncPoint> flush_sites;               // "@F<n>@"
+    // per flush site: a guest call (BL / BLR) or return. AAPCS64 does not keep NZCV across either, and no runtime
+    // or HLE code reads s.nzcv after a guest call, so those write-backs leave NZCV out: the compiler then no longer
+    // packs flags only a call would have seen (SUBS + B.cond compiles to cmp + jcc).
+    std::vector<bool> flush_abi;
     std::vector<std::pair<SyncPoint, u64>> edges;     // goto edges: (from, target)
     u64 cw = 0;                                       // writes since block start / last reload in this block
     bool csynced = false;
@@ -859,12 +863,13 @@ struct Emitter {
         return NzR();
     }
     // A write-back site of the current block at this point.
-    std::string FlushMark() {
+    std::string FlushMark(bool abi = false) {
         flush_sites.push_back({cur, cw, csynced});
+        flush_abi.push_back(abi);
         return "@F" + std::to_string(flush_sites.size() - 1) + "@";
     }
     std::string FlushText(const std::string&) { return FlushMark(); }
-    void Flush(const std::string& pad) { o << pad << FlushMark() << "\n"; }
+    void Flush(const std::string& pad, bool abi = false) { o << pad << FlushMark(abi) << "\n"; }
     void Edge(u64 target) { edges.push_back({{cur, cw, csynced}, target}); }
     // A call returned into the function and reloaded: nothing is dirty on the way to the return block.
     void EdgeAfterReload(u64 target) { edges.push_back({{cur, 0, true}, target}); }
@@ -928,7 +933,10 @@ struct Emitter {
                     n = n * 10 + size_t(body[q++] - '0');
                 const SyncPoint& sp = flush_sites.at(n);
                 auto it = dirty_in.find(sp.block);
-                outp += ExpandFlush(sp.writes | (sp.synced || it == dirty_in.end() ? 0 : it->second));
+                u64 mask = sp.writes | (sp.synced || it == dirty_in.end() ? 0 : it->second);
+                if (flush_abi.at(n))
+                    mask &= ~(1ull << kNzBit);
+                outp += ExpandFlush(mask);
                 at = q + 1; // closing '@'
             } else if (body.compare(p, 9, "@RELOADC@") == 0) {
                 outp += reload_call;
@@ -1003,16 +1011,16 @@ struct Emitter {
         case Op::A64SetNZCV: o << NzW() << " = " << A(0) << ";\n"; return;
         case Op::A64GetW: o << "u32 " << Def(in) << " = u32(" << R(int(in.GetArg(0).GetA64RegRef())) << ");\n"; return;
         case Op::A64GetX: o << "u64 " << Def(in) << " = " << R(int(in.GetArg(0).GetA64RegRef())) << ";\n"; return;
-        case Op::A64GetS: o << "V128 " << Def(in) << "{u64(u32(s.v[" << A(0) << "].lo)), 0};\n"; return;
-        case Op::A64GetD: o << "V128 " << Def(in) << "{s.v[" << A(0) << "].lo, 0};\n"; return;
+        case Op::A64GetS: o << "V128 " << Def(in) << " = VZ32(s.v[" << A(0) << "]);\n"; return;
+        case Op::A64GetD: o << "V128 " << Def(in) << " = VZ64(s.v[" << A(0) << "]);\n"; return;
         case Op::A64GetQ: o << "V128 " << Def(in) << " = s.v[" << A(0) << "];\n"; return;
         case Op::A64GetSP: o << "u64 " << Def(in) << " = " << SpR() << ";\n"; return;
         case Op::A64GetFPCR: o << "u32 " << Def(in) << " = s.fpcr;\n"; return;
         case Op::A64GetFPSR: o << "u32 " << Def(in) << " = s.fpsr;\n"; return;
         case Op::A64SetW: o << RW(int(in.GetArg(0).GetA64RegRef())) << " = u64(" << A(1) << ");\n"; return;
         case Op::A64SetX: o << RW(int(in.GetArg(0).GetA64RegRef())) << " = " << A(1) << ";\n"; return;
-        case Op::A64SetS: o << "s.v[" << A(0) << "] = V128{u64(u32(" << A(1) << ".lo)), 0};\n"; return;
-        case Op::A64SetD: o << "s.v[" << A(0) << "] = V128{" << A(1) << ".lo, 0};\n"; return;
+        case Op::A64SetS: o << "s.v[" << A(0) << "] = VZ32(" << A(1) << ");\n"; return;
+        case Op::A64SetD: o << "s.v[" << A(0) << "] = VZ64(" << A(1) << ");\n"; return;
         case Op::A64SetQ: o << "s.v[" << A(0) << "] = " << A(1) << ";\n"; return;
         case Op::A64SetSP: o << SpW() << " = " << A(0) << ";\n"; return;
         case Op::A64SetFPSR: o << "s.fpsr = " << A(0) << ";\n"; return;
@@ -1046,11 +1054,11 @@ struct Emitter {
         case Op::A64ReadMemory64: {
             static const char* ty[] = {"u8", "u16", "u32", "u64"};
             const char* t = ty[int(op) - int(Op::A64ReadMemory8)];
-            o << t << " " << Def(in) << " = " << (ordered(2) ? "RdOrdered<" : "Rd<") << t << ">(s, " << A(1) << ");\n";
+            o << t << " " << Def(in) << " = " << (ordered(2) ? "RdOrdered<" : "Rd<") << t << ">(gm, " << A(1) << ");\n";
             return;
         }
         case Op::A64ReadMemory128:
-            o << "V128 " << Def(in) << " = Rd128(s, " << A(1) << ");" << (ordered(2) ? " _ReadWriteBarrier();" : "")
+            o << "V128 " << Def(in) << " = Rd128(gm, " << A(1) << ");" << (ordered(2) ? " _ReadWriteBarrier();" : "")
               << "\n";
             return;
         case Op::A64ExclusiveReadMemory8: o << "u8 " << Def(in) << " = ExRead8(s, " << A(1) << ");\n"; return;
@@ -1065,12 +1073,12 @@ struct Emitter {
             static const char* ty[] = {"u8", "u16", "u32", "u64"};
             const char* t = ty[int(op) - int(Op::A64WriteMemory8)];
             if (ordered(3))
-                o << "WrOrdered(s, " << A(1) << ", " << t << "(" << A(2) << "));\n";
+                o << "WrOrdered(gm, " << A(1) << ", " << t << "(" << A(2) << "));\n";
             else
-                o << "Wr<" << t << ">(s, " << A(1) << ", " << A(2) << ");\n";
+                o << "Wr<" << t << ">(gm, " << A(1) << ", " << A(2) << ");\n";
             return;
         }
-        case Op::A64WriteMemory128: o << "Wr128(s, " << A(1) << ", " << A(2) << ");\n"; return;
+        case Op::A64WriteMemory128: o << "Wr128(gm, " << A(1) << ", " << A(2) << ");\n"; return;
         case Op::A64ExclusiveWriteMemory8:
         case Op::A64ExclusiveWriteMemory16:
         case Op::A64ExclusiveWriteMemory32:
@@ -1128,7 +1136,7 @@ struct Emitter {
     void Jump(u64 t, int depth) {
         const std::string pad(depth * 2, ' ');
         if (is_call && !sh.has_svc) {
-            Flush(pad);
+            Flush(pad, true);
             const u64 ret = sh.ret_loc;
             o << pad << "s.pc = " << Hex(t) << "; ";
             if (gen_index.count(t))
@@ -1187,7 +1195,7 @@ struct Emitter {
             if (sh.setpc_imm && !(is_call && !sh.has_svc)) {
                 Jump(*sh.setpc_imm, depth);
             } else if (is_call) {
-                Flush(pad);
+                Flush(pad, true);
                 o << pad << IcSite() << ";";
                 if (blockset.count(sh.ret_loc)) {
                     o << " if (s.pc != " << Hex(sh.ret_loc) << ") return; @RELOADC@ goto b_" << std::hex << sh.ret_loc
@@ -1196,7 +1204,7 @@ struct Emitter {
                 } else
                     o << " return;\n";
             } else if (boost::get<IR::Term::PopRSBHint>(&t)) {
-                Flush(pad);
+                Flush(pad, true);
                 o << pad << "return;\n";
             } else {
                 // Register branch: a local jump table target, a tail call or unknown code. The block's own
@@ -1323,7 +1331,7 @@ int main(int argc, char** argv) {
     double coverage = 1.0;
     size_t max_funcs = SIZE_MAX;
     bool stats_only = false, all_funcs = false;
-    std::set<u64> noopt_funcs, skip_funcs;
+    std::set<u64> noopt_funcs, skip_funcs, nogm_funcs;
     int i = 2;
     for (; i + 2 < argc && argv[i][0] != '-'; i += 3) {
         Module m;
@@ -1341,7 +1349,11 @@ int main(int argc, char** argv) {
             coverage = std::atof(argv[i + 1]);
         else if (k == "--all") // profiles only add entries; emit every function
             all_funcs = true;
-        else if (k == "--noopt") { // file with function entries (hex) to compile without optimisation
+        else if (k == "--nogm") { // functions that keep the old s.mem accesses (see "u8* const gm" below)
+            std::ifstream in(argv[i + 1]);
+            for (std::string a; in >> a;)
+                nogm_funcs.insert(std::strtoull(a.c_str(), nullptr, 16));
+        } else if (k == "--noopt") { // file with function entries (hex) to compile without optimisation
             std::ifstream in(argv[i + 1]);
             for (std::string a; in >> a;)
                 noopt_funcs.insert(std::strtoull(a.c_str(), nullptr, 16));
@@ -1604,9 +1616,18 @@ int main(int argc, char** argv) {
     u32 shard_ic = 0;                                 // inline cache sites of the shard being emitted
     std::vector<std::pair<std::string, u32>> ic_shards; // array name, site count
     auto ic_name = [](u64 bucket) { return Emitter::fmt("ic_%llx", bucket); };
+    // MSVC compiles a function above ~380 KB of C++ with no optimisation at all (warning C4883) unless the file is
+    // compiled with /d2OptimizeHugeFunctions, and that flag on a whole shard can need over 20 GB (shard 229). So a
+    // function between kSplitMin and kSplitMax bytes goes to a file of its own, recomp_<shard>_<entry>.cpp, which the
+    // builders compile with the flag (one ~1 MB function: minutes, a few GB); bigger ones stay in their shard as
+    // before. Its inline cache sites stay numbered in its shard's ic_<shard>[] array.
+    constexpr size_t kSplitMin = 300'000, kSplitMax = 1'000'000;
+    bool bucket_used = false;
+    size_t split_funcs = 0;
     auto flush = [&] {
-        if (cur.tellp() == 0)
+        if (!bucket_used)
             return;
+        bucket_used = false;
         const std::string name = Emitter::fmt("recomp_%llx.cpp", cur_bucket);
         written.insert(name);
         shard++;
@@ -1651,13 +1672,20 @@ int main(int argc, char** argv) {
             flush();
             cur_bucket = f.entry >> 18;
         }
+        bucket_used = true;
         defined.insert(f.entry);
+        // the function's text: appended to the shard, or written to a file of its own (kSplitMin)
+        std::ostringstream fo;
+        std::set<u64> fcalled;
+        std::ostream& shard_out = cur;
+        {
+        std::ostream& cur = fo;
         cur << "u8 ok_" << std::hex << f.entry << std::dec << ";\n";
         std::unordered_set<u64> blockset(f.blocks.begin(), f.blocks.end());
         // Blocks first: a block that fails to emit becomes an exit stub, and must not be the entry or a resume point.
         std::ostringstream body;
         Emitter em{body, f, blockset, gen_index};
-        em.called = &called;
+        em.called = &fcalled;
         em.ic_count = &shard_ic;
         em.ic_array = ic_name(cur_bucket);
         em.Block(f.entry, g_blocks[f.entry]);
@@ -1684,9 +1712,15 @@ int main(int argc, char** argv) {
         } else {
         if (noopt)
             cur << "#pragma optimize(\"\", off)\n";
+        // Guest accesses go through `gm`, the fastmem base cached in a local: a guest store may alias the State, so
+        // s.mem would be read again after every store. For a few functions MSVC's optimizer then takes hours (a
+        // 224-instruction copy loop in f_83c2ed0, shard 20f): those, listed in nogm.txt, keep reading s.mem.
+        const bool nogm = nogm_funcs.count(f.entry) != 0;
+        if (nogm)
+            cur << "#define gm s.mem\n";
         cur << "void f_" << std::hex << f.entry << std::dec << "(State& s) {\n  if (!ok_" << std::hex << f.entry << std::dec
             << " || reinterpret_cast<u64>(_AddressOfReturnAddress()) < s.stack_limit) return;\n"
-               "  bool cbit = false;\n"
+               "  bool cbit = false;\n" << (nogm ? "" : "  u8* const gm = s.mem;\n")
             << em.Declarations();
         // Resume points: call-return blocks (the JIT can come back into this function after a callee it ran) and the
         // blocks after SVCs (a thread halted inside an SVC continues there).
@@ -1715,8 +1749,27 @@ int main(int argc, char** argv) {
             cur << std::dec << "  default: return;\n  }\n";
         }
         cur << em.Expand(body.str()) << "}\n\n";
+        if (nogm)
+            cur << "#undef gm\n";
         if (noopt)
             cur << "#pragma optimize(\"\", on)\n";
+        }
+        }
+        const std::string text = fo.str();
+        if (!skip_funcs.count(f.entry) && !noopt_funcs.count(f.entry) && !g_intrinsics.count(f.entry) &&
+            text.size() > kSplitMin && text.size() <= kSplitMax) {
+            const std::string name = Emitter::fmt("recomp_%llx", cur_bucket) + Emitter::fmt("_%llx.cpp", f.entry);
+            written.insert(name);
+            split_funcs++;
+            ChangedFile sf(out / name);
+            sf << "#include \"core/cpu/recomp/recomp_rt.h\"\n#pragma warning(disable : 4102 4189 4100)\nnamespace recomp {\n";
+            sf << "extern u64 " << ic_name(cur_bucket) << "[];\n";
+            for (u64 c : fcalled)
+                sf << "void f_" << std::hex << c << std::dec << "(State& s);\n";
+            sf << text << "}\n";
+        } else {
+            shard_out << text;
+            called.insert(fcalled.begin(), fcalled.end());
         }
         // verification ranges: merged [start, end) of all blocks
         std::vector<std::pair<u64, u64>> r;
@@ -1738,6 +1791,7 @@ int main(int argc, char** argv) {
         all_ranges.insert(all_ranges.end(), m.begin(), m.end());
     }
     flush();
+    std::printf("%zu big functions in files of their own (%zu..%zu bytes of C++)\n", split_funcs, kSplitMin, kSplitMax);
     for (const auto& e : std::filesystem::directory_iterator(out)) {
         const std::string n = e.path().filename().string();
         if (n.rfind("recomp_", 0) == 0 && n.ends_with(".cpp") && n != "recomp_table.cpp" && !written.count(n))
