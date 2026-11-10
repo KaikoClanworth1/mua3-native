@@ -115,13 +115,32 @@ static u64 ContentHash(const u8* p, size_t n) {
         r = (r ^ p[i]) * 0x100000001B3ull;
     return r ^ (r >> 29);
 }
-static u64 GuestHash(u64 gpu_va, u64 size) {
-    if (const u8* p = G().GpuPtr(gpu_va, size_t(size)))
-        return ContentHash(p, size_t(size));
-    static thread_local std::vector<u8> tmp;
-    tmp.resize(size_t(size));
-    G().ReadGpuPartial(gpu_va, tmp.data(), tmp.size());
-    return ContentHash(tmp.data(), tmp.size());
+
+// Per 4 KiB page of the texture's backing CPU memory (cpu_ranges order): a write marks pages dirty, and only those
+// are hashed again to tell whether the texture changed (a whole 4 MB texture was hashed for one written page).
+template <typename F>
+static void ForEachPage(const CachedTexture& t, F f) {
+    size_t k = 0;
+    for (auto& [a, n] : t.cpu_ranges)
+        for (u64 off = 0; off < n; k++) {
+            const u64 chunk = std::min<u64>(n - off, 0x1000 - ((a + off) & 0xFFF));
+            f(k, a + off, chunk);
+            off += chunk;
+        }
+}
+static void HashPages(CachedTexture& t) {
+    t.page_hash.clear();
+    ForEachPage(t, [&](size_t, u64 cpu, u64 n) { t.page_hash.push_back(ContentHash(G().Mem().Ptr(cpu), size_t(n))); });
+}
+// True if a dirty page's contents differ from when the texture was decoded (pages are re-hashed: call it once).
+static bool DirtyPagesChanged(CachedTexture& t) {
+    bool changed = false;
+    ForEachPage(t, [&](size_t k, u64 cpu, u64 n) {
+        if (changed || !G().Mem().ConsumeDirty(cpu, n))
+            return;
+        changed = k >= t.page_hash.size() || ContentHash(G().Mem().Ptr(cpu), size_t(n)) != t.page_hash[k];
+    });
+    return changed;
 }
 
 ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::TextureUse& use, u32& swizzle) {
@@ -190,9 +209,9 @@ ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::T
         CachedTexture& t = *it->second;
         // Pages written, contents as uploaded: keep it (MUA3_TEX_NOHASH=1 re-decodes on every write as before).
         static const bool no_hash = std::getenv("MUA3_TEX_NOHASH") != nullptr;
-        if (!no_hash && t.content_hash && GuestHash(t.gpu_va, t.size) == t.content_hash) {
+        if (!no_hash && !t.page_hash.empty() && !DirtyPagesChanged(t)) {
             for (auto& [a, n] : t.cpu_ranges)
-                G().Mem().TrackWrites(a, n);
+                G().Mem().TrackWrites(a, n), tracked_bytes += n;
             t.last_use = frame_;
             unchanged_rewrites++;
             return t.srv.Get();
@@ -211,9 +230,9 @@ ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::T
             tmp.assign(bd.ByteWidth, 0);
             G().ReadGpuPartial(addr, tmp.data(), bd.ByteWidth);
             ctx_->UpdateSubresource(t.res.Get(), 0, nullptr, tmp.data(), 0, 0);
-            t.content_hash = GuestHash(t.gpu_va, t.size);
+            HashPages(t);
             for (auto& [a, n] : t.cpu_ranges)
-                G().Mem().TrackWrites(a, n);
+                G().Mem().TrackWrites(a, n), tracked_bytes += n;
             t.last_use = frame_;
             return t.srv.Get();
         }
@@ -302,7 +321,6 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
         G().ReadGpu(tic.Address(), guest_copy.data(), size_t(total));
         guest = guest_copy.data();
     }
-    const u64 content_hash = ContentHash(guest, size_t(total));
 
     // Decode every subresource into reused scratch buffers (no per-upload allocation or zero fill).
     struct Sub {
@@ -352,8 +370,8 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
             ctx_->UpdateSubresource(reuse->res.Get(), UINT(i), nullptr, init[i].pSysMem, init[i].SysMemPitch,
                                     init[i].SysMemSlicePitch);
         for (auto& [a, n] : reuse->cpu_ranges)
-            G().Mem().TrackWrites(a, n);
-        reuse->content_hash = content_hash;
+            G().Mem().TrackWrites(a, n), tracked_bytes += n;
+        HashPages(*reuse);
         reuse->last_use = frame_;
         return reuse->srv.Get();
     }
@@ -366,7 +384,6 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
     tex->key = key;
     tex->gpu_va = tic.Address();
     tex->size = total;
-    tex->content_hash = content_hash;
     tex->last_use = frame_;
     HRESULT hr;
     D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
@@ -446,9 +463,10 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
             break;
         const u64 n = std::min(run, total - off);
         tex->cpu_ranges.emplace_back(cpu, n);
-        G().Mem().TrackWrites(cpu, n);
+        G().Mem().TrackWrites(cpu, n), tracked_bytes += n;
         off += n;
     }
+    HashPages(*tex);
     auto* srv = tex->srv.Get();
     tex->updatable = updatable;
     TrackPages(*tex, +1);

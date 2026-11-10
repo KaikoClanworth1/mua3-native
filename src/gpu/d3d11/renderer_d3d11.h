@@ -179,6 +179,7 @@ private:
         bool stale = false;         // an overlapping buffer was written: re-upload everything
         bool retired = false;       // lies inside a larger buffer that now serves its windows
         bool gpu_written = false;
+        bool listed = false;        // in active_ (SyncGuest)
         // MUA3_RB_GPUDIFF: GPU copy of what guest memory holds (as of the last copy-back plus re-uploads), so a
         // kernel pass can flag the 4 KiB pages that changed and copy-backs compare only those on the CPU.
         ComPtr<ID3D11Buffer> prev;
@@ -192,8 +193,14 @@ private:
         u64 last_use = 0;
     };
     std::vector<std::unique_ptr<GpuBuf>> gbufs_;
-    std::vector<GpuBuf*> active_; // (SyncGuest) buffers with results in flight or not copied back yet
-    bool active_stale_ = true;    // set by anything that changes which buffers those are, or frees one
+    std::vector<GpuBuf*> active_; // (SyncGuest) buffers with results in flight or not copied back yet (a superset)
+    bool active_stale_ = true;    // a buffer was freed: rebuild the list
+    void MarkActive(GpuBuf& b) {  // b got results in flight or not yet copied back
+        if (!b.listed) {
+            b.listed = true;
+            active_.push_back(&b);
+        }
+    }
     bool in_sync_ = false;
     struct Readback {
         GpuBuf* b;

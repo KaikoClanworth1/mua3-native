@@ -217,6 +217,7 @@ static u64 g_prof_rb_waits, g_prof_rb_wait_ns, g_prof_rb_queued, g_prof_rb_bytes
 static u64 g_prof_resident; // draws reading compute output from the resident copy
 static u64 g_prof_rb_pages, g_prof_rb_changed_pages; // copy-back pages compared / found changed
 static u64 g_prof_rb_not_ready; // polls that found the oldest copy-back still in flight
+static u64 g_prof_track_bytes[3]; // bytes write-protected again per consumer: 0 textures, 1 compute, 2 index/vertex
 static u64 g_prof_rb_site[12]; // waits by consumer: 0 compute, 1 texture, 2/3 culling-gs, 4 index, 5 vertex, 6 cbuf, 7 geometry
 static u64 g_prof_tex_get_ns, g_prof_tex_samp_ns, g_prof_tex_calls;
 static u64 g_prof_last = 0;
@@ -673,7 +674,7 @@ void D3D11Renderer::Reupload(GpuBuf& b, bool all, u32 from) {
             b.page_serial[p] = b.serial;
     }
     for (auto& r : b.cpu_ranges)
-        g.Mem().TrackWrites(r.cpu, r.size, 1);
+        g.Mem().TrackWrites(r.cpu, r.size, 1), g_prof_track_bytes[1] += r.size;
     b.stale = false;
 }
 
@@ -777,7 +778,7 @@ D3D11Renderer::GpuBuf* D3D11Renderer::ComputeBuffer(u64 addr, u32 size) {
         nb->stale = true;
         e = nb.get();
         gbufs_.push_back(std::move(nb));
-        active_stale_ = true;
+        // (not active until a kernel writes it)
     }
     e->last_use = frame_counter_;
     if (size > e->size) {
@@ -964,7 +965,7 @@ void D3D11Renderer::QueueReadback(GpuBuf& b) {
         ctx_->End(rb.done.Get());
     b.in_flight++;
     b.gpu_dirty = false;
-    active_stale_ = true;
+    MarkActive(b);
     g_prof_rb_queued++, g_prof_rb_bytes += b.size;
     readbacks_.push_back(std::move(rb));
 }
@@ -1032,7 +1033,7 @@ void D3D11Renderer::ApplyReadback(GpuBuf& b, const u8* now, u32 size, u32 serial
     if (lo < hi) {
         textures_->Invalidate(b.addr + lo, hi - lo);
         for (auto& r : b.cpu_ranges) // our own writes dirtied the pages
-            g.Mem().TrackWrites(r.cpu, r.size, 1);
+            g.Mem().TrackWrites(r.cpu, r.size, 1), g_prof_track_bytes[1] += r.size;
     }
 }
 
@@ -1093,7 +1094,7 @@ void D3D11Renderer::PollReadbacks(bool wait, const GpuBuf* until) {
         if (rb.done)
             query_pool_.push_back(std::move(rb.done));
         rb.b->in_flight--;
-        active_stale_ = true;
+        // (finished buffers leave the active list at the next SyncGuest)
         staging_pool_.push_back(std::move(rb.staging));
         readbacks_.pop_front();
         if (need)
@@ -1108,12 +1109,23 @@ void D3D11Renderer::SyncGuest(u64 gpu_va, u64 size, int site) {
     sync_va_ = gpu_va;
     // Only buffers with results in flight or not yet copied can need landing: a list of those, rebuilt when that
     // changes, instead of every resident buffer on each texture / constant / index lookup.
-    if (active_stale_ || in_sync_) {
+    if (active_stale_) { // a buffer was freed: list the active ones again
         active_.clear();
-        for (auto& b : gbufs_)
-            if (b->in_flight || b->gpu_dirty)
+        for (auto& b : gbufs_) {
+            b->listed = b->in_flight || b->gpu_dirty;
+            if (b->listed)
                 active_.push_back(b.get());
+        }
         active_stale_ = false;
+    } else if (!in_sync_) { // drop the ones whose results have landed
+        size_t n = 0;
+        for (GpuBuf* b : active_) {
+            if (b->in_flight || b->gpu_dirty)
+                active_[n++] = b;
+            else
+                b->listed = false;
+        }
+        active_.resize(n);
     }
     if (in_sync_) { // (re-entered: use a list of its own)
         const std::vector<GpuBuf*> list = active_;
@@ -1278,7 +1290,7 @@ bool D3D11Renderer::RefreshGeometry(GeomBuf& b, D3D11_BIND_FLAG bind, bool& fill
         }
     }
     for (auto& r : b.cpu_ranges)
-        g.Mem().TrackWrites(r.cpu, r.size, 2);
+        g.Mem().TrackWrites(r.cpu, r.size, 2), g_prof_track_bytes[2] += r.size;
     return true;
 }
 
@@ -1683,7 +1695,7 @@ void D3D11Renderer::Dispatch(const ComputeLaunch& l) {
         w->gpu_written = true;
         w->gpu_dirty = true;
         gpu_dirty_any_ = true;
-        active_stale_ = true;
+        MarkActive(*w);
     }
 }
 
@@ -2852,6 +2864,12 @@ void D3D11Renderer::Present(const PresentInfo& p) {
         LOG_INFO("Profile", "  copy-back pages: {:.0f} compared/frame, {:.0f} changed; {:.1f} polls/frame found none ready",
                  g_prof_rb_pages / 150.0, g_prof_rb_changed_pages / 150.0, g_prof_rb_not_ready / 150.0);
         g_prof_rb_pages = g_prof_rb_changed_pages = g_prof_rb_not_ready = 0;
+        static u64 last_tex_track = 0;
+        LOG_INFO("Profile", "  write tracking re-armed per frame: textures {:.0f} KB, compute {:.0f} KB, index/vertex {:.0f} KB",
+                 (textures_->tracked_bytes - last_tex_track) / 150.0 / 1024, g_prof_track_bytes[1] / 150.0 / 1024,
+                 g_prof_track_bytes[2] / 150.0 / 1024);
+        last_tex_track = textures_->tracked_bytes;
+        g_prof_track_bytes[1] = g_prof_track_bytes[2] = 0;
         LOG_INFO("Profile", "  waits by consumer: compute {} texture {} cull-index {} cull-counter {} index {} vertex {} cbuf {} geometry {}",
                  g_prof_rb_site[0], g_prof_rb_site[1], g_prof_rb_site[2], g_prof_rb_site[3], g_prof_rb_site[4], g_prof_rb_site[5],
                  g_prof_rb_site[6], g_prof_rb_site[7]);
