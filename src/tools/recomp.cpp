@@ -47,6 +47,7 @@ namespace mcl::detail {
 using namespace Dynarmic;
 using Op = IR::Opcode;
 using u8 = std::uint8_t;
+using u16 = std::uint16_t;
 using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 
@@ -123,6 +124,7 @@ struct BlockInfo {
     bool untranslatable = false; // dynarmic cannot decode the first instruction: the block raises the guest exception
     bool switch_like = false;    // ends in an unresolved register branch fed by an indexed table load (a switch)
     bool tail_call = false;      // ends in a register branch that is certainly a call (PLT stub, after an epilogue)
+    u64 plt_target = 0;          // PLT stub: the function its GOT slot imports (checked against the loaded pointer)
     std::vector<std::string> unsupported_ops;
 };
 
@@ -140,7 +142,7 @@ std::vector<u64> JumpTableTargets(u64 br) {
     // "mov w8, #1"), then LDRSW xT, [xB, xI, LSL #2] shortly before that.
     auto writes = [](u32 w, u32 r) { return (w & 31) == r && (w & 0x9F000000u) != 0x14000000u; }; // rough: Rd field
     u64 add_at = 0;
-    for (u64 a = br - 4; a + 4 * 5 > br && InText(a); a -= 4) {
+    for (u64 a = br - 4; a + 4 * 8 > br && InText(a); a -= 4) {
         const u32 w = Word(a);
         if ((w & 0xFFE0FC00u) == 0x8B000000u && (w & 31) == t) {
             add_at = a;
@@ -156,7 +158,7 @@ std::vector<u64> JumpTableTargets(u64 br) {
     // LDRSW Xl, [Xb, Xi, LSL #2] where Xl is one ADD operand and Xb the other (Xl may differ from the branch
     // register: "ldrsw x11, [x10, x9, lsl #2]; add x10, x11, x10; br x10")
     u64 ld_at = 0;
-    for (u64 a = add_at - 4; a + 4 * 4 > add_at && InText(a); a -= 4) {
+    for (u64 a = add_at - 4; a + 4 * 10 > add_at && InText(a); a -= 4) {
         const u32 w = Word(a);
         if ((w & 0xFFE0FC00u) == 0xB8A07800u) {
             const u32 rt = w & 31, rb = (w >> 5) & 31;
@@ -169,7 +171,7 @@ std::vector<u64> JumpTableTargets(u64 br) {
     if (!ld_at)
         return out;
     const u32 w_ld = Word(ld_at);
-    const u32 base_reg = (w_ld >> 5) & 31;
+    u32 base_reg = (w_ld >> 5) & 31;
     u32 idx_reg = (w_ld >> 16) & 31;
     // Walk back for the bound (CMP idx, #imm then B.HI / B.HS; the index may have been copied with MOV after the
     // check) and the base: ADRP + ADD of base_reg, or ADR. Loops keep the table base in a callee-saved register set
@@ -183,12 +185,22 @@ std::vector<u64> JumpTableTargets(u64 br) {
             // MOV Wd, Wm (ORR Wd, WZR, Wm) / MOV Xd, Xm into the index: follow the copy
             if ((w & 0x7FE0FFE0u) == 0x2A0003E0u && (w & 31) == idx_reg)
                 idx_reg = (w >> 16) & 31;
+            // a masked index needs no bound check: AND idx, x, #(2^k - 1) / UBFX idx, x, #lsb, #k
+            else if ((w & 0x7F800000u) == 0x12000000u && (w & 31) == idx_reg) {
+                const u32 sf = w >> 31, n = (w >> 22) & 1, immr = (w >> 16) & 63, imms = (w >> 10) & 63;
+                if (immr == 0 && n == sf && imms < (sf ? 63u : 31u) && imms < 12)
+                    count = 1u << (imms + 1);
+            } else if ((w & 0x7F800000u) == 0x53000000u && (w & 31) == idx_reg) {
+                const u32 immr = (w >> 16) & 63, imms = (w >> 10) & 63;
+                if (imms >= immr && imms - immr < 12)
+                    count = 1u << (imms - immr + 1);
+            }
             // CMP Wn/Xn, #imm12 (SUBS with Rd = zr, no shift), then a B.HI or B.HS right after it
             else if ((w & 0x7FC0001Fu) == 0x7100001Fu && ((w >> 5) & 31) == idx_reg) {
                 // the B.HI / B.HS may follow a few instructions later (stores and moves scheduled in between;
                 // anything that sets flags or branches ends the search)
                 const u32 n = (w >> 10) & 0xFFF;
-                for (u64 b = a + 4; b <= a + 16 && InText(b); b += 4) {
+                for (u64 b = a + 4; b <= a + 40 && InText(b); b += 4) {
                     const u32 next = Word(b);
                     if ((next & 0xFF00001Fu) == 0x54000008u) { // B.HI
                         count = n + 1;
@@ -207,7 +219,9 @@ std::vector<u64> JumpTableTargets(u64 br) {
                 }
             }
         }
-        if (!lo && !adr && (w & 0xFFC00000u) == 0x91000000u && (w & 31) == base_reg && ((w >> 5) & 31) == base_reg)
+        if (!lo && !adr && (w & 0xFFE0FFE0u) == 0xAA0003E0u && (w & 31) == base_reg)
+            base_reg = (w >> 16) & 31; // MOV xB, xC: the base was built in xC
+        else if (!lo && !adr && (w & 0xFFC00000u) == 0x91000000u && (w & 31) == base_reg && ((w >> 5) & 31) == base_reg)
             lo = (w >> 10) & 0xFFF; // ADD xB, xB, #imm12
         else if (lo && !page && (w & 0x9F000000u) == 0x90000000u && (w & 31) == base_reg) { // ADRP xB
             const int64_t imm = int64_t(int32_t((((w >> 5) & 0x7FFFF) << 2 | ((w >> 29) & 3)) << 11) >> 11);
@@ -245,6 +259,30 @@ size_t g_jump_tables = 0, g_jump_targets = 0;
 std::unordered_set<u64> g_jt_targets;
 std::unordered_set<u64> g_ext_targets; // jump targets outside the jumping function that are no entry
 std::vector<u64> g_unresolved_br;      // register branches (not calls/returns) without a recognised jump table
+// Dynamic linking, for PLT stubs: exported functions (name -> address; a name several modules export resolves to
+// the lowest-loaded one, the order rtld searches) and GOT slots of imports (slot -> symbol, addend).
+std::unordered_map<std::string, std::pair<u64, u64>> g_exports; // name -> (module base, address)
+std::unordered_map<u64, std::pair<std::string, u64>> g_got;
+size_t g_plt_bound = 0;
+// "adrp x16, page; ldr x17, [x16, #off]; add x16, x16, #off; br x17": the imported function, or 0
+u64 PltTarget(u64 br) {
+    if (!InText(br - 12) || Word(br) != 0xD61F0220u)
+        return 0;
+    const u32 adrp = Word(br - 12), ldr = Word(br - 8), add = Word(br - 4);
+    if ((adrp & 0x9F00001Fu) != 0x90000010u || (ldr & 0xFFC003FFu) != 0xF9400211u || (add & 0xFFC003FFu) != 0x91000210u)
+        return 0;
+    const int64_t imm = int64_t(int32_t((((adrp >> 5) & 0x7FFFF) << 2 | ((adrp >> 29) & 3)) << 11) >> 11);
+    const u64 slot = ((br - 12) & ~0xFFFull) + u64(imm << 12) + ((ldr >> 10) & 0xFFF) * 8;
+    const auto g = g_got.find(slot);
+    if (g == g_got.end())
+        return 0;
+    // NVN entry points may get host implementations at run time (table overrides a direct call would skip)
+    const auto e = g_exports.find(g->second.first);
+    if (e == g_exports.end() || g->second.first.rfind("nvn", 0) == 0)
+        return 0;
+    const u64 t = e->second.second + g->second.second;
+    return InText(t) ? t : 0;
+}
 std::set<u64> g_missing;             // --missing: pcs the runtime had to run on the JIT
 bool g_sweep = false;                 // --sweep: entries for every code gap no scan reached
 std::unordered_set<u64> g_extra_resume; // of those, block starts of recompiled functions
@@ -557,6 +595,9 @@ const BlockInfo& Analyze(u64 pc) {
             g_jump_tables++, g_jump_targets += targets.size();
             bi.succ.insert(bi.succ.end(), targets.begin(), targets.end());
             g_jt_targets.insert(targets.begin(), targets.end());
+        } else if ((bi.plt_target = PltTarget(bi.end - 4))) {
+            bi.tail_call = true;
+            g_plt_bound++;
         } else if ((Word(bi.end - 4) & 0xFFFFFC1Fu) == 0xD61F0000u) { // BR Xn (not RET / BLR) left unresolved
             g_unresolved_br.push_back(bi.end - 4);
             // A switch whose table form is not recognised: an indexed load (LDR/LDRB/LDRH/LDRSW... [Xn, Xm/Wm])
@@ -673,12 +714,16 @@ void FindEntries(u64 text_size) {
         return;
     }
     const u64 dyn = mod0 + int32_t(ImgRead<u32>(mod0 + 4));
-    u64 rela = 0, relasz = 0, symtab = 0, strtab = 0, hash = 0;
+    u64 rela = 0, relasz = 0, symtab = 0, strtab = 0, hash = 0, jmprel = 0, pltrelsz = 0;
     for (u64 p = dyn; p < g_image.size(); p += 16) {
         const u64 tag = ImgRead<u64>(p), val = ImgRead<u64>(p + 8);
         if (tag == 0)
             break;
-        if (tag == 7)
+        if (tag == 23)
+            jmprel = val;
+        else if (tag == 2)
+            pltrelsz = val;
+        else if (tag == 7)
             rela = val;
         else if (tag == 8)
             relasz = val;
@@ -711,8 +756,28 @@ void FindEntries(u64 text_size) {
                     name += char(ImgRead<u8>(p));
                 if (IntrinsicNames().count(name))
                     g_intrinsics[g_base + value] = name;
+                // exports for PLT stubs: defined global/weak functions
+                if (ImgRead<u16>(s + 6) && ((info >> 4) == 1 || (info >> 4) == 2)) {
+                    auto [e, fresh] = g_exports.try_emplace(name, g_base, g_base + value);
+                    if (!fresh && g_base < e->second.first)
+                        e->second = {g_base, g_base + value};
+                }
             }
         }
+        // GOT slots of imported functions (JUMP_SLOT in the PLT relocations, GLOB_DAT in either table)
+        auto sym_name = [&](u32 si) {
+            std::string name;
+            for (u64 p = strtab + ImgRead<u32>(symtab + u64(si) * 24); p < g_image.size() && ImgRead<u8>(p); p++)
+                name += char(ImgRead<u8>(p));
+            return name;
+        };
+        for (auto [table, size] : {std::pair{rela, relasz}, std::pair{jmprel, pltrelsz}})
+            for (u64 p = table; table && p + 24 <= table + size; p += 24) {
+                const u64 inf = ImgRead<u64>(p + 8);
+                const u32 type = u32(inf), si = u32(inf >> 32);
+                if ((type == 1025 || type == 1026) && si && strtab)
+                    g_got[g_base + ImgRead<u64>(p)] = {sym_name(si), ImgRead<u64>(p + 16)};
+            }
     }
     std::printf("entries: %zu from BL, %zu from ADRP+ADD, %zu from relocations, %zu from symbols\n", from_bl, from_adrp,
                 from_rel, from_sym);
@@ -733,6 +798,10 @@ struct Emitter {
     BlockShape sh;
     bool is_call = false;
     std::set<u64>* called = nullptr; // generated functions this shard calls directly (for its declarations)
+    // Inline cache slots (recomp_rt.h): register call / jump sites of this shard, numbered in ic_<shard>[]
+    u32* ic_count = nullptr;
+    std::string ic_array;
+    std::string IcSite() { return "CallIc(s, " + ic_array + "[" + std::to_string((*ic_count)++) + "])"; }
     // Function-wide register promotion: the guest registers, SP, NZCV and the instruction count a function touches
     // live in locals for the whole function (MSVC cannot keep s.x[] in host registers: guest stores may alias the
     // State). They are loaded once on entry, stay in locals across the function's own gotos, and are written back
@@ -1119,7 +1188,7 @@ struct Emitter {
                 Jump(*sh.setpc_imm, depth);
             } else if (is_call) {
                 Flush(pad);
-                o << pad << "Dispatch(s);";
+                o << pad << IcSite() << ";";
                 if (blockset.count(sh.ret_loc)) {
                     o << " if (s.pc != " << Hex(sh.ret_loc) << ") return; @RELOADC@ goto b_" << std::hex << sh.ret_loc
                       << std::dec << ";\n";
@@ -1156,7 +1225,12 @@ struct Emitter {
                     o << pad << "default: break;\n" << pad << "}\n";
                 }
                 Flush(pad);
-                o << pad << "Dispatch(s); return;\n";
+                // PLT stub: a direct tail call when the GOT holds the import found at build time (it always should;
+                // anything else still goes through Dispatch)
+                if (cur_bi->plt_target && gen_index.count(cur_bi->plt_target))
+                    o << pad << "if (s.pc == " << Hex(cur_bi->plt_target) << ") return " << Fn(cur_bi->plt_target)
+                      << "(s);\n";
+                o << pad << IcSite() << "; return;\n";
             }
         } else if (auto* in = boost::get<IR::Term::Interpret>(&t)) {
             // An instruction dynarmic cannot decode (UDF #0 after no-return calls, unallocated encodings): the
@@ -1415,6 +1489,20 @@ int main(int argc, char** argv) {
             std::printf("sweep: %zu entries added; text coverage %zu of %zu code words (%.3f%%)\n", added, covered,
                         code, 100.0 * double(covered) / double(std::max<size_t>(code, 1)));
         }
+        // what is left (uncovered.txt: "<pc> <word>"), for checking it is padding or data and not lost code
+        if (FILE* uf = std::fopen((out / "uncovered.txt").string().c_str(), "w")) {
+            for (const auto& m : g_mods) {
+                std::vector<bool> in((m.text_end - m.base) / 4);
+                for (auto& [b, bi] : g_blocks)
+                    if (b >= m.base && b < m.text_end)
+                        for (u64 a = b; a < bi.end && a < m.text_end; a += 4)
+                            in[(a - m.base) / 4] = true;
+                for (size_t i = 0; i < in.size(); i++)
+                    if (const u32 w = Word(m.base + i * 4); w && !in[i])
+                        std::fprintf(uf, "%llx %08x\n", (unsigned long long)(m.base + i * 4), w);
+            }
+            std::fclose(uf);
+        }
     }
     size_t nblocks = 0;
     for (auto& f : funcs)
@@ -1513,6 +1601,9 @@ int main(int argc, char** argv) {
     std::set<u64> called, defined;
     std::set<std::string> written;
     u64 cur_bucket = ~0ull;
+    u32 shard_ic = 0;                                 // inline cache sites of the shard being emitted
+    std::vector<std::pair<std::string, u32>> ic_shards; // array name, site count
+    auto ic_name = [](u64 bucket) { return Emitter::fmt("ic_%llx", bucket); };
     auto flush = [&] {
         if (cur.tellp() == 0)
             return;
@@ -1520,14 +1611,21 @@ int main(int argc, char** argv) {
         written.insert(name);
         shard++;
         ChangedFile f(out / name);
+        const std::string ic = ic_name(cur_bucket);
         f << "#include \"core/cpu/recomp/recomp_rt.h\"\n#pragma warning(disable : 4102 4189 4100)\nnamespace recomp {\n";
+        f << "extern u64 " << ic << "[];\n";
         for (u64 c : called) // including functions defined further down this shard
             f << "void f_" << std::hex << c << std::dec << "(State& s);\n";
-        f << cur.str() << "}\n";
+        f << cur.str();
+        // the slots, and the count this shard was built with (checked against the table at startup)
+        f << "alignas(64) u64 " << ic << "[" << std::max<u32>(shard_ic, 1) << "] = {};\nextern const u32 " << ic
+          << "_n = " << shard_ic << ";\n}\n";
+        ic_shards.emplace_back(ic, shard_ic);
         cur.str("");
         cur.clear();
         called.clear();
         defined.clear();
+        shard_ic = 0;
     };
     std::vector<std::pair<u64, u64>> all_ranges;
     std::vector<std::tuple<u64, u32, u32, u64>> table; // entry, range_first, range_count, hash
@@ -1560,6 +1658,8 @@ int main(int argc, char** argv) {
         std::ostringstream body;
         Emitter em{body, f, blockset, gen_index};
         em.called = &called;
+        em.ic_count = &shard_ic;
+        em.ic_array = ic_name(cur_bucket);
         em.Block(f.entry, g_blocks[f.entry]);
         for (u64 b : f.blocks) {
             const BlockInfo& bi = g_blocks[b];
@@ -1672,13 +1772,26 @@ int main(int argc, char** argv) {
         if (resumes.empty())
             t << "{0, 0},\n";
         t << "};\nstatic const Table kTable{kFuncs, " << table.size() << ", kRanges, " << all_ranges.size()
-          << ", kOk, kResumes, " << resumes.size() << "};\nconst Table& GetTable() { return kTable; }\n}\n";
+          << ", kOk, kResumes, " << resumes.size() << "};\nconst Table& GetTable() { return kTable; }\n";
+        // inline cache slots of every shard (recomp_ic.cpp clears them, checks the counts at startup)
+        for (auto& [ic, n] : ic_shards)
+            t << "extern u64 " << ic << "[];\nextern const u32 " << ic << "_n;\n";
+        t << "const IcShard kIcShards[] = {\n";
+        u64 ic_total = 0;
+        for (auto& [ic, n] : ic_shards) {
+            t << "{" << ic << ", &" << ic << "_n, " << n << "},\n";
+            ic_total += n;
+        }
+        if (ic_shards.empty())
+            t << "{nullptr, nullptr, 0},\n";
+        t << "};\nconst u32 kIcShardCount = " << ic_shards.size() << ";\n}\n";
+        std::printf("%llu inline-cached call sites\n", (unsigned long long)ic_total);
     }
     std::printf("%zu blocks failed to emit\n", g_emit_failures);
     std::printf("%zu C library routines run on the host\n", g_intrinsics.size());
     std::printf("%zu resume points\n", resumes.size());
-    std::printf("%zu jump tables resolved (%zu targets), %zu register branches unresolved\n", g_jump_tables,
-                g_jump_targets, g_unresolved_br.size());
+    std::printf("%zu jump tables resolved (%zu targets), %zu PLT stubs bound to their import, %zu register branches "
+                "unresolved\n", g_jump_tables, g_jump_targets, g_plt_bound, g_unresolved_br.size());
     if (FILE* uf = std::fopen((out / "unresolved_br.txt").string().c_str(), "w")) {
         for (u64 a : g_unresolved_br)
             std::fprintf(uf, "%llx\n", (unsigned long long)a);

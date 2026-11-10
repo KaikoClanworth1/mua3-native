@@ -1151,3 +1151,34 @@ RC_INLINE u32 SignedSaturatedDoublingMultiplyReturnHigh32(State& s, u32 a, u32 b
 }
 
 } // namespace recomp
+
+// ==== Inline caches for indirect calls (static analysis chat; runtime in recomp_ic.cpp) ====
+// Every register call / jump site in generated code owns one u64 slot (per-shard arrays ic_<shard>[]), holding the
+// last target it resolved: (~guest pc & 0xFFFFFFF) << 36 | (epoch & 15) << 32 | (host function - __ImageBase).
+// One aligned 64-bit word, so readers on other threads see either the old or the new entry, never a mix. The
+// runtime bumps the epoch and clears every slot on each change of the native table (SetSlot / Publish): an entry
+// from before a change never matches again, even one stored by a miss that raced with the clear. 0 = empty (only
+// pc 0xFFFFFFF, which no call reaches, could match it).
+extern "C" const char __ImageBase; // linker-defined start of this module (mua3.exe)
+namespace recomp {
+// one shard's slots, listed by the generated recomp_table.cpp; emitted = the count the shard itself was built with
+struct IcShard {
+    u64* slots;
+    const u32* emitted;
+    u32 count;
+};
+extern const IcShard kIcShards[];
+extern const u32 kIcShardCount;
+extern std::atomic<u32> g_ic_epoch;
+// miss: Dispatch, and remember the target in the slot when it is an ordinary native function
+void DispatchIc(State& s, u64& slot);
+RC_INLINE void CallIc(State& s, u64& slot) {
+    const u64 c = u64(__iso_volatile_load64(reinterpret_cast<const __int64*>(&slot)));
+    const u64 key = ((s.pc ^ 0xFFFFFFFull) << 4) | (g_ic_epoch.load(std::memory_order_acquire) & 15);
+    if ((c >> 32) == key)
+        reinterpret_cast<Fn>(reinterpret_cast<uintptr_t>(&__ImageBase) + u32(c))(s);
+    else
+        DispatchIc(s, slot);
+}
+} // namespace recomp
+// ==== end of inline caches ====

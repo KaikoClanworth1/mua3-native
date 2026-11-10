@@ -4,4 +4,6 @@
 namespace recomp {
 static const Table kEmpty{nullptr, 0, nullptr, 0, nullptr, nullptr, 0};
 const Table& GetTable() { return kEmpty; }
+const IcShard kIcShards[] = {{nullptr, nullptr, 0}};
+const u32 kIcShardCount = 0;
 } // namespace recomp
