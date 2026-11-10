@@ -32,9 +32,7 @@ Copy-Item "$bin\recomp.exe" "$out\sdk\tools"
 Copy-Item "$root\src\core\cpu\recomp\recomp_rt.h" "$out\sdk\include\core\cpu\recomp"
 $libs = @(
     "src\$cfg\nxcore.lib", "src\$cfg\platform.lib", "src\$cfg\nxloader.lib", "$cfg\imgui.lib",
-    "external\SDL\$cfg\SDL3-static.lib", "external\dynarmic\src\dynarmic\$cfg\dynarmic.lib",
-    "external\dynarmic\externals\zydis\$cfg\Zydis.lib", "external\dynarmic\externals\zydis\zycore\$cfg\Zycore.lib",
-    "external\dynarmic\externals\mcl\src\$cfg\mcl.lib", "external\dynarmic\externals\fmt\$cfg\fmt.lib")
+    "external\SDL\$cfg\SDL3-static.lib", "external\dynarmic\externals\fmt\$cfg\fmt.lib")
 foreach ($l in $libs) { Copy-Item (Join-Path $build $l) "$out\sdk\lib" }
 foreach ($o in 'main.obj', 'alloc_trace.obj') { Copy-Item (Join-Path $build "src\mua3.dir\$cfg\$o") "$out\sdk\obj" }
 # function lists for the recompiler: coverage seen in game runs (prof*, missing*) and the functions this compiler

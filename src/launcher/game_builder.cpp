@@ -29,7 +29,7 @@ constexpr u8 kMainBuildId[8] = {0xe8, 0x53, 0xc4, 0x4f, 0xdf, 0x18, 0xb8, 0x8f};
 const char* const kCompileFlags = "/c /nologo /O2 /Ob3 /GS- /EHsc /MT /std:c++20 /permissive- /bigobj /utf-8 /DNDEBUG";
 const char* const kLibs[] = {
     // the port (sdk/lib)
-    "nxcore.lib", "platform.lib", "nxloader.lib", "dynarmic.lib", "Zydis.lib", "Zycore.lib", "mcl.lib", "fmt.lib",
+    "nxcore.lib", "platform.lib", "nxloader.lib", "fmt.lib",
     "imgui.lib", "SDL3-static.lib",
     // Windows
     "dbghelp.lib", "bcrypt.lib", "mfplat.lib", "mfreadwrite.lib", "mfuuid.lib", "kernel32.lib", "user32.lib",
