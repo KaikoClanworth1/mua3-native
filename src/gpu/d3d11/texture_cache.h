@@ -41,6 +41,7 @@ struct CachedTexture {
     ComPtr<ID3D11ShaderResourceView> srv;
     u64 last_use = 0;
     bool updatable = false; // DEFAULT usage: rewrites are decoded into it in place
+    u64 content_hash = 0;   // of the guest bytes it was decoded from (rewrites that change nothing are skipped)
 };
 
 class TextureCache {
@@ -51,7 +52,7 @@ public:
     ID3D11SamplerState* GetSampler(const u32* tsc, bool compare);
     void Invalidate(u64 gpu_va, u64 size);
     void NextFrame() { frame_++; }
-    u64 reuploads = 0, uploads = 0;
+    u64 reuploads = 0, uploads = 0, unchanged_rewrites = 0;
 
 private:
     // `reuse`: decode into this existing (updatable) texture; `updatable`: create with DEFAULT usage.

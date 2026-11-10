@@ -98,6 +98,32 @@ ID3D11ShaderResourceView* TextureCache::Fallback(const shader::TextureUse& use) 
     return fallbacks_[kind].Get();
 }
 
+// Hash of a texture's guest bytes, to tell a real rewrite from writes that left it as it was (neighbouring data on
+// the same pages, or the same contents written again).
+static u64 ContentHash(const u8* p, size_t n) {
+    u64 h[4] = {0x9E3779B97F4A7C15ull, 0xC2B2AE3D27D4EB4Full, 0x165667B19E3779F9ull, 0x27D4EB2F165667C5ull};
+    size_t i = 0;
+    for (; i + 32 <= n; i += 32)
+        for (int k = 0; k < 4; k++) {
+            u64 w;
+            std::memcpy(&w, p + i + k * 8, 8);
+            h[k] = (h[k] ^ w) * 0x100000001B3ull;
+            h[k] ^= h[k] >> 31;
+        }
+    u64 r = h[0] ^ (h[1] * 3) ^ (h[2] * 5) ^ (h[3] * 7) ^ n;
+    for (; i < n; i++)
+        r = (r ^ p[i]) * 0x100000001B3ull;
+    return r ^ (r >> 29);
+}
+static u64 GuestHash(u64 gpu_va, u64 size) {
+    if (const u8* p = G().GpuPtr(gpu_va, size_t(size)))
+        return ContentHash(p, size_t(size));
+    static thread_local std::vector<u8> tmp;
+    tmp.resize(size_t(size));
+    G().ReadGpuPartial(gpu_va, tmp.data(), tmp.size());
+    return ContentHash(tmp.data(), tmp.size());
+}
+
 ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::TextureUse& use, u32& swizzle) {
     // Pack x/y/z/w component sources (3 bits each) for the shader's ApplySwizzle.
     swizzle = tic.Swizzle();
@@ -161,8 +187,21 @@ ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::T
             it->second->last_use = frame_;
             return it->second->srv.Get();
         }
-        reuploads++;
         CachedTexture& t = *it->second;
+        // Pages written, contents as uploaded: keep it (MUA3_TEX_NOHASH=1 re-decodes on every write as before).
+        static const bool no_hash = std::getenv("MUA3_TEX_NOHASH") != nullptr;
+        if (!no_hash && t.content_hash && GuestHash(t.gpu_va, t.size) == t.content_hash) {
+            for (auto& [a, n] : t.cpu_ranges)
+                G().Mem().TrackWrites(a, n);
+            t.last_use = frame_;
+            unchanged_rewrites++;
+            return t.srv.Get();
+        }
+        reuploads++;
+        static std::map<u64, u32> logged; // (diagnostics) textures the CPU really rewrites
+        if (logged.size() < 32 && logged[addr]++ == 0)
+            LOG_INFO("Texture", "rewritten by the CPU: {:#x} fmt {:#x} {}x{}x{} type {} {} bytes", addr, tic.Format(),
+                     tic.Width(), tic.Height(), tic.Depth(), tic.Type(), t.size);
         D3D11_RESOURCE_DIMENSION dim{};
         t.res->GetType(&dim);
         if (dim == D3D11_RESOURCE_DIMENSION_BUFFER) { // linear texel buffer: refresh the bytes in place
@@ -172,6 +211,7 @@ ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::T
             tmp.assign(bd.ByteWidth, 0);
             G().ReadGpuPartial(addr, tmp.data(), bd.ByteWidth);
             ctx_->UpdateSubresource(t.res.Get(), 0, nullptr, tmp.data(), 0, 0);
+            t.content_hash = GuestHash(t.gpu_va, t.size);
             for (auto& [a, n] : t.cpu_ranges)
                 G().Mem().TrackWrites(a, n);
             t.last_use = frame_;
@@ -262,6 +302,7 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
         G().ReadGpu(tic.Address(), guest_copy.data(), size_t(total));
         guest = guest_copy.data();
     }
+    const u64 content_hash = ContentHash(guest, size_t(total));
 
     // Decode every subresource into reused scratch buffers (no per-upload allocation or zero fill).
     struct Sub {
@@ -312,6 +353,7 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
                                     init[i].SysMemSlicePitch);
         for (auto& [a, n] : reuse->cpu_ranges)
             G().Mem().TrackWrites(a, n);
+        reuse->content_hash = content_hash;
         reuse->last_use = frame_;
         return reuse->srv.Get();
     }
@@ -324,6 +366,7 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
     tex->key = key;
     tex->gpu_va = tic.Address();
     tex->size = total;
+    tex->content_hash = content_hash;
     tex->last_use = frame_;
     HRESULT hr;
     D3D11_SHADER_RESOURCE_VIEW_DESC sv{};

@@ -216,6 +216,7 @@ static u64 g_prof_ns[kProfCount], g_prof_vb_bytes, g_prof_cb_bytes, g_prof_ib_co
 static u64 g_prof_rb_waits, g_prof_rb_wait_ns, g_prof_rb_queued, g_prof_rb_bytes; // compute result copy-backs
 static u64 g_prof_resident; // draws reading compute output from the resident copy
 static u64 g_prof_rb_pages, g_prof_rb_changed_pages; // copy-back pages compared / found changed
+static u64 g_prof_rb_not_ready; // polls that found the oldest copy-back still in flight
 static u64 g_prof_rb_site[12]; // waits by consumer: 0 compute, 1 texture, 2/3 culling-gs, 4 index, 5 vertex, 6 cbuf, 7 geometry
 static u64 g_prof_tex_get_ns, g_prof_tex_samp_ns, g_prof_tex_calls;
 static u64 g_prof_last = 0;
@@ -952,6 +953,15 @@ void D3D11Renderer::QueueReadback(GpuBuf& b) {
     rb.mask = DiffPages(b, rb.pages);
     const D3D11_BOX box{0, 0, 0, b.size, 1, 1};
     ctx_->CopySubresourceRegion(rb.staging.Get(), 0, 0, 0, 0, b.buf.Get(), 0, &box);
+    if (!query_pool_.empty()) {
+        rb.done = std::move(query_pool_.back());
+        query_pool_.pop_back();
+    } else {
+        const D3D11_QUERY_DESC qd{D3D11_QUERY_EVENT, 0};
+        dev_->CreateQuery(&qd, &rb.done);
+    }
+    if (rb.done)
+        ctx_->End(rb.done.Get());
     b.in_flight++;
     b.gpu_dirty = false;
     active_stale_ = true;
@@ -1054,6 +1064,15 @@ void D3D11Renderer::PollReadbacks(bool wait, const GpuBuf* until) {
             } else
                 rb.b->apply_full = true;
         } else {
+            // Not landed yet and nothing waits for it: ask the event (cheap) instead of trying to map (a driver call).
+            if (!need && rb.done) {
+                BOOL landed = FALSE;
+                if (ctx_->GetData(rb.done.Get(), &landed, sizeof(landed), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_FALSE) {
+                    if (g_profile)
+                        g_prof_rb_not_ready++;
+                    break;
+                }
+            }
             D3D11_MAPPED_SUBRESOURCE mp, mm;
             const HRESULT hr = ctx_->Map(rb.staging.Get(), 0, D3D11_MAP_READ, need ? 0 : D3D11_MAP_FLAG_DO_NOT_WAIT, &mp);
             if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
@@ -1071,6 +1090,8 @@ void D3D11Renderer::PollReadbacks(bool wait, const GpuBuf* until) {
         }
         if (rb.mask)
             mask_pool_.push_back(std::move(rb.mask));
+        if (rb.done)
+            query_pool_.push_back(std::move(rb.done));
         rb.b->in_flight--;
         active_stale_ = true;
         staging_pool_.push_back(std::move(rb.staging));
@@ -2828,9 +2849,9 @@ void D3D11Renderer::Present(const PresentInfo& p) {
                  g_prof_rb_queued / 150.0, g_prof_rb_bytes / 150 / 1048576.0, g_prof_rb_waits / 150.0, g_prof_rb_wait_ns / 150e6,
                  g_prof_resident / 150.0);
         g_prof_resident = 0;
-        LOG_INFO("Profile", "  copy-back pages: {:.0f} compared/frame, {:.0f} changed", g_prof_rb_pages / 150.0,
-                 g_prof_rb_changed_pages / 150.0);
-        g_prof_rb_pages = g_prof_rb_changed_pages = 0;
+        LOG_INFO("Profile", "  copy-back pages: {:.0f} compared/frame, {:.0f} changed; {:.1f} polls/frame found none ready",
+                 g_prof_rb_pages / 150.0, g_prof_rb_changed_pages / 150.0, g_prof_rb_not_ready / 150.0);
+        g_prof_rb_pages = g_prof_rb_changed_pages = g_prof_rb_not_ready = 0;
         LOG_INFO("Profile", "  waits by consumer: compute {} texture {} cull-index {} cull-counter {} index {} vertex {} cbuf {} geometry {}",
                  g_prof_rb_site[0], g_prof_rb_site[1], g_prof_rb_site[2], g_prof_rb_site[3], g_prof_rb_site[4], g_prof_rb_site[5],
                  g_prof_rb_site[6], g_prof_rb_site[7]);
@@ -2838,11 +2859,13 @@ void D3D11Renderer::Present(const PresentInfo& p) {
                  g_prof_rb_site[10], g_prof_rb_site[11]);
         std::memset(g_prof_rb_site, 0, sizeof(g_prof_rb_site));
         g_prof_rb_queued = g_prof_rb_bytes = g_prof_rb_waits = g_prof_rb_wait_ns = 0;
-        static u64 last_uploads = 0;
-        LOG_INFO("Profile", "  textures: {} lookups/frame, Get {:.2f} ms, samplers {:.2f} ms, uploads {:.1f}/frame",
+        static u64 last_uploads = 0, last_unchanged = 0;
+        LOG_INFO("Profile", "  textures: {} lookups/frame, Get {:.2f} ms, samplers {:.2f} ms, uploads {:.1f}/frame, "
+                            "CPU-written but unchanged {:.1f}/frame",
                  g_prof_tex_calls / 150, g_prof_tex_get_ns / 150e6, g_prof_tex_samp_ns / 150e6,
-                 (textures_->uploads - last_uploads) / 150.0);
+                 (textures_->uploads - last_uploads) / 150.0, (textures_->unchanged_rewrites - last_unchanged) / 150.0);
         last_uploads = textures_->uploads;
+        last_unchanged = textures_->unchanged_rewrites;
         g_prof_tex_get_ns = g_prof_tex_samp_ns = g_prof_tex_calls = 0;
         std::memset(g_prof_ns, 0, sizeof(g_prof_ns));
         std::memset(g_hitch_prof, 0, sizeof(g_hitch_prof));

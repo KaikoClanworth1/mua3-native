@@ -202,7 +202,9 @@ private:
         u32 serial; // buffer's upload serial when the copy was taken
         ComPtr<ID3D11Buffer> mask; // staging: u32 per page, nonzero = changed (MUA3_RB_GPUDIFF), null = compare all
         u32 pages = 0;
+        ComPtr<ID3D11Query> done; // event after the copies: polled before trying to map (a failed Map costs a driver call)
     };
+    std::vector<ComPtr<ID3D11Query>> query_pool_;
     std::vector<ComPtr<ID3D11Buffer>> mask_pool_;
     ComPtr<ID3D11ComputeShader> diff_cs_;
     ComPtr<ID3D11Buffer> diff_mask_, diff_cb_;
