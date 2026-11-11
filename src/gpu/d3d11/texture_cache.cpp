@@ -286,7 +286,10 @@ ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::T
         auto* srv = Upload(tic, use, key, nullptr, true);
         return srv ? srv : Fallback(use);
     }
-    if (budget_ns_ && use.dim == shader::TexDim::Tex2D &&
+    // Only in load-sized bursts (a level's textures arrive at once: 238-470 in a frame entering ST010): a hero swap or
+    // an enemy spawn uploads far fewer and stays synchronous, so gameplay never draws a placeholder.
+    constexpr u64 kAsyncMinUploads = 96;
+    if (budget_ns_ && use.dim == shader::TexDim::Tex2D && up_count_ >= kAsyncMinUploads &&
         up_ns_[0] + up_ns_[1] + up_ns_[2] + up_ns_[3] >= budget_ns_) {
         std::lock_guard lk(aq_mutex_);
         if (pending_.insert(key).second) {
