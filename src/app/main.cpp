@@ -51,10 +51,18 @@ ImVec2 UiVec(float x, float y) { return ImVec2(x * g_ui, y * g_ui); }
 // Settings changed in the game's GRAPHICS page (core::System::UpdateConfig): the window mode and size, and the
 // overlay's FPS counter. The frame limiter reads the running config itself.
 // Hidden test instances keep their window as it is.
-void ApplyGameSettings(const core::Config& n, core::Config& cfg, platform::Display& display, bool keep_window) {
+void ApplyGameSettings(const core::Config& n, core::Config& cfg, platform::Display& display, platform::Input& input,
+                       bool keep_window) {
     cfg.show_fps = n.show_fps;
     cfg.fps_limit = n.fps_limit;
     cfg.vsync = n.vsync;
+    if ((n.volume != cfg.volume || n.mute != cfg.mute) && !keep_window) // test instances stay muted
+        platform::Audio().SetVolume(n.mute ? 0 : n.volume);
+    cfg.volume = n.volume;
+    cfg.mute = n.mute;
+    if (n.camera_speed != cfg.camera_speed)
+        input.SetCameraSpeed(n.camera_speed);
+    cfg.camera_speed = n.camera_speed;
     LOG_INFO("Main", "settings from the game: {} {}x{}, fps limit {}, show fps {}", n.fullscreen ? "fullscreen" : "window",
              n.width, n.height, n.fps_limit, n.show_fps);
     if (keep_window)
@@ -636,7 +644,7 @@ int main(int argc, char** argv) {
     }
     platform::Input input;
     input.Init(cfg.input, cfg.camera_speed);
-    platform::Audio().Init(cfg.audio, cfg.volume);
+    platform::Audio().Init(cfg.audio, cfg.mute ? 0 : cfg.volume);
     hle::SetAudioOutput([](const s16* pcm, size_t frames) { platform::Audio().Push(pcm, frames); },
                         [] { return platform::Audio().Queued(); });
 
@@ -710,7 +718,7 @@ int main(int argc, char** argv) {
     while (display.PumpEvents() && !sys.ExitRequested()) {
         if (const u32 g = sys.ConfigGeneration(); g != settings_generation) {
             settings_generation = g;
-            ApplyGameSettings(sys.CfgSnapshot(), cfg, display, test_instance);
+            ApplyGameSettings(sys.CfgSnapshot(), cfg, display, input, test_instance);
         }
         if (autopress_after == 0 && !g_script_active && !test_instance) // the test aids drive player 1 themselves
             input.Update(display.Focused());

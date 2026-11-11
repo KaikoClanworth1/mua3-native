@@ -76,6 +76,7 @@ class Input {
 public:
     bool Init(core::InputBackend backend, int camera_speed = 100);
     void Update(bool window_focused);
+    void SetCameraSpeed(int percent) { camera_speed_ = percent < 10 ? 10 : percent > 200 ? 200 : percent; }
     std::string DeviceName() const { return device_name_; }
 
 private:
@@ -89,6 +90,7 @@ private:
 class AudioOut {
 public:
     bool Init(core::AudioBackend backend, int volume);
+    void SetVolume(int volume); // 0-100, live
     void Shutdown();
     void Push(const s16* samples, size_t frames);
     size_t Queued() const;

@@ -213,13 +213,24 @@ The title screen's SYSTEM submenu (SAVE, LOAD, OPTIONS, TIPS, GALLERY; title men
   language (GRAPHICS, AFFICHAGE, GRAFIK, ...); SetItemAppearance (+0x480) uses them for the slot.
 - **Page**: Execute (+0x4a8) opens OPTIONS the game's way, flagged to show the GRAPHICS page
   (`menu_graphics.cpp`): tab 2's row count, row types, row table and value bytes are replaced while it is open, the
-  tab is named GRAPHICS, the other tabs and L/R are hidden, L/R do nothing, A steps the row to its next value (wrapping), our text comes from a GetString
-  hook (hashes 0xFE00xxxx). Closing puts the tab back and skips the store, so the game's own settings are untouched.
+  tab is named GRAPHICS, A steps the row to its next value (wrapping), our text comes from a GetString hook (hashes
+  0xFE00xxxx). Closing puts the tab back and skips the store, so the game's own settings are untouched.
+- **Two pages**: the page shows two tabs, GRAPHICS (tab 2's place) and PC SETTINGS (tab 3's place, its name pane
+  answered through the same GetString hook); tabs 0, 1 and 4 are hidden, the L/R icons stay. L/R (TabPrev / TabNext
+  hooked) switch the page the game's way: idle check (state +0x1a0 == 8), the tab ON/OFF animations (u8[5] at
+  main+0x1a634a8 / 0x1a634ad), the new page's tables installed in tab 2's slot, FillRows 0x7c5900, the tab sound
+  (0x563690 with GOT main+0x2188cc0 +0x168, hash 0xba0cf4d2) and RowsDone 0x7c5d80. Each page has at most 8 rows
+  (tab 2's row-type table).
 - **Settings**: DISPLAY MODE, RESOLUTION, RENDER SCALE, FRAME RATE, FPS LIMIT, VSYNC, SHOW FPS, ANTI-ALIASING
   (mua3.ini [video], the launcher's choices). Every change goes through `core::System::UpdateConfig`: the running
   config (FPS limit, show FPS, VSync, window mode and size: the main loop applies them; anti-aliasing, OFF / FXAA:
   the renderer reads it at every present) and mua3.ini (also render scale and frame rate, which apply after a
   restart). The page shows the running config, except RENDER SCALE and FRAME RATE, which show the value saved in
   mua3.ini for the next start; their info line names the value running now.
+- **PC SETTINGS**: MASTER VOLUME (0-100%, live, on top of the SOUND tab's volumes), MUTE (live, mua3.ini `mute`),
+  CAMERA SPEED (10-200%, 100% = original, live: `platform::Input::SetCameraSpeed`, multiplies the CAMERA tab's
+  CONTROL SENSITIVITY), CONTROLLER TYPE (XInput / SDL) and AUDIO OUTPUT (XAudio2 / SDL / off), which apply after a
+  restart. No language row: the INTERFACE tab's LANGUAGE SELECTION is the game's own. Hidden test instances apply
+  volume changes to the ini only (they stay muted).
 
 `MUA3_GRAPHICS_TEST=1` (test aid) opens the first OPTIONS screen as the GRAPHICS page.

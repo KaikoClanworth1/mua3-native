@@ -28,6 +28,7 @@ struct Config {
 
     AudioBackend audio = AudioBackend::XAudio2;
     int volume = 100;
+    bool mute = false; // volume kept, output silent (the in-game MUTE row)
     InputBackend input = InputBackend::XInput;
     int camera_speed = 100; // right stick (camera) sensitivity in percent
     bool docked = true;

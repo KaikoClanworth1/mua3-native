@@ -12,11 +12,12 @@
 //    tabs (vfuncs +0x1e8 / +0x1f0), A runs a button row (vfunc +0x228). All text comes from the system string
 //    table by hash (GetString, main+0x1d6290).
 //
-// The GRAPHICS page is tab 2 with its data replaced while the page is open: our row table, row types, value bytes
-// and choice counts, our text for hashes 0xFE00xxxx, the tab named GRAPHICS (the game's own string) and the other
-// tabs hidden. L / R and A do nothing there. Every change is applied at once (core::System::UpdateConfig): what
-// can change while the game runs changes now, the rest is saved to mua3.ini for the next start. Closing the page
-// puts the tab back and leaves the game's own settings as they were.
+// Our pages (GRAPHICS and PC SETTINGS) are tab 2 with its data replaced while they are open: our row table, row
+// types, value bytes and choice counts, our text for hashes 0xFE00xxxx. Only the headers of tabs 2 and 3 show,
+// named GRAPHICS (the game's own string) and PC SETTINGS; L / R switch between the two pages (tab 2's data slot
+// is refilled, tab 3's header lights up), A steps a row to its next value. Every change is applied at once
+// (core::System::UpdateConfig): what can change while the game runs changes now, the rest is saved to mua3.ini for
+// the next start and the row says so. Closing puts the tab back and leaves the game's own settings as they were.
 #include "core/hle/menu_graphics.h"
 
 #include <algorithm>
@@ -56,15 +57,19 @@ constexpr u64 kGetString = 0x1d6290;                  // (string table, hash) ->
 constexpr u64 kRowsGot = 0x218bd40, kValuesGot = 0x218bd20; // tab 2's row table and value bytes (GOT entries)
 constexpr u64 kRowCounts = 0x1a634b2;                 // u16[5]
 constexpr u64 kRowTypes = 0x1a634ec;                  // u32[] tab 2 (the next table, the language row's, is tab 0's)
-constexpr u64 kTabAnims = 0x1a634a8;                  // u8[5]: tab_0N_ON animation
-constexpr u32 kTab = 2;
+constexpr u64 kTabAnims = 0x1a634a8, kTabOffAnims = 0x1a634ad; // u8[5]: tab_0N_ON / tab_0N_OFF animations
+constexpr u64 kPlaySound = 0x563690, kSoundGot = 0x2188cc0; // (sound player, id): what L / R play
+constexpr u32 kSoundTab = 0xba0cf4d2;
+constexpr u32 kTab = 2;                                 // the tab whose data slot shows our pages
+constexpr u32 kPageTabs[2] = {2, 3};                    // the header each page lights up
 // options object layout
-constexpr u64 kObjTab = 0x198, kObjAnims = 0xc0, kObjTabLayout = 0xc8;
+constexpr u64 kObjTab = 0x198, kObjState = 0x1a0, kObjAnims = 0xc0, kObjTabLayout = 0xc8;
+constexpr u32 kStateIdle = 8;
 // 09_option_tub_menu panes: tab N (0-4) = Window_tab_0N, Window_tab_ON_0N, tab_name_0N at 1 + 3N..; L/R icons 16-19
 constexpr u32 kTabPanes = 1, kPanesPerTab = 3, kButtonPanes = 16, kButtonPaneCount = 4;
 // system string hashes
-constexpr u32 kStrControls = 0x023fd6, kStrGraphics = 0x36c4b2, kStrOn = 0x3a32fb, kStrOff = 0x19edbe,
-              kStrAuto = 0x0855d9;
+constexpr u32 kStrControls = 0x023fd6, kStrSound = 0x1f0d31, kStrGraphics = 0x36c4b2, kStrOn = 0x3a32fb,
+              kStrOff = 0x19edbe, kStrAuto = 0x0855d9;
 constexpr u32 kOurs = 0xFE000000; // our strings: kOurs + index (the game's hashes are 22-bit)
 
 enum RowType : u32 { kTwoChoices = 1, kArrows = 2 };
@@ -74,7 +79,13 @@ constexpr std::pair<int, int> kResolutions[] = {{1280, 720},  {1600, 900},  {192
 constexpr int kRates[] = {30, 60, 72, 90, 120, 144, 165, 240}; // as the launcher offers them
 constexpr int kLimits[] = {0, 30, 60, 72, 90, 120, 144, 165, 240};
 
-enum Rows { kRowMode, kRowResolution, kRowScale, kRowRate, kRowLimit, kRowVsync, kRowShowFps, kRowAa, kRowCount };
+constexpr u32 kMaxRows = 8; // tab 2's row-type table has room for 8 (the next table is tab 0's)
+enum GraphicsRows { kRowMode, kRowResolution, kRowScale, kRowRate, kRowLimit, kRowVsync, kRowShowFps, kRowAa, kGraphicsRows };
+enum PcRows { kRowVolume, kRowMute, kRowCamera, kRowController, kRowAudio, kPcRows };
+static_assert(kGraphicsRows <= kMaxRows && kPcRows <= kMaxRows);
+constexpr int kCameraSpeeds[] = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200};
+const char16_t* const kControllerNames[] = {u"XBOX (XINPUT)", u"ANY CONTROLLER (SDL)"};
+const char16_t* const kAudioNames[] = {u"XAUDIO2", u"SDL", u"OFF"};
 
 core::Memory* g_mem = nullptr;
 u64 g_main = 0;
@@ -85,21 +96,30 @@ constexpr u64 kBlockSize = 0x8000;
 std::vector<u64> g_strings;     // our string index -> guest address
 u64 g_custom_res_text = 0;      // "W x H" for a window size that is no preset (rewritten on open)
 u64 g_custom_limit_text = 0;    // "N" for an fps limit that is no preset
-u64 g_rows = 0, g_values = 0;
 struct RowInfo {
     u32 label, info;
     RowType type;
     std::vector<u32> choices; // hashes
     u64 guest_choices = 0;
 };
-std::vector<RowInfo> g_row_info;
+struct Page {
+    u32 title = 0; // the header's text (string hash)
+    std::vector<RowInfo> rows;
+    u64 rows_guest = 0, values = 0;
+    u8 applied[kMaxRows]{}; // the value bytes last applied
+    void (*to)(const core::Config&, u8* v) = nullptr;
+    void (*from)(core::Config&, bool running, const u8* v) = nullptr;
+};
+Page g_pages[2];
+int g_cur = 0; // the page shown
+Page& Cur() { return g_pages[g_cur]; }
 
 std::mutex g_mutex;
 std::atomic<bool> g_open_next{false}, g_active{false};
 u64 g_page = 0; // the options object showing the page
 u64 g_saved_rows = 0, g_saved_values = 0;
 u16 g_saved_count = 0;
-u32 g_saved_types[kRowCount]{};
+u32 g_saved_types[kMaxRows]{};
 
 enum Hook {
     kHInit, kHStore, kHCount, kHTabPrev, kHTabNext, kHDecide, kHDefault, kHString, kHookCount
@@ -130,19 +150,50 @@ u32 Text(const std::u16string& t, size_t room = 0) {
 }
 std::u16string U16(const std::string& s) { return std::u16string(s.begin(), s.end()); }
 
-u32 g_custom_res = 0, g_custom_limit = 0; // hashes of the two rewritable strings
-u32 g_scale_info = 0, g_rate_info = 0;     // the restart rows' info lines (they name the running value)
+u32 g_custom_res = 0, g_custom_limit = 0, g_custom_volume = 0, g_custom_camera = 0; // rewritable value texts
+// the restart rows' info lines (they name the value running now)
+u32 g_scale_info = 0, g_rate_info = 0, g_controller_info = 0, g_audio_info = 0;
 const std::u16string kScaleInfo = u"The resolution the game renders at. AUTO matches your display.";
 const std::u16string kRateInfo = u"The game's frame rate. 30 is the original, 60 is fully supported.";
+const std::u16string kControllerInfo = u"XINPUT: Xbox controllers. SDL: PlayStation, Switch Pro and other controllers.";
+const std::u16string kAudioInfo = u"How the game's sound is played. XAUDIO2 suits most PCs; OFF plays no sound.";
 const std::u16string kScaleNames[] = {u"AUTO", u"1X (1080P)", u"2X (1440P / 4K)", u"3X", u"4X"};
+constexpr size_t kInfoRoom = 200;
 
-void BuildPage() {
+// A page's row table, choice arrays and value bytes in guest memory.
+void Finish(Page& page) {
+    for (RowInfo& r : page.rows) {
+        r.guest_choices = Alloc(4 * r.choices.size());
+        for (size_t i = 0; i < r.choices.size(); i++)
+            W32(r.guest_choices + 4 * i, r.choices[i]);
+    }
+    page.rows_guest = Alloc(16 * page.rows.size());
+    for (size_t i = 0; i < page.rows.size(); i++) {
+        W32(page.rows_guest + 16 * i, page.rows[i].label);
+        W32(page.rows_guest + 16 * i + 4, page.rows[i].info);
+        W64(page.rows_guest + 16 * i + 8, page.rows[i].guest_choices);
+    }
+    page.values = Alloc(16);
+}
+
+void ToGraphics(const core::Config& c, u8* v);
+void FromGraphics(core::Config& c, bool running, const u8* v);
+void ToPc(const core::Config& c, u8* v);
+void FromPc(core::Config& c, bool running, const u8* v);
+
+void BuildPages() {
     g_block = g_mem->FindFree(core::layout::kKernelMapBase, 0x1000000000ull, kBlockSize);
     g_mem->Map(g_block, kBlockSize, core::MS_Normal, core::MP_RW);
     g_alloc = g_block;
-    auto add = [](u32 label, u32 info, RowType type, std::vector<u32> choices) {
-        g_row_info.push_back({label, info, type, std::move(choices)});
+    Page* page = nullptr;
+    auto add = [&page](u32 label, u32 info, RowType type, std::vector<u32> choices) {
+        page->rows.push_back({label, info, type, std::move(choices)});
     };
+    // GRAPHICS
+    page = &g_pages[0];
+    page->title = kStrGraphics;
+    page->to = ToGraphics;
+    page->from = FromGraphics;
     add(Text(u"DISPLAY MODE"), Text(u"Play in a window or fullscreen. F11 also switches."), kTwoChoices,
         {Text(u"WINDOWED"), Text(u"FULLSCREEN")});
     std::vector<u32> res;
@@ -152,14 +203,14 @@ void BuildPage() {
     res.push_back(g_custom_res);
     add(Text(u"RESOLUTION"), Text(u"The window's size in windowed mode.\r\nFullscreen uses the monitor's resolution."),
         kArrows, res);
-    g_scale_info = Text(kScaleInfo, 200);
+    g_scale_info = Text(kScaleInfo, kInfoRoom);
     add(Text(u"RENDER SCALE"), g_scale_info, kArrows,
         {kStrAuto, Text(kScaleNames[1]), Text(kScaleNames[2]), Text(kScaleNames[3]), Text(kScaleNames[4])});
     std::vector<u32> rates;
     for (int r : kRates)
         rates.push_back(Text(U16(r == 30 ? "30 (ORIGINAL)" : r > 60 ? fmt::format("{} (EXPERIMENTAL)", r)
                                                                    : std::to_string(r))));
-    g_rate_info = Text(kRateInfo, 200);
+    g_rate_info = Text(kRateInfo, kInfoRoom);
     add(Text(u"FRAME RATE"), g_rate_info, kArrows, rates);
     std::vector<u32> limits;
     for (int l : kLimits)
@@ -175,21 +226,37 @@ void BuildPage() {
         Text(u"Smooths jagged edges. FXAA costs nothing; SSAA renders more pixels (high VRAM).\r\n"
              u"SSAA multiplies the render scale (4X in total at most)."),
         kArrows, {kStrOff, Text(u"FXAA"), Text(u"SSAA 2X"), Text(u"SSAA 3X"), Text(u"SSAA 4X")});
+    Finish(*page);
+    // PC SETTINGS
+    page = &g_pages[1];
+    page->title = Text(u"PC SETTINGS");
+    page->to = ToPc;
+    page->from = FromPc;
+    std::vector<u32> volumes;
+    for (int v = 0; v <= 100; v += 10)
+        volumes.push_back(Text(U16(fmt::format("{}%", v))));
+    g_custom_volume = Text(u"", 8);
+    volumes.push_back(g_custom_volume);
+    add(Text(u"MASTER VOLUME"), Text(u"The volume of all the game's sound, on top of the SOUND tab's own volumes."),
+        kArrows, volumes);
+    add(Text(u"MUTE"), Text(u"Silences the game. The volume is kept for when you switch it back off."), kTwoChoices,
+        {kStrOn, kStrOff});
+    std::vector<u32> speeds;
+    for (int v : kCameraSpeeds)
+        speeds.push_back(Text(U16(v == 100 ? "100% (ORIGINAL)" : fmt::format("{}%", v))));
+    g_custom_camera = Text(u"", 8);
+    speeds.push_back(g_custom_camera);
+    add(Text(u"CAMERA SPEED"), Text(u"How fast the right stick turns the camera. 100% is the original speed.\r\n"
+             u"Multiplies the CAMERA tab's CONTROL SENSITIVITY."), kArrows,
+        speeds);
+    g_controller_info = Text(kControllerInfo, kInfoRoom);
+    add(Text(u"CONTROLLER TYPE"), g_controller_info, kArrows, {Text(kControllerNames[0]), Text(kControllerNames[1])});
+    g_audio_info = Text(kAudioInfo, kInfoRoom);
+    add(Text(u"AUDIO OUTPUT"), g_audio_info, kArrows,
+        {Text(kAudioNames[0]), Text(kAudioNames[1]), Text(kAudioNames[2])});
+    Finish(*page);
     g_custom_res_text = g_strings[g_custom_res - kOurs];
     g_custom_limit_text = g_strings[g_custom_limit - kOurs];
-    // the row table and the value bytes
-    for (RowInfo& r : g_row_info) {
-        r.guest_choices = Alloc(4 * r.choices.size());
-        for (size_t i = 0; i < r.choices.size(); i++)
-            W32(r.guest_choices + 4 * i, r.choices[i]);
-    }
-    g_rows = Alloc(16 * g_row_info.size());
-    for (size_t i = 0; i < g_row_info.size(); i++) {
-        W32(g_rows + 16 * i, g_row_info[i].label);
-        W32(g_rows + 16 * i + 4, g_row_info[i].info);
-        W64(g_rows + 16 * i + 8, g_row_info[i].guest_choices);
-    }
-    g_values = Alloc(16);
 }
 
 template <size_t N, typename T> int IndexOf(const T (&list)[N], const T& v, int otherwise) {
@@ -199,29 +266,38 @@ template <size_t N, typename T> int IndexOf(const T (&list)[N], const T& v, int 
     return otherwise;
 }
 
-// The settings as value bytes.
-void ToPage(const core::Config& c) {
-    u8 v[kRowCount]{};
+void PutString(u32 hash, const std::u16string& t, size_t room) {
+    const size_t n = std::min(t.size(), room - 1);
+    std::u16string u = t.substr(0, n);
+    g_mem->WriteBlock(g_strings[hash - kOurs], u.c_str(), (n + 1) * 2);
+}
+
+// The settings as value bytes (custom value texts rewritten).
+void ToGraphics(const core::Config& c, u8* v) {
     v[kRowMode] = c.fullscreen ? 1 : 0;
     const int res = IndexOf(kResolutions, std::pair{c.width, c.height}, int(std::size(kResolutions)));
-    const std::u16string custom = U16(fmt::format("{} x {}", c.width, c.height));
-    g_mem->WriteBlock(g_custom_res_text, custom.c_str(), (custom.size() + 1) * 2);
+    PutString(g_custom_res, U16(fmt::format("{} x {}", c.width, c.height)), 24);
     v[kRowResolution] = u8(res);
     v[kRowScale] = u8(std::clamp(c.resolution_scale, 0, 4));
     v[kRowRate] = u8(IndexOf(kRates, c.fps_target, 1));
-    const std::u16string limit = U16(std::to_string(c.fps_limit));
-    g_mem->WriteBlock(g_custom_limit_text, limit.c_str(), (limit.size() + 1) * 2);
+    PutString(g_custom_limit, U16(std::to_string(c.fps_limit)), 8);
     v[kRowLimit] = u8(IndexOf(kLimits, c.fps_limit, int(std::size(kLimits))));
     v[kRowVsync] = c.vsync ? 0 : 1;
     v[kRowShowFps] = c.show_fps ? 0 : 1;
     v[kRowAa] = u8(std::clamp(c.anti_aliasing, 0, 4));
-    g_mem->WriteBlock(g_values, v, sizeof(v));
+}
+void ToPc(const core::Config& c, u8* v) {
+    PutString(g_custom_volume, U16(fmt::format("{}%", c.volume)), 8);
+    v[kRowVolume] = u8(c.volume % 10 == 0 ? std::clamp(c.volume, 0, 100) / 10 : 11);
+    v[kRowMute] = c.mute ? 0 : 1;
+    PutString(g_custom_camera, U16(fmt::format("{}%", c.camera_speed)), 8);
+    v[kRowCamera] = u8(IndexOf(kCameraSpeeds, c.camera_speed, int(std::size(kCameraSpeeds))));
+    v[kRowController] = u8(std::clamp(int(c.input), 0, 1));
+    v[kRowAudio] = u8(std::clamp(int(c.audio), 0, 2));
 }
 
 // The value bytes as settings: `running` = only what can change while the game runs.
-void FromPage(core::Config& c, bool running) {
-    u8 v[kRowCount];
-    g_mem->ReadBlock(g_values, v, sizeof(v));
+void FromGraphics(core::Config& c, bool running, const u8* v) {
     c.fullscreen = v[kRowMode] == 1;
     if (v[kRowResolution] < std::size(kResolutions))
         std::tie(c.width, c.height) = kResolutions[v[kRowResolution]];
@@ -236,6 +312,23 @@ void FromPage(core::Config& c, bool running) {
     if (v[kRowRate] < std::size(kRates))
         c.fps_target = kRates[v[kRowRate]];
 }
+void FromPc(core::Config& c, bool running, const u8* v) {
+    if (v[kRowVolume] <= 10)
+        c.volume = v[kRowVolume] * 10;
+    c.mute = v[kRowMute] == 0;
+    if (v[kRowCamera] < std::size(kCameraSpeeds))
+        c.camera_speed = kCameraSpeeds[v[kRowCamera]];
+    if (running)
+        return;
+    c.input = core::InputBackend(std::min<int>(v[kRowController], 1));
+    c.audio = core::AudioBackend(std::min<int>(v[kRowAudio], 2));
+}
+
+void ToPage(Page& page, const core::Config& c) {
+    u8 v[16]{};
+    page.to(c, v);
+    g_mem->WriteBlock(page.values, v, sizeof(v));
+}
 
 // What the page shows: the running settings, and for the rows that apply after a restart, the value saved for the
 // next start (mua3.ini).
@@ -245,6 +338,8 @@ core::Config PageConfig() {
     if (disk.Load("mua3.ini")) {
         c.resolution_scale = disk.resolution_scale;
         c.fps_target = disk.fps_target;
+        c.input = disk.input;
+        c.audio = disk.audio;
     }
     return c;
 }
@@ -252,29 +347,51 @@ core::Config PageConfig() {
 // The restart rows' info lines name what the game runs with now.
 void WriteRestartInfo() {
     const core::Config c = core::Sys().CfgSnapshot();
-    auto put = [](u32 hash, const std::u16string& t) {
-        g_mem->WriteBlock(g_strings[hash - kOurs], t.c_str(), (std::min<size_t>(t.size(), 199) + 1) * 2);
+    auto put = [](u32 hash, const std::u16string& info, const std::u16string& now) {
+        PutString(hash, info + u"\r\nApplies after a restart (running now: " + now + u").", kInfoRoom);
     };
-    put(g_scale_info, kScaleInfo + u"\r\nApplies after a restart (running now: " +
-                          kScaleNames[std::clamp(c.resolution_scale, 0, 4)] + u").");
-    put(g_rate_info, kRateInfo + u"\r\nApplies after a restart (running now: " + U16(std::to_string(c.fps_target)) +
-                         u" FPS).");
+    put(g_scale_info, kScaleInfo, kScaleNames[std::clamp(c.resolution_scale, 0, 4)]);
+    put(g_rate_info, kRateInfo, U16(std::to_string(c.fps_target)) + u" FPS");
+    put(g_controller_info, kControllerInfo, kControllerNames[std::clamp(int(c.input), 0, 1)]);
+    put(g_audio_info, kAudioInfo, kAudioNames[std::clamp(int(c.audio), 0, 2)]);
 }
 
-u8 g_applied[kRowCount]{}; // the value bytes last applied
+// A changed page applies at once.
 void Apply(bool always = false) {
-    u8 v[kRowCount];
-    g_mem->ReadBlock(g_values, v, sizeof(v));
-    if (!always && std::memcmp(v, g_applied, sizeof(v)) == 0)
+    Page& page = Cur();
+    u8 v[16];
+    g_mem->ReadBlock(page.values, v, sizeof(v));
+    if (!always && std::memcmp(v, page.applied, kMaxRows) == 0)
         return;
-    std::memcpy(g_applied, v, sizeof(v));
-    core::Sys().UpdateConfig([](core::Config& c, bool running) { FromPage(c, running); });
+    std::memcpy(page.applied, v, kMaxRows);
+    core::Sys().UpdateConfig([&page, &v](core::Config& c, bool running) { page.from(c, running, v); });
+}
+
+// The current page into tab 2's data slot (g_mutex held).
+void Show(Page& page) {
+    W64(g_main + kRowsGot, page.rows_guest);
+    W64(g_main + kValuesGot, page.values);
+    g_mem->Write<u16>(g_main + kRowCounts + 2 * kTab, u16(page.rows.size()));
+    for (u32 i = 0; i < page.rows.size(); i++)
+        W32(g_main + kRowTypes + 4 * i, page.rows[i].type);
+    ToPage(page, PageConfig());
+    WriteRestartInfo();
+    g_mem->ReadBlock(page.values, page.applied, kMaxRows);
 }
 
 // ---- hooks
 void Hide(State& s, u64 layout, u32 pane) {
     if (const u64 p = layout ? GuestCall(s, g_main + kPane, {layout, pane}) : 0)
         GuestCall(s, g_main + kSetVisible, {p, 0});
+}
+
+// Only the two headers of our pages show, and the L / R icons.
+void HideOthers(State& s, u64 opt) {
+    const u64 tabs = R64(opt + kObjTabLayout);
+    for (u32 t = 0; t < 5; t++)
+        if (t != kPageTabs[0] && t != kPageTabs[1])
+            for (u32 p = 0; p < kPanesPerTab; p++)
+                Hide(s, tabs, kTabPanes + kPanesPerTab * t + p);
 }
 
 // Opening the OPTIONS screen: as the GRAPHICS page if asked for.
@@ -290,31 +407,19 @@ void OptInit(State& s) {
         g_saved_rows = R64(g_main + kRowsGot);
         g_saved_values = R64(g_main + kValuesGot);
         g_saved_count = g_mem->Read<u16>(g_main + kRowCounts + 2 * kTab);
-        for (u32 i = 0; i < kRowCount; i++)
+        for (u32 i = 0; i < kMaxRows; i++)
             g_saved_types[i] = R32(g_main + kRowTypes + 4 * i);
-        W64(g_main + kRowsGot, g_rows);
-        W64(g_main + kValuesGot, g_values);
-        g_mem->Write<u16>(g_main + kRowCounts + 2 * kTab, u16(kRowCount));
-        for (u32 i = 0; i < kRowCount; i++)
-            W32(g_main + kRowTypes + 4 * i, g_row_info[i].type);
-        ToPage(PageConfig());
-        WriteRestartInfo();
-        g_mem->ReadBlock(g_values, g_applied, sizeof(g_applied));
+        g_cur = 0;
+        Show(Cur());
         g_page = opt;
         g_active = true;
     }
-    // show tab 2 (named GRAPHICS by the string hook), alone
+    // show tab 2 (named GRAPHICS by the string hook) next to tab 3 (PC SETTINGS)
     g_mem->Write<u32>(opt + kObjTab, kTab);
-    GuestCall(s, g_main + kPlayAnim, {opt + kObjAnims, g_mem->Read<u8>(g_main + kTabAnims + kTab), 0});
+    GuestCall(s, g_main + kPlayAnim, {opt + kObjAnims, g_mem->Read<u8>(g_main + kTabAnims + kPageTabs[0]), 0});
     GuestCall(s, g_main + kFillRows, {opt});
     GuestCall(s, g_main + kRowsDone, {opt});
-    const u64 tabs = R64(opt + kObjTabLayout);
-    for (u32 t = 0; t < 5; t++)
-        if (t != kTab)
-            for (u32 p = 0; p < kPanesPerTab; p++)
-                Hide(s, tabs, kTabPanes + kPanesPerTab * t + p);
-    for (u32 p = 0; p < kButtonPaneCount; p++)
-        Hide(s, tabs, kButtonPanes + p);
+    HideOthers(s, opt);
     LOG_INFO("Menu", "Graphics page opened");
 }
 
@@ -328,7 +433,7 @@ void OptStore(State& s) {
         W64(g_main + kRowsGot, g_saved_rows);
         W64(g_main + kValuesGot, g_saved_values);
         g_mem->Write<u16>(g_main + kRowCounts + 2 * kTab, g_saved_count);
-        for (u32 i = 0; i < kRowCount; i++)
+        for (u32 i = 0; i < kMaxRows; i++)
             W32(g_main + kRowTypes + 4 * i, g_saved_types[i]);
         g_active = false;
         g_page = 0;
@@ -343,7 +448,7 @@ void ChoiceCount(State& s) {
     if (!OnPage(s.x[0]) || R32(s.x[0] + kObjTab) != kTab)
         return RunOriginal(s, g_hooks[kHCount]);
     const u32 row = u32(s.x[1]);
-    GuestReturn(s, row < g_row_info.size() ? g_row_info[row].choices.size() : 0);
+    GuestReturn(s, row < Cur().rows.size() ? Cur().rows[row].choices.size() : 0);
 }
 
 void Blocked(State& s, Hook h) {
@@ -351,8 +456,35 @@ void Blocked(State& s, Hook h) {
         return GuestReturn(s, 0);
     RunOriginal(s, g_hooks[h]);
 }
-void TabPrev(State& s) { Blocked(s, kHTabPrev); }
-void TabNext(State& s) { Blocked(s, kHTabNext); }
+// L / R on the page: the other page, the way the game switches tabs (header animations, rows laid out again, the
+// tab sound).
+void SwitchPage(State& s, Hook h) {
+    const u64 opt = s.x[0];
+    if (!OnPage(opt))
+        return RunOriginal(s, g_hooks[h]);
+    if (R32(opt + kObjState) != kStateIdle)
+        return GuestReturn(s, 0);
+    int from = 0, to = 0;
+    {
+        std::lock_guard lk(g_mutex);
+        Apply();
+        from = g_cur;
+        to = g_cur = 1 - g_cur;
+        Show(Cur());
+    }
+    GuestCall(s, g_main + kPlayAnim, {opt + kObjAnims, 0, 0});
+    GuestCall(s, g_main + kPlayAnim, {opt + kObjAnims, g_mem->Read<u8>(g_main + kTabAnims + kPageTabs[to]), 0});
+    GuestCall(s, g_main + kPlayAnim, {opt + kObjAnims, g_mem->Read<u8>(g_main + kTabOffAnims + kPageTabs[from]), 0});
+    GuestCall(s, g_main + kFillRows, {opt});
+    if (const u64 sound = R64(g_main + kSoundGot))
+        GuestCall(s, g_main + kPlaySound, {sound + 0x168, kSoundTab});
+    GuestCall(s, g_main + kRowsDone, {opt});
+    HideOthers(s, opt);
+    LOG_INFO("Menu", "{} page shown", to == 0 ? "GRAPHICS" : "PC SETTINGS");
+    GuestReturn(s, 0);
+}
+void TabPrev(State& s) { SwitchPage(s, kHTabPrev); }
+void TabNext(State& s) { SwitchPage(s, kHTabNext); }
 // A on the page: the row's next value, wrapping round (like right).
 void Decide(State& s) {
     const u64 opt = s.x[0];
@@ -360,11 +492,11 @@ void Decide(State& s) {
         return RunOriginal(s, g_hooks[kHDecide]);
     const u64 cursor = R64(opt + 0xb0);
     const u32 row = cursor ? u32(GuestCall(s, R64(R64(cursor) + 0x58), {cursor})) : ~0u;
-    if (row < kRowCount) {
-        u8 v[kRowCount];
-        g_mem->ReadBlock(g_values, v, sizeof(v));
-        v[row] = u8((v[row] + 1) % g_row_info[row].choices.size());
-        g_mem->WriteBlock(g_values, v, sizeof(v));
+    if (row < Cur().rows.size()) {
+        u8 v[16];
+        g_mem->ReadBlock(Cur().values, v, sizeof(v));
+        v[row] = u8((v[row] + 1) % Cur().rows[row].choices.size());
+        g_mem->WriteBlock(Cur().values, v, sizeof(v));
         GuestCall(s, g_main + kShowValue, {opt, row});
     }
     GuestReturn(s, 0);
@@ -388,17 +520,16 @@ void Default(State& s) {
         return RunOriginal(s, g_hooks[kHDefault]);
     const u64 cursor = R64(opt + 0xb0);
     const u32 row = cursor ? u32(GuestCall(s, R64(R64(cursor) + 0x58), {cursor})) : ~0u;
-    if (row < kRowCount) {
+    if (row < Cur().rows.size()) {
+        const core::Config now = PageConfig();
         core::Config defaults;
         defaults.fps_limit = 0; // the launcher's presets: no cap
-        u8 v[kRowCount];
-        g_mem->ReadBlock(g_values, v, sizeof(v));
-        ToPage(defaults);
-        u8 d[kRowCount];
-        g_mem->ReadBlock(g_values, d, sizeof(d));
+        u8 v[16], d[16]{};
+        g_mem->ReadBlock(Cur().values, v, sizeof(v));
+        Cur().to(defaults, d);
         v[row] = d[row];
-        ToPage(PageConfig()); // the custom value texts
-        g_mem->WriteBlock(g_values, v, sizeof(v));
+        ToPage(Cur(), now); // the custom value texts
+        g_mem->WriteBlock(Cur().values, v, sizeof(v));
         GuestCall(s, g_main + kShowValue, {opt, row});
     }
     GuestReturn(s, 0);
@@ -410,8 +541,12 @@ void GetString(State& s) {
         const u32 i = h - kOurs;
         if (i < g_strings.size())
             return GuestReturn(s, g_strings[i]);
-    } else if (h == kStrControls && g_active.load(std::memory_order_relaxed)) {
-        s.x[1] = kStrGraphics; // the page's tab
+    } else if ((h == kStrControls || h == kStrSound) &&
+               (g_active.load(std::memory_order_relaxed) || g_open_next.load(std::memory_order_relaxed))) {
+        const u32 title = g_pages[h == kStrControls ? 0 : 1].title; // the pages' headers
+        if ((title & 0xFF000000) == kOurs)
+            return GuestReturn(s, g_strings[title - kOurs]);
+        s.x[1] = title;
     }
     RunOriginal(s, g_hooks[kHString]);
 }
@@ -438,7 +573,7 @@ void Install(core::Memory& mem, kernel::Kernel& kernel, u64 main_base) {
         }
     g_mem = &mem;
     g_main = main_base;
-    BuildPage();
+    BuildPages();
     const std::pair<u64, void (*)(State&)> hooks[kHookCount] = {
         {kOptInit, OptInit},     {kOptStore, OptStore},   {kChoiceCount, ChoiceCount}, {kTabPrev, TabPrev},
         {kTabNext, TabNext},     {kDecide, Decide},       {kDefault, Default},         {kGetString, GetString},
@@ -450,7 +585,7 @@ void Install(core::Memory& mem, kernel::Kernel& kernel, u64 main_base) {
         kernel.Cpus().Override(g_hooks[i]);
     }
     std::thread(Watch).detach();
-    LOG_INFO("Menu", "graphics page installed ({} rows)", g_row_info.size());
+    LOG_INFO("Menu", "graphics pages installed ({} + {} rows)", g_pages[0].rows.size(), g_pages[1].rows.size());
 }
 
 } // namespace hle::menu::graphics

@@ -138,6 +138,13 @@ bool AudioOut::Init(core::AudioBackend backend, int volume) {
 
 void AudioOut::Shutdown() { impl_.reset(); }
 
+void AudioOut::SetVolume(int volume) {
+    if (!impl_)
+        return;
+    std::lock_guard lk(impl_->mutex);
+    impl_->volume = std::clamp(volume, 0, 100) / 100.0f;
+}
+
 void AudioOut::Push(const s16* samples, size_t frames) {
     if (!impl_)
         return;
