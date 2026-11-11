@@ -685,13 +685,14 @@ std::atomic<u64> g_submit_ns{0}, g_record_cycles{0}; // recorder cost diagnostic
 inline u64 NowNs() {
     return u64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 }
-int ProfileAt() {
-    static const int at = [] {
-        const char* e = std::getenv("MUA3_PROFILE_NVN");
-        return e ? std::atoi(e) : -1;
-    }();
-    return at;
-}
+// Read once at startup: the recorder checks them on every command.
+const int g_profile_at = [] {
+    const char* e = std::getenv("MUA3_PROFILE_NVN");
+    return e ? std::atoi(e) : -1;
+}();
+// MUA3_PROFILE: also time the recorder (two timestamp reads per command, about 1% of the render worker).
+const bool g_record_cost = std::getenv("MUA3_PROFILE") != nullptr;
+inline int ProfileAt() { return g_profile_at; }
 // MUA3_PROFILE_NVN=<seconds>: after that long, samples the thread that makes the most NVN calls (the first to make
 // 20,000) for 10 s.
 void MaybeProfileRecorder() {
@@ -707,7 +708,7 @@ template <int I>
 void Generic(State& s) {
     if (ProfileAt() >= 0)
         MaybeProfileRecorder();
-    const u64 cycles0 = __rdtsc();
+    const u64 cycles0 = g_record_cost ? __rdtsc() : 0;
     const GenericSlot& g = g_generic[I];
     // Commands append to the calling thread's current command buffer without the lock (each command buffer is
     // recorded by one thread; map nodes are stable, so the cached list stays valid), built in place.
@@ -829,7 +830,8 @@ void Generic(State& s) {
             obj.push_back(std::move(c));
         }
     }
-    tls_cycles += __rdtsc() - cycles0;
+    if (g_record_cost)
+        tls_cycles += __rdtsc() - cycles0;
     if ((tls_recorded & 4095) == 0 && tls_recorded) {
         Rec().recorded.fetch_add(tls_recorded, std::memory_order_relaxed);
         g_record_cycles.fetch_add(tls_cycles, std::memory_order_relaxed);
@@ -1599,6 +1601,7 @@ recomp::Fn Find(std::string_view name, recomp::Fn driver, u64 pc) {
             return nullptr;
         GenericSlot& g = g_generic[i];
         g.name = std::string(name);
+        LOG_INFO("NVN", "recorder slot {} = {}", i, name); // (profiles show Generic<slot>)
         g.driver = driver;
         g.kind = kind;
         g.draw = name.find("CommandBufferDraw") != std::string_view::npos;
