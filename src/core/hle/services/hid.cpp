@@ -53,7 +53,11 @@ void UpdateOnce() {
         std::lock_guard lk(g_pad_mutex);
         std::copy(std::begin(g_pads), std::end(g_pads), pads);
     }
-    // Player 1 also drives the handheld slot (index 8) so handheld-only code paths see input.
+    // Player 1 also drives the handheld slot (index 8) so handheld-only code paths see input: its buttons only.
+    // MUA3 builds player 1's input from No.1 and, when Handheld is connected, from Handheld too, and ADDS the two
+    // (main+0x175f80 -> 0x1773c0: buttons OR-ed, stick axes summed). Mirrored sticks reached the game doubled (2.0 at
+    // full tilt), which through the camera's squared response turned it ~5x too fast. So the handheld sticks stay
+    // centred.
     for (int idx = 0; idx < 10; idx++) {
         const PadInput& in = idx < 8 ? pads[idx] : pads[0];
         u8* np = base + kNpadBase + idx * kNpadSize;
@@ -76,7 +80,8 @@ void UpdateOnce() {
             s32 lx, ly, rx, ry;
             u32 attributes;
             u32 reserved;
-        } st{g_sampling, in.connected ? in.buttons : 0, in.lx, in.ly, in.rx, in.ry,
+        } st{g_sampling, in.connected ? in.buttons : 0,
+             handheld ? 0 : in.lx, handheld ? 0 : in.ly, handheld ? 0 : in.rx, handheld ? 0 : in.ry,
              in.connected ? (handheld ? 0x3Fu : 0x1u) : 0u, 0};
         for (int l = 0; l < 7; l++)
             WriteLifo(np + 0x28 + l * kLifoSize, ts, &st, sizeof(st));
