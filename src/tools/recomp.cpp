@@ -1331,7 +1331,7 @@ int main(int argc, char** argv) {
     double coverage = 1.0;
     size_t max_funcs = SIZE_MAX;
     bool stats_only = false, all_funcs = false;
-    std::set<u64> noopt_funcs, skip_funcs, nogm_funcs;
+    std::set<u64> noopt_funcs, skip_funcs, nogm_funcs, hugeopt_funcs;
     int i = 2;
     for (; i + 2 < argc && argv[i][0] != '-'; i += 3) {
         Module m;
@@ -1353,6 +1353,10 @@ int main(int argc, char** argv) {
             std::ifstream in(argv[i + 1]);
             for (std::string a; in >> a;)
                 nogm_funcs.insert(std::strtoull(a.c_str(), nullptr, 16));
+        } else if (k == "--hugeopt") { // big functions worth /d2OptimizeHugeFunctions (see kSplitMin below)
+            std::ifstream in(argv[i + 1]);
+            for (std::string a; in >> a;)
+                hugeopt_funcs.insert(std::strtoull(a.c_str(), nullptr, 16));
         } else if (k == "--noopt") { // file with function entries (hex) to compile without optimisation
             std::ifstream in(argv[i + 1]);
             for (std::string a; in >> a;)
@@ -1619,11 +1623,11 @@ int main(int argc, char** argv) {
     // MSVC compiles a function above ~380 KB of C++ with no optimisation at all (warning C4883) unless the file is
     // compiled with /d2OptimizeHugeFunctions, and that flag on a whole shard can need over 20 GB (shard 229). So a
     // function between kSplitMin and kSplitMax bytes goes to a file of its own, recomp_<shard>_<entry>.cpp, which the
-    // builders compile with the flag (one ~1 MB function: minutes, a few GB); bigger ones stay in their shard as
+    // builders compile with the flag when it is marked (hugeopt.txt, see below); bigger ones stay in their shard as
     // before. Its inline cache sites stay numbered in its shard's ic_<shard>[] array.
     constexpr size_t kSplitMin = 300'000, kSplitMax = 1'000'000;
     bool bucket_used = false;
-    size_t split_funcs = 0;
+    size_t split_funcs = 0, huge_marked = 0;
     auto flush = [&] {
         if (!bucket_used)
             return;
@@ -1762,6 +1766,13 @@ int main(int argc, char** argv) {
             written.insert(name);
             split_funcs++;
             ChangedFile sf(out / name);
+            // The builders give /d2OptimizeHugeFunctions only to the files that start with kHugeMark: the functions
+            // in hugeopt.txt, the ones a profile found hot. With it one file takes minutes (about 5 GB per MB);
+            // without it a cold one compiles in seconds and runs unoptimised (under 0.1% of game time in ST010).
+            if (hugeopt_funcs.count(f.entry)) {
+                sf << "// mua3: optimise huge\n";
+                huge_marked++;
+            }
             sf << "#include \"core/cpu/recomp/recomp_rt.h\"\n#pragma warning(disable : 4102 4189 4100)\nnamespace recomp {\n";
             sf << "extern u64 " << ic_name(cur_bucket) << "[];\n";
             for (u64 c : fcalled)
@@ -1791,7 +1802,8 @@ int main(int argc, char** argv) {
         all_ranges.insert(all_ranges.end(), m.begin(), m.end());
     }
     flush();
-    std::printf("%zu big functions in files of their own (%zu..%zu bytes of C++)\n", split_funcs, kSplitMin, kSplitMax);
+    std::printf("%zu big functions in files of their own (%zu..%zu bytes of C++), %zu of them to optimise\n", split_funcs,
+                kSplitMin, kSplitMax, huge_marked);
     for (const auto& e : std::filesystem::directory_iterator(out)) {
         const std::string n = e.path().filename().string();
         if (n.rfind("recomp_", 0) == 0 && n.ends_with(".cpp") && n != "recomp_table.cpp" && !written.count(n))

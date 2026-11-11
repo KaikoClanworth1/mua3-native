@@ -42,10 +42,13 @@ NOOPT = os.path.join(S, 'noopt.txt')
 SKIP = os.path.join(S, 'skip.txt')
 # functions whose guest accesses keep reading s.mem (MSVC takes hours on a few with the cached base)
 NOGM = os.path.join(S, 'nogm.txt')
+# big functions worth /d2OptimizeHugeFunctions (hot in a profile); recomp marks their files (HUGE_MARK)
+HUGEOPT = os.path.join(S, 'hugeopt.txt')
 os.makedirs(S, exist_ok=True)
 open(SKIP, 'a').close()
 open(NOOPT, 'a').close()
 open(NOGM, 'a').close()
+open(HUGEOPT, 'a').close()
 NSO = os.path.join(S, 'nso')
 if not os.path.exists(os.path.join(NSO, 'main.bin')):
     sys.exit(f'{NSO} has no main.bin: run  build\\bin\\RelWithDebInfo\\nsodump.exe game\\exefs {NSO}  first')
@@ -58,8 +61,19 @@ HUGE = '/d2OptimizeHugeFunctions'
 HUGE_LIMIT = 60 * 60
 
 
+HUGE_MARK = '// mua3: optimise huge'
+
+
 def is_big(name):
     return re.fullmatch(r'recomp_[0-9a-f]+_[0-9a-f]+\.(cpp|obj)', os.path.basename(name)) is not None
+
+
+def is_huge(name):
+    """a big-function file recomp marked for /d2OptimizeHugeFunctions (its function is in hugeopt.txt)"""
+    if not is_big(name):
+        return False
+    with open(os.path.join(GEN, os.path.basename(name)[:-4] + '.cpp'), errors='replace') as f:
+        return f.readline().startswith(HUGE_MARK)
 
 
 def free_ram():
@@ -75,21 +89,22 @@ def free_ram():
 
 def need(n):
     """estimated compiler memory: big-function files only (about 5 GB per MB of C++ with the flag), else 0"""
-    return max(1 << 30, int(os.path.getsize(os.path.join(GEN, n)) * 5 * 1024)) if is_big(n) else 0
+    return max(1 << 30, int(os.path.getsize(os.path.join(GEN, n)) * 5 * 1024)) if is_huge(n) else 0
 
 
 def compile_all(todo):
     """cl over todo with JOBS workers; big-function files first (largest first) and together within half the RAM
     free at the start (one may always run alone). Returns the exit codes in todo order."""
     budget = free_ram() // 2
-    order = sorted(range(len(todo)), key=lambda i: -need(todo[i]))
     req = [need(n) for n in todo]
+    # the optimised big files first, then everything else largest first (no long file left to the end)
+    order = sorted(range(len(todo)), key=lambda i: (-req[i], -os.path.getsize(os.path.join(GEN, todo[i]))))
     rcs = [None] * len(todo)
     lock = threading.Condition()
     state = {'reserved': 0, 'next': list(order)}
     nbig = sum(1 for r in req if r)
     if nbig:
-        log(f'{nbig} big-function files, within {budget / 2**30:.1f} GB')
+        log(f'{nbig} big functions to optimise, within {budget / 2**30:.1f} GB')
 
     def take():
         with lock:
@@ -135,13 +150,13 @@ def generate():
            # recomp_missing.txt files from game runs (pcs the JIT had to run), renamed missing<N>.txt
            *[a for p in sorted(n for n in os.listdir(S) if re.fullmatch(r'missing\d+\.txt', n))
              for a in ('--missing', os.path.join(S, p))], '--all', '1', '--sweep', '1',
-           '--noopt', NOOPT, '--skip', SKIP, '--nogm', NOGM]
+           '--noopt', NOOPT, '--skip', SKIP, '--nogm', NOGM, '--hugeopt', HUGEOPT]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, check=True)
 
 
 def cl(src, obj, huge=None):
     if huge is None:
-        huge = is_big(src)
+        huge = is_huge(src)
     tag = os.path.basename(obj).replace('.obj', '')
     bat = os.path.join(S, f'cl_{tag}.bat')
     flags = FLAGS + (' ' + HUGE if huge else '')
@@ -166,8 +181,7 @@ def cl(src, obj, huge=None):
         if rc != 0 and (rc != 2 or 'C1002' in text or 'C1060' in text):  # out of memory / crash: as before
             log(f'{tag}: {HUGE} failed (code {rc}), compiling it again without')
             return cl(src, obj, huge=False)
-        if time.time() - t0 > 600:
-            log(f'{tag}: {(time.time() - t0) / 60:.0f} min')
+        log(f'{tag}: optimised in {(time.time() - t0) / 60:.1f} min')
     return rc  # 0 ok, 2 compile error, else compiler crash
 
 

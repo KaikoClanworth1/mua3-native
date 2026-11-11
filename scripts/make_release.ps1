@@ -39,7 +39,7 @@ foreach ($o in 'main.obj', 'alloc_trace.obj') { Copy-Item (Join-Path $build "src
 # function lists for the recompiler: coverage seen in game runs (prof*, missing*) and the functions this compiler
 # version needs built unoptimised (noopt) or left out (skip). Addresses only.
 $work = Join-Path $build 'recomp_work'
-Get-ChildItem $work -File | Where-Object { $_.Name -match '^(prof\d+|missing\d+|noopt|skip|nogm)\.txt$' } | Copy-Item -Destination "$out\sdk\recomp"
+Get-ChildItem $work -File | Where-Object { $_.Name -match '^(prof\d+|missing\d+|noopt|skip|nogm|hugeopt)\.txt$' } | Copy-Item -Destination "$out\sdk\recomp"
 @"
 MUA3 Native v$Version
 =====================
