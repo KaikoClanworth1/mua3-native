@@ -357,10 +357,12 @@ void TexturePoolRegisterTexture(State& s) {
     // Per-thread fast path in front of the shared cache: the exact (pool, texture, view words) seen before with the
     // texture generation unchanged since (any texture Initialize/Finalize or pool re-initialization bumps the
     // global counter; then the texture's own generation is checked once under the lock). No lock, no map lookups.
-    struct FastReg {
-        u64 pool = 0, words[6]{}, base = 0, global_gen = 0, tex_gen = 0;
-        u8 bytes[32]{};
+    // (the lookup's compare fields share the first cache line; an entry is one aligned 128-byte pair of lines)
+    struct alignas(128) FastReg {
         bool valid = false;
+        u64 pool = 0, words[6]{};
+        u64 base = 0, global_gen = 0, tex_gen = 0;
+        u8 bytes[32]{};
     };
     constexpr u32 kFastRegs = 2048;
     thread_local std::unique_ptr<FastReg[]> fast_regs;
@@ -1148,39 +1150,60 @@ void QueueSubmitCommands(State& s) {
     }
     // native replay: hand this frame's commands, in execution order, to the renderer (ranges of the recorded lists;
     // nested Call/CopyCommands run at their call site)
+    // The same pass keeps the handles' LRU order and the stream statistics (the walk below, for the no-replay case):
+    // one pass over the frame's commands instead of two.
     if (sink && *sink) {
         struct Pending {
             CommandList list;
             size_t begin;
             int depth;
+            u64 handle;
         };
         std::vector<Pending> order;
         for (auto h = handles.rbegin(); h != handles.rend(); ++h)
             if (auto it = rec.handles.find(*h); it != rec.handles.end() && it->second)
-                order.push_back({it->second, 0, 0});
+                order.push_back({it->second, 0, 0, *h});
+            else
+                rec.unknown++;
         while (!order.empty()) {
             Pending p = std::move(order.back());
             order.pop_back();
+            if (p.begin == 0)
+                Touch(rec, p.handle);
             const auto& list = *p.list;
             size_t k = p.begin;
-            while (k < list.size() && list[k].fn >= 0)
-                k++;
+            u64 draws = 0, indirect = 0, dispatches = 0;
+            for (; k < list.size() && list[k].fn >= 0; k++) {
+                const GenericSlot& g = g_generic[list[k].fn];
+                draws += g.draw;
+                indirect += g.indirect;
+                dispatches += g.dispatch;
+            }
+            rec.cmds += k - p.begin;
+            rec.draws += draws;
+            rec.indirect += indirect;
+            rec.dispatches += dispatches;
             if (k > p.begin)
                 flat.push_back({p.list, p.begin, k});
             if (k < list.size()) { // nested: the rest of this list after them
+                rec.cmds++;
                 if (k + 1 < list.size())
                     order.push_back({p.list, k + 1, p.depth});
                 const auto& nested = list[k].extra;
-                for (auto n = nested.rbegin(); n != nested.rend(); ++n)
-                    if (auto it = rec.handles.find(*n); p.depth < 8 && it != rec.handles.end() && it->second)
-                        order.push_back({it->second, 0, p.depth + 1});
+                if (p.depth < 8)
+                    for (auto n = nested.rbegin(); n != nested.rend(); ++n)
+                        if (auto it = rec.handles.find(*n); it != rec.handles.end() && it->second)
+                            order.push_back({it->second, 0, p.depth + 1, *n});
+                        else
+                            rec.unknown++;
             }
         }
     }
-    // walk the submitted command buffers, following nested Call/CopyCommands
+    // walk the submitted command buffers, following nested Call/CopyCommands (no replay: the pass above did it)
     std::vector<std::pair<u64, int>> work;
-    for (u64 h : handles)
-        work.emplace_back(h, 0);
+    if (!(sink && *sink))
+        for (u64 h : handles)
+            work.emplace_back(h, 0);
     while (!work.empty()) {
         const auto [h, depth] = work.back();
         work.pop_back();
