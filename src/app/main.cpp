@@ -382,13 +382,16 @@ static std::string HostStack() {
     return stack;
 }
 
-// After a crash: the launcher opens its "Report a problem" form (not in automated test runs).
+// After a crash: the setup (or, in older installs, the launcher) opens its "Report a problem" form (not in automated
+// test runs).
 static void OpenProblemReport(const fs::path& summary) {
     if (std::getenv("MUA3_HEADLESS"))
         return;
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    const fs::path launcher = fs::path(exe).parent_path() / "MUA3Launcher.exe";
+    fs::path launcher = fs::path(exe).parent_path() / "MUA3Setup.exe";
+    if (!fs::exists(launcher))
+        launcher = fs::path(exe).parent_path() / "MUA3Launcher.exe";
     if (!fs::exists(launcher))
         return;
     std::error_code ec;
