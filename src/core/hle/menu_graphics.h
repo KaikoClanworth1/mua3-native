@@ -20,6 +20,10 @@ void Install(core::Memory& mem, kernel::Kernel& kernel, u64 main_base);
 // The next OPTIONS screen that opens shows the GRAPHICS page (call, then open OPTIONS the game's way).
 void OpenNext();
 
+// The render scale the renderer runs with, in thirds (3 = 1x, 4 = 4/3; main.cpp, at the start): the RENDER SCALE
+// row's info line shows the render size it gives.
+void SetRenderScale(u32 scale3);
+
 // A menu label for the GRAPHICS item (system string hash): the game's own "GRAPHICS" text.
 u32 LabelHash();
 

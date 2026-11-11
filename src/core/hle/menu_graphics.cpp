@@ -159,6 +159,7 @@ const std::u16string kControllerInfo = u"XINPUT: Xbox controllers. SDL: PlayStat
 const std::u16string kAudioInfo = u"How the game's sound is played. XAUDIO2 suits most PCs; OFF plays no sound.";
 const std::u16string kScaleNames[] = {u"AUTO", u"1X (1080P)", u"2X (1440P / 4K)", u"3X", u"4X"};
 constexpr size_t kInfoRoom = 200;
+std::atomic<u32> g_scale3{0}; // the running render scale in thirds (0 = not told)
 
 // A page's row table, choice arrays and value bytes in guest memory.
 void Finish(Page& page) {
@@ -350,7 +351,22 @@ void WriteRestartInfo() {
     auto put = [](u32 hash, const std::u16string& info, const std::u16string& now) {
         PutString(hash, info + u"\r\nApplies after a restart (running now: " + now + u").", kInfoRoom);
     };
-    put(g_scale_info, kScaleInfo, kScaleNames[std::clamp(c.resolution_scale, 0, 4)]);
+    // RENDER SCALE: also the size the game renders at now (the renderer's rule: SSAA multiplies the scale, the
+    // product capped at 4x by dropping the factor first)
+    std::u16string size;
+    if (const u32 s3 = g_scale3) {
+        const u32 w = c.docked ? 1920 : 1280, h = c.docked ? 1080 : 720;
+        auto dims = [&](u32 s) { return U16(fmt::format("{} x {}", (w * s + 2) / 3, (h * s + 2) / 3)); };
+        u32 f = c.anti_aliasing >= 2 && c.anti_aliasing <= 4 ? u32(c.anti_aliasing) : 1;
+        while (f > 1 && s3 * f > 12)
+            f--;
+        size = u"\r\nRenders at " + dims(s3) +
+               (f > 1 ? u" (" + dims(s3 * f) + u" with SSAA " + U16(std::to_string(f)) + u"X)" : u"") + u" now.";
+    }
+    PutString(g_scale_info,
+              kScaleInfo + u"\r\nApplies after a restart (running now: " +
+                  kScaleNames[std::clamp(c.resolution_scale, 0, 4)] + u")." + size,
+              kInfoRoom);
     put(g_rate_info, kRateInfo, U16(std::to_string(c.fps_target)) + u" FPS");
     put(g_controller_info, kControllerInfo, kControllerNames[std::clamp(int(c.input), 0, 1)]);
     put(g_audio_info, kAudioInfo, kAudioNames[std::clamp(int(c.audio), 0, 2)]);
@@ -365,6 +381,7 @@ void Apply(bool always = false) {
         return;
     std::memcpy(page.applied, v, kMaxRows);
     core::Sys().UpdateConfig([&page, &v](core::Config& c, bool running) { page.from(c, running, v); });
+    WriteRestartInfo(); // the render size follows the anti-aliasing
 }
 
 // The current page into tab 2's data slot (g_mutex held).
@@ -554,6 +571,8 @@ void GetString(State& s) {
 } // namespace
 
 void OpenNext() { g_open_next = true; }
+
+void SetRenderScale(u32 scale3) { g_scale3 = scale3; }
 
 u32 LabelHash() { return kStrGraphics; }
 

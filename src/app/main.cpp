@@ -22,6 +22,7 @@
 #include "core/system.h"
 #include "core/hle/audio_output.h"
 #include "core/hle/hid.h"
+#include "core/hle/menu_graphics.h"
 #include "gpu/d3d11/renderer_d3d11.h"
 #include "gpu/d3d11/shader_cache.h"
 #include "core/cpu/cpu.h"
@@ -663,6 +664,7 @@ int main(int argc, char** argv) {
     LOG_INFO("Display", "output {} px high, internal render scale {:.3g}x{}", display.PixelHeight(), scale3 / 3.0,
              cfg.resolution_scale <= 0 ? " (auto)" : "");
     renderer.SetResolutionScale3(scale3);
+    hle::menu::graphics::SetRenderScale(scale3); // the GRAPHICS page shows the render size
     gpu::G().SetRenderer(&renderer);
     gpu::InstallNvnEncoder(gpu::G());
     g_renderer = &renderer;
