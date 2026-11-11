@@ -10,6 +10,7 @@
 #include <wrl/client.h>
 
 #include "gpu/d3d11/post_aa.h"
+#include "gpu/d3d11/gpu_passes.h"
 #include "gpu/renderer.h"
 
 namespace gpu {
@@ -299,6 +300,7 @@ private:
         std::vector<u8> data;
         ID3D11Buffer* buf = nullptr;
         ID3D11ShaderResourceView* raw = nullptr;
+        u32 cb_size = 0; // bytes in `buf` (less than data.size() for a dynamically indexed buffer)
     };
     CbShadow cb_shadow_[160];
     GeomBuf* CachedIndices(u64 addr, u32 count, u32 index_size, bool strip);
@@ -350,6 +352,7 @@ private:
     ComPtr<ID3D11RenderTargetView> frame_rtv_;
     DXGI_FORMAT frame_dxgi_ = DXGI_FORMAT_UNKNOWN;
     PostAA post_aa_;
+    GpuPasses gpu_passes_; // MUA3_GPU_PASSES: GPU time per pass
     u32 frame_w_ = 0, frame_h_ = 0;
 
     friend class DrawContext;

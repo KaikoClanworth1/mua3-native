@@ -217,6 +217,7 @@ static const bool g_profile = std::getenv("MUA3_PROFILE") != nullptr;
 enum ProfSection { kProfShaders, kProfState, kProfIndex, kProfVertex, kProfCbufs, kProfTextures, kProfResources, kProfSubmit, kProfCount };
 static const char* const kProfNames[kProfCount] = {"shaders", "state", "index", "vertex", "cbufs", "textures", "other", "submit"};
 static u64 g_prof_ns[kProfCount], g_prof_vb_bytes, g_prof_cb_bytes, g_prof_ib_count, g_prof_draws;
+static u64 g_prof_cb_dyn_bytes, g_prof_cb_uploads, g_prof_cb_same; // constant buffers: dynamically indexed bytes, uploads, unchanged
 static u64 g_prof_rb_waits, g_prof_rb_wait_ns, g_prof_rb_queued, g_prof_rb_bytes; // compute result copy-backs
 static u64 g_prof_resident; // draws reading compute output from the resident copy
 static u64 g_prof_rb_pages, g_prof_rb_changed_pages; // copy-back pages compared / found changed
@@ -404,6 +405,7 @@ D3D11Renderer::D3D11Renderer(ID3D11Device* dev, ID3D11DeviceContext* ctx) : dev_
     shaders_ = std::make_unique<ShaderCache>(dev);
     shaders_->Prewarm();
     textures_ = std::make_unique<TextureCache>(dev, ctx, *this);
+    gpu_passes_.Init(dev, ctx);
     g_dc = std::make_unique<DrawContext>(dev);
     g_dc->SetContext(ctx);
     if (const char* t = std::getenv("MUA3_TRACE_DRAWS"))
@@ -644,6 +646,7 @@ Surface* D3D11Renderer::GetDepthSurface() {
 
 void D3D11Renderer::ClearColor(u32 rt, const float color[4]) {
     std::lock_guard ctx_lock(ContextMutex());
+    gpu_passes_.Mark(3, [] { return std::string("clears"); });
     clears++;
     if (Surface* s = GetColorSurface(rt)) {
         ctx_->ClearRenderTargetView(s->rtv.Get(), color);
@@ -653,6 +656,7 @@ void D3D11Renderer::ClearColor(u32 rt, const float color[4]) {
 
 void D3D11Renderer::ClearDepthStencil(bool depth, bool stencil, float depth_value, u8 stencil_value) {
     std::lock_guard ctx_lock(ContextMutex());
+    gpu_passes_.Mark(3, [] { return std::string("clears"); });
     clears++;
     if (Surface* s = GetDepthSurface()) {
         const UINT flags = (depth ? D3D11_CLEAR_DEPTH : 0) | (stencil ? D3D11_CLEAR_STENCIL : 0);
@@ -1442,6 +1446,7 @@ static std::vector<u8> ReadBufferNow(ID3D11Device* dev, ID3D11DeviceContext* ctx
 
 void D3D11Renderer::Dispatch(const ComputeLaunch& l) {
     std::lock_guard ctx_lock(ContextMutex());
+    gpu_passes_.Mark(1, [] { return std::string("compute dispatches"); });
     auto& g = G();
     auto& dc = *g_dc;
     // ---- program and launch shape
@@ -2064,6 +2069,15 @@ void D3D11Renderer::Draw() {
     for (u32 i = 0; i < 8; i++)
         bound_[i] = i < count ? colors[i] : nullptr;
     bound_[8] = depth;
+    if (gpu_passes_.On()) {
+        gpu_passes_.Mark((colors[0] ? colors[0]->gpu_va : 0) * 31 ^ (depth ? depth->gpu_va : 0) ^ count, [&] {
+            const Surface* c = colors[0] ? colors[0] : depth;
+            return c ? fmt::format("draws: rt0 {:#x} {}x{} fmt {:#x} x{} scale {} depth {}", c->gpu_va, c->width, c->height,
+                                   c->format, count, c->scale, depth ? "yes" : "no")
+                     : std::string("draws: no target");
+        });
+        gpu_passes_.CountDraw();
+    }
 
     // ---- viewport
     const float sx = m.vp_scale[0], sy = m.vp_scale[1], sz = m.vp_scale[2];
@@ -2691,11 +2705,16 @@ void D3D11Renderer::Draw() {
             // Same bytes as this slot's last upload: keep the buffer (most draws share material/scene constants).
             CbShadow& sh = cb_shadow_[stage_index * 32 + i];
             const u8* src = g.GpuPtr(b.address, size);
+            // A dynamically indexed buffer is read through its raw view (all of it); its cbuffer holds only the rows
+            // the shader reads statically (the translator declares it that size).
+            const u32 cb_size = dyn ? u32(common::AlignUp(std::max<u32>(std::min<u32>(size, s->info.cbuf_rows[i] * 16u), 16u), 16))
+                                    : size;
             if (src && !trace_draw_ && sh.addr == b.address && sh.data.size() == size && (!dyn || sh.raw) &&
-                std::memcmp(src, sh.data.data(), size) == 0) {
+                sh.cb_size >= cb_size && std::memcmp(src, sh.data.data(), size) == 0) {
                 cbs[i] = sh.buf;
                 if (dyn)
                     raws[i] = sh.raw;
+                g_prof_cb_same++;
                 continue;
             }
             // Contiguous guest memory is uploaded straight from its host copy (no staging copy per upload).
@@ -2705,12 +2724,16 @@ void D3D11Renderer::Draw() {
                 g.ReadGpu(b.address, tmp.data(), size);
                 data = tmp.data();
             }
-            cbs[i] = dc.Constant(stage_index * 32 + i, data, size);
+            cbs[i] = dc.Constant(stage_index * 32 + i, data, cb_size);
             sh.addr = b.address;
             sh.data.assign(data, data + size);
             sh.buf = cbs[i];
             sh.raw = nullptr;
-            g_prof_cb_bytes += size;
+            sh.cb_size = cb_size;
+            g_prof_cb_bytes += cb_size + (dyn ? size : 0);
+            g_prof_cb_uploads++;
+            if (dyn)
+                g_prof_cb_dyn_bytes += cb_size + size;
             if (trace_draw_ && !is_vs && size >= 13 * 16) {
                 const float* f = reinterpret_cast<const float*>(data);
                 LOG_INFO("Renderer", "TRACE upload ps c{} {:#x}@{:#x} size {:#x} dyn {} rows10-12.w {:g} {:g} {:g}", i, b.size, b.address, size,
@@ -2923,6 +2946,9 @@ void D3D11Renderer::Present(const PresentInfo& p) {
                  g_prof_ib_count / 150 / 1000, (textures_->reuploads - last_reuploads) / 150.0, index_cache_.size(),
                  vertex_cache_.size());
         last_reuploads = textures_->reuploads;
+        LOG_INFO("Profile", "  constant buffers: {} uploads/frame ({:.1f} MB, {:.1f} MB of it dynamically indexed), {} unchanged",
+                 g_prof_cb_uploads / 150, g_prof_cb_bytes / 150 / 1048576.0, g_prof_cb_dyn_bytes / 150 / 1048576.0, g_prof_cb_same / 150);
+        g_prof_cb_uploads = g_prof_cb_same = g_prof_cb_dyn_bytes = 0;
         LOG_INFO("Profile", "  copy-backs: {:.1f} queued/frame ({:.2f} MB), {:.2f} blocking waits/frame costing {:.2f} ms, {:.1f} resident binds/frame",
                  g_prof_rb_queued / 150.0, g_prof_rb_bytes / 150 / 1048576.0, g_prof_rb_waits / 150.0, g_prof_rb_wait_ns / 150e6,
                  g_prof_resident / 150.0);
@@ -3074,6 +3100,7 @@ void D3D11Renderer::Present(const PresentInfo& p) {
                 LOG_INFO("Renderer", "  surface gpu {:#x} cpu {:#x} {}x{} fmt {:#x}{}", sf->gpu_va, sf->cpu_va, sf->width,
                          sf->height, sf->format, sf->depth ? " depth" : "");
     }
+    gpu_passes_.Mark(2, [] { return std::string("present: AA pass / copy into the frame shown"); });
     std::lock_guard lk(frame_mutex_);
     if (s) {
         D3D11_TEXTURE2D_DESC desc;
@@ -3115,6 +3142,7 @@ void D3D11Renderer::Present(const PresentInfo& p) {
             ctx_->CopyResource(frame_tex_.Get(), s->tex.Get());
         SetEvent(static_cast<HANDLE>(new_frame_event_));
     }
+    gpu_passes_.EndFrame();
     ctx_->Flush();
 }
 
