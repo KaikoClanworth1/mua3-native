@@ -1,9 +1,13 @@
+#include <bit>
 #include <cstring>
 #include <chrono>
 #include <unordered_set>
 #include <fstream>
 #include "gpu/d3d11/shader_cache.h"
 #include "gpu/dxbc/dxbc.h"
+#include "gpu/shader/known_programs.h"
+#include "gpu/shader/maxwell_isa.h"
+#include "loader/formats.h"
 
 #include <cctype>
 #include <cstdlib>
@@ -28,20 +32,21 @@ const char* StageTarget(shader::Stage st) {
 } // namespace
 
 
-ShaderCache::ShaderCache(ID3D11Device* dev) : dev_(dev) {
+ShaderCache::ShaderCache(ID3D11Device* dev, unsigned build_workers) : dev_(dev) {
     LOG_INFO("Shader", "opening the shader cache");
     std::error_code ec;
     fs::create_directories(dump_dir_, ec);
     fs::create_directories(cache_dir_, ec);
     overrides_ = fs::exists("shader_override", ec);
     OpenPack();
-    const unsigned n = std::clamp(std::thread::hardware_concurrency() / 2, 2u, 6u);
+    const unsigned n = build_workers ? build_workers : std::clamp(std::thread::hardware_concurrency() / 2, 2u, 6u);
     for (unsigned i = 0; i < n; i++)
         workers_.emplace_back([this] { Worker(false); });
     workers_.emplace_back([this] { Worker(false, true); });
     // Loop shaders compile out of process (FXC can run for minutes on them); two workers so one slow shader
-    // does not hold up the rest, and one more for the shaders the game is waiting on.
-    for (int i = 0; i < 2; i++)
+    // does not hold up the rest, and one more for the shaders the game is waiting on. The setup's shader step
+    // has the machine to itself: there they are most of its time, so one per CPU it may use.
+    for (unsigned i = 0; i < (build_workers ? build_workers : 2u); i++)
         std::thread([this] { Worker(true); }).detach();
     std::thread([this] { Worker(true, true); }).detach();
 }
@@ -981,6 +986,172 @@ void ShaderCache::Tick() {
                  shaders_.size(), s, failures.load(), cache_hits.load(), info_hits.load(), translate_ns / 1e9,
                  compile_ns / 1e9, create_ns / 1e9);
     }
+}
+
+} // namespace gpu
+
+namespace gpu {
+
+int BuildShadersAhead(const fs::path& game_dir) {
+    const auto t0 = std::chrono::steady_clock::now();
+    auto say = [](const std::string& s) {
+        std::fputs((s + "\n").c_str(), stdout);
+        std::fflush(stdout);
+    };
+    const fs::path dump = "shader_dump";
+    std::error_code ec;
+    fs::create_directories(dump, ec);
+    // 1. vertex and pixel programs: every one the game ships (the same harvest a first launch would do)
+    if (const fs::path shaders = game_dir / "romfs" / "SHADER", marker = dump / "harvested.txt"; !fs::exists(marker)) {
+        if (!fs::exists(shaders)) {
+            say("no romfs/SHADER in " + game_dir.string());
+            return 1;
+        }
+        say("Finding the game's shader programs...");
+        const size_t n = shader::HarvestPrograms(shaders, dump);
+        std::ofstream(marker) << n << "\n";
+        say(fmt::format("{} vertex/pixel programs found in the game data", n));
+    }
+    // 2. programs the harvest cannot find (all compute programs, a few vertex/pixel ones): at the locations
+    // learned from play, read from this install
+    size_t cs_added = 0, cs_known = 0, cs_skipped = 0;
+    {
+        std::vector<u8> main_image;
+        if (auto img = loader::LoadNso(common::ReadFile(game_dir / "exefs" / "main")))
+            main_image = std::move(img->image);
+        std::unordered_map<u16, std::vector<u8>> files;
+        for (const auto& k : shader::KnownPrograms()) {
+            if (!k.hash || k.stage > 2)
+                continue;
+            cs_known++;
+            const bool compute = k.stage == 2;
+            const fs::path bin = dump / fmt::format("{:016x}.{}.bin", k.hash, k.stage == 0 ? "vs" : compute ? "cs" : "ps");
+            const fs::path opt_path = dump / fmt::format("{:016x}.cs.opt", k.hash);
+            if (fs::exists(bin) && (!compute || fs::exists(opt_path)))
+                continue;
+            const std::vector<u8>* src = &main_image;
+            if (k.file) {
+                if (k.file >= shader::KnownFiles().size())
+                    continue;
+                auto& f = files[k.file];
+                if (f.empty())
+                    f = common::ReadFile(game_dir / "romfs" / fs::u8path(shader::KnownFiles()[k.file]));
+                src = &f;
+            }
+            if (u64(k.offset) + k.size > src->size()) {
+                cs_skipped++;
+                continue;
+            }
+            if (!compute) {
+                const u8* code = src->data() + k.offset;
+                if ((Hash64(code, k.size) ^ (u64(k.stage) << 60)) != k.hash) {
+                    cs_skipped++;
+                    continue;
+                }
+                common::WriteFile(bin, std::span(code, k.size));
+                cs_added++;
+                continue;
+            }
+            std::vector<u8> code(0x50 + k.size, 0); // behind a zeroed SPH, as the renderer hands them over
+            std::memcpy(code.data() + 0x50, src->data() + k.offset, k.size);
+            const u32 shape[4] = {k.block[0], k.block[1], k.block[2], k.shared_bytes};
+            const u64 hash = (Hash64(code.data(), code.size()) ^ (u64(shader::Stage::Compute) << 60)) ^
+                             Hash64(shape, 16) * 0x9E3779B97F4A7C15ull;
+            if (hash != k.hash) { // another game version, or the copy differs: leave it to the game
+                cs_skipped++;
+                continue;
+            }
+            std::vector<u8> opt(16);
+            std::memcpy(opt.data(), shape, 16);
+            if (k.cb_size == shader::kUnknownCbuf) {
+                // Constant buffer 1 was never recorded: fine unless the program reads jump tables from it (BRX).
+                bool brx = false;
+                for (size_t off = 0x50 + 8; off + 8 <= code.size() && !brx; off += 8) {
+                    if ((off - 0x50) % 32 == 0)
+                        continue;
+                    u64 insn;
+                    std::memcpy(&insn, &code[off], 8);
+                    brx = shader::Decode(insn) == shader::Op::BRX;
+                }
+                if (brx) {
+                    cs_skipped++;
+                    continue;
+                }
+            } else if (k.cb_size) {
+                if (u64(k.cb_offset) + k.cb_size > main_image.size() ||
+                    Hash64(main_image.data() + k.cb_offset, k.cb_size) != k.cb_hash) {
+                    cs_skipped++;
+                    continue;
+                }
+                opt.insert(opt.end(), main_image.begin() + k.cb_offset, main_image.begin() + k.cb_offset + k.cb_size);
+            }
+            common::WriteFile(bin, std::span(code.data(), code.size()));
+            common::WriteFile(opt_path, std::span(opt.data(), opt.size()));
+            cs_added++;
+        }
+    }
+    // 3. integer variants
+    size_t var_added = 0;
+    {
+        std::unordered_set<std::string> have;
+        {
+            std::ifstream in(dump / "variants.txt");
+            for (std::string line; std::getline(in, line);)
+                have.insert(line);
+        }
+        std::ofstream out(dump / "variants.txt", std::ios::app);
+        for (const auto& v : shader::KnownVariants()) {
+            if (!v.base)
+                continue;
+            const std::string line = fmt::format("{:016x} {:x} {:x} {:x} {:x} {:x} {:x}", v.base, v.key[0], v.key[1],
+                                                 v.key[2], v.key[3], v.key[4], v.key[5]);
+            if (have.insert(line).second) {
+                out << line << "\n";
+                var_added++;
+            }
+        }
+    }
+    say(fmt::format("{} more programs known from play ({} added from this install, {} could not be used); {} variants added",
+                    cs_known, cs_added, cs_skipped, var_added));
+    // 4. translate and compile all of it into the pack
+    ComPtr<ID3D11Device> dev;
+    D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &fl, 1, D3D11_SDK_VERSION, &dev,
+                                 nullptr, nullptr)) &&
+        FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, &fl, 1, D3D11_SDK_VERSION, &dev, nullptr,
+                                 nullptr))) {
+        say("could not create a Direct3D 11 device");
+        return 1;
+    }
+    u32 total = 0, failed = 0;
+    size_t count = 0;
+    {
+        // Never destroyed: its out-of-process compile workers are detached threads (the process exits right after).
+        // One worker of each kind per CPU this process may run on (the setup can limit it with an affinity mask).
+        DWORD_PTR mask = 0, sys = 0;
+        unsigned cpus = GetProcessAffinityMask(GetCurrentProcess(), &mask, &sys) ? unsigned(std::popcount(u64(mask))) : 0;
+        if (!cpus)
+            cpus = std::max(2u, std::thread::hardware_concurrency());
+        ShaderCache& cache = *new ShaderCache(dev.Get(), cpus);
+        cache.Prewarm();
+        total = cache.prewarm_total;
+        say(fmt::format("Compiling {} shaders on {} CPUs...", total, cpus));
+        auto last = std::chrono::steady_clock::now();
+        while (!cache.PrewarmDone()) {
+            cache.Tick();
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            if (std::chrono::steady_clock::now() - last > std::chrono::seconds(10)) {
+                last = std::chrono::steady_clock::now();
+                say(fmt::format("  {} of {} left", cache.pending.load(), total));
+            }
+        }
+        failed = cache.failures;
+        count = cache.Count();
+    }
+    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    say(fmt::format("Shaders ready: {} programs and variants ({} prepared, {} cannot be translated) in {:.0f} s",
+                    count, total, failed, s));
+    return 0;
 }
 
 } // namespace gpu

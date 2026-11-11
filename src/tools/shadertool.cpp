@@ -5,7 +5,13 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <chrono>
+#include <algorithm>
+#include <fstream>
 #include <map>
+#include <set>
+
+#include "gpu/shader/known_programs.h"
+#include "loader/formats.h"
 
 #include "gpu/shader/maxwell_isa.h"
 #include "gpu/dxbc/dxbc.h"
@@ -42,6 +48,177 @@ static void Disassemble(const std::vector<u8>& data) {
     }
 }
 
+static u64 ComputeKey(const std::vector<u8>& code, const u32 shape[4]) {
+    return gpu::Hash64(code.data(), code.size()) ^ (u64(Stage::Compute) << 60) ^
+           gpu::Hash64(shape, 16) * 0x9E3779B97F4A7C15ull;
+}
+
+static int WriteKnown(const fs::path& dump, const fs::path& game, const fs::path& out_path) {
+    // Searched blobs: the main module image, then every file under romfs/SHADER.
+    std::vector<std::string> names{"main"};
+    std::vector<std::vector<u8>> blobs;
+    {
+        const auto nso = common::ReadFile(game / "exefs" / "main");
+        auto img = loader::LoadNso(nso);
+        if (!img) {
+            fmt::print("cannot load {}\n", (game / "exefs" / "main").string());
+            return 1;
+        }
+        blobs.push_back(std::move(img->image));
+    }
+    std::error_code ec;
+    for (const auto& e : fs::recursive_directory_iterator(game / "romfs" / "SHADER", ec))
+        if (e.is_regular_file()) {
+            names.push_back(fs::relative(e.path(), game / "romfs").generic_string());
+            blobs.push_back(common::ReadFile(e.path()));
+        }
+    auto locate = [&](const u8* p, size_t n, u16& file, u32& off) {
+        const size_t key = std::min<size_t>(n, 64);
+        for (size_t b = 0; b < blobs.size(); b++) {
+            const auto& d = blobs[b];
+            for (auto it = d.begin();; ++it) {
+                it = std::search(it, d.end(), p, p + key);
+                if (it == d.end())
+                    break;
+                const size_t at = size_t(it - d.begin());
+                if (at + n <= d.size() && std::memcmp(&d[at], p, n) == 0) {
+                    file = u16(b), off = u32(at);
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    std::vector<KnownProgram> cs;
+    size_t total = 0, no_shape = 0, not_found = 0;
+    for (const auto& e : fs::directory_iterator(dump, ec)) {
+        const std::string name = e.path().filename().string();
+        if (name.size() != 23 || !name.ends_with(".cs.bin"))
+            continue;
+        total++;
+        const u64 hash = std::strtoull(name.substr(0, 16).c_str(), nullptr, 16);
+        const auto code = common::ReadFile(e.path());
+        if (code.size() <= 0x50 + 8)
+            continue;
+        KnownProgram k{};
+        k.hash = hash;
+        k.stage = 2;
+        k.cb_size = kUnknownCbuf;
+        if (!locate(code.data() + 0x50, code.size() - 0x50, k.file, k.offset)) {
+            not_found++;
+            fmt::print("{:016x}: program not found in the game data\n", hash);
+            continue;
+        }
+        k.size = u32(code.size() - 0x50);
+        u32 shape[4]{};
+        const auto opt = common::ReadFile(dump / fmt::format("{:016x}.cs.opt", hash));
+        bool have = false;
+        if (opt.size() >= 16) {
+            std::memcpy(shape, opt.data(), 16);
+            have = ComputeKey(code, shape) == hash;
+            if (have && opt.size() > 16) {
+                u16 f;
+                if (locate(opt.data() + 16, opt.size() - 16, f, k.cb_offset) && f == 0) {
+                    k.cb_size = u32(opt.size() - 16);
+                    k.cb_hash = gpu::Hash64(opt.data() + 16, opt.size() - 16);
+                }
+            } else if (have) {
+                k.cb_size = 0;
+            }
+        }
+        // Dumps from before launch options were recorded: the shape is in the key, so search the likely ones.
+        for (u32 x = 1; !have && x <= 1024; x *= 2)
+            for (u32 y = 1; !have && y <= 32; y *= 2)
+                for (u32 z = 1; !have && z <= 4; z *= 2)
+                    for (u32 sh = 0; !have && sh <= 48 * 1024; sh += 16) {
+                        const u32 s[4] = {x, y, z, sh};
+                        if (ComputeKey(code, s) == hash) {
+                            std::memcpy(shape, s, 16);
+                            have = true;
+                        }
+                    }
+        if (!have) {
+            no_shape++;
+            fmt::print("{:016x}: launch shape unknown\n", hash);
+            continue;
+        }
+        k.block[0] = shape[0], k.block[1] = shape[1], k.block[2] = shape[2], k.shared_bytes = shape[3];
+        cs.push_back(k);
+    }
+    // Vertex/pixel programs the harvest does not find (it only accepts programs that translate, at offsets with a
+    // plausible header), located in the same files.
+    size_t gfx_total = 0, gfx_harvested = 0, gfx_added = 0, gfx_missing = 0;
+    {
+        const fs::path tmp = fs::temp_directory_path() / "mua3_known_harvest";
+        fs::remove_all(tmp, ec);
+        HarvestPrograms(game / "romfs" / "SHADER", tmp);
+        for (const auto& e : fs::directory_iterator(dump, ec)) {
+            const std::string name = e.path().filename().string();
+            if (name.size() != 23 || !(name.ends_with(".vs.bin") || name.ends_with(".ps.bin")))
+                continue;
+            gfx_total++;
+            if (fs::exists(tmp / name)) {
+                gfx_harvested++;
+                continue;
+            }
+            const auto code = common::ReadFile(e.path());
+            KnownProgram k{};
+            k.hash = std::strtoull(name.substr(0, 16).c_str(), nullptr, 16);
+            k.stage = name[17] == 'v' ? 0 : 1;
+            k.size = u32(code.size());
+            if (code.size() < 0x58 || !locate(code.data(), code.size(), k.file, k.offset)) {
+                gfx_missing++;
+                fmt::print("{}: not in the game data\n", name);
+                continue;
+            }
+            cs.push_back(k);
+            gfx_added++;
+        }
+        fs::remove_all(tmp, ec);
+    }
+    std::sort(cs.begin(), cs.end(), [](auto& a, auto& b) { return a.hash < b.hash; });
+    std::vector<std::string> variants;
+    {
+        std::ifstream in(dump / "variants.txt");
+        std::set<std::string> seen;
+        for (std::string line; std::getline(in, line);) {
+            unsigned long long base;
+            u32 v[6];
+            if (std::sscanf(line.c_str(), "%llx %x %x %x %x %x %x", &base, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) ==
+                7) {
+                const std::string s = fmt::format("    {{0x{:016x}ull, {{{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}}}}},\n", base,
+                                                  v[0], v[1], v[2], v[3], v[4], v[5]);
+                if (seen.insert(s).second)
+                    variants.push_back(s);
+            }
+        }
+    }
+    std::string o = "// Generated by shadertool --known; do not edit. Hashes, offsets and launch parameters only.\n"
+                    "constexpr const char* kFiles[] = {\n";
+    for (auto& n : names)
+        o += fmt::format("    \"{}\",\n", n);
+    o += "};\nconstexpr KnownProgram kPrograms[] = {\n";
+    for (auto& k : cs)
+        o += fmt::format("    {{0x{:016x}ull, {}, {}, {:#x}, {:#x}, {{{}, {}, {}}}, {}, {:#x}, {:#x}, 0x{:016x}ull}},\n",
+                         k.hash, k.stage, k.file, k.offset, k.size, k.block[0], k.block[1], k.block[2], k.shared_bytes,
+                         k.cb_offset, k.cb_size, k.cb_hash);
+    if (cs.empty())
+        o += "    {},\n";
+    o += "};\nconstexpr KnownVariant kVariants[] = {\n";
+    for (auto& v : variants)
+        o += v;
+    if (variants.empty())
+        o += "    {},\n";
+    o += "};\n";
+    common::WriteFile(out_path, std::span(reinterpret_cast<const u8*>(o.data()), o.size()));
+    fmt::print("vertex/pixel programs seen: {}, {} found by the harvest, {} more located, {} not in the game data\n",
+               gfx_total, gfx_harvested, gfx_added, gfx_missing);
+    fmt::print("compute programs seen: {}, {} located with their launch shape, {} not in the game data, {} without a "
+               "known shape; {} variants\n",
+               total, cs.size() - gfx_added, not_found, no_shape, variants.size());
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         fmt::print("usage: shadertool <file.bin|dir> [--print|--disasm]\n");
@@ -52,6 +229,10 @@ int main(int argc, char** argv) {
         fmt::print("{} new programs\n", HarvestPrograms(fs::u8path(argv[2]), fs::u8path(argv[3])));
         return 0;
     }
+    // --known <shader_dump dir> <game dir> <out.inc>: what a played shader_dump knows that the game data does not
+    // (compute program locations and launch shapes, integer variants), as known_programs.inc
+    if (std::string(argv[1]) == "--known" && argc >= 5)
+        return WriteKnown(fs::u8path(argv[2]), fs::u8path(argv[3]), fs::u8path(argv[4]));
     // Replay a captured dispatch (MUA3_CAPTURE): --replay <capture.bin> [override.hlsl] runs the kernel built by FXC and
     // by the direct backend on the captured inputs and compares every global memory window.
     if (std::string(argv[1]) == "--replay" && argc >= 3) {

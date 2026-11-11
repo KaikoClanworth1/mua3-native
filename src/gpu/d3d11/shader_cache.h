@@ -60,7 +60,9 @@ struct HostShader {
 // Translates and compiles shaders on background threads so the game never stalls on FXC.
 class ShaderCache {
 public:
-    explicit ShaderCache(ID3D11Device* dev);
+    // build_workers > 0 (the setup's shader step, nothing else running): that many in-process and that many
+    // out-of-process compile workers instead of the in-game share of the CPU.
+    explicit ShaderCache(ID3D11Device* dev, unsigned build_workers = 0);
     ~ShaderCache();
     // `code` = guest program starting at its SPH, `size` bytes available.
     HostShader* Get(shader::Stage stage, const u8* code, size_t size, const shader::TranslateOptions* opt = nullptr);
@@ -78,6 +80,7 @@ public:
     // GPU thread starts; Tick() (GPU thread, once per frame) creates the variants and reports completion.
     void Prewarm();
     void Tick();
+    bool PrewarmDone() const { return prewarm_reported_; } // Tick() reported the prewarm complete
     void RequestRescan() { rescan_ = true; } // any thread: Tick() re-reads the manifest
     std::atomic<bool> rescan_{false};
     size_t Count() const { return shaders_.size(); }
@@ -173,5 +176,11 @@ private:
 // Compiles the HLSL file `in_path` for `target` (vs_5_0/ps_5_0) into DXBC at `out_path` (process entry point
 // for `mua3 --compile-shader`). Returns false on compile errors (written to `out_path`.err).
 bool CompileShaderFile(const char* in_path, const char* out_path, const char* target);
+
+// `mua3 --build-shaders <game dir>` (the launcher's last build step): translates and compiles every shader the game
+// can use before it is first played, into shader_cache/ (current directory). The vertex and pixel programs come
+// from the game's romfs/SHADER files, compute programs from the locations in known_programs (main module and
+// romfs), plus the integer variants known to be drawn. Returns 0 when everything that could be built is built.
+int BuildShadersAhead(const fs::path& game_dir);
 
 } // namespace gpu

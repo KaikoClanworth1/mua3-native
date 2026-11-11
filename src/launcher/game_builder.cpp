@@ -507,6 +507,14 @@ bool BuildGame(const Paths& p, int jobs, Progress& prog) {
     fs::rename(p.work_dir / "mua3.exe", p.out_exe, ec);
     if (ec)
         return fail("Could not write " + p.out_exe.string() + " (is the game running?)");
+    // 6. the game's shaders, translated and compiled now so none is built while playing (shader_cache/, made from
+    // the player's own install like the game itself). Not fatal: the game builds whatever is missing as it runs.
+    stage("Preparing the game's shaders (up to half an hour on a hard disk)");
+    if (const int rc = Run(W(Q(p.out_exe) + " --build-shaders " + Q(fs::absolute(p.game_dir))), nullptr, log,
+                           BELOW_NORMAL_PRIORITY_CLASS, &prog.cancel);
+        rc != 0)
+        note(prog.cancel ? "Shader preparation cancelled: the game prepares them as it runs."
+                         : fmt::format("Shader preparation failed (code {}): the game prepares them as it runs.", rc));
     const double mins = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / 60.0;
     stage(fmt::format("Done: {} built in {:.0f} minutes", p.out_exe.filename().string(), mins));
     prog.ok = true;

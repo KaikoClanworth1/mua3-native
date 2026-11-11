@@ -556,6 +556,9 @@ int main(int argc, char** argv) {
     // Child-process mode used by the shader cache for compiles that may not finish (see ShaderCache).
     if (argc == 5 && std::string(argv[1]) == "--compile-shader")
         return gpu::CompileShaderFile(argv[2], argv[3], argv[4]) ? 0 : 1;
+    // The launcher's last build step: every shader translated and compiled before the first launch.
+    if (argc == 3 && std::string(argv[1]) == "--build-shaders")
+        return gpu::BuildShadersAhead(fs::u8path(argv[2]));
     core::Config cfg;
     cfg.Load("mua3.ini");
     int watch_seconds = 0;
