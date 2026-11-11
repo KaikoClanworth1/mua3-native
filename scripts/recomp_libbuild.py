@@ -64,6 +64,28 @@ HUGE_LIMIT = 60 * 60
 HUGE_MARK = '// mua3: optimise huge'
 
 
+def find_clang():
+    """clang-cl: MUA3_CLANG ('0' = MSVC only), else LLVM's, else Visual Studio's (component "C++ Clang Compiler for
+    Windows"). It builds the generated code about 10x faster than cl and the result runs faster (it folds SUBS + B.cond
+    into cmp + jcc, spills about half as much, and optimises functions of any size)."""
+    e = os.environ.get('MUA3_CLANG')
+    if e == '0':
+        return None
+    cands = [e] if e else []
+    cands.append(os.path.join(os.environ.get('ProgramFiles', r'C:\Program Files'), 'LLVM', 'bin', 'clang-cl.exe'))
+    cands.append(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(VC))), 'Tools', 'Llvm', 'x64', 'bin',
+                              'clang-cl.exe'))
+    return next((c for c in cands if c and os.path.exists(c)), None)
+
+
+CLANG = find_clang()
+# The same code as cl: MSVC ABI and headers, no FMA contraction (guest FMUL + FADD round twice), no type-based alias
+# analysis (guest memory is one byte array seen through many types), and the instruction sets recomp_rt.h already
+# needs (SSE4.1 / SSSE3 / FMA intrinsics).
+CLANG_FLAGS = ('/c /nologo /O2 /GS- /EHsc /MT /std:c++20 /bigobj /utf-8 /DNDEBUG -Wno-everything -msse4.2 -mfma -mpopcnt -mpclmul '
+               '-ffp-contract=off -fno-strict-aliasing')
+
+
 def is_big(name):
     return re.fullmatch(r'recomp_[0-9a-f]+_[0-9a-f]+\.(cpp|obj)', os.path.basename(name)) is not None
 
@@ -89,6 +111,8 @@ def free_ram():
 
 def need(n):
     """estimated compiler memory: big-function files only (about 5 GB per MB of C++ with the flag), else 0"""
+    if CLANG:
+        return 0  # clang-cl: under 1 GB per file
     return max(1 << 30, int(os.path.getsize(os.path.join(GEN, n)) * 5 * 1024)) if is_huge(n) else 0
 
 
@@ -154,7 +178,20 @@ def generate():
     subprocess.run(cmd, stdout=subprocess.DEVNULL, check=True)
 
 
-def cl(src, obj, huge=None):
+def cl(src, obj, huge=None, msvc=False):
+    if CLANG and not msvc:
+        tag = os.path.basename(obj).replace('.obj', '')
+        bat = os.path.join(S, f'cl_{tag}.bat')
+        out = os.path.join(S, f'cl_{tag}.log')
+        open(bat, 'w').write(f'@call "{VC}" >nul 2>&1\n"{CLANG}" {CLANG_FLAGS} /I "{INC}" /I "{GEN}" /Fo"{obj}" "{src}" '
+                             f'>"{out}" 2>&1\nexit /b %ERRORLEVEL%\n')
+        rc = subprocess.run(['cmd', '/c', bat]).returncode
+        os.remove(bat)
+        if rc == 0:
+            os.remove(out)
+            return 0
+        log(f'{tag}: clang-cl failed (code {rc}, {out}), compiling it with cl')
+        return cl(src, obj, huge, msvc=True)
     if huge is None:
         huge = is_huge(src)
     tag = os.path.basename(obj).replace('.obj', '')

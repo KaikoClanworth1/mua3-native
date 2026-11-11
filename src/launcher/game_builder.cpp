@@ -30,6 +30,31 @@ constexpr Module kModules[] = {
 constexpr u8 kMainBuildId[8] = {0xe8, 0x53, 0xc4, 0x4f, 0xdf, 0x18, 0xb8, 0x8f};
 
 const char* const kCompileFlags = "/c /nologo /O2 /Ob3 /GS- /EHsc /MT /std:c++20 /permissive- /bigobj /utf-8 /DNDEBUG";
+// clang-cl, when installed (LLVM, or Visual Studio's "C++ Clang Compiler for Windows"), compiles the game's code about
+// 10x faster than cl and the result runs faster (flags compares fold into cmp + jcc, half the register spills, big
+// functions optimised too). Same MSVC ABI and headers; no FMA contraction (the guest rounds FMUL and FADD apart), no
+// type-based alias analysis (guest memory is one byte array seen through many types), and the instruction sets
+// recomp_rt.h needs anyway (SSE4.1 / SSSE3 / FMA intrinsics). Any part it fails on is compiled with cl.
+const char* const kClangFlags = "/c /nologo /O2 /GS- /EHsc /MT /std:c++20 /bigobj /utf-8 /DNDEBUG -Wno-everything "
+                                "-msse4.2 -mfma -mpopcnt -mpclmul -ffp-contract=off -fno-strict-aliasing";
+
+// MUA3_CLANG (a path, or "0" for cl only), else LLVM's clang-cl, else Visual Studio's. Empty: cl only.
+static fs::path FindClang(const fs::path& vcvars) {
+    std::vector<fs::path> c;
+    if (const wchar_t* e = _wgetenv(L"MUA3_CLANG")) {
+        if (std::wstring(e) == L"0")
+            return {};
+        c.push_back(e);
+    }
+    c.push_back(fs::path(_wgetenv(L"ProgramFiles") ? _wgetenv(L"ProgramFiles") : L"C:\\Program Files") / "LLVM" / "bin" /
+                "clang-cl.exe");
+    c.push_back(vcvars.parent_path().parent_path().parent_path() / "Tools" / "Llvm" / "x64" / "bin" / "clang-cl.exe");
+    std::error_code ec;
+    for (auto& p : c)
+        if (fs::exists(p, ec))
+            return p;
+    return {};
+}
 const char* const kLibs[] = {
     // the port (sdk/lib)
     "nxcore.lib", "platform.lib", "nxloader.lib", "fmt.lib",
@@ -262,6 +287,8 @@ bool BuildGame(const Paths& p, int jobs, Progress& prog) {
     if (!fs::exists(cl) || !fs::exists(link))
         return fail("cl.exe / link.exe not found in " + bin.string());
     note(fmt::format("MSVC {} at {}", tc.version, bin.string()));
+    const fs::path clang = FindClang(tc.vcvars);
+    note(clang.empty() ? std::string("clang-cl not found: compiling with cl (slower)") : "clang-cl at " + clang.string());
     for (const char* need : {"include/core/cpu/recomp/recomp_rt.h", "lib/nxcore.lib", "obj/main.obj", "tools/recomp.exe"})
         if (!fs::exists(p.sdk_dir / need))
             return fail("The release is incomplete: " + (p.sdk_dir / need).string() + " is missing.");
@@ -348,7 +375,7 @@ bool BuildGame(const Paths& p, int jobs, Progress& prog) {
     for (size_t i = 0; i < shards.size(); i++) {
         order[i] = i;
         size[i] = fs::file_size(shards[i], ec);
-        if (is_huge(shards[i]))
+        if (clang.empty() && is_huge(shards[i])) // (clang-cl: under 1 GB for any part)
             need[i] = std::max<u64>(1ull << 30, u64(double(size[i]) * 5.0 * 1024.0));
     }
     std::stable_sort(order.begin(), order.end(),
@@ -416,8 +443,16 @@ bool BuildGame(const Paths& p, int jobs, Progress& prog) {
             fs::remove(shard_log, ec);
             const std::string base = Q(cl) + " " + kCompileFlags + " /I " + Q(p.sdk_dir / "include") + " /I " + Q(gen) +
                                      " /Fo" + Q(o) + " " + Q(src);
-            int rc;
-            if (need[i]) {
+            int rc = -1;
+            if (!clang.empty()) {
+                rc = Run(W(Q(clang) + " " + kClangFlags + " /I " + Q(p.sdk_dir / "include") + " /I " + Q(gen) + " /Fo" +
+                           Q(o) + " " + Q(src)),
+                         &env, shard_log, BELOW_NORMAL_PRIORITY_CLASS, &prog.cancel);
+                if (rc != 0 && !prog.cancel)
+                    note(fmt::format("{}: clang-cl failed (code {}), compiling it with cl", src.filename().string(), rc));
+            }
+            if (rc == 0 || prog.cancel) {
+            } else if (need[i]) {
                 rc = Run(W(base + " /d2OptimizeHugeFunctions"), &env, shard_log, BELOW_NORMAL_PRIORITY_CLASS, &prog.cancel);
                 if (rc != 0 && !prog.cancel) { // out of memory (C1002 / C1060) or a crash: as before, unoptimised
                     std::ifstream in(shard_log);
