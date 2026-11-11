@@ -168,8 +168,10 @@ void BuildPage() {
         {kStrOn, kStrOff});
     add(Text(u"SHOW FPS"), Text(u"Shows the frame rate in the corner of the screen."), kTwoChoices,
         {kStrOn, kStrOff});
-    add(Text(u"ANTI-ALIASING"), Text(u"Smooths jagged edges. FXAA is fast and soft."), kArrows,
-        {kStrOff, Text(u"FXAA")});
+    add(Text(u"ANTI-ALIASING"),
+        Text(u"Smooths jagged edges. FXAA costs nothing; SSAA renders more pixels (high VRAM).\r\n"
+             u"SSAA multiplies the render scale (4X in total at most)."),
+        kArrows, {kStrOff, Text(u"FXAA"), Text(u"SSAA 2X"), Text(u"SSAA 3X"), Text(u"SSAA 4X")});
     g_custom_res_text = g_strings[g_custom_res - kOurs];
     g_custom_limit_text = g_strings[g_custom_limit - kOurs];
     // the row table and the value bytes
@@ -209,7 +211,7 @@ void ToPage(const core::Config& c) {
     v[kRowLimit] = u8(IndexOf(kLimits, c.fps_limit, int(std::size(kLimits))));
     v[kRowVsync] = c.vsync ? 0 : 1;
     v[kRowShowFps] = c.show_fps ? 0 : 1;
-    v[kRowAa] = u8(std::clamp(c.anti_aliasing, 0, 1));
+    v[kRowAa] = u8(std::clamp(c.anti_aliasing, 0, 4));
     g_mem->WriteBlock(g_values, v, sizeof(v));
 }
 
@@ -224,7 +226,7 @@ void FromPage(core::Config& c, bool running) {
         c.fps_limit = kLimits[v[kRowLimit]];
     c.vsync = v[kRowVsync] == 0;
     c.show_fps = v[kRowShowFps] == 0;
-    c.anti_aliasing = std::min<int>(v[kRowAa], 1);
+    c.anti_aliasing = std::min<int>(v[kRowAa], 4);
     if (running)
         return;
     c.resolution_scale = std::min<int>(v[kRowScale], 4);
