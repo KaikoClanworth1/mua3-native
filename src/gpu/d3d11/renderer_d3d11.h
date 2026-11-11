@@ -9,6 +9,7 @@
 #include <d3d11.h>
 #include <wrl/client.h>
 
+#include "gpu/d3d11/post_aa.h"
 #include "gpu/renderer.h"
 
 namespace gpu {
@@ -340,6 +341,9 @@ private:
     std::vector<RecentTexture> recent_;
     ComPtr<ID3D11Texture2D> frame_tex_;
     ComPtr<ID3D11ShaderResourceView> frame_srv_;
+    ComPtr<ID3D11RenderTargetView> frame_rtv_;
+    DXGI_FORMAT frame_dxgi_ = DXGI_FORMAT_UNKNOWN;
+    PostAA post_aa_;
     u32 frame_w_ = 0, frame_h_ = 0;
 
     friend class DrawContext;

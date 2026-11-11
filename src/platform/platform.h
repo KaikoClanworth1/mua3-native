@@ -48,6 +48,8 @@ public:
 
 private:
     void CreateBackbuffer();
+    static bool TearingSupported();
+    u32 SwapChainFlags() const;
     void SaveBackbuffer(const fs::path& path);
     void DrawFrameTexture();
 
@@ -59,7 +61,9 @@ private:
     struct ID3D11Texture2D* frame_tex_ = nullptr;
     struct ID3D11ShaderResourceView* frame_srv_ = nullptr;
     u32 frame_w_ = 0, frame_h_ = 0;
-    bool vsync_ = true, focused_ = true, fullscreen_ = false;
+    const core::Config* live_cfg_ = nullptr; // the caller's config (outlives the display): vsync read per present
+    void* frame_wait_ = nullptr;             // the swap chain's frame latency waitable object
+    bool tearing_ = false, focused_ = true, fullscreen_ = false;
     std::chrono::steady_clock::time_point next_frame_{};
     std::mutex frame_mutex_;
     std::vector<u8> pending_frame_;

@@ -3,7 +3,7 @@
 #include <ctime>
 #include <cstdlib>
 #include <d3d11.h>
-#include <dxgi1_2.h>
+#include <dxgi1_5.h>
 
 #include <wincodec.h>
 
@@ -84,7 +84,10 @@ bool Display::Init(const core::Config& cfg, const char* title) {
     sd.SampleDesc.Count = 1;
     sd.Windowed = TRUE;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+    // Waitable: the UI thread waits for a free frame slot before it draws, outside Present (which holds the D3D
+    // device lock the GPU thread needs). Tearing (when the system allows it): vsync off shows frames at once.
+    tearing_ = TearingSupported();
+    sd.Flags = SwapChainFlags();
     const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
     UINT dflags = 0;
     if (std::getenv("MUA3_D3D_DEBUG"))
@@ -112,7 +115,16 @@ bool Display::Init(const core::Config& cfg, const char* title) {
         SafeRelease(dxgi);
     }
     CreateBackbuffer();
-    vsync_ = cfg.vsync;
+    live_cfg_ = &cfg;
+    {
+        IDXGISwapChain2* sc2 = nullptr;
+        if (SUCCEEDED(swapchain_->QueryInterface(__uuidof(IDXGISwapChain2), (void**)&sc2))) {
+            sc2->SetMaximumFrameLatency(1);
+            frame_wait_ = sc2->GetFrameLatencyWaitableObject();
+            sc2->Release();
+        }
+        LOG_INFO("Display", "vsync {}, tearing {}", cfg.vsync ? "on" : "off", tearing_ ? "supported" : "not supported");
+    }
     {
         ID3D10Multithread* mt = nullptr;
         if (SUCCEEDED(ctx_->QueryInterface(__uuidof(ID3D10Multithread), (void**)&mt))) {
@@ -132,6 +144,22 @@ bool Display::Init(const core::Config& cfg, const char* title) {
     return true;
 }
 
+bool Display::TearingSupported() {
+    IDXGIFactory5* f = nullptr;
+    BOOL allow = FALSE;
+    if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory5), (void**)&f))) {
+        if (FAILED(f->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow, sizeof(allow))))
+            allow = FALSE;
+        f->Release();
+    }
+    return allow != FALSE;
+}
+
+u32 Display::SwapChainFlags() const {
+    return DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
+           (tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
+}
+
 void Display::CreateBackbuffer() {
     ID3D11Texture2D* bb = nullptr;
     swapchain_->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb);
@@ -148,6 +176,9 @@ void Display::Shutdown() {
     SafeRelease(frame_srv_);
     SafeRelease(frame_tex_);
     SafeRelease(rtv_);
+    if (frame_wait_)
+        CloseHandle(frame_wait_);
+    frame_wait_ = nullptr;
     SafeRelease(swapchain_);
     SafeRelease(ctx_);
     SafeRelease(device_);
@@ -181,7 +212,7 @@ bool Display::PumpEvents() {
         case SDL_EVENT_WINDOW_FOCUS_LOST: focused_ = false; break;
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
             SafeRelease(rtv_);
-            swapchain_->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH);
+            swapchain_->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, SwapChainFlags()); // (the same flags)
             CreateBackbuffer();
             break;
         case SDL_EVENT_KEY_DOWN:
@@ -215,6 +246,10 @@ void Display::UploadFrame(const u8* rgba, u32 width, u32 height, u32 pitch) {
 }
 
 void Display::BeginFrame() {
+    // Wait for the swap chain to take another frame (with vsync: the next vblank) before drawing, so Present
+    // itself never blocks; the timeout keeps the UI going while the window is not presented (minimised).
+    if (frame_wait_)
+        WaitForSingleObjectEx(frame_wait_, 100, TRUE);
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
@@ -323,9 +358,11 @@ void Display::EndFrame() {
     // Don't hold the context lock while Present waits for vblank: the GPU thread needs the context.
     if (lk.owns_lock())
         lk.unlock();
-    // Never block inside Present: it holds the D3D device lock the GPU thread needs. With flip-discard and
-    // sync interval 0 DWM still composes without tearing; the UI loop paces itself (PaceFrame).
-    swapchain_->Present(0, 0);
+    // Never block inside Present: it holds the D3D device lock the GPU thread needs (BeginFrame waited for the
+    // frame slot). VSync (mua3.ini / the in-game Graphics menu, read live): the next vblank; off: at once, with
+    // tearing where the system allows it (else DWM composes at sync interval 0 without tearing).
+    const bool vsync = live_cfg_ ? live_cfg_->vsync : true;
+    swapchain_->Present(vsync ? 1 : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
 }
 
 void Display::PaceFrame() {

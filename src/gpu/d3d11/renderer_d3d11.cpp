@@ -14,6 +14,7 @@
 #include <d3dcompiler.h>
 
 #include "core/memory.h"
+#include "core/system.h"
 #include "gpu/d3d11/shader_cache.h"
 #include "gpu/d3d11/texture_cache.h"
 #include "gpu/formats.h"
@@ -3020,12 +3021,18 @@ void D3D11Renderer::Present(const PresentInfo& p) {
     if (s) {
         D3D11_TEXTURE2D_DESC desc;
         s->tex->GetDesc(&desc);
-        if (!frame_tex_ || frame_w_ != s->width * s->scale || frame_h_ != s->height * s->scale) {
+        if (!frame_tex_ || frame_w_ != s->width * s->scale || frame_h_ != s->height * s->scale || frame_dxgi_ != s->dxgi) {
             frame_tex_.Reset();
             frame_srv_.Reset();
+            frame_rtv_.Reset();
             D3D11_TEXTURE2D_DESC td = desc;
-            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET; // (target of the AA pass)
             dev_->CreateTexture2D(&td, nullptr, &frame_tex_);
+            D3D11_RENDER_TARGET_VIEW_DESC rv{};
+            rv.Format = s->dxgi;
+            rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+            dev_->CreateRenderTargetView(frame_tex_.Get(), &rv, &frame_rtv_);
+            frame_dxgi_ = s->dxgi;
             D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
             sv.Format = s->dxgi == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : s->dxgi;
             sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
@@ -3034,7 +3041,13 @@ void D3D11Renderer::Present(const PresentInfo& p) {
             frame_w_ = s->width * s->scale;
             frame_h_ = s->height * s->scale;
         }
-        ctx_->CopyResource(frame_tex_.Get(), s->tex.Get());
+        // Anti-aliasing (mua3.ini / the in-game Graphics menu, read live): FXAA into the frame shown; off, a copy.
+        const bool srgb = s->dxgi == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || s->dxgi == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        if (core::Sys().Cfg().anti_aliasing == 1 &&
+            post_aa_.Fxaa(dev_, ctx_, s->srv.Get(), frame_rtv_.Get(), frame_w_, frame_h_, srgb))
+            ContextEpoch()++; // (the draw state caches forget what the pass bound)
+        else
+            ctx_->CopyResource(frame_tex_.Get(), s->tex.Get());
         SetEvent(static_cast<HANDLE>(new_frame_event_));
     }
     ctx_->Flush();
