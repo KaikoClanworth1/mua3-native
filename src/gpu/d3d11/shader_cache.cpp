@@ -5,6 +5,8 @@
 #include <fstream>
 #include "gpu/d3d11/shader_cache.h"
 #include "gpu/dxbc/dxbc.h"
+#include "gpu/gpu.h"
+#include "gpu/shader/anticipate.h"
 #include "gpu/shader/known_programs.h"
 #include "gpu/shader/maxwell_isa.h"
 #include "loader/formats.h"
@@ -622,6 +624,50 @@ void ShaderCache::Realize(HostShader* s) {
     s->created.store(true, std::memory_order_release);
 }
 
+// Programs the game set up since the last frame (most at boot): each is looked up, so a program that is in neither
+// the pack nor the game's files (some are built at runtime) compiles now instead of at its first draw.
+void ShaderCache::Anticipate() {
+    constexpr size_t kPerFrame = 64; // programs looked up per frame (each a GPU memory read of its code)
+    for (const u64 va : shader::TakeAnticipated())
+        anticipate_pending_.push_back(va), anticipate_taken_++;
+    if (frame % 600 == 0 && anticipate_taken_ != anticipate_logged_) {
+        anticipate_logged_ = anticipate_taken_;
+        LOG_INFO("Shader", "programs set up by the game: {}, looked up {}, {} of them new (compiled ahead), {} to go",
+                 anticipate_taken_, anticipate_lookups_, anticipate_new_, anticipate_pending_.size());
+    }
+    static thread_local std::vector<u8> buf;
+    for (size_t n = 0; n < kPerFrame && !anticipate_pending_.empty(); n++) {
+        const u64 va = anticipate_pending_.front();
+        anticipate_pending_.pop_front();
+        // The header and first instructions first: the same program set up again (same code at the same address)
+        // is skipped without reading all of it.
+        u8 head[0x60];
+        if (G().ReadGpuPartial(va, head, sizeof(head)) < sizeof(head))
+            continue;
+        u32 w0;
+        std::memcpy(&w0, head, 4);
+        // graphics programs only (SPH as the harvest checks it); compute programs have no header
+        const u32 type = w0 & 0x1F, version = (w0 >> 5) & 0x1F, stype = (w0 >> 10) & 0xF, sass = (w0 >> 17) & 0xF;
+        if (!((type == 1 && stype == 1) || (type == 2 && stype == 5)) || version != 3 || sass != 3)
+            continue;
+        const u64 head_hash = Hash64(head, sizeof(head));
+        if (auto [it, fresh] = anticipate_seen_.try_emplace(va, head_hash); !fresh) {
+            if (it->second == head_hash)
+                continue;
+            it->second = head_hash;
+        }
+        buf.assign(0x10000, 0);
+        const size_t got = G().ReadGpuPartial(va, buf.data(), buf.size());
+        if (got < 0x60)
+            continue;
+        const u32 before = new_programs;
+        Get(type == 1 ? shader::Stage::Vertex : shader::Stage::Fragment, buf.data(), got);
+        anticipate_lookups_++;
+        anticipate_new_ += new_programs != before;
+        new_programs = before; // (that count is programs first seen by a draw)
+    }
+}
+
 HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size, const shader::TranslateOptions* opt) {
     size = shader::ProgramSize(code, size);
     u64 hash = Hash64(code, size) ^ (u64(stage) << 60);
@@ -945,6 +991,7 @@ void ShaderCache::Tick() {
     if (rescan_.exchange(false)) // new programs in the manifest (first-launch harvest)
         Prewarm();
     const u32 now = ++frame;
+    Anticipate();
     if (now % 600 == 0) { // every ~5 s: release driver objects no draw has bound for a minute
         u32 n = 0;
         for (auto& [hash, sp] : shaders_) {

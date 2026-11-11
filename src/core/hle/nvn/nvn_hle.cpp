@@ -25,6 +25,7 @@
 #include "common/common.h"
 #include "common/profiler.h"
 #include "gpu/gpu.h"
+#include "gpu/shader/anticipate.h"
 
 namespace hle::nvn {
 namespace {
@@ -738,11 +739,13 @@ void Generic(State& s) {
             EnsureTexture(s, s.x[4]);
         }
     }
-    if (g.shaders) // nvnProgramSetShaders(program, count, const NVNshaderData*): {code address, control pointer}
+    if (g.shaders) { // nvnProgramSetShaders(program, count, const NVNshaderData*): {code address, control pointer}
         for (u64 i = 0; i < u32(s.x[1]) && i < 8; i++) {
             c.extra.push_back(recomp::Rd<u64>(s, s.x[2] + i * 16));
             c.extra.push_back(recomp::Rd<u64>(s, s.x[2] + i * 16 + 8));
         }
+        gpu::shader::AnticipatePrograms(c.extra); // the shader cache compiles new ones before their first draw
+    }
     const bool replay = g_sink.load() != nullptr;
     if (g.program && replay && s.x[1]) {
         auto& rec = Rec();

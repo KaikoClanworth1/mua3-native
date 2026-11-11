@@ -171,6 +171,14 @@ private:
     bool prewarm_reported_ = true;
     std::atomic<s64> prewarm_end_ns{0}; // when the last queued shader finished (the report waits for a Present)
     bool replaying_ = false; // Tick() is recreating manifest variants
+
+    // Programs the game set up (shader/anticipate.h): looked up here, so one never seen before compiles before its
+    // first draw. (The game sets up all of its ~4700 programs at boot, so this says nothing about which a level draws:
+    // driver objects stay created at first use.)
+    void Anticipate();                             // GPU thread (Tick)
+    std::deque<u64> anticipate_pending_;           // program addresses not looked up yet
+    std::unordered_map<u64, u64> anticipate_seen_; // address -> hash of the header last looked up there
+    u64 anticipate_taken_ = 0, anticipate_lookups_ = 0, anticipate_new_ = 0, anticipate_logged_ = 0;
 };
 
 // Compiles the HLSL file `in_path` for `target` (vs_5_0/ps_5_0) into DXBC at `out_path` (process entry point
