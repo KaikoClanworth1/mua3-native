@@ -1,5 +1,7 @@
 #include "gpu/d3d11/texture_cache.h"
 
+#include <chrono>
+#include <windows.h>
 #include <map>
 #include <set>
 
@@ -13,6 +15,11 @@ namespace gpu {
 
 TextureCache::TextureCache(ID3D11Device* dev, ID3D11DeviceContext* ctx, D3D11Renderer& r)
     : dev_(dev), ctx_(ctx), r_(r) {
+    const char* b = std::getenv("MUA3_TEX_BUDGET_MS");
+    budget_ns_ = u64(b ? std::atof(b) : 8.0) * 1'000'000;
+    if (budget_ns_)
+        for (int i = 0; i < 2; i++)
+            workers_.emplace_back([this] { AsyncWorker(); });
     // 1x1 opaque grey used when a texture can't be decoded.
     D3D11_TEXTURE2D_DESC td{1, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_IMMUTABLE,
                             D3D11_BIND_SHADER_RESOURCE, 0, 0};
@@ -39,9 +46,25 @@ void TextureCache::Erase(common::U64Map<std::unique_ptr<CachedTexture>>::iterato
     it = textures_.erase(it);
 }
 
+TextureCache::~TextureCache() {
+    {
+        std::lock_guard lk(aq_mutex_);
+        stop_ = true;
+    }
+    aq_cv_.notify_all();
+    for (auto& t : workers_)
+        t.join();
+}
+
 void TextureCache::Invalidate(u64 gpu_va, u64 size) {
     if (!size)
         return;
+    {
+        std::lock_guard lk(aq_mutex_);
+        inval_gen_++;
+        if (!pending_.empty())
+            inval_log_.push_back({inval_gen_, {gpu_va, size}});
+    }
     // Most writes (constant uploads, index lists) touch no cached texture: check the page index first.
     bool hit = false;
     for (u64 p = gpu_va >> 16, e = (gpu_va + size - 1) >> 16; p <= e && !hit; p++)
@@ -55,6 +78,23 @@ void TextureCache::Invalidate(u64 gpu_va, u64 size) {
         else
             ++it;
     }
+}
+
+static u64 NowNs() { return u64(std::chrono::steady_clock::now().time_since_epoch().count()); }
+
+void TextureCache::NextFrame() {
+    const u64 total = up_ns_[0] + up_ns_[1] + up_ns_[2] + up_ns_[3];
+    static u64 logged_queued = 0;
+    if (total > 20'000'000 || (async_queued_ != logged_queued && frame_ % 300 == 0)) {
+        logged_queued = async_queued_;
+        LOG_INFO("Texture", "{} uploads ({:.1f} MB) took {:.1f} ms (tracking + hashes + read + decode {:.1f}, create {:.1f}); "
+                            "asynchronous so far: {} queued, {} installed, {} dropped",
+                 up_count_, up_bytes_ / 1048576.0, total / 1e6, up_ns_[0] / 1e6, up_ns_[1] / 1e6, async_queued_,
+                 async_installed_, async_dropped_);
+    }
+    std::fill(std::begin(up_ns_), std::end(up_ns_), 0);
+    up_count_ = up_bytes_ = 0;
+    frame_++;
 }
 
 ID3D11ShaderResourceView* TextureCache::Fallback(const shader::TextureUse& use) {
@@ -144,6 +184,8 @@ static bool DirtyPagesChanged(CachedTexture& t) {
 }
 
 ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::TextureUse& use, u32& swizzle) {
+    if (has_done_.load(std::memory_order_acquire))
+        InstallAsync();
     // Pack x/y/z/w component sources (3 bits each) for the shader's ApplySwizzle.
     swizzle = tic.Swizzle();
     const u64 addr = tic.Address();
@@ -244,21 +286,108 @@ ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::T
         auto* srv = Upload(tic, use, key, nullptr, true);
         return srv ? srv : Fallback(use);
     }
+    if (budget_ns_ && use.dim == shader::TexDim::Tex2D &&
+        up_ns_[0] + up_ns_[1] + up_ns_[2] + up_ns_[3] >= budget_ns_) {
+        std::lock_guard lk(aq_mutex_);
+        if (pending_.insert(key).second) {
+            aq_.push_back({tic, use, key, inval_gen_});
+            async_queued_++;
+            aq_cv_.notify_one();
+        }
+        return Placeholder(use);
+    }
+    if (!pending_.empty()) { // (a job for it may be running: this frame has budget left, so do it now)
+        std::lock_guard lk(aq_mutex_);
+        if (pending_.count(key))
+            return Placeholder(use);
+    }
     auto* srv = Upload(tic, use, key);
     return srv ? srv : Fallback(use);
 }
 
+void TextureCache::AsyncWorker() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    for (;;) {
+        AsyncJob job;
+        {
+            std::unique_lock lk(aq_mutex_);
+            aq_cv_.wait(lk, [&] { return stop_ || !aq_.empty(); });
+            if (stop_)
+                return;
+            job = aq_.front();
+            aq_.pop_front();
+        }
+        std::unique_ptr<CachedTexture> tex;
+        Upload(job.tic, job.use, job.key, nullptr, false, &tex);
+        std::lock_guard lk(aq_mutex_);
+        done_.push_back({job.key, job.gen, std::move(tex)});
+        has_done_.store(true, std::memory_order_release);
+    }
+}
+
+// Finished asynchronous uploads join the cache, unless guest memory under them was invalidated (DMA) after they
+// were queued: then the next use uploads again.
+void TextureCache::InstallAsync() {
+    std::vector<AsyncDone> done;
+    std::vector<std::pair<u64, std::pair<u64, u64>>> inval;
+    {
+        std::lock_guard lk(aq_mutex_);
+        done.swap(done_);
+        inval = inval_log_;
+        has_done_.store(false, std::memory_order_relaxed);
+        for (auto& d : done)
+            pending_.erase(d.key);
+    }
+    for (auto& d : done) {
+        bool stale = !d.tex || textures_.find(d.key) != textures_.end();
+        for (auto& [gen, r] : inval)
+            if (!stale && d.tex && gen > d.gen && r.first < d.tex->gpu_va + d.tex->size && d.tex->gpu_va < r.first + r.second)
+                stale = true;
+        if (stale) {
+            async_dropped_++;
+            continue;
+        }
+        d.tex->last_use = frame_;
+        TrackPages(*d.tex, +1);
+        textures_[d.key] = std::move(d.tex);
+        async_installed_++;
+    }
+    std::lock_guard lk(aq_mutex_);
+    if (pending_.empty())
+        inval_log_.clear();
+}
+
+// Drawn until an asynchronous upload lands: transparent black (UI pieces stay hidden instead of grey boxes).
+ID3D11ShaderResourceView* TextureCache::Placeholder(const shader::TextureUse& use) {
+    if (use.dim != shader::TexDim::Tex2D || use.array)
+        return Fallback(use);
+    if (!placeholder_) {
+        const u32 px = 0;
+        const D3D11_SUBRESOURCE_DATA sd{&px, 4, 4};
+        D3D11_TEXTURE2D_DESC td{1, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+        ComPtr<ID3D11Texture2D> t;
+        dev_->CreateTexture2D(&td, &sd, &t);
+        dev_->CreateShaderResourceView(t.Get(), nullptr, &placeholder_);
+    }
+    return placeholder_.Get();
+}
+
 ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader::TextureUse& use, u64 key, CachedTexture* reuse,
-                                               bool updatable) {
+                                               bool updatable, std::unique_ptr<CachedTexture>* out) {
     const TexFormatInfo fi = TicFormat(tic.Format(), tic.RType(), tic.Srgb());
     uploads++;
+    const bool async = out != nullptr;
+    u64 t0 = NowNs();
+    static std::mutex diag_mutex; // (workers upload too)
     {
+        std::lock_guard dl(diag_mutex);
         static std::map<u64, u32> seen;
         if (seen.size() < 4096 && ++seen[tic.Address()] == 20)
             LOG_INFO("Texture", "uploaded 20 times: {:#x} fmt {:#x} {}x{}x{} type {} dim {} (frame {})", tic.Address(), tic.Format(),
                      tic.Width(), tic.Height(), tic.Depth(), tic.Type(), int(use.dim), frame_);
     }
     if (fi.dxgi == DXGI_FORMAT_UNKNOWN) {
+        std::lock_guard dl(diag_mutex);
         static std::set<u32> warned;
         if (warned.insert(tic.Format()).second)
             LOG_WARN("Texture", "Unsupported texture format {:#x} (type {})", tic.Format(), tic.RType());
@@ -311,6 +440,23 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
     if (total == 0 || total > (512ull << 20)) {
         LOG_WARN("Texture", "Texture too large or empty ({} bytes)", total);
         return nullptr;
+    }
+    // A new texture: track CPU writes to its backing memory and hash its pages before reading it, so a write that
+    // lands while it is decoded (on a worker, possibly) still marks it dirty.
+    std::unique_ptr<CachedTexture> tex;
+    if (!reuse) {
+        tex = std::make_unique<CachedTexture>();
+        for (u64 off = 0; off < total;) {
+            u64 run = 0;
+            const u64 cpu = G().As().TranslateRun(tic.Address() + off, run);
+            if (!cpu || !run)
+                break;
+            const u64 n = std::min(run, total - off);
+            tex->cpu_ranges.emplace_back(cpu, n);
+            G().Mem().TrackWrites(cpu, n), tracked_bytes += n;
+            off += n;
+        }
+        HashPages(*tex);
     }
     // Read guest memory in place when it is contiguous (textures rewritten every frame make this a hot path).
     const u8* guest = G().GpuPtr(tic.Address(), size_t(total));
@@ -375,12 +521,17 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
         reuse->last_use = frame_;
         return reuse->srv.Get();
     }
+    u64 t1 = NowNs();
+    if (!async) {
+        up_ns_[0] += t1 - t0;
+        up_count_++;
+        up_bytes_ += total;
+    }
     const D3D11_USAGE usage = updatable ? D3D11_USAGE_DEFAULT : D3D11_USAGE_IMMUTABLE;
     // The init array points into the thread-local scratch buffers (`sub`), valid until the next upload.
     for (size_t i = 0; i < init.size(); i++)
         init[i].pSysMem = sub[i].data;
 
-    auto tex = std::make_unique<CachedTexture>();
     tex->key = key;
     tex->gpu_va = tic.Address();
     tex->size = total;
@@ -455,20 +606,14 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
     }
     if (FAILED(dev_->CreateShaderResourceView(tex->res.Get(), &sv, &tex->srv)))
         return nullptr;
-    // Track CPU writes to the backing memory.
-    for (u64 off = 0; off < total;) {
-        u64 run = 0;
-        const u64 cpu = G().As().TranslateRun(tic.Address() + off, run);
-        if (!cpu || !run)
-            break;
-        const u64 n = std::min(run, total - off);
-        tex->cpu_ranges.emplace_back(cpu, n);
-        G().Mem().TrackWrites(cpu, n), tracked_bytes += n;
-        off += n;
-    }
-    HashPages(*tex);
+    if (!async)
+        up_ns_[1] += NowNs() - t1;
     auto* srv = tex->srv.Get();
     tex->updatable = updatable;
+    if (async) {
+        *out = std::move(tex);
+        return srv;
+    }
     TrackPages(*tex, +1);
     textures_[key] = std::move(tex);
     return srv;

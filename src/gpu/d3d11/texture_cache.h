@@ -1,7 +1,13 @@
 #pragma once
 #include <array>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <d3d11.h>
 #include <wrl/client.h>
@@ -47,17 +53,46 @@ struct CachedTexture {
 class TextureCache {
 public:
     TextureCache(ID3D11Device* dev, ID3D11DeviceContext* ctx, D3D11Renderer& r);
+    ~TextureCache();
     // Returns an SRV for the TIC entry (or null). `swizzle_out` receives the packed component swizzle.
     ID3D11ShaderResourceView* Get(const TicEntry& tic, const shader::TextureUse& use, u32& swizzle_out);
     ID3D11SamplerState* GetSampler(const u32* tsc, bool compare);
     void Invalidate(u64 gpu_va, u64 size);
-    void NextFrame() { frame_++; }
+    void NextFrame();
     u64 reuploads = 0, uploads = 0, unchanged_rewrites = 0, tracked_bytes = 0;
 
 private:
     // `reuse`: decode into this existing (updatable) texture; `updatable`: create with DEFAULT usage.
+    // `out`: build the texture there instead of adding it to the cache (worker threads).
     ID3D11ShaderResourceView* Upload(const TicEntry& tic, const shader::TextureUse& use, u64 key, CachedTexture* reuse = nullptr,
-                                     bool updatable = false);
+                                     bool updatable = false, std::unique_ptr<CachedTexture>* out = nullptr);
+    // Asynchronous uploads (MUA3_TEX_BUDGET_MS per frame of synchronous upload time, default 8, 0 = all synchronous):
+    // a load that brings hundreds of textures at once spreads them over a few frames instead of one long one.
+    struct AsyncJob {
+        TicEntry tic;
+        shader::TextureUse use;
+        u64 key, gen;
+    };
+    struct AsyncDone {
+        u64 key, gen;
+        std::unique_ptr<CachedTexture> tex;
+    };
+    void AsyncWorker();
+    void InstallAsync();
+    ID3D11ShaderResourceView* Placeholder(const shader::TextureUse& use);
+    u64 budget_ns_ = 0;
+    std::mutex aq_mutex_;
+    std::condition_variable aq_cv_;
+    std::deque<AsyncJob> aq_;
+    std::vector<AsyncDone> done_;
+    std::atomic<bool> has_done_{false};
+    bool stop_ = false;
+    std::vector<std::thread> workers_;
+    std::unordered_set<u64> pending_;                    // keys queued or being built
+    u64 inval_gen_ = 0;                                  // Invalidate() calls so far
+    std::vector<std::pair<u64, std::pair<u64, u64>>> inval_log_; // (generation, (gpu va, size)) while jobs are pending
+    ComPtr<ID3D11ShaderResourceView> placeholder_;
+    u64 async_queued_ = 0, async_installed_ = 0, async_dropped_ = 0;
     ID3D11Device* dev_;
     ID3D11DeviceContext* ctx_;
     D3D11Renderer& r_;
@@ -70,6 +105,8 @@ private:
     ComPtr<ID3D11ShaderResourceView> fallback_;
     ComPtr<ID3D11ShaderResourceView> fallbacks_[5]; // 2D, 3D, cube, 2D array, buffer
     u64 frame_ = 0;
+    // this frame's uploads (ns): guest read + deswizzle/decode, driver create, write tracking, page hashes; count, bytes
+    u64 up_ns_[4]{}, up_count_ = 0, up_bytes_ = 0;
 };
 
 } // namespace gpu
