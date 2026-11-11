@@ -830,10 +830,26 @@ struct Emitter {
     u64 cw = 0;                                       // writes since block start / last reload in this block
     bool csynced = false;
     std::unordered_map<u64, u64> dirty_in;            // resolved: may-be-unsynced locals at block entry
+    // NZCV liveness for the halt exits at back edges: a halted thread resumes at the loop head with nzcv = s.nzcv,
+    // so the write-back needs NZCV only if some path from the loop head reads the flags before setting them. Keeping
+    // NZCV out of those write-backs lets the compiler keep the flags in EFLAGS through the loop (no packing).
+    // Per block: gen = the flags are read (or written back at an exit) before the block sets them, kill = the block
+    // sets them. Reads and exits after a reload inside the block count too (the reload reads s.nzcv).
+    struct NzBlock {
+        bool gen = false, kill = false;
+    };
+    std::unordered_map<u64, NzBlock> nzb;
+    std::unordered_map<size_t, u64> halt_flush; // flush site -> loop head it resumes at
+    void NzUse() {
+        NzBlock& n = nzb[cur];
+        if (!n.kill)
+            n.gen = true;
+    }
     void BeginBlock(u64 pc) {
         cur = pc;
         cw = 0;
         csynced = false;
+        nzb[pc] = {};
     }
     std::string R(int r) {
         used_regs.insert(r);
@@ -855,18 +871,57 @@ struct Emitter {
     }
     std::string NzR() {
         nz_used = true;
+        NzUse();
         return "nzcv";
     }
     std::string NzW() {
-        nz_dirty = true;
+        nz_used = nz_dirty = true;
         cw |= 1ull << kNzBit;
-        return NzR();
+        nzb[cur].kill = true;
+        return "nzcv";
     }
-    // A write-back site of the current block at this point.
+    // A write-back site of the current block at this point. A non-ABI write-back hands the flags to other code.
     std::string FlushMark(bool abi = false) {
         flush_sites.push_back({cur, cw, csynced});
         flush_abi.push_back(abi);
+        if (!abi)
+            NzUse();
         return "@F" + std::to_string(flush_sites.size() - 1) + "@";
+    }
+    // The halt exit at a back edge to loop head t: not a use (the flags flow on to t, see NzLive).
+    std::string HaltFlushMark(u64 t) {
+        flush_sites.push_back({cur, cw, csynced});
+        flush_abi.push_back(false);
+        halt_flush[flush_sites.size() - 1] = t;
+        return "@F" + std::to_string(flush_sites.size() - 1) + "@";
+    }
+    // Blocks where the incoming flags may still be read: backward dataflow over the function's goto edges. Blocks
+    // without a record (not emitted here) count as live.
+    std::unordered_map<u64, bool> NzLive() const {
+        std::unordered_map<u64, std::vector<u64>> succ;
+        for (const auto& [sp, to] : edges)
+            succ[sp.block].push_back(to);
+        std::unordered_map<u64, bool> live;
+        for (const auto& [b, n] : nzb)
+            live[b] = n.gen;
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (const auto& [b, n] : nzb) {
+                if (live[b] || n.kill)
+                    continue;
+                auto it = succ.find(b);
+                if (it == succ.end())
+                    continue;
+                for (u64 t : it->second) {
+                    auto l = live.find(t);
+                    if (l == live.end() || l->second) {
+                        live[b] = changed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        return live;
     }
     std::string FlushText(const std::string&) { return FlushMark(); }
     void Flush(const std::string& pad, bool abi = false) { o << pad << FlushMark(abi) << "\n"; }
@@ -917,6 +972,7 @@ struct Emitter {
     std::string Declarations() const { return "  " + ExpandLoad(true) + "\n"; }
     std::string Expand(std::string body) {
         Resolve();
+        const auto nz_live = NzLive();
         const std::string reload = ExpandLoad(false), reload_call = ExpandLoad(false, true);
         std::string outp;
         outp.reserve(body.size() + body.size() / 4);
@@ -936,6 +992,11 @@ struct Emitter {
                 u64 mask = sp.writes | (sp.synced || it == dirty_in.end() ? 0 : it->second);
                 if (flush_abi.at(n))
                     mask &= ~(1ull << kNzBit);
+                if (auto h = halt_flush.find(n); h != halt_flush.end()) {
+                    auto l = nz_live.find(h->second);
+                    if (l != nz_live.end() && !l->second)
+                        mask &= ~(1ull << kNzBit);
+                }
                 outp += ExpandFlush(mask);
                 at = q + 1; // closing '@'
             } else if (body.compare(p, 9, "@RELOADC@") == 0) {
@@ -1155,7 +1216,7 @@ struct Emitter {
                 // a halt request leaves at back edges: the loop head must be a resume point to come back to.
                 // Guest memory accesses are not volatile: the compiler barrier makes every loop iteration read
                 // memory again (wait loops on a flag another thread sets).
-                o << pad << "_ReadWriteBarrier(); if (*s.halt) { " << FlushMark() << " s.pc = " << Hex(t) << "; return; }\n";
+                o << pad << "_ReadWriteBarrier(); if (*hp) { " << HaltFlushMark(t) << " s.pc = " << Hex(t) << "; return; }\n";
                 halt_targets.insert(t);
             }
             o << pad << "goto b_" << std::hex << t << std::dec << ";\n";
@@ -1721,10 +1782,10 @@ int main(int argc, char** argv) {
         // 224-instruction copy loop in f_83c2ed0, shard 20f): those, listed in nogm.txt, keep reading s.mem.
         const bool nogm = nogm_funcs.count(f.entry) != 0;
         if (nogm)
-            cur << "#define gm s.mem\n";
+            cur << "#define gm s.mem\n#define hp s.halt\n";
         cur << "void f_" << std::hex << f.entry << std::dec << "(State& s) {\n  if (!ok_" << std::hex << f.entry << std::dec
             << " || reinterpret_cast<u64>(_AddressOfReturnAddress()) < s.stack_limit) return;\n"
-               "  bool cbit = false;\n" << (nogm ? "" : "  u8* const gm = s.mem;\n")
+               "  bool cbit = false;\n" << (nogm ? "" : "  u8* const gm = s.mem; volatile u32* const hp = s.halt;\n")
             << em.Declarations();
         // Resume points: call-return blocks (the JIT can come back into this function after a callee it ran) and the
         // blocks after SVCs (a thread halted inside an SVC continues there).
@@ -1754,7 +1815,7 @@ int main(int argc, char** argv) {
         }
         cur << em.Expand(body.str()) << "}\n\n";
         if (nogm)
-            cur << "#undef gm\n";
+            cur << "#undef gm\n#undef hp\n";
         if (noopt)
             cur << "#pragma optimize(\"\", on)\n";
         }
