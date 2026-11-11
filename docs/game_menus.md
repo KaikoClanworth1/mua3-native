@@ -213,12 +213,13 @@ The title screen's SYSTEM submenu (SAVE, LOAD, OPTIONS, TIPS, GALLERY; title men
   language (GRAPHICS, AFFICHAGE, GRAFIK, ...); SetItemAppearance (+0x480) uses them for the slot.
 - **Page**: Execute (+0x4a8) opens OPTIONS the game's way, flagged to show the GRAPHICS page
   (`menu_graphics.cpp`): tab 2's row count, row types, row table and value bytes are replaced while it is open, the
-  tab is named GRAPHICS, the other tabs and L/R are hidden, L/R and A do nothing, our text comes from a GetString
+  tab is named GRAPHICS, the other tabs and L/R are hidden, L/R do nothing, A steps the row to its next value (wrapping), our text comes from a GetString
   hook (hashes 0xFE00xxxx). Closing puts the tab back and skips the store, so the game's own settings are untouched.
 - **Settings**: DISPLAY MODE, RESOLUTION, RENDER SCALE, FRAME RATE, FPS LIMIT, VSYNC, SHOW FPS, ANTI-ALIASING
   (mua3.ini [video], the launcher's choices). Every change goes through `core::System::UpdateConfig`: the running
   config (FPS limit, show FPS, VSync, window mode and size: the main loop applies them; anti-aliasing, OFF / FXAA:
   the renderer reads it at every present) and mua3.ini (also render scale and frame rate, which apply after a
-  restart).
+  restart). The page shows the running config, except RENDER SCALE and FRAME RATE, which show the value saved in
+  mua3.ini for the next start; their info line names the value running now.
 
 `MUA3_GRAPHICS_TEST=1` (test aid) opens the first OPTIONS screen as the GRAPHICS page.

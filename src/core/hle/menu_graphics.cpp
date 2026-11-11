@@ -131,6 +131,10 @@ u32 Text(const std::u16string& t, size_t room = 0) {
 std::u16string U16(const std::string& s) { return std::u16string(s.begin(), s.end()); }
 
 u32 g_custom_res = 0, g_custom_limit = 0; // hashes of the two rewritable strings
+u32 g_scale_info = 0, g_rate_info = 0;     // the restart rows' info lines (they name the running value)
+const std::u16string kScaleInfo = u"The resolution the game renders at. AUTO matches your display.";
+const std::u16string kRateInfo = u"The game's frame rate. 30 is the original, 60 is fully supported.";
+const std::u16string kScaleNames[] = {u"AUTO", u"1X (1080P)", u"2X (1440P / 4K)", u"3X", u"4X"};
 
 void BuildPage() {
     g_block = g_mem->FindFree(core::layout::kKernelMapBase, 0x1000000000ull, kBlockSize);
@@ -148,16 +152,15 @@ void BuildPage() {
     res.push_back(g_custom_res);
     add(Text(u"RESOLUTION"), Text(u"The window's size in windowed mode.\r\nFullscreen uses the monitor's resolution."),
         kArrows, res);
-    add(Text(u"RENDER SCALE"),
-        Text(u"The resolution the game renders at. AUTO matches your display.\r\nApplies after a restart."), kArrows,
-        {kStrAuto, Text(u"1X (1080P)"), Text(u"2X (1440P / 4K)"), Text(u"3X"), Text(u"4X")});
+    g_scale_info = Text(kScaleInfo, 200);
+    add(Text(u"RENDER SCALE"), g_scale_info, kArrows,
+        {kStrAuto, Text(kScaleNames[1]), Text(kScaleNames[2]), Text(kScaleNames[3]), Text(kScaleNames[4])});
     std::vector<u32> rates;
     for (int r : kRates)
         rates.push_back(Text(U16(r == 30 ? "30 (ORIGINAL)" : r > 60 ? fmt::format("{} (EXPERIMENTAL)", r)
                                                                    : std::to_string(r))));
-    add(Text(u"FRAME RATE"),
-        Text(u"The game's frame rate. 30 is the original, 60 is fully supported.\r\nApplies after a restart."),
-        kArrows, rates);
+    g_rate_info = Text(kRateInfo, 200);
+    add(Text(u"FRAME RATE"), g_rate_info, kArrows, rates);
     std::vector<u32> limits;
     for (int l : kLimits)
         limits.push_back(l == 0 ? kStrOff : Text(U16(std::to_string(l))));
@@ -234,6 +237,30 @@ void FromPage(core::Config& c, bool running) {
         c.fps_target = kRates[v[kRowRate]];
 }
 
+// What the page shows: the running settings, and for the rows that apply after a restart, the value saved for the
+// next start (mua3.ini).
+core::Config PageConfig() {
+    core::Config c = core::Sys().CfgSnapshot();
+    core::Config disk;
+    if (disk.Load("mua3.ini")) {
+        c.resolution_scale = disk.resolution_scale;
+        c.fps_target = disk.fps_target;
+    }
+    return c;
+}
+
+// The restart rows' info lines name what the game runs with now.
+void WriteRestartInfo() {
+    const core::Config c = core::Sys().CfgSnapshot();
+    auto put = [](u32 hash, const std::u16string& t) {
+        g_mem->WriteBlock(g_strings[hash - kOurs], t.c_str(), (std::min<size_t>(t.size(), 199) + 1) * 2);
+    };
+    put(g_scale_info, kScaleInfo + u"\r\nApplies after a restart (running now: " +
+                          kScaleNames[std::clamp(c.resolution_scale, 0, 4)] + u").");
+    put(g_rate_info, kRateInfo + u"\r\nApplies after a restart (running now: " + U16(std::to_string(c.fps_target)) +
+                         u" FPS).");
+}
+
 u8 g_applied[kRowCount]{}; // the value bytes last applied
 void Apply(bool always = false) {
     u8 v[kRowCount];
@@ -270,7 +297,8 @@ void OptInit(State& s) {
         g_mem->Write<u16>(g_main + kRowCounts + 2 * kTab, u16(kRowCount));
         for (u32 i = 0; i < kRowCount; i++)
             W32(g_main + kRowTypes + 4 * i, g_row_info[i].type);
-        ToPage(core::Sys().CfgSnapshot());
+        ToPage(PageConfig());
+        WriteRestartInfo();
         g_mem->ReadBlock(g_values, g_applied, sizeof(g_applied));
         g_page = opt;
         g_active = true;
@@ -325,7 +353,22 @@ void Blocked(State& s, Hook h) {
 }
 void TabPrev(State& s) { Blocked(s, kHTabPrev); }
 void TabNext(State& s) { Blocked(s, kHTabNext); }
-void Decide(State& s) { Blocked(s, kHDecide); }
+// A on the page: the row's next value, wrapping round (like right).
+void Decide(State& s) {
+    const u64 opt = s.x[0];
+    if (!OnPage(opt))
+        return RunOriginal(s, g_hooks[kHDecide]);
+    const u64 cursor = R64(opt + 0xb0);
+    const u32 row = cursor ? u32(GuestCall(s, R64(R64(cursor) + 0x58), {cursor})) : ~0u;
+    if (row < kRowCount) {
+        u8 v[kRowCount];
+        g_mem->ReadBlock(g_values, v, sizeof(v));
+        v[row] = u8((v[row] + 1) % g_row_info[row].choices.size());
+        g_mem->WriteBlock(g_values, v, sizeof(v));
+        GuestCall(s, g_main + kShowValue, {opt, row});
+    }
+    GuestReturn(s, 0);
+}
 
 // While the page is open its value bytes are watched (an arrow row commits its new value some frames after the
 // key, at the end of its animation): a change applies at once.
@@ -354,7 +397,7 @@ void Default(State& s) {
         u8 d[kRowCount];
         g_mem->ReadBlock(g_values, d, sizeof(d));
         v[row] = d[row];
-        ToPage(core::Sys().CfgSnapshot()); // the custom value texts
+        ToPage(PageConfig()); // the custom value texts
         g_mem->WriteBlock(g_values, v, sizeof(v));
         GuestCall(s, g_main + kShowValue, {opt, row});
     }
