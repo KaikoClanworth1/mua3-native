@@ -48,7 +48,9 @@ A native Windows port of Marvel Ultimate Alliance 3: The Black Order, built on y
 This package contains no part of the game.
 
 1. Install Microsoft's free "Build Tools for Visual Studio 2026" (workload: Desktop development with C++) if you
-   don't have Visual Studio 2026 already. The game is compiled on your PC with it.
+   don't have Visual Studio 2026 already. The game is compiled on your PC with it. Also tick the individual
+   component "C++ Clang Compiler for Windows" (recommended): the build takes about 15-30 min instead of hours and
+   the game runs a little faster. Without it the setup builds with Microsoft's compiler.
 2. Run MUA3Setup.exe. It finds your base game, the 4.0.1 update and any DLC (.nsp / .xci) and your prod.keys
    (or Browse / drop them on the window), asks where to install, and shows the space needed.
 3. Press "Build the game": it installs the game data, translates and compiles the game and prepares its

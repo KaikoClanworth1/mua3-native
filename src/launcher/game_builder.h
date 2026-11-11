@@ -21,6 +21,9 @@ struct Toolchain {
 // Minimum compiler: the one the prebuilt libraries were made with (an older linker cannot read them).
 constexpr int kMinCompiler = _MSC_VER; // e.g. 1951 = MSVC 19.51 (Visual Studio 2026)
 Toolchain FindToolchain();
+// clang-cl (MUA3_CLANG, LLVM's, or Visual Studio's "C++ Clang Compiler for Windows"): the game builds much faster and
+// runs a little faster with it. Empty: not installed (the build uses cl).
+fs::path FindClang(const fs::path& vcvars);
 
 // Where the build reads and writes.
 struct Paths {

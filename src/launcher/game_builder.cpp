@@ -39,7 +39,7 @@ const char* const kClangFlags = "/c /nologo /O2 /GS- /EHsc /MT /std:c++20 /bigob
                                 "-msse4.2 -mfma -mpopcnt -mpclmul -ffp-contract=off -fno-strict-aliasing";
 
 // MUA3_CLANG (a path, or "0" for cl only), else LLVM's clang-cl, else Visual Studio's. Empty: cl only.
-static fs::path FindClang(const fs::path& vcvars) {
+fs::path FindClangPath(const fs::path& vcvars) {
     std::vector<fs::path> c;
     if (const wchar_t* e = _wgetenv(L"MUA3_CLANG")) {
         if (std::wstring(e) == L"0")
@@ -155,6 +155,8 @@ u64 MTime(const fs::path& p) {
 }
 
 } // namespace
+
+fs::path FindClang(const fs::path& vcvars) { return FindClangPath(vcvars); }
 
 void Progress::Stage(std::string s) {
     std::lock_guard lk(mutex);

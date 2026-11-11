@@ -360,6 +360,7 @@ struct Wizard {
     fs::path keys;
     std::vector<fs::path> keys_found;
     builder::Toolchain toolchain;
+    fs::path clang; // clang-cl: a much faster build and a slightly faster game (empty: cl only)
     std::atomic<bool> toolchain_ready{false};
 
     fs::path install_dir = setup::DefaultInstallDir();
@@ -432,6 +433,10 @@ struct Wizard {
             }
             scanning = false;
             toolchain = builder::FindToolchain();
+            if (toolchain.ok)
+                clang = builder::FindClang(toolchain.vcvars);
+            LOG_INFO("Setup", "C++ tools: {}; clang-cl: {}", toolchain.ok ? toolchain.version : toolchain.problem,
+                     clang.empty() ? "not found" : clang.string());
             toolchain_ready = true;
         });
     }
@@ -548,10 +553,13 @@ struct Wizard {
     // normal priority, the PC in use): the game is ~1130 MB of ordinary generated C++, compiled at ~0.55 MB per
     // minute per worker, and ~200 MB in 350 huge functions, optimised at ~0.04 MB per minute per worker, of which
     // only as many run at once as fit in half the free memory (~3.6 GB each). Plus reading the game files (~6 min),
-    // translating (~3), linking (~2) and the shaders (~55 min on 4 cores).
+    // translating (~3), linking (~2) and the shaders (~55 min on 4 cores). With clang-cl the game's code compiles
+    // about 10x faster and no function is a special case.
     double EstimateMinutes() const {
         constexpr double kNormalMb = 1130, kNormalRate = 0.55, kHugeMb = 200, kHugeRate = 0.04, kHugeGb = 3.6;
         const int jobs = Jobs();
+        if (toolchain_ready && !clang.empty())
+            return 11.0 + 220.0 / jobs + (kNormalMb + kHugeMb) / (kNormalRate * 10 * jobs);
         MEMORYSTATUSEX ms{sizeof(ms)};
         GlobalMemoryStatusEx(&ms);
         const double half_free_gb = double(ms.ullAvailPhys) / double(1ull << 30) / 2;
@@ -810,7 +818,8 @@ void FilesPage(Wizard& w) {
     const float half = (ImGui::GetContentRegionAvail().x - S(16)) * 0.5f;
     ImGui::BeginGroup();
     Label("KEYS");
-    if (BeginPanel("keys", ImVec2(half, S(84)))) {
+    const float tools_h = S(w.toolchain_ready && w.toolchain.ok && w.clang.empty() ? 104 : 84); // (the row's height)
+    if (BeginPanel("keys", ImVec2(half, tools_h))) {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const bool ok = !w.keys.empty() && fs::exists(w.keys);
         const ImVec2 p = ImGui::GetCursorScreenPos();
@@ -842,7 +851,7 @@ void FilesPage(Wizard& w) {
     ImGui::SameLine(0, S(16));
     ImGui::BeginGroup();
     Label("C++ BUILD TOOLS");
-    if (BeginPanel("tools", ImVec2(half, S(84)))) {
+    if (BeginPanel("tools", ImVec2(half, tools_h))) {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 p = ImGui::GetCursorScreenPos();
         const bool ready = w.toolchain_ready;
@@ -855,8 +864,19 @@ void FilesPage(Wizard& w) {
             dl->AddCircle(ImVec2(p.x + S(9), p.y + S(10)), S(9), col::amber, 0, S(1.6f));
         ImGui::SetCursorScreenPos(ImVec2(p.x + S(28), p.y));
         ImGui::BeginGroup();
-        ImGui::TextUnformatted(!ready ? "Checking..." : ok ? ("Microsoft C++ " + w.toolchain.version).c_str() : "Microsoft C++ Build Tools needed");
-        Dim(ok ? "Compiles the game on this PC." : ready ? "Free from Microsoft: \"Desktop development with C++\"." : "", true);
+        ImGui::TextUnformatted(!ready ? "Checking..."
+                               : ok   ? ("Microsoft C++ " + w.toolchain.version + (w.clang.empty() ? "" : "  ·  clang-cl")).c_str()
+                                      : "Microsoft C++ Build Tools needed");
+        if (ok && w.clang.empty())
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, V(col::amber));
+            ImGui::TextWrapped("%s", "clang-cl not found: slower build, slightly slower game.");
+            ImGui::PopStyleColor();
+        }
+        Dim(ok ? (w.clang.empty() ? "Recommended: add \"C++ Clang Compiler for Windows\" in the Visual Studio Installer."
+                                  : "Compiles the game on this PC (clang-cl: fast build, faster game).")
+               : ready ? "Free from Microsoft: \"Desktop development with C++\"." : "",
+            true);
         ImGui::EndGroup();
         if (ready && !ok) {
             ImGui::SameLine(ImGui::GetWindowWidth() - S(100));
@@ -1791,6 +1811,10 @@ void ReportPage(Wizard& w, bool& quit) {
         std::vector<std::string> extra;
         const auto tc = builder::FindToolchain();
         extra.push_back("C++ tools: " + (tc.ok ? "MSVC " + tc.version : tc.problem));
+        if (tc.ok) {
+            const fs::path cc = builder::FindClang(tc.vcvars);
+            extra.push_back("clang-cl: " + (cc.empty() ? std::string("not found") : cc.string()));
+        }
         w.last_report = report::Create(w.about, extra, "game", work, save);
     }
     ImGui::SameLine();
