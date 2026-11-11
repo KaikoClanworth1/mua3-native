@@ -60,6 +60,7 @@ private:
     struct ID3D11RenderTargetView* rtv_ = nullptr;
     struct ID3D11Texture2D* frame_tex_ = nullptr;
     struct ID3D11ShaderResourceView* frame_srv_ = nullptr;
+    struct ID3D11BlendState* opaque_blend_ = nullptr; // the game frame is drawn without blending (its alpha is not coverage)
     u32 frame_w_ = 0, frame_h_ = 0;
     const core::Config* live_cfg_ = nullptr; // the caller's config (outlives the display): vsync read per present
     void* frame_wait_ = nullptr;             // the swap chain's frame latency waitable object

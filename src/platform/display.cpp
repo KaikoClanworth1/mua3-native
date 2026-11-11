@@ -175,6 +175,7 @@ void Display::Shutdown() {
     }
     SafeRelease(frame_srv_);
     SafeRelease(frame_tex_);
+    SafeRelease(opaque_blend_);
     SafeRelease(rtv_);
     if (frame_wait_)
         CloseHandle(frame_wait_);
@@ -297,7 +298,23 @@ void Display::DrawFrameTexture() {
     const float s = std::min(sx, sy);
     const float w = fw * s, h = fh * s;
     const ImVec2 p0((ds.x - w) * 0.5f, (ds.y - h) * 0.5f);
-    ImGui::GetBackgroundDrawList()->AddImage((ImTextureID)srv, p0, ImVec2(p0.x + w, p0.y + h));
+    // Opaque: the frame's alpha channel is whatever the game left there (its UI uses destination alpha as a mask,
+    // e.g. the pause menu and the loading screen's picture panel leave it 0), and the Switch never shows it. ImGui's
+    // alpha blending over the cleared backbuffer turned those areas black.
+    if (!opaque_blend_) {
+        D3D11_BLEND_DESC bd{};
+        bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        device_->CreateBlendState(&bd, &opaque_blend_);
+    }
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    dl->AddCallback(
+        [](const ImDrawList*, const ImDrawCmd* cmd) {
+            auto* self = static_cast<Display*>(cmd->UserCallbackData);
+            self->ctx_->OMSetBlendState(self->opaque_blend_, nullptr, 0xFFFFFFFF);
+        },
+        this);
+    dl->AddImage((ImTextureID)srv, p0, ImVec2(p0.x + w, p0.y + h));
+    dl->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
 }
 
 // Writes the current backbuffer to a 24-bit BMP (automation: screenshots of hidden windows).

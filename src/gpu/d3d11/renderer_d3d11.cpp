@@ -2659,6 +2659,9 @@ void D3D11Renderer::Draw() {
                  vs->hash, ps ? ps->hash : 0, indices.size(), rts, m.blend_enable[0], m.color_mask[0],
                  depth ? fmt::format("{:#x}/{:#x}", depth->gpu_va, depth->format) : "-", m.depth_test,
                  m.depth_write, m.depth_func);
+        LOG_INFO("Renderer", "TRACE blend0 eq {:#x}/{:#x} rgb {:#x} {:#x} alpha {:#x} {:#x} color ({:g},{:g},{:g},{:g})",
+                 m.blend[0].eq_rgb, m.blend[0].eq_a, m.blend[0].src_rgb, m.blend[0].dst_rgb, m.blend[0].src_a,
+                 m.blend[0].dst_a, m.blend_color[0], m.blend_color[1], m.blend_color[2], m.blend_color[3]);
         LOG_INFO("Renderer", "TRACE stencil en {} func {:#x} ref {:#x} fmask {:#x} wmask {:#x} ops {:#x}/{:#x}/{:#x} back func {:#x} ops {:#x}/{:#x}/{:#x} cull {} {:#x} front ccw {}",
                  m.stencil_test, m.stencil_front.func, m.stencil_ref, m.stencil_read_mask, m.stencil_write_mask,
                  m.stencil_front.op_fail, m.stencil_front.op_zfail, m.stencil_front.op_zpass, m.stencil_back.func,
