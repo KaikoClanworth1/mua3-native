@@ -174,8 +174,8 @@ ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::T
         if (s->sub_w != w || s->sub_h != h) {
             D3D11_TEXTURE2D_DESC td;
             s->tex->GetDesc(&td);
-            td.Width = w * s->scale;
-            td.Height = h * s->scale;
+            td.Width = s->Scaled(w);
+            td.Height = s->Scaled(h);
             td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
             D3D11_SHADER_RESOURCE_VIEW_DESC sv;
             s->srv->GetDesc(&sv);
@@ -189,7 +189,7 @@ ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::T
             s->sub_serial = 0;
         }
         if (s->sub_serial != s->write_serial) { // only when the target was written since the last copy
-            const D3D11_BOX box{0, 0, 0, w * s->scale, h * s->scale, 1};
+            const D3D11_BOX box{0, 0, 0, s->Scaled(w), s->Scaled(h), 1};
             ctx_->CopySubresourceRegion(s->sub_tex.Get(), 0, 0, 0, 0, s->tex.Get(), 0, &box);
             s->sub_serial = s->write_serial;
         }

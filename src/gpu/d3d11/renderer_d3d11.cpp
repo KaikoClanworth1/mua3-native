@@ -442,7 +442,7 @@ u32 D3D11Renderer::TextureScale(u64 gpu_va, bool tex2d) {
     if (!tex2d)
         return 1;
     const Surface* s = FindSurfaceByGpu(gpu_va);
-    return s && s->srv ? s->scale : 1;
+    return s && s->srv ? s->scale3 : 0;
 }
 
 Surface* D3D11Renderer::FindSurfaceByGpu(u64 gpu_va) {
@@ -479,10 +479,10 @@ bool LearnOnce(u64 key) {
 // Supersampling (anti_aliasing 2-4: SSAA 2x/3x/4x per axis) multiplies the render scale; the frame shown is resolved
 // back to the render scale (PostAA::Downsample). The product is capped (kMaxScale: VRAM), the factor dropped first.
 static u32 SsaaFactor(int anti_aliasing) { return anti_aliasing >= 2 && anti_aliasing <= 4 ? u32(anti_aliasing) : 1; }
-constexpr u32 kMaxScale = 4;
+constexpr u32 kMaxScale = 12; // (in thirds: 4x)
 
-void D3D11Renderer::SetResolutionScale(u32 s) {
-    base_scale_ = std::max<u32>(s, 1);
+void D3D11Renderer::SetResolutionScale3(u32 s) {
+    base_scale_ = std::clamp<u32>(s, 3, kMaxScale);
     applied_aa_ = core::Sys().Cfg().anti_aliasing;
     res_scale_ = ScaleFor(applied_aa_);
 }
@@ -504,7 +504,7 @@ void D3D11Renderer::ApplyAntiAliasing(int anti_aliasing) {
     const size_t before = surfaces_.size();
     std::erase_if(surfaces_, [](const auto& kv) { return kv.second->screen_like; });
     LOG_INFO("Renderer", "anti-aliasing {}: internal scale {}x -> {}x ({} screen-sized targets dropped)", anti_aliasing,
-             res_scale_, scale, before - surfaces_.size());
+             res_scale_ / 3.0, scale / 3.0, before - surfaces_.size());
     res_scale_ = scale;
     std::fill(std::begin(bound_), std::end(bound_), nullptr);
     ContextEpoch()++;
@@ -540,14 +540,14 @@ Surface* D3D11Renderer::GetSurface(u64 gpu_va, u32 width, u32 height, u32 format
     // maps, lookup tables and other square or tiny targets keep their size.
     const bool screen_like = width >= 240 && height >= 135 && width > height &&
                              std::abs(int(width * 9) - int(height * 16)) <= int(width * 9 / 16);
-    s->scale = screen_like ? res_scale_ : 1;
+    s->scale3 = screen_like ? res_scale_ : 3;
     s->screen_like = screen_like;
     if (screen_like) { // (the game's dynamic resolution shows up as new frame-sized targets)
         static std::set<u64> sizes;
         if (sizes.insert((u64(width) << 32) | height).second)
             LOG_INFO("Renderer", "screen-sized target {}x{} (format {:#x}{}) first seen", width, height, format, depth ? ", depth" : "");
     }
-    const u32 tw = width * s->scale, th = height * s->scale;
+    const u32 tw = s->Scaled(width), th = s->Scaled(height);
     s->format = format;
     s->depth = depth;
     s->dxgi = fi.dxgi;
@@ -567,12 +567,12 @@ Surface* D3D11Renderer::GetSurface(u64 gpu_va, u32 width, u32 height, u32 format
         if (G().ReadGpuPartial(gpu_va, raw.data(), raw.size()) == raw.size()) {
             initial.resize(size_t(width) * height * fi.bpp);
             Deswizzle(raw.data(), initial.data(), width, height, 1, fi.bpp, bh, 0, width * fi.bpp);
-            if (s->scale > 1) { // nearest-neighbour upscale of the initial contents
+            if (s->scale3 != 3) { // nearest-neighbour upscale of the initial contents
                 std::vector<u8> up(size_t(tw) * th * fi.bpp);
                 for (u32 y = 0; y < th; y++)
                     for (u32 x = 0; x < tw; x++)
                         std::memcpy(&up[(size_t(y) * tw + x) * fi.bpp],
-                                    &initial[(size_t(y / s->scale) * width + x / s->scale) * fi.bpp], fi.bpp);
+                                    &initial[(size_t(std::min(y * 3 / s->scale3, height - 1)) * width + std::min(x * 3 / s->scale3, width - 1)) * fi.bpp], fi.bpp);
                 initial.swap(up);
             }
             init.pSysMem = initial.data();
@@ -2073,7 +2073,7 @@ void D3D11Renderer::Draw() {
         gpu_passes_.Mark((colors[0] ? colors[0]->gpu_va : 0) * 31 ^ (depth ? depth->gpu_va : 0) ^ count, [&] {
             const Surface* c = colors[0] ? colors[0] : depth;
             return c ? fmt::format("draws: rt0 {:#x} {}x{} fmt {:#x} x{} scale {} depth {}", c->gpu_va, c->width, c->height,
-                                   c->format, count, c->scale, depth ? "yes" : "no")
+                                   c->format, count, c->scale3 / 3.0, depth ? "yes" : "no")
                      : std::string("draws: no target");
         });
         gpu_passes_.CountDraw();
@@ -2083,13 +2083,13 @@ void D3D11Renderer::Draw() {
     const float sx = m.vp_scale[0], sy = m.vp_scale[1], sz = m.vp_scale[2];
     const float tx = m.vp_translate[0], ty = m.vp_translate[1], tz = m.vp_translate[2];
     // Targets stored at a higher resolution scale the viewport and scissor with them.
-    u32 rscale = 1;
+    u32 rscale = 3; // (thirds)
     for (Surface* b : bound_)
         if (b) {
-            rscale = b->scale;
+            rscale = b->scale3;
             break;
         }
-    const float fs = float(rscale);
+    const float fs = float(rscale) / 3.0f;
     D3D11_VIEWPORT vp{(tx - std::abs(sx)) * fs, (ty - std::abs(sy)) * fs, 2 * std::abs(sx) * fs, 2 * std::abs(sy) * fs,
                       0.0f, 1.0f};
     if (std::memcmp(&pipe_.vp, &vp, sizeof(vp)) != 0) {
@@ -2101,12 +2101,13 @@ void D3D11Renderer::Draw() {
     // ---- scissor
     D3D11_RECT sr{0, 0, 16384, 16384};
     if (m.scissor_enable)
-        sr = {LONG(m.scissor[0]) * LONG(rscale), LONG(m.scissor[1]) * LONG(rscale), LONG(m.scissor[2]) * LONG(rscale), LONG(m.scissor[3]) * LONG(rscale)};
+        sr = {LONG(m.scissor[0] * rscale / 3), LONG(m.scissor[1] * rscale / 3), LONG((m.scissor[2] * rscale + 2) / 3),
+              LONG((m.scissor[3] * rscale + 2) / 3)};
     // Pixel history (debug "pick x y"): restrict every draw of one frame to that pixel and count samples.
     const bool counting = occl_frame_ == frame_counter_; // debug "occl": samples written by every draw
     const bool picking = (pick_frame_ == frame_counter_ && colors[0] && colors[0]->width >= 1280 / 2) || counting;
     if (picking && !counting) {
-        const u32 px = u32(pick_x_ * colors[0]->width * rscale), py = u32(pick_y_ * colors[0]->height * rscale);
+        const u32 px = u32(pick_x_ * colors[0]->width * fs), py = u32(pick_y_ * colors[0]->height * fs);
         sr = {std::max<LONG>(sr.left, LONG(px)), std::max<LONG>(sr.top, LONG(py)), std::min<LONG>(sr.right, LONG(px + 1)),
               std::min<LONG>(sr.bottom, LONG(py + 1))};
     }
@@ -3050,7 +3051,7 @@ void D3D11Renderer::Present(const PresentInfo& p) {
                 continue;
             if (sf->depth) // depth-stencil copies must be whole-resource; read the full copy instead
                 continue;
-            const D3D11_BOX box{r.x * sf->scale, r.y * sf->scale, 0, r.x * sf->scale + 1, r.y * sf->scale + 1, 1};
+            const D3D11_BOX box{r.x * sf->scale3 / 3, r.y * sf->scale3 / 3, 0, r.x * sf->scale3 / 3 + 1, r.y * sf->scale3 / 3 + 1, 1};
             ctx_->CopySubresourceRegion(st.Get(), 0, 0, 0, 0, sf->tex.Get(), 0, &box);
             D3D11_MAPPED_SUBRESOURCE mp;
             if (SUCCEEDED(ctx_->Map(st.Get(), 0, D3D11_MAP_READ, 0, &mp))) {
@@ -3088,7 +3089,7 @@ void D3D11Renderer::Present(const PresentInfo& p) {
                 SUCCEEDED(ad3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vm))) {
                 u64 surf = 0;
                 for (auto& [k, sf] : surfaces_)
-                    surf += u64(sf->width * sf->scale) * (sf->height * sf->scale) * 4;
+                    surf += u64(sf->Scaled(sf->width)) * sf->Scaled(sf->height) * 4;
                 DXGI_QUERY_VIDEO_MEMORY_INFO sys{};
                 ad3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &sys);
                 LOG_INFO("Renderer", "VRAM in use {} MB (budget {} MB), GPU system memory {} MB; render targets ~{} MB in {} surfaces",
@@ -3106,8 +3107,8 @@ void D3D11Renderer::Present(const PresentInfo& p) {
         D3D11_TEXTURE2D_DESC desc;
         s->tex->GetDesc(&desc);
         // A supersampled frame is shown at the render scale (resolved below).
-        const u32 ssaa = s->scale > base_scale_ && s->scale % base_scale_ == 0 ? s->scale / base_scale_ : 1;
-        const u32 out_w = s->width * s->scale / ssaa, out_h = s->height * s->scale / ssaa;
+        const u32 ssaa = s->scale3 > base_scale_ && s->scale3 % base_scale_ == 0 ? s->scale3 / base_scale_ : 1;
+        const u32 out_w = s->Scaled(s->width) / ssaa, out_h = s->Scaled(s->height) / ssaa;
         if (!frame_tex_ || frame_w_ != out_w || frame_h_ != out_h || frame_dxgi_ != s->dxgi) {
             frame_tex_.Reset();
             frame_srv_.Reset();

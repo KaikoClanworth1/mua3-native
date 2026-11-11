@@ -19,7 +19,7 @@
 namespace gpu {
 
 // Bump kTranslatorVersion whenever the translator output changes, to invalidate cached bytecode.
-constexpr int kTranslatorVersion = 29;
+constexpr int kTranslatorVersion = 30;
 
 
 namespace {

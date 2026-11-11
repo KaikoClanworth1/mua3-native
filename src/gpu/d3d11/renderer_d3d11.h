@@ -31,7 +31,9 @@ struct HostShader;
 struct Surface {
     u64 gpu_va = 0, cpu_va = 0;
     u32 width = 0, height = 0, format = 0; // as the guest sees it
-    u32 scale = 1;                         // host texture is width*scale x height*scale (resolution scaling)
+    u32 scale3 = 3;                        // render scale in thirds (3 = 1x, 4 = 4/3, 6 = 2x): host texture is
+                                           // Scaled(width) x Scaled(height)
+    u32 Scaled(u32 v) const { return (v * scale3 + 2) / 3; }
     bool depth = false;
     bool screen_like = false;              // scaled by the render scale (and supersampling)
     DXGI_FORMAT dxgi = DXGI_FORMAT_UNKNOWN;
@@ -63,8 +65,10 @@ public:
     void Draw() override;
     void Dispatch(const ComputeLaunch& l) override;
     // Internal resolution multiplier for screen-sized render targets (1 = native).
-    // The render scale for screen-sized targets (supersampling, anti_aliasing 2-4, multiplies it).
-    void SetResolutionScale(u32 s);
+    // The render scale for screen-sized targets, in thirds (3 = 1x, 4 = 4/3: native 1440p from 1080p targets, 6 = 2x);
+    // supersampling (anti_aliasing 2-4) multiplies it.
+    void SetResolutionScale3(u32 scale3);
+    void SetResolutionScale(u32 s) { SetResolutionScale3(std::max<u32>(s, 1) * 3); }
     ShaderCache* Shaders() { return shaders_.get(); }
     void Present(const PresentInfo& p) override;
     void InvalidateRegion(u64 gpu_va, u64 size) override;
@@ -328,8 +332,8 @@ private:
     Surface* bound_[9]{}; // colour targets 0-7 and depth of the draw being set up
     u64 draw_serial_ = 0;
     u64 surface_writes_ = 1;
-    u32 res_scale_ = 1;  // what screen-sized targets are created at: base_scale_ x the SSAA factor
-    u32 base_scale_ = 1; // the render scale (resolution_scale / auto)
+    u32 res_scale_ = 3;  // what screen-sized targets are created at, in thirds: base_scale_ x the SSAA factor
+    u32 base_scale_ = 3; // the render scale in thirds (resolution_scale / auto)
     int applied_aa_ = 0; // anti_aliasing as last applied
     u32 ScaleFor(int anti_aliasing) const;
     void ApplyAntiAliasing(int anti_aliasing);

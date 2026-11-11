@@ -692,7 +692,7 @@ void Translator::TexSample(u64 insn, u32 pc, Op op) {
         const u32 mask = u32(Bits(insn, 31, 4));
         const u32 slot = TexSlot(cbuf_off, TexDim::Tex2D, false, false);
         if (query == 1) { // dimensions
-            Line(fmt::format("tex{0}.GetDimensions({1}, tmpu.x, tmpu.y, tmpu.w); tmpu.z = 1u; tmpu.xy /= max(tex_swizzle[{0}].y, 1u);",
+            Line(fmt::format("tex{0}.GetDimensions({1}, tmpu.x, tmpu.y, tmpu.w); tmpu.z = 1u; tmpu.xy = tmpu.xy * 3u / max(tex_swizzle[{0}].y, 3u);",
                              slot, ra == RZ ? "0u" : R(ra)));
             static const char* cs = "xyzw";
             u32 r = d;
@@ -2124,12 +2124,13 @@ cbuffer Driver : register(b13) {
     uint4 drv_gmem[8];       // compute global memory windows: x base lo, y base hi, z size
     uint4 drv_image[8];      // compute images (SUST): base, size and layout (see ImageStore)
 };
-// Resolution scaling: render targets may be stored N times larger than the guest sees them. Texel fetches scale
-// their coordinates and keep the pixel's position inside the N x N block (rs_sub, set from SV_Position).
-static int2 rs_sub = int2(0, 0);
+// Resolution scaling: render targets may be stored larger than the guest sees them, by s/3 (tex_swizzle.y in
+// thirds: 3 = 1x, 4 = 4/3, 6 = 2x). Texel fetches scale their coordinates and keep the pixel's position inside the
+// guest texel (rs_frac, set from SV_Position).
+static float2 rs_frac = float2(0, 0);
 int2 RsXY(int2 c, uint slot) {
     const uint s = tex_swizzle[slot].y;
-    return s > 1u ? c * int(s) + min(rs_sub, int2(int(s) - 1, int(s) - 1)) : c;
+    return s > 3u ? int2(floor((float2(c) + rs_frac) * (float(s) / 3.0f))) : c;
 }
 float2 H2(uint v) { return float2(f16tof32(v & 0xFFFFu), f16tof32(v >> 16)); }
 uint P2(float2 v) { return f32tof16(v.x) | (f32tof16(v.y) << 16); }
@@ -2737,7 +2738,7 @@ bool Translator::Run() {
         src += "PSOut main(PSIn i) {\n";
         src += "    frag_coord = i.pos; frag_coord.w = 1.0f / i.pos.w; front_face = i.front;\n"
                "    if (drv_viewport.w > 1.0f) { frag_coord.xy = i.pos.xy / drv_viewport.w;"
-               " rs_sub = int2(i.pos.xy) - int2(frag_coord.xy) * int(drv_viewport.w); }\n";
+               " rs_frac = frac(frag_coord.xy); }\n";
         for (u32 a : in_attrs_)
             src += fmt::format("    in_attr{0} = i.a{0};\n", a);
         src += "    Run();\n";
