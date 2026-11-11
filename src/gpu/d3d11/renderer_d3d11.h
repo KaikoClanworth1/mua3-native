@@ -32,6 +32,7 @@ struct Surface {
     u32 width = 0, height = 0, format = 0; // as the guest sees it
     u32 scale = 1;                         // host texture is width*scale x height*scale (resolution scaling)
     bool depth = false;
+    bool screen_like = false;              // scaled by the render scale (and supersampling)
     DXGI_FORMAT dxgi = DXGI_FORMAT_UNKNOWN;
     ComPtr<ID3D11Texture2D> tex;
     ComPtr<ID3D11RenderTargetView> rtv;
@@ -61,7 +62,8 @@ public:
     void Draw() override;
     void Dispatch(const ComputeLaunch& l) override;
     // Internal resolution multiplier for screen-sized render targets (1 = native).
-    void SetResolutionScale(u32 s) { res_scale_ = std::max<u32>(s, 1); }
+    // The render scale for screen-sized targets (supersampling, anti_aliasing 2-4, multiplies it).
+    void SetResolutionScale(u32 s);
     ShaderCache* Shaders() { return shaders_.get(); }
     void Present(const PresentInfo& p) override;
     void InvalidateRegion(u64 gpu_va, u64 size) override;
@@ -324,7 +326,11 @@ private:
     Surface* bound_[9]{}; // colour targets 0-7 and depth of the draw being set up
     u64 draw_serial_ = 0;
     u64 surface_writes_ = 1;
-    u32 res_scale_ = 1;
+    u32 res_scale_ = 1;  // what screen-sized targets are created at: base_scale_ x the SSAA factor
+    u32 base_scale_ = 1; // the render scale (resolution_scale / auto)
+    int applied_aa_ = 0; // anti_aliasing as last applied
+    u32 ScaleFor(int anti_aliasing) const;
+    void ApplyAntiAliasing(int anti_aliasing);
     void* new_frame_event_ = nullptr;
 
     std::unique_ptr<ShaderCache> shaders_;

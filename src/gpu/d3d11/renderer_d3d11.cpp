@@ -3,6 +3,9 @@
 #include "gpu/shader/maxwell_isa.h"
 
 #include <chrono>
+#include <cstdio>
+#include <sstream>
+#include <thread>
 #include <emmintrin.h>
 #include <unordered_set>
 #include <set>
@@ -405,6 +408,20 @@ D3D11Renderer::D3D11Renderer(ID3D11Device* dev, ID3D11DeviceContext* ctx) : dev_
     g_dc->SetContext(ctx);
     if (const char* t = std::getenv("MUA3_TRACE_DRAWS"))
         trace_draws_ = std::atoi(t);
+    // Test aid: MUA3_AA_AT=<seconds>=<mode>,... changes anti_aliasing while the game runs (as the Graphics menu does).
+    if (const char* e = std::getenv("MUA3_AA_AT"))
+        std::thread([plan = std::string(e)] {
+            const auto t0 = std::chrono::steady_clock::now();
+            std::istringstream in(plan);
+            for (std::string item; std::getline(in, item, ',');) {
+                int at = 0, mode = 0;
+                if (std::sscanf(item.c_str(), "%d=%d", &at, &mode) != 2)
+                    continue;
+                std::this_thread::sleep_until(t0 + std::chrono::seconds(at));
+                LOG_INFO("Renderer", "test: anti_aliasing -> {}", mode);
+                core::Sys().UpdateConfig([mode](core::Config& c, bool) { c.anti_aliasing = mode; });
+            }
+        }).detach();
     if (const char* d = std::getenv("MUA3_DEBUG_PS")) {
         debug_mode_ = std::atoi(d);
         const char* src = "float4 main() : SV_Target0 { return float4(1, 0, 1, 1); }";
@@ -457,6 +474,40 @@ bool LearnOnce(u64 key) {
 }
 } // namespace
 
+// Supersampling (anti_aliasing 2-4: SSAA 2x/3x/4x per axis) multiplies the render scale; the frame shown is resolved
+// back to the render scale (PostAA::Downsample). The product is capped (kMaxScale: VRAM), the factor dropped first.
+static u32 SsaaFactor(int anti_aliasing) { return anti_aliasing >= 2 && anti_aliasing <= 4 ? u32(anti_aliasing) : 1; }
+constexpr u32 kMaxScale = 4;
+
+void D3D11Renderer::SetResolutionScale(u32 s) {
+    base_scale_ = std::max<u32>(s, 1);
+    applied_aa_ = core::Sys().Cfg().anti_aliasing;
+    res_scale_ = ScaleFor(applied_aa_);
+}
+
+u32 D3D11Renderer::ScaleFor(int anti_aliasing) const {
+    u32 f = SsaaFactor(anti_aliasing);
+    while (f > 1 && base_scale_ * f > kMaxScale)
+        f--;
+    return base_scale_ * f;
+}
+
+// The anti-aliasing setting changed (read at every present): a new supersampling factor drops the screen-sized
+// targets, which the next frame creates again at the new scale (their contents start over from guest memory).
+void D3D11Renderer::ApplyAntiAliasing(int anti_aliasing) {
+    applied_aa_ = anti_aliasing;
+    const u32 scale = ScaleFor(anti_aliasing);
+    if (scale == res_scale_)
+        return;
+    const size_t before = surfaces_.size();
+    std::erase_if(surfaces_, [](const auto& kv) { return kv.second->screen_like; });
+    LOG_INFO("Renderer", "anti-aliasing {}: internal scale {}x -> {}x ({} screen-sized targets dropped)", anti_aliasing,
+             res_scale_, scale, before - surfaces_.size());
+    res_scale_ = scale;
+    std::fill(std::begin(bound_), std::end(bound_), nullptr);
+    ContextEpoch()++;
+}
+
 Surface* D3D11Renderer::GetSurface(u64 gpu_va, u32 width, u32 height, u32 format, bool depth, u32 tile_mode) {
     if (!gpu_va || !width || !height || width > 16384 || height > 16384)
         return nullptr;
@@ -488,6 +539,7 @@ Surface* D3D11Renderer::GetSurface(u64 gpu_va, u32 width, u32 height, u32 format
     const bool screen_like = width >= 240 && height >= 135 && width > height &&
                              std::abs(int(width * 9) - int(height * 16)) <= int(width * 9 / 16);
     s->scale = screen_like ? res_scale_ : 1;
+    s->screen_like = screen_like;
     if (screen_like) { // (the game's dynamic resolution shows up as new frame-sized targets)
         static std::set<u64> sizes;
         if (sizes.insert((u64(width) << 32) | height).second)
@@ -2933,6 +2985,8 @@ void D3D11Renderer::Present(const PresentInfo& p) {
         }
     }
     textures_->NextFrame();
+    if (const int aa = core::Sys().Cfg().anti_aliasing; aa != applied_aa_)
+        ApplyAntiAliasing(aa);
     Surface* s = FindSurfaceByCpu(p.cpu_addr);
     last_present_cpu_ = p.cpu_addr;
     {
@@ -3021,11 +3075,16 @@ void D3D11Renderer::Present(const PresentInfo& p) {
     if (s) {
         D3D11_TEXTURE2D_DESC desc;
         s->tex->GetDesc(&desc);
-        if (!frame_tex_ || frame_w_ != s->width * s->scale || frame_h_ != s->height * s->scale || frame_dxgi_ != s->dxgi) {
+        // A supersampled frame is shown at the render scale (resolved below).
+        const u32 ssaa = s->scale > base_scale_ && s->scale % base_scale_ == 0 ? s->scale / base_scale_ : 1;
+        const u32 out_w = s->width * s->scale / ssaa, out_h = s->height * s->scale / ssaa;
+        if (!frame_tex_ || frame_w_ != out_w || frame_h_ != out_h || frame_dxgi_ != s->dxgi) {
             frame_tex_.Reset();
             frame_srv_.Reset();
             frame_rtv_.Reset();
             D3D11_TEXTURE2D_DESC td = desc;
+            td.Width = out_w;
+            td.Height = out_h;
             td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET; // (target of the AA pass)
             dev_->CreateTexture2D(&td, nullptr, &frame_tex_);
             D3D11_RENDER_TARGET_VIEW_DESC rv{};
@@ -3038,14 +3097,17 @@ void D3D11Renderer::Present(const PresentInfo& p) {
             sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
             sv.Texture2D.MipLevels = 1;
             dev_->CreateShaderResourceView(frame_tex_.Get(), &sv, &frame_srv_);
-            frame_w_ = s->width * s->scale;
-            frame_h_ = s->height * s->scale;
+            frame_w_ = out_w;
+            frame_h_ = out_h;
         }
         // Anti-aliasing (mua3.ini / the in-game Graphics menu, read live): FXAA into the frame shown; off, a copy.
         const bool srgb = s->dxgi == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || s->dxgi == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-        if (core::Sys().Cfg().anti_aliasing == 1 &&
-            post_aa_.Fxaa(dev_, ctx_, s->srv.Get(), frame_rtv_.Get(), frame_w_, frame_h_, srgb))
-            ContextEpoch()++; // (the draw state caches forget what the pass bound)
+        if (ssaa > 1) {
+            if (post_aa_.Downsample(dev_, ctx_, s->srv.Get(), frame_rtv_.Get(), frame_w_, frame_h_, srgb, ssaa))
+                ContextEpoch()++; // (the draw state caches forget what the pass bound)
+        } else if (applied_aa_ == 1 &&
+                   post_aa_.Fxaa(dev_, ctx_, s->srv.Get(), frame_rtv_.Get(), frame_w_, frame_h_, srgb))
+            ContextEpoch()++;
         else
             ctx_->CopyResource(frame_tex_.Get(), s->tex.Get());
         SetEvent(static_cast<HANDLE>(new_frame_event_));

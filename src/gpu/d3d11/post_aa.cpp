@@ -12,7 +12,7 @@ namespace {
 // edge for its ends, and resample across it in proportion to the pixel's distance from the nearer end; plus a
 // sub-pixel term for single-pixel features. Luma from gamma-space colour (sqrt of linear for sRGB surfaces).
 constexpr const char kSource[] = R"(
-cbuffer P : register(b0) { float2 rcp_size; float srgb; float pad; };
+cbuffer P : register(b0) { float2 rcp_size; float srgb; float factor; };
 Texture2D<float4> tex : register(t0);
 SamplerState lin : register(s0);
 
@@ -104,26 +104,49 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
     if (horz) at.y += amount * stepLen; else at.x += amount * stepLen;
     return float4(tex.SampleLevel(lin, at, 0).rgb, rgbM.a);
 }
+
+// Supersampling resolve: the average of the factor x factor source texels under each output pixel (an ordered-grid
+// box filter, exact for integer factors), in linear light (gamma-encoded surfaces are decoded and encoded again).
+float3 ToLinear(float3 c) { return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4); }
+float3 ToGamma(float3 c) { return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055; }
+float4 ps_down(float4 pos : SV_Position) : SV_Target {
+    const int n = int(factor);
+    const int2 base = int2(pos.xy) * n;
+    float4 sum = 0;
+    [loop] for (int y = 0; y < n; y++)
+        [loop] for (int x = 0; x < n; x++) {
+            float4 c = tex.Load(int3(base + int2(x, y), 0));
+            if (srgb < 0.5)
+                c.rgb = ToLinear(saturate(c.rgb));
+            sum += c;
+        }
+    sum /= float(n * n);
+    if (srgb < 0.5)
+        sum.rgb = ToGamma(sum.rgb);
+    return sum;
+}
 )";
 
 struct Params {
-    float rcp_w, rcp_h, srgb, pad;
+    float rcp_w, rcp_h, srgb, factor;
 };
 
 } // namespace
 
 bool PostAA::Init(ID3D11Device* dev) {
     tried_ = true;
-    Microsoft::WRL::ComPtr<ID3DBlob> vs, ps, err;
+    Microsoft::WRL::ComPtr<ID3DBlob> vs, ps, down, err;
     const UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
     if (FAILED(D3DCompile(kSource, sizeof(kSource) - 1, "fxaa", nullptr, nullptr, "vs_main", "vs_5_0", flags, 0, &vs, &err)) ||
-        FAILED(D3DCompile(kSource, sizeof(kSource) - 1, "fxaa", nullptr, nullptr, "ps_main", "ps_5_0", flags, 0, &ps, &err))) {
-        LOG_ERROR("Renderer", "FXAA shader: {}", err ? std::string(static_cast<const char*>(err->GetBufferPointer()),
+        FAILED(D3DCompile(kSource, sizeof(kSource) - 1, "fxaa", nullptr, nullptr, "ps_main", "ps_5_0", flags, 0, &ps, &err)) ||
+        FAILED(D3DCompile(kSource, sizeof(kSource) - 1, "fxaa", nullptr, nullptr, "ps_down", "ps_5_0", flags, 0, &down, &err))) {
+        LOG_ERROR("Renderer", "AA shaders: {}", err ? std::string(static_cast<const char*>(err->GetBufferPointer()),
                                                                    err->GetBufferSize()) : "compile failed");
         return false;
     }
     if (FAILED(dev->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &vs_)) ||
-        FAILED(dev->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, &ps_)))
+        FAILED(dev->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, &ps_)) ||
+        FAILED(dev->CreatePixelShader(down->GetBufferPointer(), down->GetBufferSize(), nullptr, &down_)))
         return false;
     D3D11_SAMPLER_DESC sd{};
     sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
@@ -144,7 +167,7 @@ bool PostAA::Init(ID3D11Device* dev) {
         FAILED(dev->CreateRasterizerState(&rd, &raster_)) || FAILED(dev->CreateBlendState(&bl, &blend_)) ||
         FAILED(dev->CreateDepthStencilState(&dd, &depth_)))
         return false;
-    LOG_INFO("Renderer", "FXAA ready");
+    LOG_INFO("Renderer", "post AA passes ready");
     return ok_ = true;
 }
 
@@ -160,7 +183,7 @@ void PostAA::ReadTimer(ID3D11DeviceContext* ctx, Timer& t) {
         return;
     time_sum_ += double(e - b) * 1000.0 / double(dj.Frequency);
     if (++time_n_ == 300) {
-        LOG_INFO("Renderer", "FXAA pass: {:.3f} ms GPU time per frame", time_sum_ / time_n_);
+        LOG_INFO("Renderer", "{} pass: {:.3f} ms GPU time per frame", t.name, time_sum_ / time_n_);
         time_sum_ = 0;
         time_n_ = 0;
     }
@@ -168,14 +191,24 @@ void PostAA::ReadTimer(ID3D11DeviceContext* ctx, Timer& t) {
 
 bool PostAA::Fxaa(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* src, ID3D11RenderTargetView* dst,
                   u32 width, u32 height, bool srgb) {
+    return Pass(dev, ctx, false, src, dst, width, height, srgb, 1);
+}
+
+bool PostAA::Downsample(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* src,
+                        ID3D11RenderTargetView* dst, u32 width, u32 height, bool srgb, u32 factor) {
+    return Pass(dev, ctx, true, src, dst, width, height, srgb, factor);
+}
+
+bool PostAA::Pass(ID3D11Device* dev, ID3D11DeviceContext* ctx, bool down, ID3D11ShaderResourceView* src,
+                  ID3D11RenderTargetView* dst, u32 width, u32 height, bool srgb, u32 factor) {
     if (!tried_)
         Init(dev);
     if (!ok_ || !src || !dst || !width || !height)
         return false;
-    if (width != cb_w_ || height != cb_h_ || u32(srgb) != cb_srgb_) {
-        const Params p{1.0f / width, 1.0f / height, srgb ? 1.0f : 0.0f, 0};
+    if (width != cb_w_ || height != cb_h_ || u32(srgb) != cb_srgb_ || factor != cb_factor_) {
+        const Params p{1.0f / width, 1.0f / height, srgb ? 1.0f : 0.0f, float(factor)};
         ctx->UpdateSubresource(cb_.Get(), 0, nullptr, &p, 0, 0);
-        cb_w_ = width, cb_h_ = height, cb_srgb_ = srgb;
+        cb_w_ = width, cb_h_ = height, cb_srgb_ = srgb, cb_factor_ = factor;
     }
     ID3D11ShaderResourceView* null_srv = nullptr;
     ctx->OMSetRenderTargets(1, &dst, nullptr);
@@ -190,7 +223,7 @@ bool PostAA::Fxaa(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11ShaderResou
     ctx->GSSetShader(nullptr, nullptr, 0);
     ctx->HSSetShader(nullptr, nullptr, 0);
     ctx->DSSetShader(nullptr, nullptr, 0);
-    ctx->PSSetShader(ps_.Get(), nullptr, 0);
+    ctx->PSSetShader(down ? down_.Get() : ps_.Get(), nullptr, 0);
     ctx->PSSetConstantBuffers(0, 1, cb_.GetAddressOf());
     ctx->PSSetSamplers(0, 1, sampler_.GetAddressOf());
     ctx->PSSetShaderResources(0, 1, &src);
@@ -216,6 +249,7 @@ bool PostAA::Fxaa(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11ShaderResou
         ctx->End(t->end.Get());
         ctx->End(t->disjoint.Get());
         t->pending = true;
+        t->name = down ? "SSAA resolve" : "FXAA";
     }
     ctx->PSSetShaderResources(0, 1, &null_srv);
     ID3D11RenderTargetView* null_rtv = nullptr;

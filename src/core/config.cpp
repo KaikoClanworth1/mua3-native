@@ -54,7 +54,7 @@ bool Config::Load(const fs::path& ini) {
     get_i("fps_target", fps_target);
     get_i("swap_interval", swap_interval);
     get_i("anti_aliasing", anti_aliasing);
-    anti_aliasing = std::clamp(anti_aliasing, 0, 1);
+    anti_aliasing = std::clamp(anti_aliasing, 0, 4);
     get_b("show_fps", show_fps);
     get_b("show_debug_overlay", show_debug_overlay);
     int a = int(audio), in = int(input);
