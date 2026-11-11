@@ -77,6 +77,9 @@ target_link_options(mua3 PRIVATE /INCREMENTAL:NO /PDBALTPATH:mua3.pdb)
 
 add_executable(MUA3Launcher WIN32 launcher/launcher.cpp launcher/game_builder.cpp launcher/report.cpp)
 target_link_libraries(MUA3Launcher PRIVATE nxloader platform windowscodecs)
+# The setup wizard (replaces the launcher): installs from the player's dumps, builds the game, makes the shortcuts.
+add_executable(MUA3Setup WIN32 setup/setup.cpp setup/install_ops.cpp launcher/game_builder.cpp launcher/report.cpp)
+target_link_libraries(MUA3Setup PRIVATE nxloader platform windowscodecs)
 
 # Executable icon: build/mua3.ico, made from your installed game's icon by scripts/make_icon.ps1 (game data, so it is
 # generated locally and never committed). Without it the executables keep the default icon.

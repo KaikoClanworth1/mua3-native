@@ -28,6 +28,10 @@ struct Paths {
     fs::path sdk_dir;  // the release's sdk/: include/, lib/, obj/, recomp/ (lists), tools/recomp.exe
     fs::path work_dir; // nso/, gen/ (generated C++), obj/ (compiled), logs
     fs::path out_exe;  // mua3.exe to write
+    fs::path icon;     // optional .ico (made from the player's own game) embedded in mua3.exe
+    bool windowed = false; // link as a Windows app (no console window: started from a shortcut like any PC game)
+    fs::path prebuilt_code; // developers only: link this library of already compiled game code (the dev tree's
+                            // nxrecomp_full.lib) instead of translating and compiling the game (tests the rest quickly)
 };
 // The release layout next to the launcher, or the source tree when run from build/bin (developers).
 Paths DefaultPaths(const fs::path& game_dir);

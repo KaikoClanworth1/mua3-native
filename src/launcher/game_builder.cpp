@@ -266,6 +266,14 @@ bool BuildGame(const Paths& p, int jobs, Progress& prog) {
         if (!fs::exists(p.sdk_dir / need))
             return fail("The release is incomplete: " + (p.sdk_dir / need).string() + " is missing.");
 
+    std::vector<fs::path> shards;
+    const fs::path obj = p.work_dir / "obj";
+    if (!p.prebuilt_code.empty()) { // developers: the game's code compiled already (steps 2-4 skipped)
+        if (!fs::exists(p.prebuilt_code))
+            return fail("Prebuilt code not found: " + p.prebuilt_code.string());
+        stage("Compiling the game (developer: prebuilt " + p.prebuilt_code.filename().string() + ")");
+        note("Translating and compiling skipped: linking " + p.prebuilt_code.string());
+    } else {
     // 2. the game's code, from the install
     stage("Unpacking the game's code from your install");
     const fs::path nso = p.work_dir / "nso";
@@ -305,11 +313,12 @@ bool BuildGame(const Paths& p, int jobs, Progress& prog) {
     }
     args += " --all 1 --sweep 1 --noopt " + Q(p.sdk_dir / "recomp" / "noopt.txt") + " --skip " +
             Q(p.sdk_dir / "recomp" / "skip.txt") + " --nogm " + Q(p.sdk_dir / "recomp" / "nogm.txt");
+    if (fs::exists(p.sdk_dir / "recomp" / "hugeopt.txt"))
+        args += " --hugeopt " + Q(p.sdk_dir / "recomp" / "hugeopt.txt");
     if (const int rc = Run(W(args), nullptr, log, BELOW_NORMAL_PRIORITY_CLASS, &prog.cancel); rc != 0)
         return fail(prog.cancel ? "Cancelled." : fmt::format("recomp.exe failed (code {}); see {}", rc, log.string()));
 
     // 4. compile it
-    std::vector<fs::path> shards;
     for (auto& e : fs::directory_iterator(gen, ec)) {
         const std::string n = e.path().filename().string();
         if (n.rfind("recomp_", 0) == 0 && e.path().extension() == ".cpp")
@@ -318,28 +327,36 @@ bool BuildGame(const Paths& p, int jobs, Progress& prog) {
     std::sort(shards.begin(), shards.end());
     if (shards.empty())
         return fail("recomp.exe produced no code.");
-    const fs::path obj = p.work_dir / "obj";
     fs::create_directories(obj, ec);
     prog.total = int(shards.size());
     stage(fmt::format("Compiling the game ({} parts, {} at a time)", shards.size(), jobs));
     const u64 header_time = MTime(p.sdk_dir / "include" / "core" / "cpu" / "recomp" / "recomp_rt.h");
     // Big functions (300 KB .. 1 MB of C++) come in files of their own, recomp_<shard>_<entry>.cpp: MSVC compiles them
-    // with no optimisation at all unless told to (/d2OptimizeHugeFunctions), and with it one such file needs about
-    // 5 GB per MB of C++. They start first (largest first, not left as stragglers), and together they stay within half
-    // the RAM free now; the ordinary parts run alongside as before.
-    auto is_big = [](const fs::path& f) { return f.stem().string().find('_', 7) != std::string::npos; };
+    // with no optimisation at all unless told to (/d2OptimizeHugeFunctions). The flag costs minutes and about 5 GB per
+    // MB of C++, so only the hot ones get it (hugeopt.txt; recomp marks their files' first line). Those start first,
+    // together within half the RAM free now; everything else follows largest first, so no long part is left to the end.
+    auto is_huge = [](const fs::path& f) {
+        if (f.stem().string().find('_', 7) == std::string::npos)
+            return false;
+        std::ifstream in(f);
+        std::string first;
+        std::getline(in, first);
+        return first.rfind("// mua3: optimise huge", 0) == 0;
+    };
     std::vector<size_t> order(shards.size());
-    std::vector<u64> need(shards.size(), 0); // estimated bytes, big files only
+    std::vector<u64> need(shards.size(), 0), size(shards.size(), 0); // need: estimated bytes, marked files only
     for (size_t i = 0; i < shards.size(); i++) {
         order[i] = i;
-        if (is_big(shards[i]))
-            need[i] = std::max<u64>(1ull << 30, u64(double(fs::file_size(shards[i], ec)) * 5.0 * 1024.0));
+        size[i] = fs::file_size(shards[i], ec);
+        if (is_huge(shards[i]))
+            need[i] = std::max<u64>(1ull << 30, u64(double(size[i]) * 5.0 * 1024.0));
     }
-    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return need[a] > need[b]; });
+    std::stable_sort(order.begin(), order.end(),
+                     [&](size_t a, size_t b) { return need[a] != need[b] ? need[a] > need[b] : size[a] > size[b]; });
     MEMORYSTATUSEX ms{sizeof(ms)};
     GlobalMemoryStatusEx(&ms);
     const u64 budget = ms.ullAvailPhys / 2;
-    const int big_total = int(std::count_if(shards.begin(), shards.end(), is_big));
+    const int big_total = int(std::count_if(need.begin(), need.end(), [](u64 n) { return n != 0; }));
     std::atomic<int> big_done{0};
     if (big_total)
         note(fmt::format("{} large functions to optimise, within {:.1f} GB of memory", big_total, budget / double(1ull << 30)));
@@ -446,18 +463,41 @@ bool BuildGame(const Paths& p, int jobs, Progress& prog) {
         return fail("Cancelled (finished parts are kept; building again continues).");
     if (broken)
         return fail(broken_why);
+    } // (not prebuilt)
 
     // 5. link mua3.exe
     stage("Linking mua3.exe");
+    // the icon, as a resource (rc.exe from the Windows SDK that vcvars64 set up); without it the exe keeps the default
+    fs::path res;
+    if (!p.icon.empty() && fs::exists(p.icon)) {
+        std::wstring sdk_bin;
+        for (const wchar_t* e = env.data(); *e; e += wcslen(e) + 1)
+            if (_wcsnicmp(e, L"WindowsSdkVerBinPath=", 21) == 0)
+                sdk_bin = e + 21;
+        const fs::path rc = fs::path(sdk_bin) / "x64" / "rc.exe";
+        const fs::path rc_src = p.work_dir / "mua3_icon.rc";
+        std::ofstream(rc_src) << "1 ICON \"" << fs::absolute(p.icon).generic_string() << "\"\n";
+        res = p.work_dir / "mua3_icon.res";
+        if (sdk_bin.empty() || !fs::exists(rc) ||
+            Run(W(Q(rc) + " /nologo /fo " + Q(res) + " " + Q(rc_src)), &env, log, BELOW_NORMAL_PRIORITY_CLASS) != 0) {
+            note("Could not compile the icon resource: mua3.exe keeps the default icon.");
+            res.clear();
+        }
+    }
     const fs::path rsp = p.work_dir / "link.rsp";
     {
         std::ofstream r(rsp);
-        r << "/NOLOGO /MACHINE:X64 /SUBSYSTEM:CONSOLE /INCREMENTAL:NO /OPT:REF /OPT:NOICF\n";
+        r << "/NOLOGO /MACHINE:X64 " << (p.windowed ? "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup" : "/SUBSYSTEM:CONSOLE")
+          << " /INCREMENTAL:NO /OPT:REF /OPT:NOICF\n";
+        if (!res.empty())
+            r << Q(res) << "\n";
         r << "/OUT:" << Q(p.work_dir / "mua3.exe") << "\n/LIBPATH:" << Q(p.sdk_dir / "lib") << "\n";
         for (const char* o : {"main.obj", "alloc_trace.obj"})
             r << Q(p.sdk_dir / "obj" / o) << "\n";
         for (auto& s : shards)
             r << Q(obj / s.filename().replace_extension(".obj")) << "\n";
+        if (!p.prebuilt_code.empty())
+            r << Q(p.prebuilt_code) << "\n";
         for (const char* l : kLibs)
             r << l << "\n";
     }
