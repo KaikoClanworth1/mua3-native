@@ -169,15 +169,29 @@ bool ShaderCache::Build(HostShader& s, bool slow) {
         failures++;
         if (!s.is_variant && !s.no_cache) // don't retry it at every launch's prewarm
             MarkFailed(s.hash);
-        common::WriteFile(dump_dir_ / fmt::format("{:016x}.{}.hlsl", s.hash, tag),
-                          std::span(reinterpret_cast<const u8*>(s.info.hlsl.data()), s.info.hlsl.size()));
-        LOG_ERROR("Shader", "{} {:016x} failed: {}", tag, s.hash, err.substr(0, 1500));
+        bool quiet;
+        {
+            std::lock_guard lk(ready_mutex_);
+            quiet = s.quiet;
+            if (quiet)
+                s.quiet_error = err.substr(0, 1500);
+        }
+        if (quiet) {
+            LOG_DEBUG("Shader", "{} {:016x} (set up, not drawn yet) failed: {}", tag, s.hash, err.substr(0, 200));
+        } else {
+            common::WriteFile(dump_dir_ / fmt::format("{:016x}.{}.hlsl", s.hash, tag),
+                              std::span(reinterpret_cast<const u8*>(s.info.hlsl.data()), s.info.hlsl.size()));
+            LOG_ERROR("Shader", "{} {:016x} failed: {}", tag, s.hash, err.substr(0, 1500));
+        }
     } else {
         std::string un;
         for (auto& u : s.info.unimplemented)
             un += u + " ";
-        LOG_INFO("Shader", "{} {:016x}: {} bytes, {} textures{}{}", tag, s.hash, s.code.size(), s.info.textures.size(),
-                 un.empty() ? "" : ", unimplemented: ", un);
+        if (s.quiet)
+            LOG_DEBUG("Shader", "{} {:016x} (set up, not drawn yet): {} bytes", tag, s.hash, s.code.size());
+        else
+            LOG_INFO("Shader", "{} {:016x}: {} bytes, {} textures{}{}", tag, s.hash, s.code.size(),
+                     s.info.textures.size(), un.empty() ? "" : ", unimplemented: ", un);
     }
     s.code.clear();
     s.code.shrink_to_fit();
@@ -661,7 +675,9 @@ void ShaderCache::Anticipate() {
         if (got < 0x60)
             continue;
         const u32 before = new_programs;
+        anticipating_ = true;
         Get(type == 1 ? shader::Stage::Vertex : shader::Stage::Fragment, buf.data(), got);
+        anticipating_ = false;
         anticipate_lookups_++;
         anticipate_new_ += new_programs != before;
         new_programs = before; // (that count is programs first seen by a draw)
@@ -675,11 +691,19 @@ HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size, c
         const u32 shape[4] = {opt->block[0], opt->block[1], opt->block[2], opt->shared_bytes};
         hash ^= Hash64(shape, sizeof(shape)) * 0x9E3779B97F4A7C15ull;
     }
-    if (ordered_.insert(hash).second) // first use this launch and never listed: the next Prewarm starts with it
+    // first use this launch and never listed: the next Prewarm starts with it (programs the game only set up don't
+    // count: it sets up all of them at boot)
+    if (!anticipating_ && ordered_.insert(hash).second)
         AppendLine(dump_dir_ / "order.txt", fmt::format("{:016x}\n", hash));
     auto it = shaders_.find(hash);
     if (it != shaders_.end()) {
         HostShader* found = it->second.get();
+        if (found->quiet && !anticipating_) { // a draw asks for a program only set up so far: failures matter now
+            std::lock_guard lk(ready_mutex_);
+            found->quiet = false;
+            if (found->state == HostShader::Failed)
+                LOG_ERROR("Shader", "{} {:016x} failed: {}", StageTag(found->stage), found->hash, found->quiet_error);
+        }
         if (found->prewarm && found->state == HostShader::Pending) { // still waiting in the prewarm backlog
             found->prewarm = false;
             std::lock_guard lk(mutex_);
@@ -689,8 +713,22 @@ HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size, c
         }
         return found;
     }
+    if (HasFailed(hash)) { // failed in an earlier run (or the setup's shader step): not compiled and logged again
+        auto s = std::make_unique<HostShader>();
+        s->stage = stage;
+        s->hash = hash;
+        s->state = HostShader::Failed;
+        s->quiet = anticipating_;
+        s->quiet_error = "failed in an earlier run";
+        if (!anticipating_)
+            LOG_WARN("Shader", "{} {:016x} failed in an earlier run: its draws are skipped", StageTag(stage), hash);
+        auto* raw = s.get();
+        shaders_[hash] = std::move(s);
+        return raw;
+    }
     new_programs++;
-    return Queue(stage, hash, code, size, opt, false, true); // (the worker writes it to the dump and the pack)
+    HostShader* s = Queue(stage, hash, code, size, opt, false, true); // (the worker writes it to the dump and pack)
+    return s;
 }
 
 HostShader* ShaderCache::Queue(shader::Stage stage, u64 hash, const u8* code, size_t size,
@@ -698,6 +736,7 @@ HostShader* ShaderCache::Queue(shader::Stage stage, u64 hash, const u8* code, si
     auto s = std::make_unique<HostShader>();
     s->prewarm = prewarm;
     s->persist = persist;
+    s->quiet = anticipating_ && !prewarm;
     s->stage = stage;
     s->hash = hash;
     s->code.assign(code, code + size);

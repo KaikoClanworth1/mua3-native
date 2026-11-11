@@ -33,6 +33,10 @@ struct HostShader {
     std::atomic<bool> created{true};
     u32 last_used = 0; // ShaderCache::frame when a draw last bound it (GPU thread)
     bool prewarm = false;             // queued by Prewarm (back of the queue) and not yet asked for by the game
+    // Looked up because the game set it up, no draw has asked for it yet: a failure is logged at debug level only
+    // (MUA3 sets up programs it never draws, some untranslatable), and as an error once a draw asks for it.
+    bool quiet = false;
+    std::string quiet_error;
     bool ok = false; // valid once state != Pending
     shader::TranslateResult info;
     ComPtr<ID3D11VertexShader> vs;
@@ -179,6 +183,7 @@ private:
     std::deque<u64> anticipate_pending_;           // program addresses not looked up yet
     std::unordered_map<u64, u64> anticipate_seen_; // address -> hash of the header last looked up there
     u64 anticipate_taken_ = 0, anticipate_lookups_ = 0, anticipate_new_ = 0, anticipate_logged_ = 0;
+    bool anticipating_ = false; // Get() called by Anticipate: no first-use order, quiet failures
 };
 
 // Compiles the HLSL file `in_path` for `target` (vs_5_0/ps_5_0) into DXBC at `out_path` (process entry point
