@@ -21,6 +21,7 @@ struct Config {
     int resolution_scale = 0; // internal render scale; 0 = auto from the output size
     int fps_limit = 60;
     int fps_target = 60; // game frame rate: 30 (original) or 60; higher values are experimental (patched timing)
+    int anti_aliasing = 0; // post-process anti-aliasing of the final image: 0 off, 1 FXAA (read live)
     int swap_interval = 0; // 0: the game's own (MUA3 asks for 2 = 30 fps); 1 presents every vblank
     bool show_fps = true;
     bool show_debug_overlay = false;
