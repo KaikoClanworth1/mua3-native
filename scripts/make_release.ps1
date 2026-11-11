@@ -1,6 +1,7 @@
-# Packages the release: the launcher, the recompiler and the port's prebuilt libraries (sdk/), so players build the
-# game on their own PC from their own install. It contains none of the game: no recompiled code (nxrecomp*.lib,
-# recomp_full/), no game data, no keys, and the launcher is built without the icon made from the game.
+# Packages the release: the setup (MUA3Setup.exe), the recompiler and the port's prebuilt libraries (sdk/), so players
+# build the game on their own PC from their own files. It contains none of the game: no recompiled code (nxrecomp*.lib,
+# recomp_full/), no game data, no keys, and the setup is built without the icon made from the game (the setup makes
+# the game's icon on the player's PC, from their own files).
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\make_release.ps1 -Version 0.2.0 [-Zip]
 param([string]$Version = '0.2.0', [switch]$Zip)
 $ErrorActionPreference = 'Stop'
@@ -15,10 +16,10 @@ function Build([string[]]$Targets) {
     if ($LASTEXITCODE) { throw "build failed: $Targets" }
 }
 
-# the launcher without the game's icon, the tools, and the libraries mua3 links
+# the setup without the game's icon, the tools, and the libraries mua3 links
 & cmake -S $root -B $build -DMUA3_GAME_ICON=OFF | Out-Null
 try {
-    Build @('MUA3Launcher', 'recomp', 'nxcore', 'platform', 'nxloader', 'imgui')
+    Build @('MUA3Setup', 'recomp', 'nxcore', 'platform', 'nxloader', 'imgui')
     Build @('mua3') # (only for main.obj / alloc_trace.obj: the exe itself is never packaged)
 } finally {
     & cmake -S $root -B $build -DMUA3_GAME_ICON=ON | Out-Null
@@ -27,7 +28,7 @@ try {
 Remove-Item $out -Recurse -Force -ErrorAction SilentlyContinue
 foreach ($d in 'sdk\include\core\cpu\recomp', 'sdk\lib', 'sdk\obj', 'sdk\recomp', 'sdk\tools') { New-Item -ItemType Directory -Force (Join-Path $out $d) | Out-Null }
 $bin = Join-Path $build "bin\$cfg"
-Copy-Item "$bin\MUA3Launcher.exe" $out
+Copy-Item "$bin\MUA3Setup.exe" $out
 Copy-Item "$bin\recomp.exe" "$out\sdk\tools"
 Copy-Item "$root\src\core\cpu\recomp\recomp_rt.h" "$out\sdk\include\core\cpu\recomp"
 $libs = @(
@@ -46,11 +47,15 @@ MUA3 Native v$Version
 A native Windows port of Marvel Ultimate Alliance 3: The Black Order, built on your PC from your own copy.
 This package contains no part of the game.
 
-1. Run MUA3Launcher.exe.
-2. Install tab: choose your prod.keys, add the base game, the 4.0.1 update and any DLC (.nsp / .xci), install.
-3. Step 5: install Microsoft's free "Build Tools for Visual Studio 2026" (Desktop development with C++) if the
-   launcher asks, then press "Build the game". The first build takes about an hour and needs ~5 GB.
-4. Play.
+1. Install Microsoft's free "Build Tools for Visual Studio 2026" (workload: Desktop development with C++) if you
+   don't have Visual Studio 2026 already. The game is compiled on your PC with it.
+2. Run MUA3Setup.exe. It finds your base game, the 4.0.1 update and any DLC (.nsp / .xci) and your prod.keys
+   (or Browse / drop them on the window), asks where to install, and shows the space needed.
+3. Press "Build the game": it installs the game data, translates and compiles the game and prepares its
+   shaders (setup shows how long it takes on your PC; it stays usable meanwhile).
+4. Choose a desktop shortcut and a Start-menu entry, then Play. Every setting is in the game
+   (title screen > SYSTEM > GRAPHICS). Run MUA3Setup.exe again, or use Windows Settings > Apps, to update,
+   repair or uninstall.
 
 https://github.com/KaikoClanworth1/mua3-native
 "@ | Set-Content "$out\READ ME FIRST.txt" -Encoding utf8
