@@ -150,9 +150,13 @@ public:
         Reg(0, "GetCurrentTime", [](Request& r) { r.Push<s64>(PosixNow()); });
         Ok(1, "SetCurrentTime");
         Reg(2, "GetSystemClockContext", [](Request& r) {
+            // {offset; steady time point; steady clock id}: offset + the steady clock = now (as in the shared memory)
             u8 ctx[0x20]{};
-            const s64 t = PosixNow();
-            std::memcpy(ctx, &t, 8);
+            const s64 steady = s64(r.k.GetTicks() / 19200000), offset = PosixNow() - steady;
+            const u64 uuid[2] = {0x4D554133ull, 0x0123456789ull};
+            std::memcpy(ctx, &offset, 8);
+            std::memcpy(ctx + 8, &steady, 8);
+            std::memcpy(ctx + 16, uuid, 16);
             r.PushRaw(ctx, sizeof(ctx));
         });
         Ok(3, "SetSystemClockContext");
@@ -235,6 +239,32 @@ public:
     }
 };
 
+// The time shared memory (6.x layout). The SDK reads the clocks from here rather than over IPC: user/local/network
+// time = context offset + steady clock time point, steady time = (internal offset + ticks) in seconds. Left zeroed,
+// every clock read as seconds since boot, so saves were dated 1970-01-01 plus the play time. Each value is a
+// lock-free pair {u32 counter; T storage[2]}: both slots are written.
+void FillTimeSharedMemory(u8* m, u64 ticks) {
+    const s64 steady = s64(ticks / 19200000); // the steady clock in seconds, as ISteadyClock reports it
+    const u64 uuid[2] = {0x4D554133ull, 0x0123456789ull};
+    // standard steady clock context at 0x0: {u64 internal_offset (ns); uuid}
+    for (int i = 0; i < 2; i++) {
+        u8* c = m + 0x8 + i * 0x18;
+        std::memset(c, 0, 8);
+        std::memcpy(c + 8, uuid, 16);
+    }
+    // local (0x38) and network (0x80) system clock contexts: {s64 offset; s64 time_point; uuid}
+    const s64 offset = PosixNow() - steady;
+    for (u32 base : {0x38u, 0x80u})
+        for (int i = 0; i < 2; i++) {
+            u8* c = m + base + 8 + i * 0x20;
+            std::memcpy(c, &offset, 8);
+            std::memcpy(c + 8, &steady, 8);
+            std::memcpy(c + 16, uuid, 16);
+        }
+    // user system clock automatic correction (0xc8): enabled
+    m[0xcc] = m[0xcd] = 1;
+}
+
 class TimeService final : public Service {
 public:
     explicit TimeService(std::string n) : Service(std::move(n)) {
@@ -245,7 +275,11 @@ public:
         Reg(4, "GetStandardLocalSystemClock", [](Request& r) { r.PushInterface(Make<ISystemClock>()); });
         Reg(5, "GetEphemeralNetworkSystemClock", [](Request& r) { r.PushInterface(Make<ISystemClock>()); });
         Reg(20, "GetSharedMemoryNativeHandle", [](Request& r) {
-            static auto shm = std::make_shared<kernel::SharedMemory>(0x1000, "time");
+            static auto shm = [&r] {
+                auto m = std::make_shared<kernel::SharedMemory>(0x1000, "time");
+                FillTimeSharedMemory(m->Data(), r.k.GetTicks());
+                return m;
+            }();
             r.PushCopy(shm);
         });
         Reg(100, "IsStandardUserSystemClockAutomaticCorrectionEnabled", [](Request& r) { r.Push<u8>(1); });
