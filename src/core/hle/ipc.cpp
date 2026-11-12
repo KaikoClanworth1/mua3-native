@@ -1,4 +1,7 @@
 #include <algorithm>
+#include <mutex>
+#include <set>
+#include <string>
 
 #include "core/hle/service.h"
 
@@ -54,7 +57,12 @@ size_t Request::WriteOut(const void* data, size_t size, size_t i) {
 void Service::Dispatch(Request& r) {
     auto it = handlers_.find(r.cmd);
     if (it == handlers_.end()) {
-        LOG_WARN("Service", "{}: unimplemented command {} (returning success)", name_, r.cmd);
+        // once per service and command: games poll some of them every frame
+        static std::mutex m;
+        static std::set<std::pair<std::string, u32>> logged;
+        std::lock_guard lk(m);
+        if (logged.insert({name_, u32(r.cmd)}).second)
+            LOG_WARN("Service", "{}: unimplemented command {} (returning success; logged once)", name_, r.cmd);
         return;
     }
     if (!quiet_)

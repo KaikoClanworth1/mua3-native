@@ -1,3 +1,7 @@
+#include <mutex>
+#include <set>
+#include <string>
+
 #include "core/hle/service.h"
 
 namespace hle {
@@ -9,7 +13,12 @@ class StubService final : public Service {
 public:
     explicit StubService(std::string n) : Service(std::move(n)) {}
     void Dispatch(Request& r) override {
-        LOG_WARN("Stub", "{}: command {} (stubbed)", name_, r.cmd);
+        // once per service and command (mm:u is called a few times a frame during movies)
+        static std::mutex m;
+        static std::set<std::pair<std::string, u32>> logged;
+        std::lock_guard lk(m);
+        if (logged.insert({name_, u32(r.cmd)}).second)
+            LOG_WARN("Stub", "{}: command {} (stubbed; logged once)", name_, r.cmd);
     }
 };
 

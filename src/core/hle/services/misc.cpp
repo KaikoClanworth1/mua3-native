@@ -249,6 +249,8 @@ public:
             r.PushCopy(shm);
         });
         Reg(100, "IsStandardUserSystemClockAutomaticCorrectionEnabled", [](Request& r) { r.Push<u8>(1); });
+        // (the network clock is the host's clock: accurate)
+        Reg(200, "IsStandardNetworkSystemClockAccuracySufficient", [](Request& r) { r.Push<u8>(1); });
         Reg(300, "CalculateMonotonicSystemClockBaseTimePoint", [](Request& r) {
             r.Push<s64>(PosixNow() - s64(r.k.GetTicks() / 19200000));
         });
