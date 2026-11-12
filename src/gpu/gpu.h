@@ -111,6 +111,12 @@ public:
     }
 
     std::atomic<u64> submits{0}, methods{0}, draws{0}, presents{0};
+    // Advances whenever guest memory a submit reads may change under it: a submit starting, a GPU-side write (WriteGpu,
+    // DMA), a fence completing. Data checked at one value is unchanged while it holds (the game does not rewrite what
+    // a submit in flight reads).
+    u64 MemEpoch() const { return mem_epoch_.load(std::memory_order_relaxed); }
+    void BumpMemEpoch() { mem_epoch_.fetch_add(1, std::memory_order_relaxed); }
+    std::atomic<u64> mem_epoch_{1};
     std::atomic<u64> busy_ns{0}, draw_ns{0}; // time the GPU thread spent executing commands / in Renderer::Draw
 
 private:

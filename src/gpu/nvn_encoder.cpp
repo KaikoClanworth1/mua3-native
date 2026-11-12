@@ -218,6 +218,7 @@ public:
     }
 
     void Run(const Frame& cmds) {
+        g_.BumpMemEpoch(); // (a new submit: guest memory may have changed since the last one)
         for (size_t i = 0; i < cmds.size(); i++)
             Encode(cmds[i]);
     }

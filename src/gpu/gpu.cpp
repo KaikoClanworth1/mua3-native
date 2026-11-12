@@ -162,6 +162,7 @@ size_t Gpu::ReadGpuPartial(u64 gpu_va, void* dst, size_t size) {
 }
 
 bool Gpu::WriteGpu(u64 gpu_va, const void* src, size_t size) {
+    BumpMemEpoch();
     const u8* s = static_cast<const u8*>(src);
     if (gpu_va >= kHostBase) {
         if (gpu_va + size > kHostBase + kHostSize)
@@ -215,6 +216,7 @@ bool Gpu::WaitSyncpoint(u32 id, u32 value, s64 timeout_us) {
 }
 
 void Gpu::CompleteFence(u32 syncpt_id, u32 target) {
+    BumpMemEpoch();
     submits++;
     SubmitHost([this, syncpt_id, target] {
         if (syncpt_id >= kNumSyncpoints)
@@ -379,6 +381,7 @@ void Gpu::RunDma(const u32* r, u32 launch) {
                               ((d.depth + (1u << d.bd) - 1) >> d.bd) * (512ull << (d.bh + d.bd));
         // Write straight into guest memory when the surface is mapped contiguously (the common case).
         std::vector<u8> surf_copy;
+        BumpMemEpoch();
         u8* surf = GpuPtr(dst, size_t(surf_size));
         if (!surf) {
             surf_copy.resize(size_t(surf_size));

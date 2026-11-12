@@ -220,6 +220,7 @@ enum ProfSection { kProfShaders, kProfState, kProfIndex, kProfVertex, kProfCbufs
 static const char* const kProfNames[kProfCount] = {"shaders", "state", "index", "vertex", "cbufs", "textures", "other", "submit"};
 static u64 g_prof_ns[kProfCount], g_prof_vb_bytes, g_prof_cb_bytes, g_prof_ib_count, g_prof_draws;
 static u64 g_prof_cb_dyn_bytes, g_prof_cb_uploads, g_prof_cb_same; // constant buffers: dynamically indexed bytes, uploads, unchanged
+static u64 g_prof_raw_cmp, g_prof_raw_skip; // large raw constant buffers: compared / known unchanged (same memory epoch)
 static u64 g_prof_rb_waits, g_prof_rb_wait_ns, g_prof_rb_queued, g_prof_rb_bytes; // compute result copy-backs
 static u64 g_prof_resident; // draws reading compute output from the resident copy
 static u64 g_prof_rb_pages, g_prof_rb_changed_pages; // copy-back pages compared / found changed
@@ -312,9 +313,18 @@ public:
     }
     // A large dynamically indexed constant buffer's raw view, kept per guest address: `src` is uploaded only when it
     // differs from the last upload of that address (`changed`).
-    ID3D11ShaderResourceView* RawByAddress(u64 addr, const u8* src, u32 size, u64 frame, bool& changed) {
+    // `epoch` (Gpu::MemEpoch, 0: none): when it is the one the last check of this address saw, the bytes are
+    // unchanged without comparing them.
+    ID3D11ShaderResourceView* RawByAddress(u64 addr, const u8* src, u32 size, u64 frame, u64 epoch, bool& changed) {
         RawCached& e = raw_by_addr_[addr];
         e.last_use = frame;
+        if (epoch && e.epoch == epoch && e.raw.srv && e.data.size() == size) {
+            changed = false;
+            g_prof_raw_skip++;
+            return e.raw.srv.Get();
+        }
+        g_prof_raw_cmp++;
+        e.epoch = epoch;
         changed = !e.raw.srv || e.data.size() != size || std::memcmp(src, e.data.data(), size) != 0;
         if (changed) {
             const u32 n = std::max<u32>(16, common::AlignUp(size, 16));
@@ -513,6 +523,7 @@ private:
         Raw raw;
         std::vector<u8> data; // contents of the last upload
         u64 last_use = 0;
+        u64 epoch = 0; // Gpu::MemEpoch of the last check
     };
     common::U64Map<RawCached> raw_by_addr_;
     std::unordered_map<u32, Cb> vbufs_;
@@ -2903,7 +2914,8 @@ void D3D11Renderer::Draw() {
             // Large ones (64 KB windows several draws a frame bind in turn) keep a raw buffer per address.
             if (dyn && src && !trace_draw_ && size >= kRawByAddressMin) {
                 bool changed;
-                raws[i] = dc.RawByAddress(b.address, src, size, frame_counter_, changed);
+                // (driver constant buffers in host memory are written between draws without an epoch change)
+                raws[i] = dc.RawByAddress(b.address, src, size, frame_counter_, b.address < Gpu::kHostBase ? g.MemEpoch() : 0, changed);
                 if (!changed && sh.by_address && sh.addr == b.address && sh.cb_size >= cb_size && sh.gen == ring_gen) {
                     cbs[i] = sh.buf;
                     cb_first[i] = sh.first, cb_num[i] = sh.num;
@@ -3178,7 +3190,9 @@ void D3D11Renderer::Present(const PresentInfo& p) {
         last_reuploads = textures_->reuploads;
         LOG_INFO("Profile", "  constant buffers: {} uploads/frame ({:.1f} MB, {:.1f} MB of it dynamically indexed), {} unchanged",
                  g_prof_cb_uploads / 150, g_prof_cb_bytes / 150 / 1048576.0, g_prof_cb_dyn_bytes / 150 / 1048576.0, g_prof_cb_same / 150);
-        g_prof_cb_uploads = g_prof_cb_same = g_prof_cb_dyn_bytes = 0;
+        LOG_INFO("Profile", "  large raw constant buffers: {} compared/frame, {} known unchanged/frame", g_prof_raw_cmp / 150,
+                 g_prof_raw_skip / 150);
+        g_prof_cb_uploads = g_prof_cb_same = g_prof_cb_dyn_bytes = g_prof_raw_cmp = g_prof_raw_skip = 0;
         LOG_INFO("Profile", "  copy-backs: {:.1f} queued/frame ({:.2f} MB), {:.2f} blocking waits/frame costing {:.2f} ms, {:.1f} resident binds/frame",
                  g_prof_rb_queued / 150.0, g_prof_rb_bytes / 150 / 1048576.0, g_prof_rb_waits / 150.0, g_prof_rb_wait_ns / 150e6,
                  g_prof_resident / 150.0);
