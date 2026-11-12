@@ -568,7 +568,9 @@ bool ShaderCache::Compile(HostShader& s, const std::string& hlsl, std::string& e
     // FXC failed on a vertex / pixel shader (an internal compiler error on some, or a 2-minute timeout): the direct
     // backend builds it instead, so its draws are not left out.
     auto direct_fallback = [&]() {
-        if (s.stage == shader::Stage::Compute)
+        // (doubles: the direct backend has none, and its parse error would be a C++ exception the crash handler
+        // logs with a stack trace. The only such programs are harvest hits on data no draw uses.)
+        if (s.stage == shader::Stage::Compute || source.find("asdouble") != std::string::npos)
             return false;
         std::vector<u8> b;
         std::string derr;
