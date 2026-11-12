@@ -22,6 +22,8 @@ namespace gpu {
 
 // Bump kTranslatorVersion whenever the translator output changes, to invalidate cached bytecode.
 constexpr int kTranslatorVersion = 30;
+// Failure markers carry this: older ones (before the direct backend took over what FXC fails on) are retried once.
+constexpr u8 kFailGeneration = 1;
 
 
 namespace {
@@ -139,7 +141,23 @@ bool ShaderCache::Build(HostShader& s, bool slow) {
     const char* target = StageTarget(s.stage);
     // Compute shaders go through the direct DXBC backend (milliseconds): no slow FXC queue for them.
     const bool direct = s.stage == shader::Stage::Compute && !std::getenv("MUA3_FXC_COMPUTE");
-    if (!slow && !direct && s.info.ok && s.info.uses_loop && !HasBytecode(s)) {
+    // Vertex and pixel shaders: FXC, and the direct backend for what FXC fails on (Compile). MUA3_DIRECT_VSPS=1 uses
+    // the direct backend first (milliseconds instead of up to minutes per loop shader), but its bytecode costs the
+    // driver ~2.5x FXC's to compile at first draw, so it is not the default.
+    static const bool direct_vsps = std::getenv("MUA3_DIRECT_VSPS") != nullptr;
+    if (s.stage != shader::Stage::Compute && direct_vsps && !overrides_ && s.info.ok && !s.direct_tried &&
+        !HasBytecode(s)) {
+        s.direct_tried = true;
+        std::string derr;
+        const auto d0 = std::chrono::steady_clock::now();
+        if (!dxbc::CompileHlsl(s.info.hlsl, s.stage == shader::Stage::Vertex ? dxbc::Stage::Vertex : dxbc::Stage::Pixel,
+                               s.direct_blob, derr)) {
+            s.direct_blob.clear();
+            LOG_DEBUG("Shader", "{} {:016x}: direct DXBC failed ({}), using FXC", tag, s.hash, derr.substr(0, 120));
+        }
+        compile_ns += u64((std::chrono::steady_clock::now() - d0).count());
+    }
+    if (!slow && !direct && s.direct_blob.empty() && s.info.ok && s.info.uses_loop && !HasBytecode(s)) {
         s.slow = true;
         s.claimed = false;
         {
@@ -359,8 +377,8 @@ void ShaderCache::OpenPack() {
                 pack_dxbc_[hash] = {pos + 13, size};
             else if (kind == PackInfo)
                 pack_info_[hash] = {pos + 13, size};
-            else if (kind == PackFail)
-                pack_fail_.insert(hash);
+            else if (kind == PackFail && size >= 1 && pack_[pos + 13] >= kFailGeneration)
+                pack_fail_.insert(hash); // (older markers: retried once, the direct backend may build it now)
             else if (kind >= PackProgram && kind < PackProgram + 3)
                 pack_prog_[kind - PackProgram][hash] = {pos + 13, size};
             else if (kind == PackOpt)
@@ -448,7 +466,7 @@ bool ShaderCache::HasFailed(u64 hash) const {
         if (pack_fail_.count(hash))
             return true;
     }
-    return fs::exists(cache_dir_ / fmt::format("{:016x}_v{}.fail", hash, kTranslatorVersion));
+    return fs::exists(cache_dir_ / fmt::format("{:016x}_v{}_g{}.fail", hash, kTranslatorVersion, kFailGeneration));
 }
 
 void ShaderCache::MarkFailed(u64 hash) {
@@ -456,8 +474,9 @@ void ShaderCache::MarkFailed(u64 hash) {
         std::lock_guard lk(pack_mutex_);
         pack_fail_.insert(hash);
     }
-    PackPut(PackFail, hash, {});
-    std::ofstream(cache_dir_ / fmt::format("{:016x}_v{}.fail", hash, kTranslatorVersion));
+    const u8 generation = kFailGeneration;
+    PackPut(PackFail, hash, std::span(&generation, 1));
+    std::ofstream(cache_dir_ / fmt::format("{:016x}_v{}_g{}.fail", hash, kTranslatorVersion, kFailGeneration));
 }
 
 // A cached base shader skipped translation: its variants are rewritten from the HLSL, so translate it now.
@@ -533,6 +552,34 @@ bool ShaderCache::Compile(HostShader& s, const std::string& hlsl, std::string& e
         cached.clear();
         LOG_INFO("Shader", "using override {}", override_path.string());
     }
+    if (blob.empty() && !s.direct_blob.empty()) { // built by the direct backend in Build
+        blob = std::move(s.direct_blob);
+        s.direct_blob.clear();
+        if (!cached.empty()) {
+            common::WriteFile(cached, blob);
+            PackPut(PackDxbc, s.hash, blob);
+        }
+    }
+    // FXC failed on a vertex / pixel shader (an internal compiler error on some, or a 2-minute timeout): the direct
+    // backend builds it instead, so its draws are not left out.
+    auto direct_fallback = [&]() {
+        if (s.stage == shader::Stage::Compute)
+            return false;
+        std::vector<u8> b;
+        std::string derr;
+        if (!dxbc::CompileHlsl(source, s.stage == shader::Stage::Vertex ? dxbc::Stage::Vertex : dxbc::Stage::Pixel, b,
+                               derr))
+            return false;
+        LOG_INFO("Shader", "{} {:016x}: FXC failed ({}), built by the direct backend", StageTag(s.stage), s.hash,
+                 err.substr(0, 100));
+        blob = std::move(b);
+        err.clear();
+        if (!cached.empty()) {
+            common::WriteFile(cached, blob);
+            PackPut(PackDxbc, s.hash, blob);
+        }
+        return true;
+    };
     if (blob.empty() && out_of_process) {
         // Run FXC in a child process we can kill: some loop shaders make it spin for many minutes.
         const auto tmp = fs::temp_directory_path() / fmt::format("mua3_shader_{:016x}", s.hash);
@@ -575,7 +622,7 @@ bool ShaderCache::Compile(HostShader& s, const std::string& hlsl, std::string& e
         fs::remove(in, ec);
         fs::remove(out, ec);
         fs::remove(out.string() + ".err", ec);
-        if (!err.empty())
+        if (!err.empty() && !direct_fallback())
             return false;
     }
     if (blob.empty()) {
@@ -585,12 +632,14 @@ bool ShaderCache::Compile(HostShader& s, const std::string& hlsl, std::string& e
                                       &code, &errors);
         if (FAILED(hr)) {
             err = errors ? std::string((const char*)errors->GetBufferPointer(), errors->GetBufferSize()) : "D3DCompile failed";
-            return false;
-        }
-        blob.assign((const u8*)code->GetBufferPointer(), (const u8*)code->GetBufferPointer() + code->GetBufferSize());
-        if (!cached.empty()) {
-            common::WriteFile(cached, blob);
-            PackPut(PackDxbc, s.hash, blob);
+            if (!direct_fallback())
+                return false;
+        } else {
+            blob.assign((const u8*)code->GetBufferPointer(), (const u8*)code->GetBufferPointer() + code->GetBufferSize());
+            if (!cached.empty()) {
+                common::WriteFile(cached, blob);
+                PackPut(PackDxbc, s.hash, blob);
+            }
         }
     }
     if (s.prewarm && s.stage != shader::Stage::Compute) {
@@ -636,6 +685,66 @@ void ShaderCache::Realize(HostShader* s) {
     realized++;
     live_objects++;
     s->created.store(true, std::memory_order_release);
+}
+
+// Every vertex / pixel shader's driver object created once and released: the driver compiles each in the background
+// and keeps the GPU code in its disk cache (setup step; GPU thread idle). Returns how many were handed over.
+u32 ShaderCache::WarmDriverCache() {
+    u32 n = 0;
+    for (auto& [hash, sp] : shaders_) {
+        HostShader& s = *sp;
+        if (s.state != HostShader::Ready || !s.ok || s.dxbc.empty() || s.stage == shader::Stage::Compute)
+            continue;
+        if (s.stage == shader::Stage::Vertex) {
+            ComPtr<ID3D11VertexShader> o;
+            dev_->CreateVertexShader(s.dxbc.data(), s.dxbc.size(), nullptr, &o);
+        } else {
+            ComPtr<ID3D11PixelShader> o;
+            dev_->CreatePixelShader(s.dxbc.data(), s.dxbc.size(), nullptr, &o);
+        }
+        n++;
+    }
+    return n;
+}
+
+// The driver's compiler threads run in this process: done when its CPU time has stopped growing (under 3% of one
+// CPU over 3 s). Returns the seconds waited.
+double WaitForDriverCompiles(std::chrono::seconds cap) {
+    auto cpu_s = [] {
+        FILETIME c, e, k, u;
+        GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
+        auto v = [](const FILETIME& f) { return double((u64(f.dwHighDateTime) << 32) | f.dwLowDateTime) * 1e-7; };
+        return v(k) + v(u);
+    };
+    const auto t0 = std::chrono::steady_clock::now();
+    double last = cpu_s();
+    while (std::chrono::steady_clock::now() - t0 < cap) {
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        const double now = cpu_s();
+        if (now - last < 0.09)
+            break;
+        last = now;
+    }
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// "<vendor id> <driver version>" of the device's adapter ("" when unknown): a new driver starts with an empty cache.
+std::string DriverVersion(ID3D11Device* dev) {
+    ComPtr<IDXGIDevice> dxgi;
+    ComPtr<IDXGIAdapter> adapter;
+    DXGI_ADAPTER_DESC desc{};
+    LARGE_INTEGER umd{};
+    if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&dxgi))) || FAILED(dxgi->GetAdapter(&adapter)) ||
+        FAILED(adapter->GetDesc(&desc)) || FAILED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd)))
+        return {};
+    const u64 v = u64(umd.QuadPart);
+    return fmt::format("{:04x} {}.{}.{}.{}", desc.VendorId, v >> 48, (v >> 32) & 0xFFFF, (v >> 16) & 0xFFFF, v & 0xFFFF);
+}
+
+void SaveDriverVersion(ID3D11Device* dev) {
+    const std::string v = DriverVersion(dev);
+    if (!v.empty())
+        common::WriteFile(fs::path("shader_cache") / "driver.txt", std::span((const u8*)v.data(), v.size()));
 }
 
 // Programs the game set up since the last frame (most at boot): each is looked up, so a program that is in neither
@@ -1202,10 +1311,10 @@ int BuildShadersAhead(const fs::path& game_dir) {
     // 4. translate and compile all of it into the pack
     ComPtr<ID3D11Device> dev;
     D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
-    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &fl, 1, D3D11_SDK_VERSION, &dev,
-                                 nullptr, nullptr)) &&
-        FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, &fl, 1, D3D11_SDK_VERSION, &dev, nullptr,
-                                 nullptr))) {
+    const bool hardware = SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &fl, 1,
+                                                      D3D11_SDK_VERSION, &dev, nullptr, nullptr));
+    if (!hardware && FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, &fl, 1, D3D11_SDK_VERSION,
+                                              &dev, nullptr, nullptr))) {
         say("could not create a Direct3D 11 device");
         return 1;
     }
@@ -1233,10 +1342,22 @@ int BuildShadersAhead(const fs::path& game_dir) {
         }
         failed = cache.failures;
         count = cache.Count();
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        say(fmt::format("Shaders ready: {} programs and variants ({} prepared, {} cannot be translated) in {:.0f} s",
+                        count, total, failed, s));
+        // 5. the graphics driver's own shader cache. The driver turns this bytecode into GPU code at a shader's first
+        // use (~0.1 s each cold, several seconds for a new area's shaders) and keeps the result on disk: creating
+        // every object once here, and waiting for its compiler threads, makes the first launch use warm entries.
+        if (hardware && !std::getenv("MUA3_NO_DRIVER_WARM")) {
+            const auto w0 = std::chrono::steady_clock::now();
+            const u32 n = cache.WarmDriverCache();
+            say(fmt::format("Preparing {} shaders in the graphics driver...", n));
+            const double secs = WaitForDriverCompiles(std::chrono::minutes(20));
+            say(fmt::format("Graphics driver shaders prepared in {:.0f} s ({:.0f} s after the last one was handed over)",
+                            std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count(), secs));
+            SaveDriverVersion(dev.Get());
+        }
     }
-    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    say(fmt::format("Shaders ready: {} programs and variants ({} prepared, {} cannot be translated) in {:.0f} s",
-                    count, total, failed, s));
     return 0;
 }
 

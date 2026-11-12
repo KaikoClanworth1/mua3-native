@@ -125,15 +125,44 @@ void Checksum(const u8* blob, size_t size, u32 out[4]) {
     std::memcpy(out, buf, 16);
 }
 
-std::vector<u8> Container(const std::vector<u32>& shex) {
+// ISGN / OSGN: count, offset of the element table (8), 24-byte elements, then the names (each once), padded to 4.
+static std::vector<u8> Signature(const std::vector<SigElement>& els) {
+    std::vector<u8> out(8 + els.size() * 24, 0);
+    const u32 head[2] = {u32(els.size()), 8};
+    std::memcpy(out.data(), head, 8);
+    std::vector<std::pair<std::string, u32>> names;
+    for (size_t i = 0; i < els.size(); i++) {
+        const SigElement& e = els[i];
+        u32 name_off = 0;
+        for (auto& [n, o] : names)
+            if (n == e.name)
+                name_off = o;
+        if (!name_off) {
+            name_off = u32(out.size());
+            names.push_back({e.name, name_off});
+            out.insert(out.end(), e.name.begin(), e.name.end());
+            out.push_back(0);
+        }
+        const u32 w[5] = {name_off, e.index, e.sys_value, e.comp_type, e.reg};
+        u8* p = out.data() + 8 + i * 24;
+        std::memcpy(p, w, 20);
+        p[20] = e.mask;
+        p[21] = e.rw_mask;
+    }
+    while (out.size() % 4)
+        out.push_back(0xAB); // (FXC pads names with 0xAB)
+    return out;
+}
+
+std::vector<u8> Container(const std::vector<u32>& shex, const std::vector<SigElement>& isgn,
+                          const std::vector<SigElement>& osgn) {
     struct Chunk {
         char tag[4];
         std::vector<u8> data;
     };
     std::vector<Chunk> chunks;
-    const u32 empty_sig[2] = {0, 8}; // element count, offset of the (empty) element table
-    chunks.push_back({{'I', 'S', 'G', 'N'}, std::vector<u8>((const u8*)empty_sig, (const u8*)empty_sig + 8)});
-    chunks.push_back({{'O', 'S', 'G', 'N'}, std::vector<u8>((const u8*)empty_sig, (const u8*)empty_sig + 8)});
+    chunks.push_back({{'I', 'S', 'G', 'N'}, Signature(isgn)});
+    chunks.push_back({{'O', 'S', 'G', 'N'}, Signature(osgn)});
     chunks.push_back({{'S', 'H', 'E', 'X'}, std::vector<u8>((const u8*)shex.data(), (const u8*)shex.data() + shex.size() * 4)});
     const u32 header = 32 + 4 * u32(chunks.size());
     u32 total = header;

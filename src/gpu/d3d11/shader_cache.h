@@ -44,6 +44,10 @@ struct HostShader {
     ComPtr<ID3D11ComputeShader> cs;
     ComPtr<ID3D11ComputeShader> cs_ref; // MUA3_DXBC_VERIFY: the same kernel compiled by FXC, for A/B checks
     bool direct_dxbc = false;           // compiled by the FXC-free backend
+    // Vertex / pixel: the direct backend's bytecode, built in Build before it decides on the slow FXC queue (empty:
+    // not tried yet, or it could not build this one and FXC does).
+    bool direct_tried = false;
+    std::vector<u8> direct_blob;
     shader::TranslateOptions opt; // compute: workgroup shape and shared memory from the launch
     std::vector<u8> cbuf1;        // compute: constant buffer 1 at first launch (opt.cbuf1 points here)
     std::vector<u8> code; // guest program (kept until compiled)
@@ -83,6 +87,9 @@ public:
     // the integer variants recorded in shader_dump/variants.txt, so gameplay finds them compiled. Call before the
     // GPU thread starts; Tick() (GPU thread, once per frame) creates the variants and reports completion.
     void Prewarm();
+    // Setup step: every vertex / pixel shader's driver object created once, so the driver compiles it into its disk
+    // cache (see BuildShadersAhead). Returns how many.
+    u32 WarmDriverCache();
     void Tick();
     bool PrewarmDone() const { return prewarm_reported_; } // Tick() reported the prewarm complete
     void RequestRescan() { rescan_ = true; } // any thread: Tick() re-reads the manifest
@@ -195,5 +202,8 @@ bool CompileShaderFile(const char* in_path, const char* out_path, const char* ta
 // from the game's romfs/SHADER files, compute programs from the locations in known_programs (main module and
 // romfs), plus the integer variants known to be drawn. Returns 0 when everything that could be built is built.
 int BuildShadersAhead(const fs::path& game_dir);
+// "<vendor id> <driver version>" of the device's adapter ("" if unknown); the setup step saves it as
+// shader_cache/driver.txt (a different driver starts with an empty shader cache).
+std::string DriverVersion(ID3D11Device* dev);
 
 } // namespace gpu

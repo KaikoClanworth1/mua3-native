@@ -5,6 +5,7 @@
 // Back end: straightforward code generation without optimisation. Every value lives in temp registers (scalars
 // packed four to a register), user functions become subroutines (label/call) with their own temp pools, and
 // asfloat/asuint are free because DXBC registers are typeless.
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <deque>
@@ -222,9 +223,10 @@ struct LocalDecl {
     std::string name;
     u32 array = 0;
     EP init;
+    std::string struct_name; // a struct-typed local (the entry point's output)
 };
 struct Stmt {
-    enum K { ExprS, Decl, If, For, Switch, Break, Continue, Return, Block } k;
+    enum K { ExprS, Decl, If, For, Switch, Break, Continue, Return, Block, Discard } k;
     EP e;                        // expression / condition / return value / selector
     EP inc;                      // for: increment
     std::vector<LocalDecl> decls;
@@ -238,10 +240,18 @@ struct Param {
     Ty t;
     std::string name, semantic;
     bool out = false, in = true;
+    std::string struct_name; // a struct-typed parameter (the entry point's input)
+};
+// Vertex and pixel entry points take and return structs of semantic-tagged members.
+struct StructMember {
+    Ty t;
+    std::string name, semantic;
+    u32 interp = 0; // 0 default (linear), 1 nointerpolation, 3 noperspective
 };
 struct Func {
     std::string name;
     Ty ret;
+    std::string ret_struct;
     std::vector<Param> params;
     SP body;
     u32 numthreads[3] = {1, 1, 1};
@@ -278,11 +288,16 @@ public:
     std::map<u32, u32> cb_size;              // slot -> rows
     std::vector<std::pair<std::string, Global>> globals;
     std::map<std::string, Func> funcs;
+    std::map<std::string, std::vector<StructMember>> structs;
 
     void ParseProgram() {
         while (Cur().k != Token::End) {
             if (Is("cbuffer")) {
                 ParseCBuffer();
+                continue;
+            }
+            if (Is("struct")) {
+                ParseStruct();
                 continue;
             }
             std::vector<std::string> attrs;
@@ -318,13 +333,18 @@ public:
                 continue;
             }
             Ty ty;
-            if (!ParseScalarType(tname, ty))
+            const bool struct_ret = structs.count(tname) != 0;
+            if (struct_ret)
+                ty = {B::Void, 0};
+            else if (!ParseScalarType(tname, ty))
                 Fail("unknown type " + tname + " at line " + std::to_string(Cur().line));
             const std::string name = Ident();
             if (Is("(")) { // function
                 Func f;
                 f.name = name;
                 f.ret = ty;
+                if (struct_ret)
+                    f.ret_struct = tname;
                 std::memcpy(f.numthreads, nt, sizeof(nt));
                 Next();
                 while (!Is(")")) {
@@ -336,7 +356,10 @@ public:
                             p.out = true;
                         Next();
                     }
-                    if (!ParseScalarType(Ident(), p.t))
+                    const std::string ptype = Ident();
+                    if (structs.count(ptype))
+                        p.struct_name = ptype;
+                    else if (!ParseScalarType(ptype, p.t))
                         Fail("bad parameter type in " + name);
                     p.name = Ident();
                     if (Is(":")) {
@@ -459,6 +482,36 @@ private:
         Expect(";");
         resources[name] = r;
     }
+    void ParseStruct() {
+        Next();
+        const std::string sname = Ident();
+        Expect("{");
+        std::vector<StructMember> members;
+        while (!Is("}")) {
+            StructMember m;
+            while (Is("nointerpolation") || Is("noperspective") || Is("linear") || Is("centroid")) {
+                if (Is("nointerpolation"))
+                    m.interp = 1;
+                else if (Is("noperspective"))
+                    m.interp = 3;
+                else if (Is("centroid"))
+                    Fail("centroid interpolation");
+                Next();
+            }
+            if (!ParseScalarType(Ident(), m.t))
+                Fail("bad struct member type in " + sname);
+            m.name = Ident();
+            if (Is(":")) {
+                Next();
+                m.semantic = Ident();
+            }
+            Expect(";");
+            members.push_back(m);
+        }
+        Next();
+        Expect(";");
+        structs[sname] = std::move(members);
+    }
     void ParseCBuffer() {
         Next();
         Ident(); // block name
@@ -502,7 +555,7 @@ private:
     }
     bool AtType() const {
         Ty t;
-        return Cur().k == Token::Id && ParseScalarType(Cur().s, t) && At(1).k == Token::Id;
+        return Cur().k == Token::Id && (ParseScalarType(Cur().s, t) || structs.count(Cur().s)) && At(1).k == Token::Id;
     }
     SP ParseStmt() {
         const int line = Cur().line;
@@ -600,6 +653,12 @@ private:
             s->k = Stmt::Continue;
             return s;
         }
+        if (Is("discard")) {
+            Next();
+            Expect(";");
+            s->k = Stmt::Discard;
+            return s;
+        }
         if (Is("return")) {
             Next();
             s->k = Stmt::Return;
@@ -621,10 +680,15 @@ private:
         if (AtType()) {
             s->k = Stmt::Decl;
             Ty t;
-            ParseScalarType(Ident(), t);
+            const std::string tname = Ident();
+            const bool is_struct = structs.count(tname) != 0;
+            if (!is_struct)
+                ParseScalarType(tname, t);
             for (;;) {
                 LocalDecl d;
                 d.t = t;
+                if (is_struct)
+                    d.struct_name = tname;
                 d.name = Ident();
                 if (Is("[")) {
                     Next();
@@ -828,10 +892,13 @@ enum Opcode : u32 {
     OP_IMM_ATOMIC_IADD = 180, OP_IMM_ATOMIC_AND = 181, OP_IMM_ATOMIC_OR = 182, OP_IMM_ATOMIC_XOR = 183,
     OP_IMM_ATOMIC_EXCH = 184, OP_IMM_ATOMIC_IMAX = 186, OP_IMM_ATOMIC_IMIN = 187, OP_IMM_ATOMIC_UMAX = 188,
     OP_IMM_ATOMIC_UMIN = 189, OP_SYNC = 190,
+    OP_DERIV_RTX = 11, OP_DERIV_RTY = 12, OP_DISCARD = 13, OP_SAMPLE = 69, OP_SAMPLE_C = 70, OP_SAMPLE_D = 73,
+    OP_SAMPLE_B = 74, OP_LOD = 108, OP_DCL_INPUT_SGV = 96, OP_DCL_INPUT_PS = 98, OP_DCL_INPUT_PS_SGV = 99,
+    OP_DCL_INPUT_PS_SIV = 100, OP_DCL_OUTPUT = 101, OP_DCL_OUTPUT_SIV = 103,
 };
 enum OperandType : u32 {
     OT_TEMP = 0, OT_INDEXABLE_TEMP = 3, OT_IMM32 = 4, OT_SAMPLER = 6, OT_RESOURCE = 7, OT_CB = 8, OT_LABEL = 10, OT_NULL = 13,
-    OT_UAV = 30, OT_TGSM = 31, OT_THREAD_ID = 32, OT_THREAD_GROUP_ID = 33, OT_THREAD_ID_IN_GROUP = 34,
+    OT_INPUT = 1, OT_OUTPUT = 2, OT_OUTPUT_DEPTH = 12, OT_UAV = 30, OT_TGSM = 31, OT_THREAD_ID = 32, OT_THREAD_GROUP_ID = 33, OT_THREAD_ID_IN_GROUP = 34,
     OT_THREAD_ID_IN_GROUP_FLATTENED = 35,
 };
 constexpr u32 kSaturate = 1u << 13;
@@ -839,7 +906,7 @@ constexpr u32 kTestNonZero = 1u << 18;
 
 // A source operand.
 struct Opnd {
-    enum K { None, Temp, Imm, CB, Input, ITemp } k = None;
+    enum K { None, Temp, Imm, CB, Input, ITemp, InReg } k = None; // InReg: v# (reg = register)
     u32 reg = 0;        // temp index, input operand type, cb slot, indexable temp array
     u32 idx = 0;        // cb row / indexable element (immediate part)
     int rel = -1;       // relative index: temp register
@@ -856,7 +923,7 @@ struct Val {
 // Where a variable lives.
 struct VarLoc {
     Ty t;
-    enum K { Temp, ITemp, Tgsm, Const, Input } k = Temp;
+    enum K { Temp, ITemp, Tgsm, Const, Input, InReg } k = Temp; // InReg: entry-point input register v#
     u32 reg = 0;        // temp register / indexable array / input type
     u8 comp = 0;        // first component (scalars packed four to a register)
     u32 array = 0;      // element count for arrays
@@ -865,7 +932,8 @@ struct VarLoc {
 
 class Codegen {
 public:
-    Codegen(Parser& p) : p_(p) {}
+    Codegen(Parser& p, Stage stage) : p_(p), stage_(stage) {}
+    std::vector<SigElement> isgn, osgn; // filled by Run (vertex / pixel)
 
     std::vector<u32> Run() {
         auto mit = p_.funcs.find("main");
@@ -897,6 +965,19 @@ public:
         cur_pool_ = &pools_.emplace_back();
         scopes_.emplace_back();
         for (auto& prm : main.params) {
+            if (!prm.struct_name.empty()) { // vertex / pixel inputs: member i in v<i>
+                if (stage_ == Stage::Compute || !in_members_.empty())
+                    Fail("struct parameter");
+                in_members_ = p_.structs.at(prm.struct_name);
+                for (u32 i = 0; i < in_members_.size(); i++) {
+                    VarLoc v;
+                    v.t = in_members_[i].t;
+                    v.k = VarLoc::InReg;
+                    v.reg = i;
+                    scopes_.back()[prm.name + "." + in_members_[i].name] = v;
+                }
+                continue;
+            }
             VarLoc v;
             v.t = prm.t;
             v.k = VarLoc::Input;
@@ -923,6 +1004,9 @@ public:
             EndStatement();
         }
         in_main_ = true;
+        main_ret_struct_ = main.ret_struct;
+        if (stage_ != Stage::Compute && main.ret_struct.empty())
+            Fail("entry point without an output struct");
         // The final call in main (the translator's Run()) is inlined: barriers inside subroutines are not handled
         // reliably by drivers, and any return inside it can simply end the shader.
         const Stmt* body = main.body.get();
@@ -951,6 +1035,7 @@ public:
         Emit(OP_BREAK, {});
         Emit(OP_ENDLOOP, {});
         frames_.pop_back();
+        WriteOutputs();
         Emit(OP_RET, {});
         scopes_.pop_back();
         in_main_ = false;
@@ -975,6 +1060,11 @@ private:
     std::vector<u32> tgsm_;
     u32 tgsm_count_ = 0;
     std::set<u32> inputs_;
+    Stage stage_;
+    std::vector<StructMember> in_members_;  // entry-point input struct (v0, v1, ...)
+    std::vector<StructMember> out_members_; // entry-point output struct
+    std::vector<VarLoc> out_vars_;          // its members' temps, copied to the outputs before `ret`
+    std::string main_ret_struct_;
     struct Pool;
     struct FuncInfo {
         const Func* f = nullptr;
@@ -1063,6 +1153,7 @@ private:
         switch (o.k) {
         case Opnd::Temp: type = OT_TEMP, dim = 1; break;
         case Opnd::Input: type = o.reg, dim = 0; break;
+        case Opnd::InReg: type = OT_INPUT, dim = 1; break;
         case Opnd::CB: type = OT_CB, dim = 2; break;
         case Opnd::ITemp: type = OT_INDEXABLE_TEMP, dim = 2; break;
         default: Fail("bad source operand");
@@ -1076,7 +1167,7 @@ private:
         t.push_back(tok);
         if (mod)
             t.push_back(1u | ((o.neg && o.abs ? 3u : o.abs ? 2u : 1u) << 6));
-        if (o.k == Opnd::Temp) {
+        if (o.k == Opnd::Temp || o.k == Opnd::InReg) {
             t.push_back(o.reg);
         } else if (dim == 2) {
             t.push_back(o.reg);
@@ -1098,6 +1189,10 @@ private:
     void PutDst(std::vector<u32>& t, const Dst& d) {
         if (d.type == OT_NULL) {
             t.push_back(OT_NULL << 12);
+            return;
+        }
+        if (d.type == OT_OUTPUT_DEPTH) { // one component, no index
+            t.push_back(1u | (OT_OUTPUT_DEPTH << 12));
             return;
         }
         u32 tok = 2 | (u32(d.mask) << 4) | (d.type << 12);
@@ -1295,6 +1390,11 @@ private:
             r.o.reg = v.reg;
             return r;
         }
+        if (v.k == VarLoc::InReg) {
+            r.o.k = Opnd::InReg;
+            r.o.reg = v.reg;
+            return r; // (scalar members are in .x)
+        }
         r.o.k = Opnd::Temp;
         r.o.reg = v.reg;
         if (v.t.n == 1)
@@ -1351,8 +1451,19 @@ private:
         default: return 3;
         }
     }
+    // `s.m` where s is a struct variable: the member's own variable (registered as "s.m"), else null.
+    const VarLoc* MemberVar(const Expr* e) {
+        if (e->k != Expr::Member || e->a[0]->k != Expr::Name)
+            return nullptr;
+        return Lookup(e->a[0]->op + "." + e->op);
+    }
     LValue EvalLValue(const Expr* e) {
         LValue lv;
+        if (const VarLoc* mv = MemberVar(e)) {
+            lv.var = mv;
+            lv.t = mv->t;
+            return lv;
+        }
         if (e->k == Expr::Name) {
             const VarLoc* v = Lookup(e->op);
             if (!v)
@@ -1647,6 +1758,8 @@ private:
             return e->post ? old : ReadLValue(lv);
         }
         case Expr::Member: {
+            if (const VarLoc* mv = MemberVar(e))
+                return Read(*mv);
             if (!IsSwizzle(e->op))
                 Fail("member " + e->op);
             Val v = Eval(e->a[0].get());
@@ -2188,6 +2301,74 @@ private:
             EmitRaw(OP_SAMPLE_C_LZ, 0, tok, ext);
             return TempVal({B::Float, 1}, out);
         }
+        // Pixel-shader sampling (implicit derivatives) and gathers. The sampler operand of gather4 selects the
+        // channel through its swizzle (s#.x red ... s#.w alpha).
+        auto sampler = [&](std::vector<u32>& tok, int select) {
+            if (e->a[1]->k != Expr::Name)
+                Fail("sampler expression");
+            const Resource& s = Res(e->a[1]->op);
+            if (select >= 0)
+                tok.push_back(2u | (2u << 2) | (u32(select) << 4) | (OT_SAMPLER << 12) | (1u << 20));
+            else
+                tok.push_back(OT_SAMPLER << 12 | (1u << 20));
+            tok.push_back(s.reg);
+        };
+        auto coords = [&]() {
+            Val c = arg(1);
+            return Plain(Convert(c, {B::Float, c.t.n}));
+        };
+        if (m == "Sample" || m == "SampleBias") {
+            Val c = coords();
+            const u32 out = Scratch();
+            std::vector<u32> tok;
+            PutDst(tok, {OT_TEMP, out, 0xF});
+            PutSrc(tok, Spread(c, 4), false);
+            PutResource(tok, OT_RESOURCE, r.reg);
+            sampler(tok, -1);
+            if (m == "SampleBias")
+                PutSrc(tok, Plain(Convert(arg(2), {B::Float, 1})).o, true);
+            EmitRaw(m == "Sample" ? OP_SAMPLE : OP_SAMPLE_B, 0, tok, ext);
+            return TempVal(rt, out);
+        }
+        if (m == "SampleCmp") {
+            Val c = coords();
+            Val ref = Plain(Convert(arg(2), {B::Float, 1}));
+            const u32 out = Scratch();
+            std::vector<u32> tok;
+            PutDst(tok, {OT_TEMP, out, 1});
+            PutSrc(tok, Spread(c, 4), false);
+            tok.push_back(2u | (2u << 2) | (OT_RESOURCE << 12) | (1u << 20)); // .x
+            tok.push_back(r.reg);
+            sampler(tok, -1);
+            PutSrc(tok, ref.o, true);
+            EmitRaw(OP_SAMPLE_C, 0, tok, ext);
+            return TempVal({B::Float, 1}, out);
+        }
+        if (m == "GatherRed" || m == "GatherGreen" || m == "GatherBlue" || m == "GatherAlpha" || m == "GatherCmp") {
+            const bool cmp = m == "GatherCmp";
+            Val c = coords();
+            const u32 out = Scratch();
+            std::vector<u32> tok;
+            PutDst(tok, {OT_TEMP, out, 0xF});
+            PutSrc(tok, Spread(c, 4), false);
+            PutResource(tok, OT_RESOURCE, r.reg);
+            sampler(tok, cmp ? 0 : m == "GatherRed" ? 0 : m == "GatherGreen" ? 1 : m == "GatherBlue" ? 2 : 3);
+            if (cmp)
+                PutSrc(tok, Plain(Convert(arg(2), {B::Float, 1})).o, true);
+            EmitRaw(cmp ? OP_GATHER4_C : OP_GATHER4, 0, tok, ext);
+            return TempVal(cmp ? Ty{B::Float, 4} : rt, out);
+        }
+        if (m == "CalculateLevelOfDetail") { // lod: x = clamped level (what this returns), y = unclamped
+            Val c = coords();
+            const u32 out = Scratch();
+            std::vector<u32> tok;
+            PutDst(tok, {OT_TEMP, out, 1});
+            PutSrc(tok, Spread(c, 4), false);
+            PutResource(tok, OT_RESOURCE, r.reg, true);
+            sampler(tok, -1);
+            EmitRaw(OP_LOD, 0, tok, ext);
+            return TempVal({B::Float, 1}, out);
+        }
         if (m == "GetDimensions" && r.dim != "Buffer") {
             // GetDimensions(mip, w[, h[, d]], levels) -> resinfo_uint: (w, h, d or slices, levels)
             const size_t nargs = e->a.size() - 1;
@@ -2270,11 +2451,44 @@ private:
             scopes_.pop_back();
             return;
         case Stmt::ExprS:
+            if (in_main_ && stage_ != Stage::Compute && s->e->k == Expr::Call && s->e->a.empty() &&
+                s->e->op == "Run" && p_.funcs.count("Run") && p_.funcs.at("Run").ret.b == B::Void) {
+                // The translated program (Run) inlined into main, in its own one-iteration loop so its returns
+                // become breaks to the code after it (outputs): drivers compile a call much more slowly.
+                scopes_.emplace_back();
+                Frame fr;
+                fr.loop_base = loops_.size();
+                fr.flag.t = {B::Bool, 1};
+                AllocVar(fr.flag, false);
+                Store(fr.flag, Imm({B::Bool, 1}, 0), nullptr);
+                frames_.push_back(fr);
+                Emit(OP_LOOP, {});
+                CompileStmt(p_.funcs.at("Run").body.get());
+                Emit(OP_BREAK, {});
+                Emit(OP_ENDLOOP, {});
+                frames_.pop_back();
+                scopes_.pop_back();
+                EndStatement();
+                return;
+            }
             Eval(s->e.get());
             EndStatement();
             return;
         case Stmt::Decl:
             for (auto& d : s->decls) {
+                if (!d.struct_name.empty()) { // the entry point's output struct: one temp per member
+                    if (d.struct_name != main_ret_struct_ || !out_vars_.empty())
+                        Fail("struct local " + d.name);
+                    out_members_ = p_.structs.at(d.struct_name);
+                    for (auto& m : out_members_) {
+                        VarLoc v;
+                        v.t = m.t;
+                        AllocVar(v, false);
+                        out_vars_.push_back(v);
+                        scopes_.back()[d.name + "." + m.name] = v;
+                    }
+                    continue;
+                }
                 VarLoc v;
                 v.t = d.t;
                 if (d.array) {
@@ -2356,8 +2570,16 @@ private:
             Emit(OP_CONTINUE, {});
             return;
         }
+        case Stmt::Discard: {
+            std::vector<u32> tok;
+            PutSrc(tok, Imm({B::Uint, 1}, ~0u).o, true);
+            Emit(OP_DISCARD, tok, kTestNonZero);
+            return;
+        }
         case Stmt::Return:
-            if (s->e) {
+            if (s->e && in_main_ && !main_ret_struct_.empty()) {
+                // `return o;`: the members are already in their temps (copied to the outputs at the end)
+            } else if (s->e) {
                 if (!cur_fn_ || cur_fn_->f->ret.b == B::Void)
                     Fail("return value outside a function");
                 Store(cur_fn_->ret, Plain(Convert(Eval(s->e.get()), cur_fn_->ret.t)), nullptr);
@@ -2418,6 +2640,100 @@ private:
         scopes_.pop_back();
     }
 
+    // ---------------- entry-point outputs
+    // Output register of member i: vertex shaders in order (o0 = SV_Position, o1.. = ATTRn, as FXC assigns them),
+    // pixel shaders by target index; SV_Depth goes to oDepth (~0u).
+    u32 OutReg(u32 i) const {
+        const StructMember& m = out_members_[i];
+        if (stage_ == Stage::Pixel) {
+            if (m.semantic == "SV_Depth")
+                return ~0u;
+            if (m.semantic.rfind("SV_Target", 0) == 0)
+                return m.semantic.size() > 9 ? u32(std::stoul(m.semantic.substr(9))) : 0u;
+            Fail("pixel shader output " + m.semantic);
+        }
+        return i;
+    }
+    void WriteOutputs() {
+        for (u32 i = 0; i < out_vars_.size(); i++) {
+            const VarLoc& v = out_vars_[i];
+            const u32 reg = OutReg(i);
+            std::vector<u32> tok;
+            if (reg == ~0u)
+                PutDst(tok, {OT_OUTPUT_DEPTH, 0, 1});
+            else
+                PutDst(tok, {OT_OUTPUT, reg, u8((1u << v.t.n) - 1)});
+            Val val = Read(v);
+            PutSrc(tok, val.o, reg == ~0u);
+            Emit(OP_MOV, tok);
+        }
+    }
+    static u32 CompType(B b) { return b == B::Float ? 3u : b == B::Int ? 2u : 1u; }
+    // Splits "ATTR12" into ("ATTR", 12); system values keep their name with index 0 ("SV_Target3" -> 3).
+    static std::pair<std::string, u32> SplitSemantic(const std::string& sem) {
+        size_t e = sem.size();
+        while (e > 0 && std::isdigit(u8(sem[e - 1])))
+            e--;
+        return {sem.substr(0, e), e < sem.size() ? u32(std::stoul(sem.substr(e))) : 0u};
+    }
+    void DeclareIo(std::vector<u32>& d) {
+        auto dcl_reg = [&](u32 op, u32 ctrl, u32 type, u32 reg, u8 mask, int name) {
+            d.push_back(op | ctrl | (u32(name >= 0 ? 4 : 3) << 24));
+            d.push_back(2u | (u32(mask) << 4) | (type << 12) | (1u << 20));
+            d.push_back(reg);
+            if (name >= 0)
+                d.push_back(u32(name));
+        };
+        for (u32 i = 0; i < in_members_.size(); i++) {
+            const StructMember& m = in_members_[i];
+            const u8 mask = u8((1u << m.t.n) - 1);
+            auto [sname, sidx] = SplitSemantic(m.semantic);
+            SigElement el{sname, sidx, 0, CompType(m.t.b), i, mask, mask};
+            if (stage_ == Stage::Vertex) {
+                if (m.semantic == "SV_VertexID" || m.semantic == "SV_InstanceID") {
+                    el.sys_value = m.semantic == "SV_VertexID" ? 6 : 8;
+                    dcl_reg(OP_DCL_INPUT_SGV, 0, OT_INPUT, i, mask, int(el.sys_value));
+                } else {
+                    dcl_reg(OP_DCL_INPUT, 0, OT_INPUT, i, mask, -1);
+                }
+            } else {
+                // interpolation (opcode bits 11-14): 1 constant, 2 linear, 4 linear noperspective
+                if (m.semantic == "SV_Position") {
+                    el.sys_value = 1;
+                    dcl_reg(OP_DCL_INPUT_PS_SIV, 4u << 11, OT_INPUT, i, mask, 1);
+                } else if (m.semantic == "SV_IsFrontFace") {
+                    el.sys_value = 9;
+                    dcl_reg(OP_DCL_INPUT_PS_SGV, 1u << 11, OT_INPUT, i, mask, 9);
+                } else {
+                    const u32 mode = m.t.b != B::Float || m.interp == 1 ? 1u : m.interp == 3 ? 4u : 2u;
+                    dcl_reg(OP_DCL_INPUT_PS, mode << 11, OT_INPUT, i, mask, -1);
+                }
+            }
+            if (el.sys_value == 9 || el.sys_value == 6 || el.sys_value == 8)
+                el.rw_mask = 0; // (as FXC writes them)
+            isgn.push_back(el);
+        }
+        for (u32 i = 0; i < out_members_.size(); i++) {
+            const StructMember& m = out_members_[i];
+            const u8 mask = u8((1u << m.t.n) - 1);
+            const u32 reg = OutReg(i);
+            auto [sname, sidx] = SplitSemantic(m.semantic);
+            SigElement el{sname, sidx, 0, CompType(m.t.b), reg, mask, 0};
+            if (reg == ~0u) {
+                d.push_back(OP_DCL_OUTPUT | (2u << 24));
+                d.push_back(1u | (OT_OUTPUT_DEPTH << 12));
+                el.mask = 1;
+                el.rw_mask = 0xE;
+            } else if (m.semantic == "SV_Position") {
+                el.sys_value = 1;
+                dcl_reg(OP_DCL_OUTPUT_SIV, 0, OT_OUTPUT, reg, mask, 1);
+            } else {
+                dcl_reg(OP_DCL_OUTPUT, 0, OT_OUTPUT, reg, mask, -1);
+            }
+            osgn.push_back(el);
+        }
+    }
+
     // ---------------- declarations and assembly
     std::vector<u32> Assemble(const Func& main) {
         std::vector<u32> d;
@@ -2451,14 +2767,18 @@ private:
         }
         for (u32 in : inputs_)
             dcl(OP_DCL_INPUT, {2u | (0x7u << 4) | (in << 12)});
+        if (stage_ != Stage::Compute)
+            DeclareIo(d);
         dcl(OP_DCL_TEMPS, {TempCount()});
         for (u32 i = 0; i < itemps_.size(); i++)
             dcl(OP_DCL_INDEXABLE_TEMP, {i, itemps_[i].count, 4});
         for (u32 i = 0; i < tgsm_.size(); i++)
             dcl(OP_DCL_TGSM_STRUCTURED, {0x0011f000u, i, 4, tgsm_[i]});
-        dcl(OP_DCL_THREAD_GROUP, {main.numthreads[0], main.numthreads[1], main.numthreads[2]});
+        if (stage_ == Stage::Compute)
+            dcl(OP_DCL_THREAD_GROUP, {main.numthreads[0], main.numthreads[1], main.numthreads[2]});
         std::vector<u32> out;
-        out.push_back(0x00050050); // cs_5_0
+        // program type (0 pixel, 1 vertex, 5 compute) << 16, shader model 5.0
+        out.push_back(stage_ == Stage::Pixel ? 0x00000050u : stage_ == Stage::Vertex ? 0x00010050u : 0x00050050u);
         out.push_back(0);
         out.insert(out.end(), d.begin(), d.end());
         out.insert(out.end(), code_.begin(), code_.end());
@@ -2473,12 +2793,12 @@ public:
 } // namespace
 
 bool CompileHlsl(const std::string& source, Stage stage, std::vector<u8>& out, std::string& err) {
-    (void)stage;
     try {
         Parser p(Lex(source));
         p.ParseProgram();
-        Codegen g(p);
-        out = Container(g.Run());
+        Codegen g(p, stage);
+        const std::vector<u32> shex = g.Run();
+        out = Container(shex, g.isgn, g.osgn);
         return true;
     } catch (const std::exception& e) {
         err = e.what();

@@ -3,7 +3,11 @@
 //   shadertool <file.bin> [--print]        translate one shader and print the HLSL
 //   shadertool <dir>                       translate + compile every dump, report failures/unimplemented ops
 #include <d3d11.h>
+#include <d3d11shader.h>
 #include <d3dcompiler.h>
+#include <wrl/client.h>
+#include <cmath>
+#include <unordered_map>
 #include <chrono>
 #include <algorithm>
 #include <fstream>
@@ -219,6 +223,702 @@ static int WriteKnown(const fs::path& dump, const fs::path& game, const fs::path
     return 0;
 }
 
+// ---------------------------------------------------------------- direct DXBC vs FXC, on the GPU
+// Runs each vertex / pixel program twice, once from FXC's bytecode (taken from a shader cache pack, where the game put
+// it) and once from the direct backend's, on the same random inputs, and compares every output.
+//   pixel shaders: a fixed vertex shader feeds 30 varying attributes over a 16x16 target; all render targets and depth
+//   vertex shaders: 16 points of random attributes, every output captured with stream output
+namespace ab {
+
+using Microsoft::WRL::ComPtr;
+
+struct Pack {
+    std::vector<u8> data;
+    std::unordered_map<u64, std::pair<size_t, u32>> dxbc;
+    bool Open(const fs::path& p) {
+        data = common::ReadFile(p);
+        size_t pos = 8;
+        while (pos + 13 <= data.size()) {
+            const u8 kind = data[pos];
+            u64 h;
+            u32 n;
+            std::memcpy(&h, &data[pos + 1], 8);
+            std::memcpy(&n, &data[pos + 9], 4);
+            if (pos + 13 + n > data.size())
+                break;
+            if (kind == 1)
+                dxbc[h] = {pos + 13, n};
+            pos += 13 + n;
+        }
+        return !dxbc.empty();
+    }
+    bool Get(u64 h, std::vector<u8>& out) const {
+        auto it = dxbc.find(h);
+        if (it == dxbc.end())
+            return false;
+        out.assign(&data[it->second.first], &data[it->second.first] + it->second.second);
+        return true;
+    }
+};
+
+struct Rng {
+    u64 s = 0x9E3779B97F4A7C15ull;
+    u32 Next() {
+        s ^= s << 13, s ^= s >> 7, s ^= s << 17;
+        return u32(s >> 16);
+    }
+    float F(float lo, float hi) { return lo + (hi - lo) * float(Next() & 0xFFFFFF) / float(0xFFFFFF); }
+    u32 FBits(float lo, float hi) {
+        const float f = F(lo, hi);
+        u32 b;
+        std::memcpy(&b, &f, 4);
+        return b;
+    }
+};
+
+class Harness {
+public:
+    bool Init() {
+        D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
+        if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &fl, 1, D3D11_SDK_VERSION, &dev_,
+                                     nullptr, &ctx_)))
+            return false;
+        // The fixed vertex shader for pixel tests: a full-screen triangle with 30 attributes varying over it.
+        std::string src = "struct O { float4 pos : SV_Position;\n";
+        for (int i = 0; i < 30; i++)
+            src += fmt::format("float4 a{0} : ATTR{0};\n", i);
+        src += "};\nO main(uint id : SV_VertexID) { O o; float2 p = float2((id << 1) & 2, id & 2);\n"
+               "o.pos = float4(p * float2(2, -2) + float2(-1, 1), 0.25, 1);\n";
+        for (int i = 0; i < 30; i++)
+            src += fmt::format("o.a{0} = float4(p.x * {1:.3f} + {2:.3f}, p.y * {3:.3f} - {4:.3f}, (p.x - p.y) * {5:.3f}, "
+                               "{6:.3f} + p.x * p.y);\n",
+                               i, 0.7 + i * 0.13, i * 0.05, 1.1 - i * 0.02, i * 0.03, 0.5 + i * 0.07, 0.2 + i * 0.01);
+        src += "return o; }\n";
+        ComPtr<ID3DBlob> code, err;
+        if (FAILED(D3DCompile(src.data(), src.size(), nullptr, nullptr, nullptr, "main", "vs_5_0", 0, 0, &code, &err)))
+            return false;
+        dev_->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &feed_vs_);
+        D3D11_RASTERIZER_DESC rd{D3D11_FILL_SOLID, D3D11_CULL_NONE};
+        rd.DepthClipEnable = TRUE;
+        dev_->CreateRasterizerState(&rd, &raster_);
+        D3D11_DEPTH_STENCIL_DESC dd{};
+        dd.DepthEnable = TRUE;
+        dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+        dd.DepthFunc = D3D11_COMPARISON_ALWAYS;
+        dev_->CreateDepthStencilState(&dd, &depth_always_);
+        D3D11_SAMPLER_DESC sd{};
+        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        dev_->CreateSamplerState(&sd, &smp_);
+        sd.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR;
+        sd.ComparisonFunc = D3D11_COMPARISON_LESS;
+        dev_->CreateSamplerState(&sd, &smp_cmp_);
+        // Driver constants (b13): identity swizzles, 1x render scale (thirds), no alpha test, plain viewport.
+        std::vector<u32> drv(4 * 128, 0);
+        const float vp[4] = {1.0f, 1.0f, 0.0f, 1.0f};
+        std::memcpy(drv.data(), vp, 16);
+        for (int i = 0; i < 32; i++) // tex_swizzle rows follow drv_viewport (1), drv_attrib (32), drv_vbuf (16)
+            drv[(1 + 32 + 16 + i) * 4] = 0xB1A, drv[(1 + 32 + 16 + i) * 4 + 1] = 3;
+        drv_ = MakeCb(drv);
+        return true;
+    }
+
+    double ms_a = 0, ms_b = 0, worst_b = 0; // time to run (create + first draw + readback): FXC's, direct's
+    // 0: same, 1: outputs differ, 2: could not run. `why` says where.
+    int Run(bool vs, const std::vector<u8>& a, const std::vector<u8>& b, std::string& why) {
+        std::vector<float> ra, rb;
+        // timed: create, first draw and readback, i.e. the driver's whole compile (cold when the blobs are salted)
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok_a = Execute(vs, a, a, ra, why);
+        const auto t1 = std::chrono::steady_clock::now();
+        const bool ok_b = ok_a && Execute(vs, b, a, rb, why);
+        const auto t2 = std::chrono::steady_clock::now();
+        ms_a += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        ms_b += std::chrono::duration<double, std::milli>(t2 - t1).count();
+        worst_b = std::max(worst_b, std::chrono::duration<double, std::milli>(t2 - t1).count());
+        if (!ok_a || !ok_b)
+            return 2;
+        if (ra.size() != rb.size()) {
+            why = "output size";
+            return 1;
+        }
+        size_t bad = 0, first = 0;
+        for (size_t i = 0; i < ra.size(); i++) {
+            const float x = ra[i], y = rb[i];
+            if (std::memcmp(&x, &y, 4) == 0 || (std::isnan(x) && std::isnan(y)))
+                continue;
+            if (std::fabs(x - y) <= 1e-3f * std::max({1.0f, std::fabs(x), std::fabs(y)}))
+                continue;
+            if (!bad++)
+                first = i;
+        }
+        if (bad) {
+            why = fmt::format("{} of {} values differ, first at {} (fxc {} direct {})", bad, ra.size(), first, ra[first],
+                              rb[first]);
+            return 1;
+        }
+        return 0;
+    }
+
+private:
+    ComPtr<ID3D11Device> dev_;
+    ComPtr<ID3D11DeviceContext> ctx_;
+    ComPtr<ID3D11VertexShader> feed_vs_;
+    ComPtr<ID3D11RasterizerState> raster_;
+    ComPtr<ID3D11DepthStencilState> depth_always_;
+    ComPtr<ID3D11SamplerState> smp_, smp_cmp_;
+    ComPtr<ID3D11Buffer> drv_;
+    std::map<std::pair<int, int>, ComPtr<ID3D11ShaderResourceView>> textures_; // (dimension, return type)
+    ComPtr<ID3D11ShaderResourceView> raw_;
+    std::map<u32, ComPtr<ID3D11Buffer>> cbs_; // by size
+
+    ComPtr<ID3D11Buffer> MakeCb(const std::vector<u32>& data) {
+        D3D11_BUFFER_DESC bd{u32(data.size() * 4), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER};
+        D3D11_SUBRESOURCE_DATA init{data.data()};
+        ComPtr<ID3D11Buffer> b;
+        dev_->CreateBuffer(&bd, &init, &b);
+        return b;
+    }
+    ID3D11Buffer* Cb(u32 bytes) {
+        bytes = std::max<u32>((bytes + 15) & ~15u, 16);
+        auto& b = cbs_[bytes];
+        if (!b) {
+            Rng r;
+            r.s ^= bytes;
+            std::vector<u32> d(bytes / 4);
+            for (u32& x : d)
+                x = (r.Next() & 3) == 0 ? r.Next() % 64 : r.FBits(-2.0f, 2.0f); // mostly floats, some small ints
+            b = MakeCb(d);
+        }
+        return b.Get();
+    }
+    ID3D11ShaderResourceView* Texture(D3D_SRV_DIMENSION dim, D3D_RESOURCE_RETURN_TYPE rt) {
+        auto& v = textures_[{int(dim), int(rt)}];
+        if (v)
+            return v.Get();
+        const DXGI_FORMAT fmt = rt == D3D_RETURN_TYPE_UINT   ? DXGI_FORMAT_R32G32B32A32_UINT
+                                : rt == D3D_RETURN_TYPE_SINT ? DXGI_FORMAT_R32G32B32A32_SINT
+                                                             : DXGI_FORMAT_R32G32B32A32_FLOAT;
+        Rng r;
+        r.s ^= u64(dim) * 977 + u64(rt);
+        const bool is_float = fmt == DXGI_FORMAT_R32G32B32A32_FLOAT;
+        std::vector<u32> texels(8 * 8 * 8 * 4 * 6);
+        for (u32& t : texels)
+            t = is_float ? r.FBits(0.0f, 1.0f) : r.Next() % 1000;
+        D3D11_SUBRESOURCE_DATA init[6 * 4];
+        auto fill = [&](u32 n, u32 pitch, u32 slice) {
+            for (u32 i = 0; i < n; i++)
+                init[i] = {texels.data(), pitch, slice};
+        };
+        D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = fmt;
+        sv.ViewDimension = dim;
+        if (dim == D3D_SRV_DIMENSION_BUFFER) {
+            D3D11_BUFFER_DESC bd{u32(texels.size() * 4), D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE};
+            ComPtr<ID3D11Buffer> buf;
+            D3D11_SUBRESOURCE_DATA bi{texels.data()};
+            dev_->CreateBuffer(&bd, &bi, &buf);
+            sv.Buffer.NumElements = u32(texels.size() / 4);
+            dev_->CreateShaderResourceView(buf.Get(), &sv, &v);
+            return v.Get();
+        }
+        if (dim == D3D_SRV_DIMENSION_TEXTURE3D) {
+            D3D11_TEXTURE3D_DESC td{8, 8, 8, 1, fmt, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE};
+            fill(1, 8 * 16, 8 * 8 * 16);
+            ComPtr<ID3D11Texture3D> t;
+            dev_->CreateTexture3D(&td, init, &t);
+            sv.Texture3D.MipLevels = 1;
+            dev_->CreateShaderResourceView(t.Get(), &sv, &v);
+            return v.Get();
+        }
+        const bool d1 = dim == D3D_SRV_DIMENSION_TEXTURE1D || dim == D3D_SRV_DIMENSION_TEXTURE1DARRAY;
+        const bool cube = dim == D3D_SRV_DIMENSION_TEXTURECUBE || dim == D3D_SRV_DIMENSION_TEXTURECUBEARRAY;
+        const bool array = dim == D3D_SRV_DIMENSION_TEXTURE1DARRAY || dim == D3D_SRV_DIMENSION_TEXTURE2DARRAY ||
+                           dim == D3D_SRV_DIMENSION_TEXTURECUBEARRAY;
+        const u32 layers = cube ? (array ? 12 : 6) : array ? 2 : 1;
+        if (d1) {
+            D3D11_TEXTURE1D_DESC td{8, 1, layers, fmt, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE};
+            fill(layers, 8 * 16, 0);
+            ComPtr<ID3D11Texture1D> t;
+            dev_->CreateTexture1D(&td, init, &t);
+            if (array)
+                sv.Texture1DArray = {0, 1, 0, layers};
+            else
+                sv.Texture1D = {0, 1};
+            dev_->CreateShaderResourceView(t.Get(), &sv, &v);
+            return v.Get();
+        }
+        D3D11_TEXTURE2D_DESC td{8, 8, 1, layers, fmt, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0,
+                                cube ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0u};
+        fill(layers, 8 * 16, 0);
+        ComPtr<ID3D11Texture2D> t;
+        dev_->CreateTexture2D(&td, init, &t);
+        if (cube && array)
+            sv.TextureCubeArray = {0, 1, 0, layers / 6};
+        else if (cube)
+            sv.TextureCube = {0, 1};
+        else if (array)
+            sv.Texture2DArray = {0, 1, 0, layers};
+        else
+            sv.Texture2D = {0, 1};
+        dev_->CreateShaderResourceView(t.Get(), &sv, &v);
+        return v.Get();
+    }
+    ID3D11ShaderResourceView* Raw() {
+        if (!raw_) {
+            Rng r;
+            std::vector<u32> d(16384);
+            for (u32& x : d)
+                x = (r.Next() & 3) == 0 ? r.Next() % 64 : r.FBits(-2.0f, 2.0f);
+            D3D11_BUFFER_DESC bd{u32(d.size() * 4), D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0,
+                                 D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS};
+            D3D11_SUBRESOURCE_DATA init{d.data()};
+            ComPtr<ID3D11Buffer> b;
+            dev_->CreateBuffer(&bd, &init, &b);
+            D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+            sv.Format = DXGI_FORMAT_R32_TYPELESS;
+            sv.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+            sv.BufferEx = {0, u32(d.size()), D3D11_BUFFEREX_SRV_FLAG_RAW};
+            dev_->CreateShaderResourceView(b.Get(), &sv, &raw_);
+        }
+        return raw_.Get();
+    }
+    // Binds what the program's reflection lists (from FXC's bytecode: both builds use the same registers).
+    bool Bind(bool vs, const std::vector<u8>& code, std::string& why) {
+        ComPtr<ID3D11ShaderReflection> refl;
+        if (FAILED(D3DReflect(code.data(), code.size(), __uuidof(ID3D11ShaderReflection), &refl))) {
+            why = "no reflection";
+            return false;
+        }
+        D3D11_SHADER_DESC sd;
+        refl->GetDesc(&sd);
+        ID3D11Buffer* cbs[14] = {};
+        ID3D11ShaderResourceView* srvs[48] = {};
+        ID3D11SamplerState* smps[16] = {};
+        for (u32 i = 0; i < sd.BoundResources; i++) {
+            D3D11_SHADER_INPUT_BIND_DESC b;
+            refl->GetResourceBindingDesc(i, &b);
+            if (b.Type == D3D_SIT_CBUFFER && b.BindPoint < 14) {
+                if (b.BindPoint == 13) {
+                    cbs[13] = drv_.Get();
+                } else {
+                    D3D11_SHADER_BUFFER_DESC cd;
+                    refl->GetConstantBufferByName(b.Name)->GetDesc(&cd);
+                    cbs[b.BindPoint] = Cb(cd.Size);
+                }
+            } else if (b.Type == D3D_SIT_TEXTURE && b.BindPoint < 48) {
+                srvs[b.BindPoint] = Texture(b.Dimension, b.ReturnType);
+            } else if (b.Type == D3D_SIT_BYTEADDRESS && b.BindPoint < 48) {
+                srvs[b.BindPoint] = Raw();
+            } else if (b.Type == D3D_SIT_SAMPLER && b.BindPoint < 16) {
+                smps[b.BindPoint] = (b.uFlags & D3D_SIF_COMPARISON_SAMPLER) ? smp_cmp_.Get() : smp_.Get();
+            } else {
+                why = fmt::format("resource type {}", int(b.Type));
+                return false;
+            }
+        }
+        if (vs) {
+            ctx_->VSSetConstantBuffers(0, 14, cbs);
+            ctx_->VSSetShaderResources(0, 48, srvs);
+            ctx_->VSSetSamplers(0, 16, smps);
+        } else {
+            ctx_->PSSetConstantBuffers(0, 14, cbs);
+            ctx_->PSSetShaderResources(0, 48, srvs);
+            ctx_->PSSetSamplers(0, 16, smps);
+        }
+        return true;
+    }
+    template <class T>
+    void ReadBack(ID3D11Resource* res, const T& desc_src, std::vector<float>& out, u32 row_bytes, u32 rows) {
+        (void)desc_src;
+        ComPtr<ID3D11Resource> st;
+        ComPtr<ID3D11Texture2D> t2;
+        ComPtr<ID3D11Buffer> b;
+        if (SUCCEEDED(res->QueryInterface(IID_PPV_ARGS(&t2)))) {
+            D3D11_TEXTURE2D_DESC td;
+            t2->GetDesc(&td);
+            td.Usage = D3D11_USAGE_STAGING, td.BindFlags = 0, td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            ComPtr<ID3D11Texture2D> s;
+            dev_->CreateTexture2D(&td, nullptr, &s);
+            st = s;
+        } else if (SUCCEEDED(res->QueryInterface(IID_PPV_ARGS(&b)))) {
+            D3D11_BUFFER_DESC bd;
+            b->GetDesc(&bd);
+            bd.Usage = D3D11_USAGE_STAGING, bd.BindFlags = 0, bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ, bd.MiscFlags = 0;
+            ComPtr<ID3D11Buffer> s;
+            dev_->CreateBuffer(&bd, nullptr, &s);
+            st = s;
+        }
+        ctx_->CopyResource(st.Get(), res);
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (FAILED(ctx_->Map(st.Get(), 0, D3D11_MAP_READ, 0, &m)))
+            return;
+        for (u32 y = 0; y < rows; y++) {
+            const float* p = reinterpret_cast<const float*>(static_cast<const u8*>(m.pData) + y * m.RowPitch);
+            out.insert(out.end(), p, p + row_bytes / 4);
+        }
+        ctx_->Unmap(st.Get(), 0);
+    }
+    // `binds`: FXC's bytecode, whose reflection (RDEF) lists the resources; the direct backend writes none.
+    bool Execute(bool vs, const std::vector<u8>& code, const std::vector<u8>& binds, std::vector<float>& out,
+                 std::string& why) {
+        ctx_->ClearState();
+        if (!Bind(vs, binds, why))
+            return false;
+        ComPtr<ID3D11ShaderReflection> refl;
+        D3DReflect(code.data(), code.size(), __uuidof(ID3D11ShaderReflection), &refl);
+        D3D11_SHADER_DESC sd;
+        refl->GetDesc(&sd);
+        if (vs) {
+            ComPtr<ID3D11VertexShader> shader;
+            if (FAILED(dev_->CreateVertexShader(code.data(), code.size(), nullptr, &shader))) {
+                why = "CreateVertexShader";
+                return false;
+            }
+            // vertex attributes: one float4/uint4/int4 per ATTR element, 16 random vertices
+            std::vector<D3D11_INPUT_ELEMENT_DESC> layout;
+            std::vector<std::string> names;
+            names.reserve(64);
+            u32 stride = 0;
+            std::vector<D3D_REGISTER_COMPONENT_TYPE> types;
+            for (u32 i = 0; i < sd.InputParameters; i++) {
+                D3D11_SIGNATURE_PARAMETER_DESC p;
+                refl->GetInputParameterDesc(i, &p);
+                if (p.SystemValueType != D3D_NAME_UNDEFINED)
+                    continue;
+                names.push_back(p.SemanticName);
+                const DXGI_FORMAT f = p.ComponentType == D3D_REGISTER_COMPONENT_UINT32   ? DXGI_FORMAT_R32G32B32A32_UINT
+                                      : p.ComponentType == D3D_REGISTER_COMPONENT_SINT32 ? DXGI_FORMAT_R32G32B32A32_SINT
+                                                                                         : DXGI_FORMAT_R32G32B32A32_FLOAT;
+                layout.push_back({names.back().c_str(), p.SemanticIndex, f, 0, stride, D3D11_INPUT_PER_VERTEX_DATA, 0});
+                types.push_back(p.ComponentType);
+                stride += 16;
+            }
+            ComPtr<ID3D11InputLayout> il;
+            if (!layout.empty()) {
+                if (FAILED(dev_->CreateInputLayout(layout.data(), u32(layout.size()), code.data(), code.size(), &il))) {
+                    why = "CreateInputLayout";
+                    return false;
+                }
+                Rng r;
+                std::vector<u32> verts(16 * stride / 4);
+                for (u32 v = 0; v < 16; v++)
+                    for (u32 e = 0; e < types.size(); e++)
+                        for (u32 c = 0; c < 4; c++)
+                            verts[(v * stride + e * 16) / 4 + c] =
+                                types[e] == D3D_REGISTER_COMPONENT_FLOAT32 ? r.FBits(-2.0f, 2.0f) : r.Next() % 8;
+                D3D11_BUFFER_DESC bd{u32(verts.size() * 4), D3D11_USAGE_DEFAULT, D3D11_BIND_VERTEX_BUFFER};
+                D3D11_SUBRESOURCE_DATA init{verts.data()};
+                ComPtr<ID3D11Buffer> vb;
+                dev_->CreateBuffer(&bd, &init, &vb);
+                ID3D11Buffer* vbs[1] = {vb.Get()};
+                const UINT strides[1] = {stride}, offsets[1] = {0};
+                ctx_->IASetVertexBuffers(0, 1, vbs, strides, offsets);
+                ctx_->IASetInputLayout(il.Get());
+            }
+            // every output, four components each, through stream output
+            std::vector<D3D11_SO_DECLARATION_ENTRY> so;
+            std::vector<std::string> onames;
+            onames.reserve(64);
+            for (u32 i = 0; i < sd.OutputParameters; i++) {
+                D3D11_SIGNATURE_PARAMETER_DESC p;
+                refl->GetOutputParameterDesc(i, &p);
+                onames.push_back(p.SemanticName);
+                so.push_back({0, onames.back().c_str(), p.SemanticIndex, 0, 4, 0});
+            }
+            const UINT so_stride = u32(so.size()) * 16;
+            ComPtr<ID3D11GeometryShader> gs;
+            if (FAILED(dev_->CreateGeometryShaderWithStreamOutput(code.data(), code.size(), so.data(), u32(so.size()),
+                                                                  &so_stride, 1, D3D11_SO_NO_RASTERIZED_STREAM, nullptr,
+                                                                  &gs))) {
+                why = "stream output";
+                return false;
+            }
+            D3D11_BUFFER_DESC bd{so_stride * 16, D3D11_USAGE_DEFAULT, D3D11_BIND_STREAM_OUTPUT};
+            ComPtr<ID3D11Buffer> sob;
+            dev_->CreateBuffer(&bd, nullptr, &sob);
+            ID3D11Buffer* sobs[1] = {sob.Get()};
+            const UINT so_off[1] = {0};
+            ctx_->SOSetTargets(1, sobs, so_off);
+            ctx_->VSSetShader(shader.Get(), nullptr, 0);
+            ctx_->GSSetShader(gs.Get(), nullptr, 0);
+            ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
+            ctx_->Draw(16, 0);
+            ctx_->SOSetTargets(0, nullptr, nullptr);
+            ReadBack(sob.Get(), 0, out, so_stride * 16, 1);
+            return true;
+        }
+        ComPtr<ID3D11PixelShader> shader;
+        if (FAILED(dev_->CreatePixelShader(code.data(), code.size(), nullptr, &shader))) {
+            why = "CreatePixelShader";
+            return false;
+        }
+        std::vector<ComPtr<ID3D11Texture2D>> rts;
+        std::vector<ComPtr<ID3D11RenderTargetView>> rtvs(8);
+        ComPtr<ID3D11Texture2D> depth;
+        ComPtr<ID3D11DepthStencilView> dsv;
+        for (u32 i = 0; i < sd.OutputParameters; i++) {
+            D3D11_SIGNATURE_PARAMETER_DESC p;
+            refl->GetOutputParameterDesc(i, &p);
+            if (p.SystemValueType == D3D_NAME_DEPTH || std::string(p.SemanticName) == "SV_Depth") {
+                D3D11_TEXTURE2D_DESC td{16, 16, 1, 1, DXGI_FORMAT_D32_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT,
+                                        D3D11_BIND_DEPTH_STENCIL};
+                dev_->CreateTexture2D(&td, nullptr, &depth);
+                dev_->CreateDepthStencilView(depth.Get(), nullptr, &dsv);
+                ctx_->ClearDepthStencilView(dsv.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+                continue;
+            }
+            if (p.Register >= 8)
+                continue;
+            D3D11_TEXTURE2D_DESC td{16, 16, 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT,
+                                    D3D11_BIND_RENDER_TARGET};
+            ComPtr<ID3D11Texture2D> t;
+            dev_->CreateTexture2D(&td, nullptr, &t);
+            dev_->CreateRenderTargetView(t.Get(), nullptr, &rtvs[p.Register]);
+            const float clear[4] = {-7, -7, -7, -7};
+            ctx_->ClearRenderTargetView(rtvs[p.Register].Get(), clear);
+            rts.push_back(t);
+        }
+        ID3D11RenderTargetView* views[8];
+        for (int i = 0; i < 8; i++)
+            views[i] = rtvs[i].Get();
+        ctx_->OMSetRenderTargets(8, views, dsv.Get());
+        ctx_->OMSetDepthStencilState(depth_always_.Get(), 0);
+        D3D11_VIEWPORT vp{0, 0, 16, 16, 0, 1};
+        ctx_->RSSetViewports(1, &vp);
+        ctx_->RSSetState(raster_.Get());
+        ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ctx_->VSSetShader(feed_vs_.Get(), nullptr, 0);
+        ctx_->PSSetShader(shader.Get(), nullptr, 0);
+        ctx_->Draw(3, 0);
+        for (auto& t : rts)
+            ReadBack(t.Get(), 0, out, 16 * 16, 16);
+        if (depth)
+            ReadBack(depth.Get(), 0, out, 16 * 4, 16);
+        return true;
+    }
+};
+
+} // namespace ab
+
+// A copy of `blob` the driver has not seen: dcl_temps raised by `salt` (no effect on what it computes), checksum redone.
+// Driver shader caches key on the bytecode, so this measures a cold compile.
+static std::vector<u8> Salted(std::vector<u8> blob, u32 salt) {
+    u32 nchunks;
+    std::memcpy(&nchunks, &blob[28], 4);
+    for (u32 c = 0; c < nchunks; c++) {
+        u32 off;
+        std::memcpy(&off, &blob[32 + c * 4], 4);
+        if (std::memcmp(&blob[off], "SHEX", 4) && std::memcmp(&blob[off], "SHDR", 4))
+            continue;
+        u32 size;
+        std::memcpy(&size, &blob[off + 4], 4);
+        for (u32 pos = off + 8 + 8; pos + 8 <= off + 8 + size;) { // past the version and length tokens
+            u32 tok;
+            std::memcpy(&tok, &blob[pos], 4);
+            const u32 op = tok & 0x7FF, len = (tok >> 24) & 0x7F;
+            if (op == 104) { // dcl_temps
+                u32 n;
+                std::memcpy(&n, &blob[pos + 4], 4);
+                n += salt;
+                std::memcpy(&blob[pos + 4], &n, 4);
+                break;
+            }
+            if (!len)
+                break;
+            pos += len * 4;
+        }
+    }
+    u32 sum[4];
+    gpu::dxbc::Checksum(blob.data(), blob.size(), sum);
+    std::memcpy(&blob[4], sum, 16);
+    return blob;
+}
+
+static int DxbcSurvey(const fs::path& dump, const fs::path& out_dir, int limit, const fs::path& pack_path) {
+    const u32 salt = std::getenv("SALT") ? u32(std::atoi(std::getenv("SALT")))
+                                         : 1 + u32(std::chrono::steady_clock::now().time_since_epoch().count() % 40);
+    ab::Pack pack;
+    if (!pack_path.empty())
+        pack.Open(pack_path);
+    double create_direct = 0, worst_direct = 0, create_fxc = 0, create_direct_paired = 0;
+    int paired = 0;
+    ID3D11Device* dev = nullptr;
+    D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
+    D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &fl, 1, D3D11_SDK_VERSION, &dev, nullptr, nullptr);
+    if (!out_dir.empty())
+        fs::create_directories(out_dir);
+    std::map<std::string, std::pair<int, std::string>> fails; // message -> count, example
+    int total = 0, ok = 0, untranslated = 0, rejected = 0, loops = 0, loops_ok = 0;
+    double ms = 0, worst = 0;
+    for (auto& e : fs::directory_iterator(dump)) {
+        const std::string name = e.path().filename().string();
+        if (name.size() != 23 || !(name.ends_with(".vs.bin") || name.ends_with(".ps.bin")))
+            continue;
+        if (total >= limit)
+            break;
+        const bool vs = name.ends_with(".vs.bin");
+        const Stage st = vs ? Stage::Vertex : Stage::Fragment;
+        const auto data = common::ReadFile(e.path());
+        TranslateOptions o;
+        auto r = Translate(st, data.data(), data.size(), o);
+        if (r.ok && r.uses_loop) { // as the shader cache: loop shaders sample with explicit LOD 0
+            o.force_lod0 = true;
+            r = Translate(st, data.data(), data.size(), o);
+        }
+        if (!r.ok) {
+            untranslated++;
+            continue;
+        }
+        total++;
+        loops += r.uses_loop;
+        std::vector<u8> blob;
+        std::string err;
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool good = gpu::dxbc::CompileHlsl(r.hlsl, vs ? gpu::dxbc::Stage::Vertex : gpu::dxbc::Stage::Pixel, blob, err);
+        const double t = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        ms += t, worst = std::max(worst, t);
+        if (!good) {
+            auto& f = fails[err.substr(0, 90)];
+            if (f.first++ == 0) {
+                f.second = name;
+                if (!out_dir.empty())
+                    common::WriteFile(out_dir / (name + ".hlsl"), std::span((const u8*)r.hlsl.data(), r.hlsl.size()));
+            }
+            continue;
+        }
+        HRESULT hr = S_OK;
+        auto create = [&](const std::vector<u8>& code) {
+            const auto c0 = std::chrono::steady_clock::now();
+            HRESULT h = S_OK;
+            if (vs) {
+                ID3D11VertexShader* s = nullptr;
+                h = dev->CreateVertexShader(code.data(), code.size(), nullptr, &s);
+                if (s)
+                    s->Release();
+            } else {
+                ID3D11PixelShader* s = nullptr;
+                h = dev->CreatePixelShader(code.data(), code.size(), nullptr, &s);
+                if (s)
+                    s->Release();
+            }
+            return std::make_pair(h, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count());
+        };
+        if (dev) {
+            auto [h, t] = create(Salted(blob, salt));
+            hr = h;
+            create_direct += t;
+            worst_direct = std::max(worst_direct, t);
+            std::vector<u8> fxc;
+            if (pack.dxbc.size() && pack.Get(std::strtoull(name.substr(0, 16).c_str(), nullptr, 16), fxc)) {
+                auto [h2, t2] = create(Salted(fxc, salt));
+                create_fxc += t2, create_direct_paired += t;
+                paired++;
+            }
+        }
+        if (FAILED(hr)) {
+            auto& f = fails[fmt::format("driver rejected ({:#x})", u32(hr))];
+            if (f.first++ == 0) {
+                f.second = name;
+                if (!out_dir.empty()) {
+                    common::WriteFile(out_dir / (name + ".hlsl"), std::span((const u8*)r.hlsl.data(), r.hlsl.size()));
+                    common::WriteFile(out_dir / (name + ".dxbc"), blob);
+                }
+            }
+            rejected++;
+            continue;
+        }
+        ok++;
+        loops_ok += r.uses_loop;
+    }
+    std::vector<std::pair<int, std::string>> sorted;
+    for (auto& [msg, f] : fails)
+        sorted.push_back({f.first, fmt::format("{:5} {}  (e.g. {})", f.first, msg, f.second)});
+    std::sort(sorted.rbegin(), sorted.rend());
+    for (auto& [n, line] : sorted)
+        fmt::print("{}\n", line);
+    fmt::print("{} of {} programs compiled and accepted ({} of {} loop shaders), {} rejected by the driver, {} not "
+               "translatable; {:.1f} ms in all, worst {:.1f} ms\n",
+               ok, total, loops_ok, loops, rejected, untranslated, ms, worst);
+    fmt::print("driver object creation (cold: salted bytecode): direct {:.0f} ms in all, worst {:.0f} ms; {} also built "
+               "by FXC: FXC's {:.0f} ms vs direct's {:.0f} ms\n",
+               create_direct, worst_direct, paired, create_fxc, create_direct_paired);
+    if (dev)
+        dev->Release();
+    return 0;
+}
+
+
+// --dxbc-ab <shader_dump dir> <pack_vNN.bin> [limit]: FXC (from the pack) vs direct DXBC on the GPU, per program.
+static int DxbcAb(const fs::path& dump, const fs::path& pack_path, int limit, u32 salt) {
+    ab::Pack pack;
+    if (!pack.Open(pack_path)) {
+        fmt::print("no bytecode in {}\n", pack_path.string());
+        return 1;
+    }
+    ab::Harness h;
+    if (!h.Init()) {
+        fmt::print("no device\n");
+        return 1;
+    }
+    int same = 0, differ = 0, unrun = 0, nofxc = 0, nodirect = 0, n = 0;
+    std::map<std::string, int> unrun_why;
+    for (auto& e : fs::directory_iterator(dump)) {
+        const std::string name = e.path().filename().string();
+        if (name.size() != 23 || !(name.ends_with(".vs.bin") || name.ends_with(".ps.bin")))
+            continue;
+        if (n >= limit)
+            break;
+        const bool vs = name.ends_with(".vs.bin");
+        const Stage st = vs ? Stage::Vertex : Stage::Fragment;
+        const u64 hash = std::strtoull(name.substr(0, 16).c_str(), nullptr, 16);
+        std::vector<u8> fxc;
+        if (!pack.Get(hash, fxc)) {
+            nofxc++;
+            continue;
+        }
+        const auto data = common::ReadFile(e.path());
+        TranslateOptions o;
+        auto r = Translate(st, data.data(), data.size(), o);
+        if (r.ok && r.uses_loop) {
+            o.force_lod0 = true;
+            r = Translate(st, data.data(), data.size(), o);
+        }
+        std::vector<u8> direct;
+        std::string err;
+        if (!r.ok || !gpu::dxbc::CompileHlsl(r.hlsl, vs ? gpu::dxbc::Stage::Vertex : gpu::dxbc::Stage::Pixel, direct, err)) {
+            nodirect++;
+            continue;
+        }
+        n++;
+        std::string why;
+        if (salt) {
+            fxc = Salted(fxc, salt);
+            direct = Salted(direct, salt);
+        }
+        switch (h.Run(vs, fxc, direct, why)) {
+        case 0: same++; break;
+        case 1:
+            differ++;
+            fmt::print("DIFF {} {}{}\n", name, why, r.uses_loop ? " (loop)" : "");
+            break;
+        default:
+            unrun++;
+            unrun_why[why]++;
+            break;
+        }
+    }
+    for (auto& [w, c] : unrun_why)
+        fmt::print("not run: {} x{}\n", w, c);
+    fmt::print("run time (create + first draw + readback): FXC {:.0f} ms, direct {:.0f} ms (worst {:.0f} ms)\n",
+               h.ms_a, h.ms_b, h.worst_b);
+    fmt::print("{} programs: {} same, {} differ, {} not run; skipped {} without FXC bytecode, {} the direct backend "
+               "cannot build\n",
+               n, same, differ, unrun, nofxc, nodirect);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         fmt::print("usage: shadertool <file.bin|dir> [--print|--disasm]\n");
@@ -233,6 +933,50 @@ int main(int argc, char** argv) {
     // (compute program locations and launch shapes, integer variants), as known_programs.inc
     if (std::string(argv[1]) == "--known" && argc >= 5)
         return WriteKnown(fs::u8path(argv[2]), fs::u8path(argv[3]), fs::u8path(argv[4]));
+    // --dxbc-survey <shader_dump dir> [out dir] [limit]: every vertex/pixel program through the direct DXBC compiler,
+    // translated as the shader cache does it; failures counted by message (one example HLSL each in out dir), the
+    // rest checked by the driver.
+    // --warm <shader_dump dir> <pack> <salt> <limit> [wait ms]: create (no draw) the driver objects of the first `limit`
+    // vertex / pixel programs from the pack, salted, then exit: does the driver's cache keep them without a draw?
+    if (std::string(argv[1]) == "--warm" && argc >= 6) {
+        ab::Pack pack;
+        pack.Open(fs::u8path(argv[3]));
+        const u32 salt = u32(std::stoul(argv[4]));
+        const int limit = std::stoi(argv[5]);
+        Microsoft::WRL::ComPtr<ID3D11Device> dev;
+        D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
+        D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &fl, 1, D3D11_SDK_VERSION, &dev, nullptr, nullptr);
+        int n = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (auto& e : fs::directory_iterator(fs::u8path(argv[2]))) {
+            const std::string name = e.path().filename().string();
+            if (name.size() != 23 || !(name.ends_with(".vs.bin") || name.ends_with(".ps.bin")) || n >= limit)
+                continue;
+            std::vector<u8> fxc;
+            if (!pack.Get(std::strtoull(name.substr(0, 16).c_str(), nullptr, 16), fxc))
+                continue;
+            fxc = Salted(fxc, salt);
+            if (name.ends_with(".vs.bin")) {
+                Microsoft::WRL::ComPtr<ID3D11VertexShader> s;
+                dev->CreateVertexShader(fxc.data(), fxc.size(), nullptr, &s);
+            } else {
+                Microsoft::WRL::ComPtr<ID3D11PixelShader> s;
+                dev->CreatePixelShader(fxc.data(), fxc.size(), nullptr, &s);
+            }
+            n++;
+        }
+        fmt::print("created {} in {:.0f} ms\n", n,
+                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        if (argc >= 7)
+            std::this_thread::sleep_for(std::chrono::milliseconds(std::stoi(argv[6])));
+        return 0;
+    }
+    if (std::string(argv[1]) == "--dxbc-ab" && argc >= 4)
+        return DxbcAb(fs::u8path(argv[2]), fs::u8path(argv[3]), argc >= 5 ? std::stoi(argv[4]) : 1 << 30,
+                      argc >= 6 ? u32(std::stoul(argv[5])) : 0u);
+    if (std::string(argv[1]) == "--dxbc-survey" && argc >= 3)
+        return DxbcSurvey(fs::u8path(argv[2]), argc >= 4 ? fs::u8path(argv[3]) : fs::path(),
+                          argc >= 5 ? std::stoi(argv[4]) : 1 << 30, argc >= 6 ? fs::u8path(argv[5]) : fs::path());
     // Replay a captured dispatch (MUA3_CAPTURE): --replay <capture.bin> [override.hlsl] runs the kernel built by FXC and
     // by the direct backend on the captured inputs and compares every global memory window.
     if (std::string(argv[1]) == "--replay" && argc >= 3) {
@@ -494,6 +1238,7 @@ int main(int argc, char** argv) {
     if (std::string(argv[1]) == "--dxbc" && argc >= 4) {
         const fs::path in = fs::u8path(argv[2]);
         std::string src;
+        gpu::dxbc::Stage dstage = gpu::dxbc::Stage::Compute;
         if (in.extension() == ".bin") {
             const auto data = common::ReadFile(in);
             TranslateOptions o;
@@ -511,7 +1256,18 @@ int main(int argc, char** argv) {
                 o.cbuf1_size = u32(cb1.size());
             }
             o.force_lod0 = true;
-            auto r = Translate(Stage::Compute, data.data(), data.size(), o);
+            const std::string fname = in.filename().string();
+            if (fname.ends_with(".vs.bin") || fname.ends_with(".ps.bin")) { // vertex / pixel: as the shader cache does
+                o = {};
+                dstage = fname.ends_with(".vs.bin") ? gpu::dxbc::Stage::Vertex : gpu::dxbc::Stage::Pixel;
+                const Stage st = dstage == gpu::dxbc::Stage::Vertex ? Stage::Vertex : Stage::Fragment;
+                auto r0 = Translate(st, data.data(), data.size(), o);
+                o.force_lod0 = r0.ok && r0.uses_loop;
+            }
+            auto r = Translate(dstage == gpu::dxbc::Stage::Vertex   ? Stage::Vertex
+                               : dstage == gpu::dxbc::Stage::Pixel ? Stage::Fragment
+                                                                   : Stage::Compute,
+                               data.data(), data.size(), o);
             if (!r.ok) {
                 fmt::print("translate failed: {}\n", r.error);
                 return 1;
@@ -524,7 +1280,7 @@ int main(int argc, char** argv) {
         std::vector<u8> blob;
         std::string err;
         const auto t0 = std::chrono::steady_clock::now();
-        const bool ok = gpu::dxbc::CompileHlsl(src, gpu::dxbc::Stage::Compute, blob, err);
+        const bool ok = gpu::dxbc::CompileHlsl(src, dstage, blob, err);
         const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         if (!ok) {
             fmt::print("DXBC compile failed: {}\n", err);
