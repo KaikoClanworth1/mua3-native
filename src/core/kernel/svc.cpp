@@ -36,20 +36,37 @@ Thread* HighestPriority(const std::vector<Thread*>& v, auto pred) {
     return best;
 }
 
+// svcSleepThread. The game's frame limiter (the only guest sleep with a real duration in gameplay) starts the next
+// frame's deadline from when this returns, so a late wake lengthens every frame: the high-resolution timer alone wakes
+// ~0.3 ms late (4.47 ms frames at a 240 fps target). The timer covers all but the last kTail, then the thread yields
+// until the deadline; the tail is bounded by kTail, and a thread that wakes past the deadline returns at once.
 void PreciseSleep(s64 ns) {
     if (ns <= 0)
         return;
-    static thread_local HANDLE timer =
-        CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    if (timer) {
-        LARGE_INTEGER due;
-        due.QuadPart = -(ns / 100);
-        if (due.QuadPart == 0)
-            due.QuadPart = -1;
-        SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
-        WaitForSingleObject(timer, INFINITE);
-    } else {
-        std::this_thread::sleep_for(std::chrono::nanoseconds(ns));
+    using clock = std::chrono::steady_clock;
+    constexpr s64 kTail = 500'000;
+    const auto deadline = clock::now() + std::chrono::nanoseconds(ns);
+    if (ns > kTail) {
+        static thread_local HANDLE timer =
+            CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        const s64 coarse = ns - kTail;
+        if (timer) {
+            LARGE_INTEGER due;
+            due.QuadPart = -std::max<s64>(coarse / 100, 1);
+            SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
+            WaitForSingleObject(timer, INFINITE);
+        } else {
+            std::this_thread::sleep_for(std::chrono::nanoseconds(coarse));
+        }
+    }
+    for (;;) {
+        const s64 left = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - clock::now()).count();
+        if (left <= 0)
+            return;
+        if (left > 20'000)
+            SwitchToThread(); // (others on this core run first; returns at once when none is waiting)
+        else
+            YieldProcessor();
     }
 }
 } // namespace
