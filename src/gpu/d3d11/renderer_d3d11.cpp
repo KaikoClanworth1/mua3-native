@@ -12,6 +12,7 @@
 
 #include <algorithm>
 
+#include <d3d11_1.h>
 #include <d3d11sdklayers.h>
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
@@ -366,7 +367,65 @@ public:
         Write(index_.Get(), data, size);
         return index_.Get();
     }
-    void SetContext(ID3D11DeviceContext* c) { ctx_ = c; }
+    void SetContext(ID3D11DeviceContext* c) {
+        ctx_ = c;
+        ctx1_.Reset();
+        ring_.Reset();
+        static const bool off = [] {
+            const char* e = std::getenv("MUA3_CB_RING");
+            return e && e[0] == '0';
+        }();
+        D3D11_FEATURE_DATA_D3D11_OPTIONS o{};
+        if (off || FAILED(dev_->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &o, sizeof(o))) ||
+            !o.ConstantBufferOffsetting || !o.MapNoOverwriteOnDynamicConstantBuffer ||
+            FAILED(c->QueryInterface(__uuidof(ID3D11DeviceContext1), (void**)&ctx1_)))
+            ctx1_.Reset();
+        if (ctx1_) {
+            D3D11_BUFFER_DESC d{kRingBytes, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0};
+            if (FAILED(dev_->CreateBuffer(&d, nullptr, &ring_)))
+                ctx1_.Reset(), ring_.Reset();
+        }
+        ring_off_ = 0;
+        ring_discard_ = true; // the first upload starts it with a discard
+        LOG_INFO("Renderer", "draw constant buffers: {}", ctx1_ ? "8 MB ring (no-overwrite maps, bound by offset)" : "one buffer per slot");
+    }
+    // Draw constant buffers come from the ring (true) and are bound with *SetConstantBuffers1.
+    bool Ring() const { return ctx1_ != nullptr; }
+    ID3D11DeviceContext1* Ctx1() const { return ctx1_.Get(); }
+    // Makes room for `bytes` of uploads (one draw's): wraps the ring now, between draws, rather than in the middle of
+    // a draw (that would discard ranges the draw already uses).
+    void RingReserve(u32 bytes) {
+        if (ctx1_ && ring_off_ + bytes > kRingBytes) {
+            ring_off_ = 0;
+            ring_gen_++;
+            ring_discard_ = true;
+        }
+    }
+    // Ring wraps so far: ranges handed out before the last one no longer hold their data.
+    u64 RingGen() const { return ring_gen_; }
+    // `size` bytes as a constant buffer: from the ring (`first`/`num` constants of the returned buffer), or the
+    // slot's own buffer (first = num = 0) without one.
+    ID3D11Buffer* ConstantAt(u32 slot_key, const void* data, u32 size, u32& first, u32& num) {
+        if (!ctx1_) {
+            first = num = 0;
+            return Constant(slot_key, data, size);
+        }
+        const u32 n = common::AlignUp(std::max<u32>(size, 16), 256u); // offsets and counts: multiples of 16 constants
+        if (ring_off_ + n > kRingBytes) // (RingReserve keeps this from happening inside a draw)
+            RingReserve(kRingBytes);
+        const D3D11_MAP mode = std::exchange(ring_discard_, false) ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE;
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (FAILED(ctx_->Map(ring_.Get(), 0, mode, 0, &m))) {
+            first = num = 0;
+            return Constant(slot_key, data, size);
+        }
+        std::memcpy(static_cast<u8*>(m.pData) + ring_off_, data, size);
+        ctx_->Unmap(ring_.Get(), 0);
+        first = ring_off_ / 16;
+        num = n / 16;
+        ring_off_ += n;
+        return ring_.Get();
+    }
 
     template <typename Desc, typename Obj, typename Create>
     Obj* Cached(common::U64Map<ComPtr<Obj>>& map, const Desc& d, Create create) {
@@ -399,6 +458,12 @@ private:
     ID3D11Device* dev_;
     ID3D11DeviceContext* ctx_ = nullptr;
     std::unordered_map<u32, Cb> cbufs_;
+    static constexpr u32 kRingBytes = 8u << 20;
+    ComPtr<ID3D11DeviceContext1> ctx1_;
+    ComPtr<ID3D11Buffer> ring_;
+    u32 ring_off_ = 0;
+    u64 ring_gen_ = 0;
+    bool ring_discard_ = true; // the next map starts a new copy of the ring
     std::unordered_map<u32, Raw> raw_;
     struct RawCached {
         Raw raw;
@@ -425,6 +490,23 @@ std::atomic<u64>& ContextEpoch() {
 
 namespace {
 // Sets only the changed span of a binding array (cache `cur` mirrors what the context has).
+// Constant buffers bound by range: `set(start, count, buffers, firsts, nums)` for the changed span.
+template <typename Set>
+void BindCbRanges(ID3D11Buffer** cur, u32* cur_first, u32* cur_num, ID3D11Buffer* const* want, const u32* first,
+                  const u32* num, u32 n, Set set) {
+    u32 lo = n, hi = 0;
+    for (u32 i = 0; i < n; i++)
+        if (cur[i] != want[i] || (want[i] && (cur_first[i] != first[i] || cur_num[i] != num[i]))) {
+            lo = std::min(lo, i);
+            hi = i + 1;
+        }
+    if (lo >= hi)
+        return;
+    set(lo, hi - lo, want + lo, first + lo, num + lo);
+    for (u32 i = lo; i < hi; i++)
+        cur[i] = want[i], cur_first[i] = first[i], cur_num[i] = num[i];
+}
+
 template <typename T, typename Set>
 void BindRange(T* cur, const T* want_begin, u32 base, u32 n, Set set) {
     u32 lo = n, hi = 0;
@@ -2729,6 +2811,9 @@ void D3D11Renderer::Draw() {
         // constant buffers
         Prof(kProfCbufs);
         ID3D11Buffer* cbs[13]{};
+        u32 cb_first[13]{}, cb_num[13]{}; // ring ranges (constants)
+        const bool ring = dc.Ring();
+        const u64 ring_gen = dc.RingGen();
         ID3D11ShaderResourceView* raws[13]{}; // dynamically indexed constant buffers as raw views (t32+)
         for (u32 i = 0; i < 13; i++) {
             if (!(s->info.cbuf_mask & (1u << i)))
@@ -2755,12 +2840,14 @@ void D3D11Renderer::Draw() {
             if (dyn && src && !trace_draw_ && size >= kRawByAddressMin) {
                 bool changed;
                 raws[i] = dc.RawByAddress(b.address, src, size, frame_counter_, changed);
-                if (!changed && sh.by_address && sh.addr == b.address && sh.cb_size >= cb_size) {
+                if (!changed && sh.by_address && sh.addr == b.address && sh.cb_size >= cb_size && sh.gen == ring_gen) {
                     cbs[i] = sh.buf;
+                    cb_first[i] = sh.first, cb_num[i] = sh.num;
                     g_prof_cb_same++;
                     continue;
                 }
-                cbs[i] = dc.Constant(stage_index * 32 + i, src, cb_size);
+                cbs[i] = dc.ConstantAt(stage_index * 32 + i, src, cb_size, cb_first[i], cb_num[i]);
+                sh.first = cb_first[i], sh.num = cb_num[i], sh.gen = dc.RingGen();
                 sh.addr = b.address;
                 sh.data.clear();
                 sh.buf = cbs[i];
@@ -2773,8 +2860,9 @@ void D3D11Renderer::Draw() {
                 continue;
             }
             if (src && !trace_draw_ && sh.addr == b.address && sh.data.size() == size && (!dyn || sh.raw) &&
-                sh.cb_size >= cb_size && std::memcmp(src, sh.data.data(), size) == 0) {
+                sh.cb_size >= cb_size && sh.gen == ring_gen && std::memcmp(src, sh.data.data(), size) == 0) {
                 cbs[i] = sh.buf;
+                cb_first[i] = sh.first, cb_num[i] = sh.num;
                 if (dyn)
                     raws[i] = sh.raw;
                 g_prof_cb_same++;
@@ -2787,7 +2875,8 @@ void D3D11Renderer::Draw() {
                 g.ReadGpu(b.address, tmp.data(), size);
                 data = tmp.data();
             }
-            cbs[i] = dc.Constant(stage_index * 32 + i, data, cb_size);
+            cbs[i] = dc.ConstantAt(stage_index * 32 + i, data, cb_size, cb_first[i], cb_num[i]);
+            sh.first = cb_first[i], sh.num = cb_num[i], sh.gen = dc.RingGen();
             sh.addr = b.address;
             sh.data.assign(data, data + size);
             sh.buf = cbs[i];
@@ -2849,18 +2938,27 @@ void D3D11Renderer::Draw() {
         }
         StageBinds& sb = binds_[is_vs ? 0 : 1];
         if (is_vs) {
-            BindRange(sb.cb, cbs, 0, 13, [&](u32 s, u32 n, ID3D11Buffer* const* p) { ctx_->VSSetConstantBuffers(s, n, p); });
+            if (ring)
+                BindCbRanges(sb.cb, sb.cb_first, sb.cb_num, cbs, cb_first, cb_num, 13,
+                             [&](u32 s, u32 n, ID3D11Buffer* const* p, const u32* f, const u32* c) { dc.Ctx1()->VSSetConstantBuffers1(s, n, p, f, c); });
+            else
+                BindRange(sb.cb, cbs, 0, 13, [&](u32 s, u32 n, ID3D11Buffer* const* p) { ctx_->VSSetConstantBuffers(s, n, p); });
             BindRange(sb.srv, srvs, 0, 32, [&](u32 s, u32 n, ID3D11ShaderResourceView* const* p) { ctx_->VSSetShaderResources(s, n, p); });
             BindRange(sb.srv, raws, 32, 13, [&](u32 s, u32 n, ID3D11ShaderResourceView* const* p) { ctx_->VSSetShaderResources(s, n, p); });
             BindRange(sb.smp, smps, 0, 16, [&](u32 s, u32 n, ID3D11SamplerState* const* p) { ctx_->VSSetSamplers(s, n, p); });
         } else {
-            BindRange(sb.cb, cbs, 0, 13, [&](u32 s, u32 n, ID3D11Buffer* const* p) { ctx_->PSSetConstantBuffers(s, n, p); });
+            if (ring)
+                BindCbRanges(sb.cb, sb.cb_first, sb.cb_num, cbs, cb_first, cb_num, 13,
+                             [&](u32 s, u32 n, ID3D11Buffer* const* p, const u32* f, const u32* c) { dc.Ctx1()->PSSetConstantBuffers1(s, n, p, f, c); });
+            else
+                BindRange(sb.cb, cbs, 0, 13, [&](u32 s, u32 n, ID3D11Buffer* const* p) { ctx_->PSSetConstantBuffers(s, n, p); });
             BindRange(sb.srv, srvs, 0, 32, [&](u32 s, u32 n, ID3D11ShaderResourceView* const* p) { ctx_->PSSetShaderResources(s, n, p); });
             BindRange(sb.srv, raws, 32, 13, [&](u32 s, u32 n, ID3D11ShaderResourceView* const* p) { ctx_->PSSetShaderResources(s, n, p); });
             BindRange(sb.smp, smps, 0, 16, [&](u32 s, u32 n, ID3D11SamplerState* const* p) { ctx_->PSSetSamplers(s, n, p); });
         }
     };
     // Unbind surfaces that may also be used as textures this draw (D3D forbids read/write hazards).
+    dc.RingReserve(2 * 13 * 65536); // both stages' constant buffers at most
     bind_stage(vs, 0, true);
     if (ps)
         bind_stage(ps, 4, false);

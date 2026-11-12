@@ -253,6 +253,7 @@ private:
     // Shader-stage bindings last set on the context (VS, PS), to skip redundant Set* calls.
     struct StageBinds {
         ID3D11Buffer* cb[14];
+        u32 cb_first[14], cb_num[14]; // ranges of cb[0..12] when bound from the constant ring
         ID3D11ShaderResourceView* srv[48];
         ID3D11SamplerState* smp[16];
     };
@@ -306,6 +307,8 @@ private:
         ID3D11ShaderResourceView* raw = nullptr;
         u32 cb_size = 0; // bytes in `buf` (less than data.size() for a dynamically indexed buffer)
         bool by_address = false; // the raw view is DrawContext::RawByAddress's (data not kept here)
+        u32 first = 0, num = 0; // range of `buf` (constant ring), 0/0 for a whole buffer
+        u64 gen = 0;            // ring generation of that range
     };
     static constexpr u32 kRawByAddressMin = 16384;
     CbShadow cb_shadow_[160];
