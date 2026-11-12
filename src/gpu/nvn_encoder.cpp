@@ -273,7 +273,14 @@ private:
                 DrvWrite(0, 0, off + 4, u32(x[3] >> 32));
                 DrvWrite(0, 0, off + 8, u32(x[4]));
             }
-        } else if (n == "BindTexture" || n == "BindImage") {
+        } else if (n == "BindTexture") { // (a run of binds: hle::nvn::ForEachTextureBind)
+            hle::nvn::ForEachTextureBind(c, [&](u64 stage, u64 slot, u64 handle) {
+                if (stage < 5 && slot < 128)
+                    DrvWrite(kHwStage[stage], 2, 0x20 + u32(slot) * 8, u32(handle));
+                else if (stage == 5 && slot < 128) // compute keeps the whole 64-bit handle
+                    DrvWrite(5, 2, 0x20 + u32(slot) * 8, handle);
+            });
+        } else if (n == "BindImage") {
             if (x[1] < 5 && x[2] < 128)
                 DrvWrite(kHwStage[x[1]], 2, (n == "BindImage" ? 0x120 : 0x20) + u32(x[2]) * 8, u32(x[3]));
             else if (x[1] == 5 && x[2] < 128) // compute keeps the whole 64-bit handle

@@ -154,6 +154,20 @@ struct ReplayCommand {
     // since SetDefaults, as of record time (the game builds many of them on the stack)
     LazyVector<std::vector<StateCall>> objects;
 };
+// nvnCommandBufferBindTexture runs: the recorder keeps consecutive BindTexture calls of a command buffer in one
+// command (thousands a frame, mostly in runs). Bind 0 is (x[1] stage, x[2] slot, x[3] handle); v[3] counts the
+// binds; binds 1-2 are (stage << 32 | slot, handle) pairs in x[4..7], further ones pairs in raw. Calls with stage or
+// slot over 32 bits start a command of their own (bind 0 keeps the full registers). Every reader of BindTexture
+// commands goes through this.
+template <typename F>
+void ForEachTextureBind(const ReplayCommand& c, F&& f) {
+    const recomp::u32 n = c.v[3] ? c.v[3] : 1;
+    f(c.x[1], c.x[2], c.x[3]);
+    for (recomp::u32 i = 1; i < n; i++) {
+        const recomp::u64* p = i < 3 ? &c.x[2 + 2 * i] : &c.raw[2 * (i - 3)];
+        f(p[0] >> 32, p[0] & 0xFFFFFFFFu, p[1]);
+    }
+}
 // A submit, in execution order: ranges of recorded command lists (shared, never copied).
 struct ReplaySpan {
     std::shared_ptr<const std::vector<ReplayCommand>> list;

@@ -244,6 +244,7 @@ u64 GetTexGen(u64 tex) {
     auto it = t.gen.find(tex);
     return it == t.gen.end() ? 0 : it->second;
 }
+std::atomic<u64> g_bt_heads{0}, g_bt_batched[3]{}; // BindTexture commands, and binds added to them (x, raw, heap)
 std::atomic<u64> g_reg_calls{0}, g_reg_hits{0}, g_list_grows{0}, g_list_new{0}, g_list_new_big{0}; // lists ExactList allocated (>= 512 KB)
 TextureDesc DescribeTexture(State& s, u64 tex) {
     TextureDesc d;
@@ -590,6 +591,7 @@ struct GenericSlot {
     bool indexed = false; // setter whose first argument selects what it sets (render target, face)
     bool host = false;    // MUA3_NVN_NATIVE: the host encoder executes it; the driver never sees it
     bool program = false; // BindProgram: the program's shader data goes into `extra`
+    bool tex_bind = false; // BindTexture: consecutive calls share one command (ForEachTextureBind)
     // texture copies: argument indices of their NVNtextureView* and NVNcopyRegion* pairs (-1 = none)
     int copy_view[2] = {-1, -1}, copy_region[2] = {-1, -1};
 };
@@ -723,6 +725,33 @@ void Generic(State& s) {
         tls_list = &rec.open[s.x[0]];
         tls_cb = s.x[0];
     }
+    // BindTexture right after a BindTexture of the same command buffer: one more bind in that command (most of a
+    // frame's ~3,000 binds come in runs; a 190-byte command each was the recorder's biggest memory traffic)
+    if (g.tex_bind && !tls_list->empty() && (s.x[1] | s.x[2]) >> 32 == 0) {
+        Command& b = tls_list->back();
+        if (b.fn == I) {
+            const u32 k = b.v[3];
+            const u64 w0 = s.x[1] << 32 | s.x[2];
+            if (k < 3) {
+                b.x[2 + 2 * k] = w0;
+                b.x[3 + 2 * k] = s.x[3];
+            } else {
+                b.raw.push_back(w0);
+                b.raw.push_back(s.x[3]);
+            }
+            b.v[3] = k + 1;
+            thread_local u64 tls_bt[3] = {}; // binds kept in x, in raw's inline words, in raw's heap
+            tls_bt[k < 3 ? 0 : k < 5 ? 1 : 2]++;
+            if (((tls_bt[0] + tls_bt[1] + tls_bt[2]) & 1023) == 0) {
+                for (int j = 0; j < 3; j++)
+                    g_bt_batched[j].fetch_add(tls_bt[j], std::memory_order_relaxed);
+                tls_bt[0] = tls_bt[1] = tls_bt[2] = 0;
+            }
+            if (g.host)
+                return Return(s, 0);
+            return g.driver(s);
+        }
+    }
     Command local;
     if (fast && tls_list->size() == tls_list->capacity())
         g_list_grows.fetch_add(1, std::memory_order_relaxed);
@@ -733,6 +762,12 @@ void Generic(State& s) {
         c.x[k] = s.x[k];
     for (int k = 0; k < 4; k++)
         c.v[k] = u32(s.v[k].lo);
+    if (g.tex_bind) { // the first bind of a run (no float arguments: v[3] counts the binds)
+        c.v[3] = 1;
+        thread_local u64 tls_heads = 0;
+        if ((++tls_heads & 1023) == 0)
+            g_bt_heads.fetch_add(1024, std::memory_order_relaxed);
+    }
     if (g.rts) { // SetRenderTargets(cb, n, NVNtexture** colors, views, depth, depthView): the arrays are temporaries
         for (u64 i = 0; i < u32(s.x[1]) && i < 8; i++)
             c.extra.push_back(recomp::Rd<u64>(s, s.x[2] + i * 8));
@@ -999,8 +1034,12 @@ void ResolveFrame(Recording& rec, std::ofstream& f, State& s, const std::vector<
             const u32 stage = u32(c.x[1]), idx = u32(c.x[2]);
             if (n == "nvnCommandBufferBindUniformBuffer" && stage < 6 && idx < 16)
                 st.stage[stage].ubo[idx] = c.x[3];
-            else if (n == "nvnCommandBufferBindTexture" && stage < 6 && idx < 32)
-                st.stage[stage].tex[idx] = c.x[3];
+            else if (n == "nvnCommandBufferBindTexture")
+                ForEachTextureBind(c, [&](u64 bs64, u64 bi64, u64 handle) {
+                    const u32 bs = u32(bs64), bi = u32(bi64);
+                    if (bs < 6 && bi < 32)
+                        st.stage[bs].tex[bi] = handle;
+                });
             else if (n == "nvnCommandBufferBindProgram") {
                 for (u32 b = 0; b < 6; b++)
                     if (c.x[2] & (1u << b))
@@ -1234,6 +1273,12 @@ void QueueSubmitCommands(State& s) {
                  double(rec.dispatches) / 600, rec.unknown, rec.recorded.load(), rec.begins, rec.ends, rec.empty_ends,
                  g_submit_ns.exchange(0) / 600e6, g_record_cycles.exchange(0) / 600e6);
         rec.cmds = rec.draws = rec.indirect = rec.dispatches = rec.unknown = 0;
+        const u64 heads = g_bt_heads.exchange(0), in_x = g_bt_batched[0].exchange(0),
+                  in_raw = g_bt_batched[1].exchange(0), on_heap = g_bt_batched[2].exchange(0);
+        LOG_INFO("NVN", "texture binds per submit: {:.0f} in {:.0f} commands (extra binds in x {:.0f}, in raw {:.0f}, "
+                        "on the heap {:.0f})",
+                 double(heads + in_x + in_raw + on_heap) / 600, double(heads) / 600, double(in_x) / 600,
+                 double(in_raw) / 600, double(on_heap) / 600);
     }
     }
     if (sink && *sink)
@@ -1633,6 +1678,7 @@ recomp::Fn Find(std::string_view name, recomp::Fn driver, u64 pc) {
         g.defaults = name.find("SetDefaults") != std::string_view::npos;
         g.shaders = name == "nvnProgramSetShaders";
         g.rts = name == "nvnCommandBufferSetRenderTargets";
+        g.tex_bind = kind == Kind::Command && name == "nvnCommandBufferBindTexture";
         if (name == "nvnCommandBufferCopyBufferToTexture") // (cb, src, dst, dstView, dstRegion, flags)
             g.copy_view[0] = 3, g.copy_region[0] = 4;
         else if (name == "nvnCommandBufferCopyTextureToBuffer") // (cb, src, srcView, srcRegion, dst, flags)
