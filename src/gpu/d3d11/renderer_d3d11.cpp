@@ -227,6 +227,17 @@ static u64 g_prof_rb_pages, g_prof_rb_changed_pages; // copy-back pages compared
 static u64 g_prof_rb_not_ready; // polls that found the oldest copy-back still in flight
 static u64 g_prof_track_bytes[3]; // bytes write-protected again per consumer: 0 textures, 1 compute, 2 index/vertex
 static u64 g_prof_rb_site[12]; // waits by consumer: 0 compute, 1 texture, 2/3 culling-gs, 4 index, 5 vertex, 6 cbuf, 7 geometry
+// The same, counted always (for the F4 capture's gpu_passes.txt): blocking copy-back waits and their CPU time by site.
+static u64 g_wait_count[12], g_wait_ns[12];
+// GPU-thread CPU time while the F4 report runs: 0 Draw, 1 Dispatch, 2 Present (off otherwise: no clock reads).
+static bool g_cpu_on = false;
+static u64 g_cpu_ns[3], g_cpu_t0, g_cpu_frame0;
+struct CpuSpan {
+    u64* acc;
+    u64 t0;
+    explicit CpuSpan(int i);
+    ~CpuSpan();
+};
 static u64 g_prof_tex_get_ns, g_prof_tex_samp_ns, g_prof_tex_calls;
 static u64 g_prof_last = 0;
 static int g_prof_section = -1;
@@ -235,6 +246,11 @@ static u64 ProfNow() {
     QueryPerformanceCounter(&c);
     static const u64 freq = (QueryPerformanceFrequency(&f), u64(f.QuadPart));
     return u64(c.QuadPart) * 1000000000ull / freq;
+}
+CpuSpan::CpuSpan(int i) : acc(g_cpu_on ? &g_cpu_ns[i] : nullptr), t0(acc ? ProfNow() : 0) {}
+CpuSpan::~CpuSpan() {
+    if (acc)
+        *acc += ProfNow() - t0;
 }
 static void Prof(int section) {
     if (!g_profile)
@@ -932,7 +948,7 @@ void D3D11Renderer::FlushGpuBuf(GpuBuf& b) {
     if (b.gpu_dirty)
         QueueReadback(b);
     if (b.in_flight) { // blocks until the GPU has run everything queued before the copy
-        const u64 t0 = g_profile ? ProfNow() : 0;
+        const u64 t0 = ProfNow();
         if (g_profile && sync_site_ == 1) { // which textures make the GPU thread wait (first few per buffer)
             static common::U64Map<int> logged;
             if (logged[b.addr]++ < 3)
@@ -940,6 +956,8 @@ void D3D11Renderer::FlushGpuBuf(GpuBuf& b) {
                          sync_va_);
         }
         PollReadbacks(true, &b);
+        if (sync_site_ < 12)
+            g_wait_count[sync_site_]++, g_wait_ns[sync_site_] += ProfNow() - t0;
         if (g_profile)
             g_prof_rb_waits++, g_prof_rb_wait_ns += ProfNow() - t0, g_prof_rb_site[sync_site_]++;
     }
@@ -962,6 +980,92 @@ D3D11Renderer::GpuBuf* D3D11Renderer::ComputeBuffer(u64 addr, u32 size) {
             e = best;
             addr = e->addr;
             size = e->size;
+        }
+    }
+    // Windows that partly overlap resident buffers (a particle pool: many windows over one region, each dispatch a
+    // different one): one buffer over the union of them all, filled on the GPU from the old buffers' results, so
+    // nothing waits. (Landing each overlapping buffer's results on the CPU first was a blocking wait per dispatch:
+    // ~150 a frame in the Sandman fight.) MUA3_GMEM_MERGE=0: the old way below.
+    static const bool merge = [] {
+        const char* v = std::getenv("MUA3_GMEM_MERGE");
+        return !(v && *v == '0');
+    }();
+    if (merge && !(e && e->addr <= addr && addr + size <= e->addr + e->size)) {
+        u64 lo = addr, hi = addr + u64(size);
+        std::vector<GpuBuf*> parts;
+        for (bool grew = true; grew;) { // (the union can reach further buffers)
+            grew = false;
+            for (auto& b : gbufs_) {
+                if (b->retired || b->addr >= hi || lo >= b->addr + b->size ||
+                    std::find(parts.begin(), parts.end(), b.get()) != parts.end())
+                    continue;
+                parts.push_back(b.get());
+                if (b->addr < lo || b->addr + b->size > hi) {
+                    lo = std::min(lo, b->addr);
+                    hi = std::max(hi, b->addr + b->size);
+                    grew = true;
+                }
+            }
+        }
+        // (one buffer at the same address that is just smaller: the grow path below keeps it)
+        const bool same_start = parts.size() == 1 && parts[0]->addr == addr;
+        if (!parts.empty() && !same_start && hi - lo <= (64u << 20)) {
+            auto nb = std::make_unique<GpuBuf>();
+            nb->addr = lo;
+            nb->size = u32(hi - lo);
+            nb->capacity = u32(common::AlignUp(nb->size, 1u << 16));
+            D3D11_BUFFER_DESC bd{nb->capacity, D3D11_USAGE_DEFAULT,
+                                 D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER,
+                                 0, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS | D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS, 0};
+            D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+            ud.Format = DXGI_FORMAT_R32_TYPELESS;
+            ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+            ud.Buffer = {0, nb->capacity / 4, D3D11_BUFFER_UAV_FLAG_RAW};
+            if (SUCCEEDED(dev_->CreateBuffer(&bd, nullptr, &nb->buf)) &&
+                SUCCEEDED(dev_->CreateUnorderedAccessView(nb->buf.Get(), &ud, &nb->uav))) {
+                // Pages the CPU wrote into a part whose results are newer than guest memory: guest memory wins there
+                // again after the parts' results are copied in (as Reupload does for a single buffer).
+                std::vector<std::pair<u32, u32>> cpu_runs;
+                for (GpuBuf* b : parts)
+                    if (b->gpu_dirty || b->in_flight) {
+                        std::vector<std::pair<u32, u32>> r = std::move(b->cpu_pages);
+                        b->cpu_pages.clear();
+                        CollectCpuWrites(b->cpu_ranges, r);
+                        for (auto [o, n] : r)
+                            cpu_runs.push_back({u32(b->addr - lo) + o, n});
+                    }
+                Reupload(*nb, true); // guest memory over the whole union (and its write tracking)
+                for (GpuBuf* b : parts) {
+                    if (b->gpu_dirty || b->in_flight) { // results not in guest memory yet: they come from the GPU
+                        const D3D11_BOX box{0, 0, 0, b->size, 1, 1};
+                        ctx_->CopySubresourceRegion(nb->buf.Get(), 0, u32(b->addr - lo), 0, 0, b->buf.Get(), 0, &box);
+                        nb->gpu_dirty = true; // (the merged buffer copies them back; in-flight copy-backs still land)
+                    }
+                    nb->gpu_written = nb->gpu_written || b->gpu_written;
+                    b->gpu_dirty = false;
+                    b->retired = true;
+                }
+                for (auto [o, n] : cpu_runs) {
+                    n = std::min(n, nb->size - std::min(o, nb->size));
+                    if (!n)
+                        continue;
+                    const D3D11_BOX box{o, 0, 0, o + n, 1, 1};
+                    ctx_->UpdateSubresource(nb->buf.Get(), 0, &box, nb->snapshot.data() + o, n, n);
+                }
+                if (nb->gpu_dirty) {
+                    gpu_dirty_any_ = true;
+                    MarkActive(*nb);
+                }
+                active_stale_ = true;
+                nb->last_use = frame_counter_;
+                static u64 merges = 0;
+                if (++merges <= 8 || (merges & (merges - 1)) == 0)
+                    LOG_INFO("Renderer", "compute windows merged ({} so far): {} buffers -> {:#x}+{:#x}", merges, parts.size(), lo,
+                             hi - lo);
+                GpuBuf* m = nb.get();
+                gbufs_.push_back(std::move(nb));
+                return m;
+            }
         }
     }
     // Another resident buffer overlapping this one: land its results and re-upload both from guest memory. One that
@@ -1639,6 +1743,7 @@ static std::vector<u8> ReadBufferNow(ID3D11Device* dev, ID3D11DeviceContext* ctx
 
 void D3D11Renderer::Dispatch(const ComputeLaunch& l) {
     std::lock_guard ctx_lock(ContextMutex());
+    const CpuSpan cpu_span(1);
     // (MUA3_GPU_PASSES=2: one pass per compute program and grid instead of one for all dispatches)
     if (gpu_passes_.PerProgram())
         gpu_passes_.Mark((0xC5ull << 56) | (u64(l.program_offset) << 24) ^ (u64(l.grid[0]) << 16) ^ (u64(l.grid[1]) << 8) ^ l.grid[2], [&] {
@@ -2070,6 +2175,7 @@ void D3D11Renderer::EmulateCullingGs() {
 
 void D3D11Renderer::Draw() {
     std::lock_guard ctx_lock(ContextMutex());
+    const CpuSpan cpu_span(0);
     auto& g = G();
     const auto& m = g.State();
     auto& dc = *g_dc;
@@ -3209,6 +3315,7 @@ void D3D11Renderer::ReportHitch() {
 }
 
 void D3D11Renderer::Present(const PresentInfo& p) {
+    const u64 present_t0 = g_cpu_on ? ProfNow() : 0;
     std::lock_guard ctx_lock(ContextMutex());
     frame_counter_++;
     shaders_->Tick();
@@ -3330,6 +3437,12 @@ void D3D11Renderer::Present(const PresentInfo& p) {
         // GPU time per pass over the next normal frames (no capture work in them), next to the capture
         passes_report_dir_ = c->Dir() / "frame";
         gpu_passes_.StartReport(30);
+        std::memset(g_wait_count, 0, sizeof(g_wait_count));
+        std::memset(g_wait_ns, 0, sizeof(g_wait_ns));
+        std::memset(g_cpu_ns, 0, sizeof(g_cpu_ns));
+        g_cpu_on = true;
+        g_cpu_t0 = ProfNow();
+        g_cpu_frame0 = frame_counter_;
         capture_ = nullptr; // written: the bug capture thread frees it
     }
     presented_cpu_.insert(p.cpu_addr);
@@ -3449,8 +3562,29 @@ void D3D11Renderer::Present(const PresentInfo& p) {
         SetEvent(static_cast<HANDLE>(new_frame_event_));
     }
     gpu_passes_.EndFrame();
+    if (g_cpu_on && present_t0)
+        g_cpu_ns[2] += ProfNow() - present_t0;
     if (!passes_report_dir_.empty())
         if (std::string r = gpu_passes_.TakeReport(); !r.empty()) {
+            static const char* const kSite[12] = {"compute",  "texture",         "culling-gs index", "culling-gs counter",
+                                                  "index",    "vertex",          "constant buffer",  "geometry",
+                                                  "compute: overlapping windows", "compute: stale buffer", "compute: grow fallback",
+                                                  "compute: sync region"};
+            g_cpu_on = false;
+            const double frames = double(std::max<u64>(1, frame_counter_ - g_cpu_frame0)), wall = (ProfNow() - g_cpu_t0) / 1e6;
+            double waits = 0;
+            for (u64 w : g_wait_ns)
+                waits += w / 1e6;
+            r += fmt::format("\nGPU thread CPU time per frame over those {:.0f} frames (wall {:.2f} ms a frame):\n"
+                             "  {:9.3f} ms  Draw\n  {:9.3f} ms  Dispatch (compute setup, uploads, the kernel call)\n"
+                             "  {:9.3f} ms  Present\n  {:9.3f} ms  of those: blocking copy-back waits (below)\n"
+                             "  {:9.3f} ms  the rest (encoder, clears, copies, waiting for work)\n",
+                             frames, wall / frames, g_cpu_ns[0] / 1e6 / frames, g_cpu_ns[1] / 1e6 / frames, g_cpu_ns[2] / 1e6 / frames,
+                             waits / frames, (wall - (g_cpu_ns[0] + g_cpu_ns[1] + g_cpu_ns[2]) / 1e6) / frames);
+            r += "\nBlocking copy-back waits on the GPU thread over those frames (each drains the GPU):\n";
+            for (u32 i = 0; i < 12; i++)
+                if (g_wait_count[i])
+                    r += fmt::format("  {:6} waits  {:9.3f} ms  {}\n", g_wait_count[i], g_wait_ns[i] / 1e6, kSite[i]);
             common::WriteFile(passes_report_dir_ / "gpu_passes.txt", std::span(reinterpret_cast<const u8*>(r.data()), r.size()));
             LOG_INFO("BugCapture", "GPU time per pass written to {}", (passes_report_dir_ / "gpu_passes.txt").string());
             passes_report_dir_.clear();
