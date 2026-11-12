@@ -346,27 +346,78 @@ void SamplerPoolInitialize(State& s) {
 
 // void nvnTexturePoolRegisterTexture(const NVNtexturePool*, int id, const NVNtexture*, const NVNtextureView*):
 // KTGL re-registers the textures it binds every frame (~3,200 calls per frame in ST010).
+// Per-thread registration cache (TexturePoolRegisterTexture): the exact (pool, texture, view words) seen before with
+// the descriptor the driver wrote for them. The lookup's compare fields share the first cache line; an entry is one
+// aligned 128-byte pair of lines. `next` is the entry hit right after this one last time: KTGL registers the same
+// sequence every frame, so each hit prefetches the next one's entry (a cold line was most of a hit's cost).
+struct alignas(128) FastReg {
+    bool valid = false;
+    u64 pool = 0, words[6]{};
+    u64 base = 0, global_gen = 0, tex_gen = 0;
+    u8 bytes[32]{};
+    FastReg* next = nullptr;
+};
+constexpr u32 kFastRegs = 2048;
+thread_local std::unique_ptr<FastReg[]> t_fast_regs;
+thread_local FastReg* t_last_reg = nullptr;
+inline void RegChain(FastReg* fr) {
+    if (FastReg* last = t_last_reg; last && last != fr && last->next != fr)
+        last->next = fr;
+    t_last_reg = fr;
+    if (const FastReg* n = fr->next) {
+        _mm_prefetch(reinterpret_cast<const char*>(n), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(n) + 64, _MM_HINT_T0);
+    }
+}
+bool RegCacheOn() {
+    static const bool on = std::getenv("MUA3_NVN_NO_REGCACHE") == nullptr;
+    return on;
+}
+inline u64 RegKey(State& s, u64 words[6]) {
+    if (const u64 view = s.x[3])
+        for (u32 k = 0; k < 5; k++)
+            words[1 + k] = recomp::Rd<u64>(s, view + k * 8);
+    u64 key = 0xcbf29ce484222325ull;
+    for (int k = 0; k < 6; k++) {
+        key = (key ^ words[k]) * 0x100000001b3ull;
+        key ^= key >> 29;
+    }
+    return key;
+}
+inline FastReg* RegSlot(State& s, u64 key) {
+    return &t_fast_regs[(key ^ (s.x[0] * 0x9E3779B97F4A7C15ull) >> 40) & (kFastRegs - 1)];
+}
+__declspec(noinline) void RegisterTextureSlow(State& s);
+// void nvnTexturePoolRegisterTexture(const NVNtexturePool*, int id, const NVNtexture*, const NVNtextureView*):
+// the cache hit (nearly every call) in a small function of its own; anything else goes the full way.
 void TexturePoolRegisterTexture(State& s) {
+    if (RegCacheOn() && t_fast_regs) {
+        u64 words[6] = {s.x[2], 0, 0, 0, 0, 0};
+        FastReg* fr = RegSlot(s, RegKey(s, words));
+        if (fr->valid && fr->pool == s.x[0] && std::memcmp(fr->words, words, sizeof(words)) == 0 &&
+            fr->global_gen == g_texture_generation.load(std::memory_order_acquire) &&
+            gpu::G().WriteGpu(fr->base + u64(u32(s.x[1])) * 32, fr->bytes, sizeof(fr->bytes))) {
+            g_reg_calls.fetch_add(1, std::memory_order_relaxed);
+            g_reg_hits.fetch_add(1, std::memory_order_relaxed);
+            RegChain(fr);
+            return Return(s, 0);
+        }
+    }
+    RegisterTextureSlow(s);
+}
+void RegisterTextureSlow(State& s) {
     const u32 id = u32(s.x[1]);
     const u64 tex = s.x[2], view = s.x[3];
     // The descriptor the driver writes for a (texture, view) pair is the same whichever slot it goes to, and KTGL
     // registers the same pairs under fresh ids every frame (thousands a frame): once the driver has written one,
     // later registrations copy those 32 bytes into the new slot on the host. A texture initialized or finalized
     // again gets a new descriptor (its generation).
-    static const bool cache = std::getenv("MUA3_NVN_NO_REGCACHE") == nullptr;
+    const bool cache = RegCacheOn();
     u64 key = 0, desc_va = 0, generation = 0;
     // Per-thread fast path in front of the shared cache: the exact (pool, texture, view words) seen before with the
     // texture generation unchanged since (any texture Initialize/Finalize or pool re-initialization bumps the
     // global counter; then the texture's own generation is checked once under the lock). No lock, no map lookups.
-    // (the lookup's compare fields share the first cache line; an entry is one aligned 128-byte pair of lines)
-    struct alignas(128) FastReg {
-        bool valid = false;
-        u64 pool = 0, words[6]{};
-        u64 base = 0, global_gen = 0, tex_gen = 0;
-        u8 bytes[32]{};
-    };
-    constexpr u32 kFastRegs = 2048;
-    thread_local std::unique_ptr<FastReg[]> fast_regs;
+    auto& fast_regs = t_fast_regs;
     FastReg* fr = nullptr;
     u64 words[6] = {tex, 0, 0, 0, 0, 0};
     u64 snap_gen = 0;
@@ -380,6 +431,7 @@ void TexturePoolRegisterTexture(State& s) {
         fr->tex_gen = generation;
         std::memcpy(fr->bytes, bytes, sizeof(fr->bytes));
         fr->valid = true;
+        RegChain(fr);
     };
     if (cache) {
         g_reg_calls.fetch_add(1, std::memory_order_relaxed);
@@ -403,6 +455,7 @@ void TexturePoolRegisterTexture(State& s) {
             }
             if (ok && gpu::G().WriteGpu(fr->base + u64(id) * 32, fr->bytes, sizeof(fr->bytes))) {
                 g_reg_hits.fetch_add(1, std::memory_order_relaxed);
+                RegChain(fr);
                 return Return(s, 0);
             }
             fr->valid = false;
