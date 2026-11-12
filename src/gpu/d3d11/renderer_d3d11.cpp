@@ -1576,14 +1576,9 @@ bool D3D11Renderer::PrepareQuadIndirect(GpuBuf& args, u32 off) {
 ID3D11ShaderResourceView* D3D11Renderer::ComputeBufferSrv(u64 gpu_va, u64 size, DXGI_FORMAT fmt, u32 bpb) {
     if (!bpb || !size || fmt == DXGI_FORMAT_UNKNOWN)
         return nullptr;
-    for (auto& bp : gbufs_) {
-        GpuBuf& b = *bp;
-        if (b.retired || !b.gpu_written || gpu_va < b.addr || gpu_va + size > b.addr + b.size)
-            continue;
+    auto view = [&](GpuBuf& b) -> ID3D11ShaderResourceView* {
         const u64 off = gpu_va - b.addr;
         if (off % bpb)
-            return nullptr;
-        if (ComputeBuffer(b.addr, b.size) != &b) // picks up CPU writes; never reallocates (size fits)
             return nullptr;
         const u64 key = off | (size << 27) | (u64(fmt) << 56);
         auto& srv = b.srvs[key];
@@ -1597,7 +1592,29 @@ ID3D11ShaderResourceView* D3D11Renderer::ComputeBufferSrv(u64 gpu_va, u64 size, 
                 return nullptr;
         }
         return srv.Get();
+    };
+    bool overlaps = false;
+    for (auto& bp : gbufs_) {
+        GpuBuf& b = *bp;
+        if (b.retired || !b.gpu_written || gpu_va >= b.addr + b.size || b.addr >= gpu_va + size)
+            continue;
+        overlaps = true;
+        if (gpu_va < b.addr || gpu_va + size > b.addr + b.size)
+            continue;
+        if ((gpu_va - b.addr) % bpb)
+            return nullptr;
+        if (ComputeBuffer(b.addr, b.size) != &b) // picks up CPU writes; never reallocates (size fits)
+            return nullptr;
+        return view(b);
     }
+    // A texel buffer that straddles compute buffers (particle pools: 0x6990-byte views across two of them at the
+    // Raft): one resident buffer over the range, merged on the GPU, instead of landing the compute results on the
+    // CPU for a texture upload (a blocking wait).
+    if (overlaps && size <= (64u << 20))
+        if (GpuBuf* m = ComputeBuffer(gpu_va, u32(size)); m && m->addr <= gpu_va && gpu_va + size <= m->addr + m->size) {
+            m->gpu_written = true; // (its contents are now what the texture reads)
+            return view(*m);
+        }
     return nullptr;
 }
 
