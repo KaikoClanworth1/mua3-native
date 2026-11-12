@@ -2564,15 +2564,20 @@ bool Translator::Run() {
             for (u32 pc = b.start; pc < b.end; pc = NextPc(pc)) {
                 const u64 insn = At(pc);
                 const Op op = Decode(insn);
-                u32 target = ~0u;
+                std::vector<u32> targets;
                 if (op == Op::BRA)
-                    target = BranchTarget(pc, insn);
+                    targets.push_back(BranchTarget(pc, insn));
                 else if ((op == Op::SYNC || op == Op::BRK || op == Op::CONT) && sync_target_.count(pc))
-                    target = sync_target_[pc];
-                auto t = blocks_.find(target);
-                if (t != blocks_.end() && t->second.id <= b.id) {
-                    loop_lo = std::min(loop_lo, t->second.id);
-                    loop_hi = std::max(loop_hi, b.id);
+                    targets.push_back(sync_target_[pc]);
+                else if (op == Op::BRX && brx_.count(pc)) // every jump table entry (some go backwards)
+                    for (auto& [value, target] : brx_[pc])
+                        targets.push_back(target);
+                for (const u32 target : targets) {
+                    auto t = blocks_.find(target);
+                    if (t != blocks_.end() && t->second.id <= b.id) {
+                        loop_lo = std::min(loop_lo, t->second.id);
+                        loop_hi = std::max(loop_hi, b.id);
+                    }
                 }
             }
         }
@@ -2883,6 +2888,66 @@ size_t ProgramSize(const u8* code, size_t max_size) {
             return off + 8;
     }
     return max_size;
+}
+
+std::vector<BrxSite> FindBrxSites(const u8* code, size_t size) {
+    // the same pattern ResolveBrx looks for: LDC Ra, c1[Rx + off] ... IMNMX bound ... BRX Ra + imm
+    std::vector<BrxSite> out;
+    auto at = [&](u32 pc) {
+        u64 v = 0;
+        if (pc + 8 <= size)
+            std::memcpy(&v, code + pc, 8);
+        return v;
+    };
+    for (u32 pc = kProgramStart + 8; pc + 8 <= size; pc += 8) {
+        if ((pc - kProgramStart) % 32 == 0)
+            continue;
+        const u64 insn = at(pc);
+        if (Decode(insn) != Op::BRX)
+            continue;
+        const u32 ra = u32(Bits(insn, 8, 8));
+        const s32 off = s32(u32(Bits(insn, 20, 24)) << 8) >> 8;
+        BrxSite s;
+        s.pc = pc;
+        s.base = u32(s32(pc + 8) + off);
+        u32 cb_index = ~0u;
+        s32 bound = -1;
+        for (u32 q = pc, steps = 0; q >= 16 && steps < 48; steps++) {
+            q -= 8;
+            if (q % 32 == 0)
+                continue;
+            const u64 j = at(q);
+            const Op o = Decode(j);
+            if (cb_index == ~0u) {
+                if (o == Op::LDC && u32(Bits(j, 0, 8)) == ra) {
+                    cb_index = u32(Bits(j, 36, 5));
+                    s.cb_off = u32(s32(u32(Bits(j, 20, 16)) << 16) >> 16);
+                }
+                continue;
+            }
+            if (o == Op::IMNMX_imm) {
+                bound = s32(u32(Bits(j, 20, 19)) | (Bit(j, 56) ? 0xFFF80000u : 0u));
+                break;
+            }
+        }
+        if (cb_index == 1 && bound >= 0 && bound <= 255) {
+            s.entries = u32(bound) + 1;
+            out.push_back(s);
+        }
+    }
+    return out;
+}
+
+bool UsesBrx(const u8* code, size_t size) {
+    for (size_t off = kProgramStart; off + 8 <= size; off += 8) {
+        if ((off - kProgramStart) % 32 == 0) // scheduling control word
+            continue;
+        u64 v;
+        std::memcpy(&v, code + off, 8);
+        if (Decode(v) == Op::BRX)
+            return true;
+    }
+    return false;
 }
 
 TranslateResult Translate(Stage stage, const u8* code, size_t size, const TranslateOptions& opt) {

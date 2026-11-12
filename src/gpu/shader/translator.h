@@ -58,5 +58,12 @@ TranslateResult Translate(Stage stage, const u8* code, size_t size, const Transl
 
 // Finds the program length (bytes, including the SPH) by scanning for the end-of-program self branch.
 size_t ProgramSize(const u8* code, size_t max_size);
+// The program has an indirect branch (BRX): its jump table is in constant buffer 1 (TranslateOptions::cbuf1).
+bool UsesBrx(const u8* code, size_t size);
+// Each BRX with a recognised jump table load: table at cbuf1 + cb_off, `entries` u32 offsets, target = base + offset.
+struct BrxSite {
+    u32 pc = 0, base = 0, cb_off = 0, entries = 0;
+};
+std::vector<BrxSite> FindBrxSites(const u8* code, size_t size);
 
 } // namespace gpu::shader

@@ -23,7 +23,7 @@ namespace gpu {
 // Bump kTranslatorVersion whenever the translator output changes, to invalidate cached bytecode.
 constexpr int kTranslatorVersion = 31; // 31: shadow textures past 16 get their own sampler register
 // Failure markers carry this: older ones (before the direct backend took over what FXC fails on) are retried once.
-constexpr u8 kFailGeneration = 1;
+constexpr u8 kFailGeneration = 2; // 2: vertex/pixel BRX programs get constant buffer 1
 
 
 namespace {
@@ -106,13 +106,14 @@ bool ShaderCache::Build(HostShader& s, bool slow) {
         const std::span<const u8> code(s.code.data(), s.code.size());
         common::WriteFile(dump_dir_ / fmt::format("{:016x}.{}.bin", s.hash, tag), code);
         PackPut(PackKind(PackProgram + StageIndex(s.stage)), s.hash, code);
-        if (s.stage == shader::Stage::Compute) { // launch shape and constant buffer 1, so Prewarm rebuilds it exactly
+        // launch shape (compute) and constant buffer 1 (BRX jump tables), so Prewarm rebuilds it exactly
+        if (s.stage == shader::Stage::Compute || !s.cbuf1.empty()) {
             std::vector<u8> o(16 + s.cbuf1.size());
             const u32 shape[4] = {s.opt.block[0], s.opt.block[1], s.opt.block[2], s.opt.shared_bytes};
             std::memcpy(o.data(), shape, 16);
             if (!s.cbuf1.empty())
                 std::memcpy(o.data() + 16, s.cbuf1.data(), s.cbuf1.size());
-            common::WriteFile(dump_dir_ / fmt::format("{:016x}.cs.opt", s.hash), std::span(o.data(), o.size()));
+            common::WriteFile(dump_dir_ / fmt::format("{:016x}.{}.opt", s.hash, tag), std::span(o.data(), o.size()));
             PackPut(PackOpt, s.hash, std::span(o.data(), o.size()));
         }
     }
@@ -188,6 +189,18 @@ bool ShaderCache::Build(HostShader& s, bool slow) {
     }
     compile_ns += u64((std::chrono::steady_clock::now() - c0).count());
     s.ok = err.empty() && (s.vs || s.ps || s.cs || !s.created);
+    // A vertex / pixel BRX program looked up without its constant buffer 1 (prewarm, setup, a set-up-only lookup):
+    // not a failure, the draw that uses it brings the jump table.
+    const bool needs_c1 = !s.ok && s.stage != shader::Stage::Compute && s.cbuf1.empty() &&
+                          s.info.error.find("jump table not found") != std::string::npos;
+    if (needs_c1) {
+        LOG_DEBUG("Shader", "{} {:016x}: BRX jump table in constant buffer 1, built at its first draw", tag, s.hash);
+        std::lock_guard lk(ready_mutex_);
+        s.state = HostShader::Failed; // (Get rebuilds it when a draw brings constant buffer 1)
+        s.needs_c1 = true;
+        ready_cv_.notify_all();
+        return true;
+    }
     if (!s.ok) {
         failures++;
         if (!s.is_variant && !s.no_cache) // don't retry it at every launch's prewarm
@@ -896,7 +909,7 @@ void ShaderCache::Anticipate() {
 HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size, const shader::TranslateOptions* opt) {
     size = shader::ProgramSize(code, size);
     u64 hash = Hash64(code, size) ^ (u64(stage) << 60);
-    if (opt) { // the launch shape is compiled into compute shaders
+    if (opt && stage == shader::Stage::Compute) { // the launch shape is compiled into compute shaders
         const u32 shape[4] = {opt->block[0], opt->block[1], opt->block[2], opt->shared_bytes};
         hash ^= Hash64(shape, sizeof(shape)) * 0x9E3779B97F4A7C15ull;
     }
@@ -907,6 +920,41 @@ HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size, c
     auto it = shaders_.find(hash);
     if (it != shaders_.end()) {
         HostShader* found = it->second.get();
+        // A program built with one constant buffer 1 (BRX jump table), looked up again with a different one: its
+        // translation would use a stale table (logged once; tables have been per-program constants so far).
+        if (opt && opt->cbuf1 && stage != shader::Stage::Compute && !found->cbuf1.empty() && !found->c1_differs &&
+            (found->cbuf1.size() != opt->cbuf1_size ||
+             std::memcmp(found->cbuf1.data(), opt->cbuf1, found->cbuf1.size()) != 0)) {
+            found->c1_differs = true;
+            LOG_WARN("Shader", "{} {:016x}: constant buffer 1 (BRX jump table) differs from the one it was built with",
+                     StageTag(stage), hash);
+        }
+        if (found->needs_c1 && !anticipating_ && opt && opt->cbuf1 && found->state == HostShader::Failed) {
+            // a BRX program built without its jump table, and a draw brings constant buffer 1: build it again
+            HostShader& s = *found;
+            s.needs_c1 = false;
+            s.cbuf1.assign(opt->cbuf1, opt->cbuf1 + opt->cbuf1_size);
+            s.opt.cbuf1 = s.cbuf1.data();
+            s.opt.cbuf1_size = u32(s.cbuf1.size());
+            s.info = {};
+            s.translated = false;
+            s.direct_tried = false;
+            s.claimed = false;
+            s.slow = false;
+            s.prewarm = false;
+            s.persist = true; // (its options, with constant buffer 1, for the next launch's prewarm)
+            {
+                std::lock_guard lk(ready_mutex_);
+                s.state = HostShader::Pending;
+            }
+            pending++;
+            {
+                std::lock_guard lk(mutex_);
+                queue_.push_front(&s);
+            }
+            cv_.notify_all();
+            return found;
+        }
         if (found->quiet && !anticipating_) { // a draw asks for a program only set up so far: failures matter now
             std::lock_guard lk(ready_mutex_);
             found->quiet = false;
@@ -951,7 +999,7 @@ HostShader* ShaderCache::Queue(shader::Stage stage, u64 hash, const u8* code, si
     s->code.assign(code, code + size);
     if (opt) {
         s->opt = *opt;
-        if (opt->cbuf1)
+        if (opt->cbuf1 && (stage == shader::Stage::Compute || shader::UsesBrx(code, size)))
             s->cbuf1.assign(opt->cbuf1, opt->cbuf1 + opt->cbuf1_size);
         s->opt.cbuf1 = s->cbuf1.empty() ? nullptr : s->cbuf1.data();
         s->opt.cbuf1_size = u32(s->cbuf1.size());
@@ -1215,7 +1263,17 @@ void ShaderCache::Prewarm() {
             opt.cbuf1_size = u32(o.size() - 16);
             Queue(shader::Stage::Compute, hash, code.data(), code.size(), &opt, true);
         } else {
-            Queue(stage, hash, code.data(), code.size(), nullptr, true);
+            // a vertex / pixel program with a BRX: its constant buffer 1, recorded at the draw that first used it
+            std::vector<u8> o;
+            if (!PackGet(PackOpt, hash, o)) {
+                o = common::ReadFile(dump_dir_ / fmt::format("{:016x}.{}.opt", hash, prog.stage == 0 ? "vs" : "ps"));
+                if (o.size() > 16)
+                    PackPut(PackOpt, hash, o);
+            }
+            shader::TranslateOptions opt;
+            opt.cbuf1 = o.size() > 16 ? o.data() + 16 : nullptr; // copied by Queue
+            opt.cbuf1_size = o.size() > 16 ? u32(o.size() - 16) : 0;
+            Queue(stage, hash, code.data(), code.size(), opt.cbuf1 ? &opt : nullptr, true);
         }
         n++;
     }

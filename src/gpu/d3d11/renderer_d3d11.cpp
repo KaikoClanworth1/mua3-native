@@ -2073,7 +2073,19 @@ void D3D11Renderer::Draw() {
         const size_t got = g.ReadGpuPartial(addr, buf.data(), buf.size());
         if (got < 0x60)
             return nullptr;
-        HostShader* sh = shaders_->Get(stage, buf.data(), got);
+        // An indirect branch (BRX) finds its jump table in the stage's constant buffer 1 (the program's constants).
+        shader::TranslateOptions opt;
+        static thread_local std::vector<u8> cb1;
+        if (shader::UsesBrx(buf.data(), shader::ProgramSize(buf.data(), got))) {
+            const ConstBufferBinding& c1 = m.cb[stage == shader::Stage::Vertex ? kCbVertex : kCbFragment][1];
+            if (c1.enabled && c1.size) {
+                cb1.assign(std::min<u32>(c1.size, 0x10000), 0);
+                g.ReadGpuPartial(c1.address, cb1.data(), cb1.size());
+                opt.cbuf1 = cb1.data();
+                opt.cbuf1_size = u32(cb1.size());
+            }
+        }
+        HostShader* sh = shaders_->Get(stage, buf.data(), got, opt.cbuf1 ? &opt : nullptr);
         shader_by_addr_[key] = sh;
         code_lo_ = std::min(code_lo_, addr);
         code_hi_ = std::max(code_hi_, addr + shader::ProgramSize(buf.data(), got));

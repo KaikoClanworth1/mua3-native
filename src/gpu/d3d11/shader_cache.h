@@ -48,6 +48,10 @@ struct HostShader {
     // not tried yet, or it could not build this one and FXC does).
     bool direct_tried = false;
     std::vector<u8> direct_blob;
+    // Vertex / pixel program with a BRX, built without its constant buffer 1 (no jump table): failed for now, rebuilt
+    // when a draw asks for it with the stage's constant buffer 1.
+    bool needs_c1 = false;
+    bool c1_differs = false; // a later lookup brought a different constant buffer 1 (warned once)
     shader::TranslateOptions opt; // compute: workgroup shape and shared memory from the launch
     std::vector<u8> cbuf1;        // compute: constant buffer 1 at first launch (opt.cbuf1 points here)
     std::vector<u8> code; // guest program (kept until compiled)

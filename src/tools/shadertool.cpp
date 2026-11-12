@@ -919,6 +919,114 @@ static int DxbcAb(const fs::path& dump, const fs::path& pack_path, int limit, u3
     return 0;
 }
 
+// --brx-check <shader_dump dir> <game dir>: every vertex / pixel program with an indirect branch (BRX), translated
+// with a constant buffer 1 holding its jump tables (found in the game's shader packages next to the program: runs
+// of offsets that all land on instructions of that program) and compiled by FXC, as the shader cache would at draw.
+static int BrxCheck(const fs::path& dump, const fs::path& game) {
+    std::vector<std::pair<std::string, std::vector<u8>>> files;
+    for (auto& e : fs::recursive_directory_iterator(game / "romfs" / "SHADER"))
+        if (e.is_regular_file())
+            files.push_back({e.path().filename().string(), common::ReadFile(e.path())});
+    int with_brx = 0, located = 0, tables = 0, translated = 0, compiled = 0;
+    std::map<std::string, int> why;
+    for (auto& e : fs::directory_iterator(dump)) {
+        const std::string name = e.path().filename().string();
+        if (name.size() != 23 || !(name.ends_with(".vs.bin") || name.ends_with(".ps.bin")))
+            continue;
+        const auto data = common::ReadFile(e.path());
+        const size_t size = ProgramSize(data.data(), data.size());
+        if (!UsesBrx(data.data(), size))
+            continue;
+        with_brx++;
+        const auto sites = FindBrxSites(data.data(), size);
+        if (sites.empty()) {
+            why["BRX without a recognised table load"]++;
+            continue;
+        }
+        // the package holding this program
+        const std::vector<u8>* file = nullptr;
+        size_t at = 0;
+        for (auto& [fname, blob] : files) {
+            auto it = std::search(blob.begin(), blob.end(), data.begin(), data.begin() + std::min<size_t>(size, 128));
+            if (it != blob.end()) {
+                file = &blob, at = size_t(it - blob.begin());
+                break;
+            }
+        }
+        if (!file) {
+            why["program not in the shader packages"]++;
+            continue;
+        }
+        located++;
+        u32 c1_size = 0;
+        for (auto& s : sites)
+            c1_size = std::max(c1_size, s.cb_off + s.entries * 4);
+        std::vector<u8> c1(c1_size, 0);
+        bool all = true;
+        for (auto& s : sites) {
+            // nearest run (by distance from the program) whose every entry lands on an instruction of the program
+            long long best = -1, best_dist = 0;
+            for (size_t p = 0; p + s.entries * 4 <= file->size(); p += 4) {
+                bool ok = true;
+                for (u32 k = 0; k < s.entries && ok; k++) {
+                    u32 v;
+                    std::memcpy(&v, &(*file)[p + k * 4], 4);
+                    u32 t = s.base + v;
+                    if (t % 32 == 0)
+                        t += 8;
+                    ok = t % 8 == 0 && t >= 0x58 && t < size;
+                }
+                if (!ok)
+                    continue;
+                const long long dist = std::llabs((long long)p - (long long)at);
+                if (best < 0 || dist < best_dist)
+                    best = (long long)p, best_dist = dist;
+            }
+            if (best < 0) {
+                all = false;
+                break;
+            }
+            std::memcpy(&c1[s.cb_off], &(*file)[size_t(best)], s.entries * 4);
+        }
+        if (!all) {
+            why["jump table not found in the package"]++;
+            continue;
+        }
+        tables++;
+        const bool vs = name.ends_with(".vs.bin");
+        const Stage st = vs ? Stage::Vertex : Stage::Fragment;
+        TranslateOptions o;
+        o.cbuf1 = c1.data();
+        o.cbuf1_size = u32(c1.size());
+        auto r = Translate(st, data.data(), data.size(), o);
+        if (r.ok && r.uses_loop) { // as the shader cache does
+            o.force_lod0 = true;
+            r = Translate(st, data.data(), data.size(), o);
+        }
+        if (!r.ok) {
+            why["translate: " + r.error.substr(0, 60)]++;
+            continue;
+        }
+        translated++;
+        std::string err;
+        const UINT saved = g_flags;
+        g_flags = D3DCOMPILE_OPTIMIZATION_LEVEL1 | D3DCOMPILE_IEEE_STRICTNESS; // the game's flags
+        const bool ok = CompileHlsl(r.hlsl, vs ? "vs_5_0" : "ps_5_0", err);
+        g_flags = saved;
+        if (ok)
+            compiled++;
+        else
+            why["FXC: " + err.substr(err.find("error") == std::string::npos ? 0 : err.find("error"), 60)]++;
+        fmt::print("{} {} BRX, table(s) found, translated{}, FXC {}\n", name, sites.size(), r.uses_loop ? " (loop)" : "",
+                   ok ? "ok" : "FAILED");
+    }
+    for (auto& [w, n] : why)
+        fmt::print("  {} x{}\n", w, n);
+    fmt::print("{} programs with BRX: {} located in the packages, {} with their tables, {} translated, {} compiled by FXC\n",
+               with_brx, located, tables, translated, compiled);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         fmt::print("usage: shadertool <file.bin|dir> [--print|--disasm]\n");
@@ -971,6 +1079,8 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(std::stoi(argv[6])));
         return 0;
     }
+    if (std::string(argv[1]) == "--brx-check" && argc >= 4)
+        return BrxCheck(fs::u8path(argv[2]), fs::u8path(argv[3]));
     if (std::string(argv[1]) == "--dxbc-ab" && argc >= 4)
         return DxbcAb(fs::u8path(argv[2]), fs::u8path(argv[3]), argc >= 5 ? std::stoi(argv[4]) : 1 << 30,
                       argc >= 6 ? u32(std::stoul(argv[5])) : 0u);
