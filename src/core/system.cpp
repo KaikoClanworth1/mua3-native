@@ -9,6 +9,7 @@
 #include "core/game_patches.h"
 #include "core/hle/camera_shake.h"
 #include "core/hle/menu_repeat.h"
+#include "core/hle/camera_speed.h"
 #include "core/hle/menu_mods.h"
 #include "core/hle/native_trace.h"
 #include "core/hle/service.h"
@@ -178,6 +179,7 @@ bool System::Load(std::string& error) {
             hle::menu::Install(*memory_, *kernel_, mod.base);
             hle::camera::Install(*memory_, *kernel_, mod.base, cfg_);
             hle::menu::repeat::Install(*memory_, *kernel_, mod.base, cfg_);
+            hle::camera_speed::Install(*memory_, *kernel_, mod.base, cfg_.camera_speed);
         }
     hle::trace::Install(*kernel_, modules_);
 

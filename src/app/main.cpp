@@ -21,6 +21,7 @@
 #include "core/kernel/kernel.h"
 #include "core/system.h"
 #include "core/hle/audio_output.h"
+#include "core/hle/camera_speed.h"
 #include "core/hle/hid.h"
 #include "core/hle/menu_graphics.h"
 #include "gpu/d3d11/renderer_d3d11.h"
@@ -63,7 +64,7 @@ void ApplyGameSettings(const core::Config& n, core::Config& cfg, platform::Displ
     cfg.volume = n.volume;
     cfg.mute = n.mute;
     if (n.camera_speed != cfg.camera_speed)
-        input.SetCameraSpeed(n.camera_speed);
+        hle::camera_speed::Set(n.camera_speed);
     cfg.camera_speed = n.camera_speed;
     LOG_INFO("Main", "settings from the game: {} {}x{}, fps limit {}, show fps {}", n.fullscreen ? "fullscreen" : "window",
              n.width, n.height, n.fps_limit, n.show_fps);

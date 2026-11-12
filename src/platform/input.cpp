@@ -19,7 +19,7 @@ namespace {
 
 // A stick with a radial deadzone, rescaled so the travel past the deadzone covers the whole range. (Clipping each
 // axis at the deadzone made the game see ~27% deflection the moment a stick left it: the camera started fast, with
-// no fine control.) `scale` = sensitivity (camera_speed / 100).
+// no fine control.) The right stick is not scaled: CAMERA SPEED scales the game's turn speed (hle::camera_speed).
 void Stick(int x, int y, int deadzone, double scale, s32& ox, s32& oy) {
     const double m = std::sqrt(double(x) * x + double(y) * y);
     if (m <= deadzone) {
@@ -104,7 +104,7 @@ void Input::Update(bool focused) {
             if (g.bLeftTrigger > 64) p.buttons |= ZL;
             if (g.bRightTrigger > 64) p.buttons |= ZR;
             Stick(g.sThumbLX, g.sThumbLY, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE, 1.0, p.lx, p.ly);
-            Stick(g.sThumbRX, g.sThumbRY, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE, camera_speed_ / 100.0, p.rx, p.ry);
+            Stick(g.sThumbRX, g.sThumbRY, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE, 1.0, p.rx, p.ry);
             device_name_ = fmt::format("XInput controller {}", i + 1);
             break;
         }
@@ -146,7 +146,7 @@ void Input::Update(bool focused) {
             Stick(SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_LEFTX), -SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_LEFTY), 7000,
                   1.0, p.lx, p.ly);
             Stick(SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_RIGHTX), -SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_RIGHTY), 7000,
-                  camera_speed_ / 100.0, p.rx, p.ry);
+                  1.0, p.rx, p.ry);
         }
     }
     if (focused)
