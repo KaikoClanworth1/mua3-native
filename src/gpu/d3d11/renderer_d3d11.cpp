@@ -1912,7 +1912,25 @@ void D3D11Renderer::Dispatch(const ComputeLaunch& l) {
         }
         ctx_->CSSetShader(cs->cs.Get(), nullptr, 0);
     }
+    // F4 bug capture: the host shader and each global memory window before and after (synchronous reads, only
+    // while a frame is being recorded)
+    FrameCapture* const dcap = [&] {
+        FrameCapture* c = capture_.load(std::memory_order_relaxed);
+        return c && c->Recording() ? c : nullptr;
+    }();
+    std::vector<std::vector<u8>> cap_before;
+    if (dcap) {
+        dcap->ComputeShader(cs->hash);
+        cap_before.resize(shader::kGmemWindows);
+        for (u32 i = 0; i < shader::kGmemWindows; i++)
+            if (win[i])
+                cap_before[i] = ReadBufferNow(dev_, ctx_, win[i]->buf.Get(), win_size[i]);
+    }
     ctx_->Dispatch(grid[0], grid[1], grid[2]);
+    if (dcap)
+        for (u32 i = 0; i < shader::kGmemWindows; i++)
+            if (win[i])
+                dcap->Gmem(i, win[i]->addr, cap_before[i], ReadBufferNow(dev_, ctx_, win[i]->buf.Get(), win_size[i]));
     ID3D11UnorderedAccessView* no_uav[shader::kGmemWindows]{};
     ctx_->CSSetUnorderedAccessViews(0, shader::kGmemWindows, no_uav, nullptr);
     ID3D11ShaderResourceView* no_srv[48]{};

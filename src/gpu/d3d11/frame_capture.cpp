@@ -56,35 +56,38 @@ u32 FormatBytes(DXGI_FORMAT f, bool& bc) {
     }
 }
 
-void WriteDds(const fs::path& path, const D3D11_TEXTURE2D_DESC& td, ID3D11DeviceContext* ctx, ID3D11Texture2D* st) {
+// A 2D (array, cube) or 3D staging texture as a DDS file with a DX10 header.
+void WriteDds(const fs::path& path, const TexDesc& td, ID3D11DeviceContext* ctx, ID3D11Resource* st) {
     bool bc = false;
-    const u32 bpe = FormatBytes(td.Format, bc);
+    const u32 bpe = FormatBytes(td.format, bc);
     std::vector<u8> out;
     auto put = [&](u32 v) { out.insert(out.end(), reinterpret_cast<u8*>(&v), reinterpret_cast<u8*>(&v) + 4); };
+    const bool vol = td.depth > 1 || td.volume;
     put(0x20534444); // "DDS "
     put(124);
-    put(0x1 | 0x2 | 0x4 | 0x1000 | 0x20000); // caps, height, width, pixel format, mip count
-    put(td.Height), put(td.Width), put(0), put(1), put(td.MipLevels);
+    put(0x1 | 0x2 | 0x4 | 0x1000 | 0x20000 | (vol ? 0x800000 : 0)); // caps, height, width, pixel format, mips, depth
+    put(td.height), put(td.width), put(0), put(vol ? td.depth : 1), put(td.mips);
     for (int i = 0; i < 11; i++)
         put(0);
     put(32), put(0x4), put(0x30315844), put(0), put(0), put(0), put(0), put(0); // pixel format: FourCC "DX10"
-    put(0x1000 | 0x400000 | (td.MipLevels > 1 ? 0x8 : 0)), put(0), put(0), put(0), put(0);
-    put(u32(td.Format)), put(3 /* 2D */), put(td.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE ? 4u : 0u),
-        put(td.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE ? td.ArraySize / 6 : td.ArraySize), put(0);
-    for (u32 a = 0; a < td.ArraySize; a++)
-        for (u32 mip = 0; mip < td.MipLevels; mip++) {
-            const u32 w = std::max(td.Width >> mip, 1u), h = std::max(td.Height >> mip, 1u);
+    put(0x1000 | 0x400000 | (td.mips > 1 ? 0x8 : 0)), put(vol ? 0x200000u : td.cube ? 0xFE00u : 0u), put(0), put(0), put(0);
+    put(u32(td.format)), put(vol ? 4u : 3u), put(td.cube ? 4u : 0u), put(td.cube ? td.array / 6 : td.array), put(0);
+    for (u32 a = 0; a < td.array; a++)
+        for (u32 mip = 0; mip < td.mips; mip++) {
+            const u32 w = std::max(td.width >> mip, 1u), h = std::max(td.height >> mip, 1u);
+            const u32 d = vol ? std::max(td.depth >> mip, 1u) : 1u;
             const u32 row = bc ? (w + 3) / 4 * bpe : w * bpe, rows = bc ? (h + 3) / 4 : h;
             D3D11_MAPPED_SUBRESOURCE mp;
-            const UINT sub = D3D11CalcSubresource(mip, a, td.MipLevels);
+            const UINT sub = D3D11CalcSubresource(mip, a, td.mips);
             if (FAILED(ctx->Map(st, sub, D3D11_MAP_READ, 0, &mp))) {
-                out.resize(out.size() + size_t(row) * rows);
+                out.resize(out.size() + size_t(row) * rows * d);
                 continue;
             }
-            for (u32 y = 0; y < rows; y++) {
-                const u8* p = static_cast<const u8*>(mp.pData) + size_t(y) * mp.RowPitch;
-                out.insert(out.end(), p, p + row);
-            }
+            for (u32 z = 0; z < d; z++)
+                for (u32 y = 0; y < rows; y++) {
+                    const u8* p = static_cast<const u8*>(mp.pData) + size_t(z) * mp.DepthPitch + size_t(y) * mp.RowPitch;
+                    out.insert(out.end(), p, p + row);
+                }
             ctx->Unmap(st, sub);
         }
     common::WriteFile(path, out);
@@ -95,7 +98,7 @@ std::string Hex(u64 v) { return fmt::format("\"{:#x}\"", v); }
 } // namespace
 
 FrameCapture::FrameCapture(fs::path dir, u64 max_bytes)
-    : dir_(std::move(dir)), budget_{max_bytes * 7 / 16, max_bytes / 8, max_bytes * 7 / 16} {
+    : dir_(std::move(dir)), budget_{max_bytes * 2 / 5, max_bytes * 2 / 5, max_bytes / 5} {
     std::error_code ec;
     for (const char* sub : {"frame", "frame/buf", "frame/tex", "frame/rt", "frame/shaders"})
         fs::create_directories(dir_ / sub, ec);
@@ -106,7 +109,7 @@ FrameCapture::~FrameCapture() = default;
 std::string FrameCapture::SaveBuffer(u64 gpu_va, u64 size, const char* kind) {
     if (!gpu_va || !size)
         return {};
-    if (size > (8u << 20) || used_[kBuf] + size > budget_[kBuf]) {
+    if (size > (64u << 20)) {
         skipped_bytes_ += size;
         return {};
     }
@@ -118,22 +121,35 @@ std::string FrameCapture::SaveBuffer(u64 gpu_va, u64 size, const char* kind) {
     std::vector<u8> data(size);
     if (G().ReadGpuPartial(gpu_va, data.data(), data.size()) != size)
         return {};
+    const std::string rel = SaveData(data, kind);
+    if (kind[0] == 'v' && !rel.empty())
+        ranges_[key] = rel;
+    return rel;
+}
+
+// Contents already saved (the same constants bound by many draws) cost nothing more; only new contents count
+// against the budget.
+std::string FrameCapture::SaveData(const std::vector<u8>& data, const char* kind) {
+    if (data.empty())
+        return {};
     const u64 h = Fnv(data.data(), data.size());
     if (auto it = saved_.find(h); it != saved_.end())
-        return kind[0] == 'v' ? ranges_[key] = it->second : it->second;
+        return it->second;
+    if (used_[kBuf] + data.size() > budget_[kBuf]) {
+        skipped_bytes_ += data.size();
+        return {};
+    }
     const std::string rel = fmt::format("buf/{}_{:016x}.bin", kind, h);
     common::WriteFile(dir_ / "frame" / rel, data);
-    used_[kBuf] += size;
-    if (kind[0] == 'v')
-        ranges_[key] = rel;
+    used_[kBuf] += data.size();
     return saved_[h] = rel;
 }
 
 void FrameCapture::FlushDraw() {
     if (!cur_open_)
         return;
-    events_ += cur_ + ",\"tex\":[" + cur_tex_ + "]}\n";
-    cur_open_ = false;
+    events_ += cur_ + (cur_dispatch_ ? ",\"gmem\":[" : ",\"tex\":[") + cur_tex_ + "]}\n";
+    cur_open_ = cur_dispatch_ = false;
 }
 
 void FrameCapture::BeginDraw(const DrawState& m) {
@@ -198,29 +214,59 @@ void FrameCapture::Texture(bool vs, u32 slot, u32 handle, const TicEntry& tic, I
             file = it->second;
         } else {
             ComPtr<ID3D11Texture2D> t2;
-            D3D11_TEXTURE2D_DESC td{};
-            bool bc = false;
-            if (SUCCEEDED(res.As(&t2)) && (t2->GetDesc(&td), td.SampleDesc.Count == 1) && FormatBytes(td.Format, bc)) {
+            ComPtr<ID3D11Texture3D> t3;
+            ComPtr<ID3D11Buffer> tb;
+            D3D11_TEXTURE2D_DESC d2{};
+            D3D11_TEXTURE3D_DESC d3{};
+            TexDesc td;
+            bool ok = false, bc = false;
+            if (SUCCEEDED(res.As(&t2))) {
+                t2->GetDesc(&d2);
+                td = {d2.Format, d2.Width, d2.Height, 1, d2.MipLevels, d2.ArraySize,
+                      (d2.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) != 0, false};
+                ok = d2.SampleDesc.Count == 1;
+            } else if (SUCCEEDED(res.As(&t3))) {
+                t3->GetDesc(&d3);
+                td = {d3.Format, d3.Width, d3.Height, d3.Depth, d3.MipLevels, 1, false, true};
+                ok = true;
+            } else if (SUCCEEDED(res.As(&tb))) { // texture buffer (TIC type 6): its guest memory, host buffer size
+                D3D11_BUFFER_DESC bd{};
+                tb->GetDesc(&bd);
+                file = SaveBuffer(tic.Address(), bd.ByteWidth, "tb");
+            }
+            if (ok && FormatBytes(td.format, bc)) {
                 u64 bytes = 0;
-                for (u32 mip = 0; mip < td.MipLevels; mip++) {
-                    const u64 w = std::max(td.Width >> mip, 1u), h = std::max(td.Height >> mip, 1u);
-                    bytes += bc ? (w + 3) / 4 * ((h + 3) / 4) * FormatBytes(td.Format, bc) : w * h * FormatBytes(td.Format, bc);
+                for (u32 mip = 0; mip < td.mips; mip++) {
+                    const u64 w = std::max(td.width >> mip, 1u), h = std::max(td.height >> mip, 1u),
+                              d = std::max(td.depth >> mip, 1u);
+                    bytes += d * (bc ? (w + 3) / 4 * ((h + 3) / 4) * FormatBytes(td.format, bc) : w * h * FormatBytes(td.format, bc));
                 }
-                bytes *= td.ArraySize;
+                bytes *= td.array;
                 if (used_[kTex] + bytes <= budget_[kTex]) {
-                    td.Usage = D3D11_USAGE_STAGING;
-                    td.BindFlags = 0;
-                    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-                    td.MiscFlags &= D3D11_RESOURCE_MISC_TEXTURECUBE;
                     ComPtr<ID3D11Device> dev;
                     ComPtr<ID3D11DeviceContext> ctx;
                     srv->GetDevice(&dev);
                     dev->GetImmediateContext(&ctx);
                     PendingTex p;
-                    if (SUCCEEDED(dev->CreateTexture2D(&td, nullptr, &p.staging))) {
-                        ctx->CopyResource(p.staging.Get(), t2.Get()); // contents as sampled by this draw
-                        p.path = fmt::format("tex/{:03}_{:x}_{}x{}_dxgi{}{}.dds", texs_.size(), tic.Address(), td.Width,
-                                             td.Height, u32(td.Format), render_target ? "_rt" : "");
+                    p.desc = td;
+                    // staging copies: CPU-readable, no bind or misc flags (the cube flag is not allowed on them)
+                    HRESULT hr;
+                    if (t2) {
+                        d2.Usage = D3D11_USAGE_STAGING, d2.BindFlags = 0, d2.CPUAccessFlags = D3D11_CPU_ACCESS_READ, d2.MiscFlags = 0;
+                        ComPtr<ID3D11Texture2D> st;
+                        hr = dev->CreateTexture2D(&d2, nullptr, &st);
+                        p.staging = st;
+                    } else {
+                        d3.Usage = D3D11_USAGE_STAGING, d3.BindFlags = 0, d3.CPUAccessFlags = D3D11_CPU_ACCESS_READ, d3.MiscFlags = 0;
+                        ComPtr<ID3D11Texture3D> st;
+                        hr = dev->CreateTexture3D(&d3, nullptr, &st);
+                        p.staging = st;
+                    }
+                    if (SUCCEEDED(hr) && p.staging) {
+                        ctx->CopyResource(p.staging.Get(), res.Get()); // contents as sampled by this draw
+                        p.path = fmt::format("tex/{:03}_{:x}_{}x{}{}_dxgi{}{}.dds", texs_.size(), tic.Address(), td.width,
+                                             td.height, td.volume ? fmt::format("x{}", td.depth) : "", u32(td.format),
+                                             render_target ? "_rt" : "");
                         file = p.path;
                         used_[kTex] += bytes;
                         pending_.push_back(std::move(p));
@@ -258,11 +304,29 @@ void FrameCapture::Dispatch(const ComputeLaunch& l) {
         if (l.cb_size[i])
             cbs += fmt::format("{}[{},{},{},\"{}\"]", cbs.empty() ? "" : ",", i, Hex(l.cb_addr[i]), l.cb_size[i],
                                SaveBuffer(l.cb_addr[i], std::min<u32>(l.cb_size[i], 0x10000), "cb"));
-    events_ += fmt::format("{{\"i\":{},\"type\":\"dispatch\",\"program\":{},\"offset\":{},\"grid\":[{},{},{}],\"block\":[{},{},{}],"
-                           "\"shared\":{},\"cb\":[{}],\"tic_base\":{},\"tsc_base\":{}}}\n",
-                           index_++, Hex(l.program), l.program_offset, l.grid[0], l.grid[1], l.grid[2], l.block[0], l.block[1],
-                           l.block[2], l.shared_bytes, cbs, Hex(l.tic_base), Hex(l.tsc_base));
+    // kept open until the next event: the renderer adds the host shader and the gmem windows
+    cur_ = fmt::format("{{\"i\":{},\"type\":\"dispatch\",\"program\":{},\"offset\":{},\"grid\":[{},{},{}],\"block\":[{},{},{}],"
+                       "\"shared\":{},\"cb\":[{}],\"tic_base\":{},\"tsc_base\":{}",
+                       index_++, Hex(l.program), l.program_offset, l.grid[0], l.grid[1], l.grid[2], l.block[0], l.block[1],
+                       l.block[2], l.shared_bytes, cbs, Hex(l.tic_base), Hex(l.tsc_base));
+    cur_tex_.clear();
+    cur_open_ = cur_dispatch_ = true;
     dispatches_++;
+}
+
+void FrameCapture::ComputeShader(u64 cs_hash) {
+    if (!cur_open_ || !cur_dispatch_)
+        return;
+    cur_ += fmt::format(",\"cs\":\"{:016x}\"", cs_hash);
+    shaders_.insert(cs_hash);
+}
+
+void FrameCapture::Gmem(u32 window, u64 gpu_va, const std::vector<u8>& before, const std::vector<u8>& after) {
+    if (!cur_open_ || !cur_dispatch_)
+        return;
+    const std::string in = SaveData(before, "gmem"), out = before == after ? in : SaveData(after, "gmem");
+    cur_tex_ += fmt::format("{}[{},{},{},\"{}\",\"{}\"]", cur_tex_.empty() ? "" : ",", window, Hex(gpu_va),
+                            std::max(before.size(), after.size()), in, out);
 }
 
 void FrameCapture::Clear(const std::string& what) {
@@ -297,11 +361,8 @@ void FrameCapture::Finish(D3D11Renderer& r, Surface* presented) {
         pending_[0].staging->GetDevice(&dev);
         dev->GetImmediateContext(&ctx);
     }
-    for (auto& p : pending_) {
-        D3D11_TEXTURE2D_DESC td;
-        p.staging->GetDesc(&td);
-        WriteDds(out / p.path, td, ctx, p.staging.Get());
-    }
+    for (auto& p : pending_)
+        WriteDds(out / p.path, p.desc, ctx, p.staging.Get());
     if (ctx)
         ctx->Release();
     pending_.clear();
@@ -330,7 +391,7 @@ void FrameCapture::Finish(D3D11Renderer& r, Surface* presented) {
     u32 progs = 0;
     std::error_code ec;
     for (u64 h : shaders_)
-        for (const char* tag : {"vs", "ps"}) {
+        for (const char* tag : {"vs", "ps", "cs"}) {
             const fs::path src = fmt::format("shader_dump/{:016x}.{}.bin", h, tag);
             if (fs::exists(src, ec) && fs::copy_file(src, out / "shaders" / src.filename(), fs::copy_options::overwrite_existing, ec))
                 progs++;
@@ -345,10 +406,12 @@ void FrameCapture::Finish(D3D11Renderer& r, Surface* presented) {
         << "events.jsonl  one JSON object per draw / dispatch / clear / present, in submission order\n"
         << "states.bin    gpu::DrawState of each draw back to back (draw 'state' = index; sizeof = " << sizeof(DrawState)
         << " bytes, src/gpu/draw_state.h of this build)\n"
-        << "buf/          guest memory: constant buffers (cb_), vertex streams (vb_), index ranges (ib_), by content hash\n"
+        << "buf/          guest memory: constant buffers (cb_), vertex streams (vb_), index ranges (ib_), texture buffers\n"
+        << "              (tb_); compute global\n"
+        << "              memory windows before / after each dispatch (gmem_, host GPU contents); all by content hash\n"
         << "tex/          every texture as first sampled this frame (DDS with a DX10 header, host format)\n"
         << "rt/           colour targets written this frame, final contents (BMP)\n"
-        << "shaders/      guest Maxwell programs by hash (shadertool reads them like shader_dump)\n";
+        << "shaders/      guest Maxwell programs by hash, compute (.cs.bin) too (shadertool reads them like shader_dump)\n";
 }
 
 } // namespace gpu

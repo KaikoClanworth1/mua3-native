@@ -38,6 +38,11 @@ fight, where it refuses to save) could corrupt the user's real save, and that sa
 So the capture copies the latest save the game wrote itself: the last checkpoint or autosave before the capture.
 `info.txt` gives the stage the player was in at capture time, which can be later than the save.
 
+The game keeps checkpoint progress inside a chapter in memory. Its autosaves during a chapter rewrite `save00` with
+the same chapter data; only the date in `savedatainfo` changes. For example, a capture in the Sandman fight
+(ST020_06) had a `save00` byte-identical to one written at the start of the Raft (ST020_00). So a capture's save
+resumes at the chapter start or the last hub, not at the moment of the capture.
+
 **Loading it** (test instances, under the test lock):
 
 ```
@@ -50,7 +55,8 @@ a stage to load, and then waits for gameplay. The script prints which stage it r
 ### The graphics capture (`frame\`)
 
 It records one whole frame: every draw, compute dispatch and clear from one present to the next, in submission
-order. The total size is capped at 512 MB: 224 MB for textures, 64 MB for guest buffers and 224 MB for target images.
+order. The total size is capped at 2.5 GB: 1 GB for textures, 1 GB for buffers and 512 MB for target images. Buffer
+contents are deduplicated by hash before they count, so constants bound by many draws are stored and counted once.
 Anything over a cap is still listed in `events.jsonl`, but without a file, and the summary gives the size skipped.
 
 - `events.jsonl` has one JSON object per line:
@@ -64,14 +70,18 @@ Anything over a cap is still listed in `events.jsonl`, but without a file, and t
     - Draws the renderer submitted also have `drawn: true` and the `vs`/`ps` shader hashes (the `shader_dump` /
       shader pack hash). Draws without `drawn` were skipped by the renderer.
   - **dispatch**: program, offset, grid, block, shared memory size, constant buffers, and the texture and sampler
-    pool addresses.
+    pool addresses. Dispatches the renderer ran also have `cs`, the host compute shader hash (its guest program is in
+    `shaders\<cs>.cs.bin`), and `gmem` as `[window, addr, size, before file, after file]`.
   - **clear**: the colour target and colour, or the depth and stencil values.
   - **present**: the presented surface.
 - `states.bin`: each draw's `gpu::DrawState` (`src/gpu/draw_state.h`), back to back. `README.txt` gives the struct
   size for that build. A replayer built from the same source can `memcpy` them straight back.
-- `buf\`: guest memory, deduplicated by content hash: constant buffers (`cb_`, up to 64 KB each), vertex streams
-  (`vb_`, up to 8 MB each) and index ranges (`ib_`).
-- `tex\`: each texture as the frame first sampled it: DDS files with a DX10 header in the host DXGI format.
+- `buf\`: deduplicated by content hash:
+  - guest memory: constant buffers (`cb_`, up to 64 KB each), vertex streams (`vb_`, up to 64 MB each), index
+    ranges (`ib_`) and texture buffers (`tb_`: TIC type 6, listed with the textures);
+  - compute global memory windows (`gmem_`): each window's contents on the host GPU before and after the dispatch.
+- `tex\`: each texture as the frame first sampled it: DDS files with a DX10 header in the host DXGI format (2D,
+  arrays, cube maps and 3D textures, whose names end in `WxHxD`).
   Render targets read as textures are included, with `_rt` in the name.
 - `rt\`: the final contents of every colour target the frame wrote, as BMPs.
 - `shaders\`: the guest Maxwell programs the frame used, `<hash>.vs.bin` / `<hash>.ps.bin`. They are copied from

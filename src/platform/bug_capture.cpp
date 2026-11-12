@@ -24,7 +24,7 @@ fs::path g_save_dir;
 std::mutex g_toast_mutex;
 std::string g_toast;
 std::chrono::steady_clock::time_point g_toast_until;
-constexpr u64 kFrameBudget = 512ull << 20; // textures, buffers and target images of the frame capture
+constexpr u64 kFrameBudget = 2560ull << 20; // frame capture: 1 GB textures, 1 GB buffers, 512 MB target images
 
 void Toast(std::string text, int seconds = 4) {
     std::lock_guard lk(g_toast_mutex);
@@ -102,8 +102,8 @@ void Run(fs::path dir, std::unique_ptr<gpu::FrameCapture> cap, gpu::D3D11Rendere
     LOG_INFO("BugCapture", "capturing to {}", dir.string());
     const std::string save = CopySave(dir);
     // the frame capture is written by the renderer at the second present from now
-    std::string frame = "not finished (no game frames presented within 15 s: loading or paused?)";
-    for (int i = 0; i < 1500; i++) {
+    std::string frame = "not finished (no game frames presented within 60 s: loading or paused?)";
+    for (int i = 0; i < 6000; i++) {
         if (cap->Done() && renderer->capture_.load() == nullptr) {
             frame = cap->Summary();
             break;
@@ -144,6 +144,9 @@ void Run(fs::path dir, std::unique_ptr<gpu::FrameCapture> cap, gpu::D3D11Rendere
         << Location(log)
         << "save files (copied from " << (g_save_dir / "account").string() << ", the game's latest save; load with "
         << "inst.ps1 tocapture <i> <this folder>):\n" << save
+        << "  the save resumes at the chapter start / last hub, not this fight: the game keeps checkpoint progress in "
+           "memory, and its autosaves inside a chapter rewrite save00 with the same chapter data (only the date in "
+           "savedatainfo changes)\n"
         << "frame capture: " << frame << "\n"
         << "settings: fps_target " << cfg.fps_target << ", resolution_scale " << cfg.resolution_scale << ", anti_aliasing "
         << cfg.anti_aliasing << ", docked " << cfg.docked << "\n"
