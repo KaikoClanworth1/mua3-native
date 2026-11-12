@@ -102,15 +102,16 @@ void Run(fs::path dir, std::unique_ptr<gpu::FrameCapture> cap, gpu::D3D11Rendere
     LOG_INFO("BugCapture", "capturing to {}", dir.string());
     const std::string save = CopySave(dir);
     // the frame capture is written by the renderer at the second present from now
-    std::string frame = "not finished (no game frames presented within 60 s: loading or paused?)";
-    for (int i = 0; i < 6000; i++) {
+    std::string frame = cap ? "not finished (no game frames presented within 60 s: loading or paused?)"
+                            : "skipped: the disk is almost full (window.bmp is the screenshot)";
+    for (int i = 0; cap && i < 6000; i++) {
         if (cap->Done() && renderer->capture_.load() == nullptr) {
             frame = cap->Summary();
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    if (renderer->capture_.load() == cap.get()) { // never finished: take it back (under the renderer's lock)
+    if (cap && renderer->capture_.load() == cap.get()) { // never finished: take it back (under the renderer's lock)
         std::lock_guard lk(gpu::ContextMutex());
         renderer->capture_ = nullptr;
     }
@@ -187,29 +188,40 @@ void Poll(gpu::D3D11Renderer& renderer, Display& display) {
     std::strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", &tm);
     const fs::path dir = fs::path("bug_captures") / name;
     std::error_code ec;
-    // Never fill the drive: the frame capture's budget shrinks to what is free, keeping kKeepFree for the game (its
-    // saves, logs, shader cache) and kFixedSize for the rest of the folder (screenshots, log, events).
-    constexpr u64 kKeepFree = 2048ull << 20, kFixedSize = 128ull << 20, kMinBudget = 128ull << 20;
+    // Never fill the drive (the user's save is on it): the frame data's budget shrinks to the free space minus
+    // kKeepFree. Under kMinBudget the frame data is skipped and only the small files are written (info, window
+    // screenshot, log, save: a few MB); with almost nothing free, nothing is written.
+    constexpr u64 kKeepFree = 5ull << 30, kMinBudget = 2ull << 30, kSmallFiles = 256ull << 20;
     const fs::space_info sp = fs::space(fs::current_path(ec), ec);
-    const u64 avail = ec ? kFrameBudget + kKeepFree + kFixedSize : u64(sp.available);
-    const u64 budget = avail > kKeepFree + kFixedSize ? std::min(kFrameBudget, avail - kKeepFree - kFixedSize) : 0;
-    if (budget < kMinBudget) {
-        Toast(fmt::format("Bug capture skipped: only {:.1f} GB free on the drive", avail / 1073741824.0), 5);
-        LOG_WARN("BugCapture", "skipped: {:.2f} GB free (keeps {:.1f} GB free)", avail / 1073741824.0, kKeepFree / 1073741824.0);
+    u64 avail = ec ? kFrameBudget + kKeepFree : u64(sp.available);
+    if (const char* fake = std::getenv("MUA3_BUGCAP_FREE_MB")) // test switch: pretend this much is free
+        avail = std::strtoull(fake, nullptr, 10) << 20;
+    const u64 budget = avail > kKeepFree ? std::min(kFrameBudget, avail - kKeepFree) : 0;
+    if (avail < kSmallFiles) {
+        Toast("Capture: disk full, nothing written", 5);
+        LOG_WARN("BugCapture", "skipped: {:.2f} GB free", avail / 1073741824.0);
         g_busy = false;
         return;
     }
-    if (budget < kFrameBudget)
+    const bool frame_data = budget >= kMinBudget;
+    if (!frame_data) {
+        Toast("Capture: disk almost full", 5);
+        LOG_WARN("BugCapture", "{:.2f} GB free: frame data skipped (info, screenshot, log and save only)", avail / 1073741824.0);
+    } else if (budget < kFrameBudget) {
         LOG_INFO("BugCapture", "{:.2f} GB free: frame capture budget {:.0f} MB instead of {:.0f} MB", avail / 1073741824.0,
                  budget / 1048576.0, kFrameBudget / 1048576.0);
+    }
     fs::create_directories(dir, ec);
     if (ec) {
         Toast("Bug capture failed: cannot create " + dir.string());
         g_busy = false;
         return;
     }
-    auto cap = std::make_unique<gpu::FrameCapture>(dir, budget);
-    renderer.capture_ = cap.get();
+    std::unique_ptr<gpu::FrameCapture> cap;
+    if (frame_data) {
+        cap = std::make_unique<gpu::FrameCapture>(dir, budget);
+        renderer.capture_ = cap.get();
+    }
     display.capture_path = dir / "window.bmp"; // the window as shown (before the toast appears in it)
     std::thread(Run, dir, std::move(cap), &renderer, std::string(when)).detach();
 }
