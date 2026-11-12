@@ -187,13 +187,28 @@ void Poll(gpu::D3D11Renderer& renderer, Display& display) {
     std::strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", &tm);
     const fs::path dir = fs::path("bug_captures") / name;
     std::error_code ec;
+    // Never fill the drive: the frame capture's budget shrinks to what is free, keeping kKeepFree for the game (its
+    // saves, logs, shader cache) and kFixedSize for the rest of the folder (screenshots, log, events).
+    constexpr u64 kKeepFree = 2048ull << 20, kFixedSize = 128ull << 20, kMinBudget = 128ull << 20;
+    const fs::space_info sp = fs::space(fs::current_path(ec), ec);
+    const u64 avail = ec ? kFrameBudget + kKeepFree + kFixedSize : u64(sp.available);
+    const u64 budget = avail > kKeepFree + kFixedSize ? std::min(kFrameBudget, avail - kKeepFree - kFixedSize) : 0;
+    if (budget < kMinBudget) {
+        Toast(fmt::format("Bug capture skipped: only {:.1f} GB free on the drive", avail / 1073741824.0), 5);
+        LOG_WARN("BugCapture", "skipped: {:.2f} GB free (keeps {:.1f} GB free)", avail / 1073741824.0, kKeepFree / 1073741824.0);
+        g_busy = false;
+        return;
+    }
+    if (budget < kFrameBudget)
+        LOG_INFO("BugCapture", "{:.2f} GB free: frame capture budget {:.0f} MB instead of {:.0f} MB", avail / 1073741824.0,
+                 budget / 1048576.0, kFrameBudget / 1048576.0);
     fs::create_directories(dir, ec);
     if (ec) {
         Toast("Bug capture failed: cannot create " + dir.string());
         g_busy = false;
         return;
     }
-    auto cap = std::make_unique<gpu::FrameCapture>(dir, kFrameBudget);
+    auto cap = std::make_unique<gpu::FrameCapture>(dir, budget);
     renderer.capture_ = cap.get();
     display.capture_path = dir / "window.bmp"; // the window as shown (before the toast appears in it)
     std::thread(Run, dir, std::move(cap), &renderer, std::string(when)).detach();

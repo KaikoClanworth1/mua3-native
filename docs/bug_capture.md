@@ -55,7 +55,9 @@ a stage to load, and then waits for gameplay. The script prints which stage it r
 ### The graphics capture (`frame\`)
 
 It records one whole frame: every draw, compute dispatch and clear from one present to the next, in submission
-order. The total size is capped at 2.5 GB: 1 GB for textures, 1 GB for buffers and 512 MB for target images. Buffer
+order. Before it starts, the capture checks the drive. It keeps 2 GB free for the game plus 128 MB for the rest of the
+folder, and shrinks the budget to fit. When less than 128 MB would be left for the frame, it writes nothing and says
+so on screen. The total size is capped at 2.5 GB: 1 GB for textures, 1 GB for buffers and 512 MB for target images. Buffer
 contents are deduplicated by hash before they count, so constants bound by many draws are stored and counted once.
 Anything over a cap is still listed in `events.jsonl`, but without a file, and the summary gives the size skipped.
 
