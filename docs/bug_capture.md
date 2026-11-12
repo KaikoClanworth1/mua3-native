@@ -76,6 +76,15 @@ Anything over a cap is still listed in `events.jsonl`, but without a file, and t
     `shaders\<cs>.cs.bin`), and `gmem` as `[window, addr, size, before file, after file]`.
   - **clear**: the colour target and colour, or the depth and stencil values.
   - **present**: the presented surface.
+  - Draws (those drawn), dispatches and clears end with `gpu_us`: the GPU time of that event's own D3D11 call in
+    microseconds, from a timestamp pair right around it (copies and uploads the renderer issues before the call are
+    not included). The captured frame itself runs slowly (the capture writes its files), so only these per-call
+    times are meaningful, not the frame's length.
+- `gpu_top.txt`: the 50 events with the highest `gpu_us`, with the frame's total.
+- `gpu_passes.txt`: GPU time per pass over the 30 normal frames after the capture: a pass is a run of draws into the
+  same render targets, or a run of dispatches of one compute program. It includes everything the GPU did in that
+  span (buffer uploads, copy-backs, copies), so a pass far above its events' `gpu_us` is spending its time on
+  transfers.
 - `states.bin`: each draw's `gpu::DrawState` (`src/gpu/draw_state.h`), back to back. `README.txt` gives the struct
   size for that build. A replayer built from the same source can `memcpy` them straight back.
 - `buf\`: deduplicated by content hash:

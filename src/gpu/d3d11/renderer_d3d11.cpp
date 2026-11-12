@@ -829,7 +829,12 @@ void D3D11Renderer::ClearColor(u32 rt, const float color[4]) {
     if (FrameCapture* c = capture_.load(std::memory_order_relaxed); c && c->Recording())
         c->Clear(fmt::format("\"rt\":{},\"color\":[{},{},{},{}]", rt, color[0], color[1], color[2], color[3]));
     if (Surface* s = GetColorSurface(rt)) {
+        FrameCapture* c = capture_.load(std::memory_order_relaxed);
+        if (c && c->Recording())
+            c->GpuBegin(ctx_);
         ctx_->ClearRenderTargetView(s->rtv.Get(), color);
+        if (c && c->Recording())
+            c->GpuEnd(ctx_);
         s->write_serial = ++surface_writes_;
     }
 }
@@ -843,7 +848,12 @@ void D3D11Renderer::ClearDepthStencil(bool depth, bool stencil, float depth_valu
                              depth_value, stencil_value));
     if (Surface* s = GetDepthSurface()) {
         const UINT flags = (depth ? D3D11_CLEAR_DEPTH : 0) | (stencil ? D3D11_CLEAR_STENCIL : 0);
+        FrameCapture* c = capture_.load(std::memory_order_relaxed);
+        if (c && c->Recording())
+            c->GpuBegin(ctx_);
         ctx_->ClearDepthStencilView(s->dsv.Get(), flags, depth_value, stencil_value);
+        if (c && c->Recording())
+            c->GpuEnd(ctx_);
         s->write_serial = ++surface_writes_;
     }
 }
@@ -1629,7 +1639,14 @@ static std::vector<u8> ReadBufferNow(ID3D11Device* dev, ID3D11DeviceContext* ctx
 
 void D3D11Renderer::Dispatch(const ComputeLaunch& l) {
     std::lock_guard ctx_lock(ContextMutex());
-    gpu_passes_.Mark(1, [] { return std::string("compute dispatches"); });
+    // (MUA3_GPU_PASSES=2: one pass per compute program and grid instead of one for all dispatches)
+    if (gpu_passes_.PerProgram())
+        gpu_passes_.Mark((0xC5ull << 56) | (u64(l.program_offset) << 24) ^ (u64(l.grid[0]) << 16) ^ (u64(l.grid[1]) << 8) ^ l.grid[2], [&] {
+            return fmt::format("compute {:#x} grid {}x{}x{} block {}x{}x{}", l.program_offset, l.grid[0], l.grid[1], l.grid[2],
+                               l.block[0], l.block[1], l.block[2]);
+        });
+    else
+        gpu_passes_.Mark(1, [] { return std::string("compute dispatches"); });
     if (FrameCapture* c = capture_.load(std::memory_order_relaxed); c && c->Recording())
         c->Dispatch(l);
     auto& g = G();
@@ -1926,7 +1943,11 @@ void D3D11Renderer::Dispatch(const ComputeLaunch& l) {
             if (win[i])
                 cap_before[i] = ReadBufferNow(dev_, ctx_, win[i]->buf.Get(), win_size[i]);
     }
+    if (dcap)
+        dcap->GpuBegin(ctx_);
     ctx_->Dispatch(grid[0], grid[1], grid[2]);
+    if (dcap)
+        dcap->GpuEnd(ctx_);
     if (dcap)
         for (u32 i = 0; i < shader::kGmemWindows; i++)
             if (win[i])
@@ -3123,6 +3144,8 @@ void D3D11Renderer::Draw() {
     if (cap)
         cap->Submit(vs->hash, ps ? ps->hash : 0, index_count);
     Prof(kProfSubmit);
+    if (cap)
+        cap->GpuBegin(ctx_);
     if (indirect_quads)
         ctx_->DrawIndexedInstancedIndirect(quad_args_buf_.Get(), 0);
     else if (direct && indirect)
@@ -3131,6 +3154,8 @@ void D3D11Renderer::Draw() {
         ctx_->DrawInstanced(index_count, 1, u32(s32(dr.first) + base_vertex), 0);
     else
         ctx_->DrawIndexedInstanced(index_count, 1, 0, base_vertex, 0);
+    if (cap)
+        cap->GpuEnd(ctx_);
     if (pick_query) {
         ctx_->End(pick_query.Get());
         UINT64 samples = 0;
@@ -3301,8 +3326,12 @@ void D3D11Renderer::Present(const PresentInfo& p) {
             shot_path_.clear();
         }
     }
-    if (FrameCapture* c = capture_.load(); c && c->Present(*this, s, p.cpu_addr))
+    if (FrameCapture* c = capture_.load(); c && c->Present(*this, s, p.cpu_addr)) {
+        // GPU time per pass over the next normal frames (no capture work in them), next to the capture
+        passes_report_dir_ = c->Dir() / "frame";
+        gpu_passes_.StartReport(30);
         capture_ = nullptr; // written: the bug capture thread frees it
+    }
     presented_cpu_.insert(p.cpu_addr);
     {
         std::vector<PixelReq> reqs;
@@ -3420,6 +3449,12 @@ void D3D11Renderer::Present(const PresentInfo& p) {
         SetEvent(static_cast<HANDLE>(new_frame_event_));
     }
     gpu_passes_.EndFrame();
+    if (!passes_report_dir_.empty())
+        if (std::string r = gpu_passes_.TakeReport(); !r.empty()) {
+            common::WriteFile(passes_report_dir_ / "gpu_passes.txt", std::span(reinterpret_cast<const u8*>(r.data()), r.size()));
+            LOG_INFO("BugCapture", "GPU time per pass written to {}", (passes_report_dir_ / "gpu_passes.txt").string());
+            passes_report_dir_.clear();
+        }
     ctx_->Flush();
 }
 

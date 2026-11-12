@@ -10,14 +10,37 @@ void GpuPasses::Init(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
     dev_ = dev;
     ctx_ = ctx;
     const char* e = std::getenv("MUA3_GPU_PASSES");
-    on_ = e && *e && *e != '0';
+    env_on_ = on_ = e && *e && *e != '0';
+    per_program_ = e && *e == '2';
     if (!on_)
         return;
+    on_ = CreateQueries();
+    LOG_INFO("Renderer", "GPU pass timing on (MUA3_GPU_PASSES)");
+}
+
+bool GpuPasses::CreateQueries() {
+    if (created_)
+        return true;
     for (auto& s : slots_) {
         D3D11_QUERY_DESC qd{D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
-        dev_->CreateQuery(&qd, &s.disjoint);
+        if (FAILED(dev_->CreateQuery(&qd, &s.disjoint)))
+            return false;
     }
-    LOG_INFO("Renderer", "GPU pass timing on (MUA3_GPU_PASSES)");
+    return created_ = true;
+}
+
+void GpuPasses::StartReport(u32 frames) {
+    if (!dev_ || !frames || !CreateQueries())
+        return;
+    for (auto& s : slots_) // (results of earlier frames are not part of the report)
+        if (s.pending)
+            Collect(s);
+    agg_.clear();
+    collected_ = 0;
+    total_ms_ = 0;
+    report_frames_ = frames;
+    report_.clear();
+    on_ = true;
 }
 
 void GpuPasses::Stamp(u64 key) {
@@ -66,7 +89,25 @@ void GpuPasses::EndFrame() {
     open_ = false;
     key_ = ~0ull;
     cur_ = (cur_ + 1) % kSlots;
-    if (++frames_ % 300 != 0 || !collected_)
+    frames_++;
+    if (report_frames_ && collected_ >= report_frames_) {
+        std::vector<std::pair<u64, Agg>> v(agg_.begin(), agg_.end());
+        std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second.ms > b.second.ms; });
+        const double n = double(collected_);
+        report_ = fmt::format("GPU {:.3f} ms per frame over {} frames, {} kinds of pass (a pass also holds the copies and "
+                              "uploads issued inside it)\n   ms/frame  passes  draws  pass\n",
+                              total_ms_ / n, collected_, v.size());
+        for (size_t i = 0; i < v.size() && i < 60; i++)
+            report_ += fmt::format("  {:9.3f}  {:6.1f}  {:5.0f}  {}\n", v[i].second.ms / n, v[i].second.count / n,
+                                   v[i].second.draws / n, names_[v[i].first]);
+        report_frames_ = 0;
+        agg_.clear();
+        collected_ = 0;
+        total_ms_ = 0;
+        on_ = env_on_;
+        return;
+    }
+    if (!env_on_ || frames_ % 300 != 0 || !collected_)
         return;
     std::vector<std::pair<u64, Agg>> v(agg_.begin(), agg_.end());
     std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second.ms > b.second.ms; });

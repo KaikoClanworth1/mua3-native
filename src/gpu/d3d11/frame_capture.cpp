@@ -352,6 +352,52 @@ bool FrameCapture::Present(D3D11Renderer& r, Surface* presented, u64 cpu_addr) {
 
 void FrameCapture::Finish(D3D11Renderer& r, Surface* presented) {
     const fs::path out = dir_ / "frame";
+    // GPU time per event: ,"gpu_us":<us> before the closing } of each timed line (lines are in event order)
+    if (const CaptureTiming::Result t = timing_.Finish(); t.ok) {
+        std::string timed;
+        timed.reserve(events_.size() + t.us.size() * 20);
+        u64 event = 0;
+        for (size_t at = 0; at < events_.size();) {
+            size_t nl = events_.find('\n', at);
+            if (nl == std::string::npos)
+                nl = events_.size();
+            const auto it = t.us.find(event++);
+            if (it != t.us.end() && nl > at && events_[nl - 1] == '}') {
+                timed.append(events_, at, nl - 1 - at);
+                timed += fmt::format(",\"gpu_us\":{:.2f}}}", it->second);
+            } else
+                timed.append(events_, at, nl - at);
+            timed += '\n';
+            at = nl + 1;
+        }
+        events_ = std::move(timed);
+        // gpu_top.txt: the 50 costliest events (the line up to its buffer lists, plus the shader hashes)
+        std::vector<std::pair<double, u64>> top;
+        for (auto& [e, us] : t.us)
+            top.push_back({us, e});
+        std::sort(top.begin(), top.end(), std::greater<>());
+        std::vector<std::string_view> lines;
+        for (size_t at = 0; at < events_.size();) {
+            const size_t nl = std::min(events_.find('\n', at), events_.size());
+            lines.push_back(std::string_view(events_).substr(at, nl - at));
+            at = nl + 1;
+        }
+        std::string txt = fmt::format("GPU {:.2f} ms in events of a {:.2f} ms frame; costliest events:\n", t.events_ms, t.frame_ms);
+        for (size_t k = 0; k < top.size() && k < 50; k++) {
+            const auto [us, e] = top[k];
+            std::string_view l = e < lines.size() ? lines[e] : std::string_view{};
+            std::string_view head = l.substr(0, std::min(l.find(",\"cb\":"), l.size()));
+            std::string shaders;
+            for (const char* f : {"\"vs\":", "\"ps\":"})
+                if (const size_t p = l.find(f); p != std::string_view::npos)
+                    shaders += fmt::format(" {}", l.substr(p, 24));
+            txt += fmt::format("{:9.1f} us  {}{}\n", us, head, shaders);
+        }
+        common::WriteFile(out / "gpu_top.txt", std::span(reinterpret_cast<const u8*>(txt.data()), txt.size()));
+        timing_summary_ = fmt::format("GPU time: draws, dispatches and clears {:.2f} ms of a {:.2f} ms frame (gpu_us per event)",
+                                      t.events_ms, t.frame_ms);
+    } else
+        timing_summary_ = "GPU time: not measured (timestamps unavailable or disjoint)";
     common::WriteFile(out / "events.jsonl", std::span(reinterpret_cast<const u8*>(events_.data()), events_.size()));
     common::WriteFile(out / "states.bin", states_);
     // textures sampled this frame
@@ -403,6 +449,7 @@ void FrameCapture::Finish(D3D11Renderer& r, Surface* presented) {
     std::ofstream(out / "README.txt")
         << "MUA3 frame capture (see docs/bug_capture.md in the source tree)\n"
         << summary_ << "\n"
+        << timing_summary_ << "\n"
         << "events.jsonl  one JSON object per draw / dispatch / clear / present, in submission order\n"
         << "states.bin    gpu::DrawState of each draw back to back (draw 'state' = index; sizeof = " << sizeof(DrawState)
         << " bytes, src/gpu/draw_state.h of this build)\n"

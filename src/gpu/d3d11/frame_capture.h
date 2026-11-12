@@ -6,6 +6,7 @@
 #include "common/common.h"
 #undef DrawState
 #include "gpu/draw_state.h"
+#include "gpu/d3d11/capture_timing.h"
 
 #include <atomic>
 #include <map>
@@ -39,6 +40,7 @@ public:
 
     bool Recording() const { return state_ == kRecording; }
     bool Done() const { return state_ == kDone; }
+    const fs::path& Dir() const { return dir_; }
     const std::string& Summary() const { return summary_; }
 
     // ---- GPU thread, context lock held
@@ -51,6 +53,9 @@ public:
     void ComputeShader(u64 cs_hash);
     void Gmem(u32 window, u64 gpu_va, const std::vector<u8>& before, const std::vector<u8>& after);
     void Clear(const std::string& what);
+    // Bracket the open event's own D3D11 call (draw, dispatch, clear): its GPU time goes into events.jsonl as gpu_us.
+    void GpuBegin(ID3D11DeviceContext* ctx) { if (index_) timing_.Begin(ctx, index_ - 1); }
+    void GpuEnd(ID3D11DeviceContext* ctx) { if (index_) timing_.End(ctx, index_ - 1); }
     // Each present: starts recording at the first, writes the capture at the second (then returns true and the
     // renderer drops it).
     bool Present(D3D11Renderer& r, Surface* presented, u64 cpu_addr);
@@ -86,6 +91,8 @@ private:
     std::vector<PendingTex> pending_;
     std::set<u64> shaders_;                       // vs/ps/cs hashes used
     std::vector<u64> targets_;                    // colour targets written, first-write order
+    CaptureTiming timing_;                        // GPU time per event
+    std::string timing_summary_;
 };
 
 } // namespace gpu

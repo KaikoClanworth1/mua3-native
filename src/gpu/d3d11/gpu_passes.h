@@ -5,6 +5,7 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <d3d11.h>
@@ -23,6 +24,12 @@ public:
     void CountDraw() { draws_++; }
     // Called once per presented frame, after its last GPU work.
     void EndFrame();
+    // One-shot report (the F4 capture): times the next `frames` frames, compute per program, even without
+    // MUA3_GPU_PASSES; TakeReport then returns the table (empty until it is ready).
+    void StartReport(u32 frames);
+    std::string TakeReport() { return std::exchange(report_, {}); }
+    // Compute dispatches are timed per program (MUA3_GPU_PASSES=2, or a report is running).
+    bool PerProgram() const { return per_program_ || report_frames_; }
 
 private:
     struct Slot {
@@ -40,7 +47,11 @@ private:
     };
     void Stamp(u64 key);
     void Collect(Slot& s);
+    bool CreateQueries();
     bool on_ = false;
+    bool env_on_ = false, per_program_ = false, created_ = false;
+    u32 report_frames_ = 0; // frames the running report still needs (0: none running)
+    std::string report_;
     ID3D11Device* dev_ = nullptr;
     ID3D11DeviceContext* ctx_ = nullptr;
     static constexpr u32 kSlots = 5;

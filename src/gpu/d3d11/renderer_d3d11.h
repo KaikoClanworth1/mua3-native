@@ -365,6 +365,7 @@ private:
     DXGI_FORMAT frame_dxgi_ = DXGI_FORMAT_UNKNOWN;
     PostAA post_aa_;
     GpuPasses gpu_passes_; // MUA3_GPU_PASSES: GPU time per pass
+    fs::path passes_report_dir_; // F4 capture written: gpu_passes.txt goes there when the report is ready
     u32 frame_w_ = 0, frame_h_ = 0;
 
     friend class DrawContext;
