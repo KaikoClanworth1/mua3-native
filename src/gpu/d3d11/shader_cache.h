@@ -108,7 +108,8 @@ public:
     std::atomic<u32> frame{0}; // Tick count, for HostShader::last_used
     u32 new_programs = 0, new_variants = 0; // first seen by a draw (not replayed by Prewarm): GPU thread
     u64 realize_ns = 0; // GPU thread time in Realize (driver shader creation)
-    u32 realized = 0, released = 0, live_objects = 0; // driver objects created by draws / released as unused / now
+    std::atomic<u32> realized{0};       // driver objects created by draws (the driver re-warm reads it too)
+    u32 released = 0, live_objects = 0; // driver objects released as unused / existing now
 
 private:
     // urgent_only: serves only shaders the game has asked for (never the prewarm backlog), so a cold cache's
@@ -187,6 +188,13 @@ private:
     // first draw. (The game sets up all of its ~4700 programs at boot, so this says nothing about which a level draws:
     // driver objects stay created at first use.)
     void Anticipate();                             // GPU thread (Tick)
+    // A different graphics driver than the one the setup prepared shaders for (shader_cache/driver.txt) starts with
+    // an empty shader cache: from boot until the first level load, a low-priority thread hands the pack's vertex /
+    // pixel bytecode to the driver again, a few per second; progress carries over to the next launch.
+    void StartDriverRewarm();
+    void DriverRewarm(std::vector<std::pair<size_t, u32>> blobs, size_t from, std::string version);
+    std::thread rewarm_;
+    std::atomic<bool> rewarm_stop_{false};
     std::deque<u64> anticipate_pending_;           // program addresses not looked up yet
     std::unordered_map<u64, u64> anticipate_seen_; // address -> hash of the header last looked up there
     u64 anticipate_taken_ = 0, anticipate_lookups_ = 0, anticipate_new_ = 0, anticipate_logged_ = 0;

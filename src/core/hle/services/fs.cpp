@@ -9,6 +9,7 @@
 #include "core/hle/menu_mods.h"
 #include "core/hle/service.h"
 #include "core/hle/video_output.h"
+#include "gpu/shader/anticipate.h"
 #include "core/system.h"
 
 namespace hle {
@@ -352,7 +353,7 @@ public:
             }
             const Extent& e = *std::prev(it);
             if (rel == e.off && e.host.extension() == ".mp4")
-                video::OnMovieRead(e.host, 0);
+                video::OnMovieRead(e.host, 0), gpu::shader::NoteGameLoading();
             if (!e.logged.exchange(true)) {
                 LOG_INFO("romfs", "open {} ({} bytes)", e.host.lexically_relative(root_).generic_string(), e.size);
                 WIN32_FILE_ATTRIBUTE_DATA a{};

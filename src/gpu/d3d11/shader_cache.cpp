@@ -43,6 +43,8 @@ ShaderCache::ShaderCache(ID3D11Device* dev, unsigned build_workers) : dev_(dev) 
     fs::create_directories(cache_dir_, ec);
     overrides_ = fs::exists("shader_override", ec);
     OpenPack();
+    if (!build_workers)
+        StartDriverRewarm();
     const unsigned n = build_workers ? build_workers : std::clamp(std::thread::hardware_concurrency() / 2, 2u, 6u);
     for (unsigned i = 0; i < n; i++)
         workers_.emplace_back([this] { Worker(false); });
@@ -63,6 +65,9 @@ ShaderCache::~ShaderCache() {
     cv_.notify_all();
     for (auto& t : workers_)
         t.join();
+    rewarm_stop_ = true;
+    if (rewarm_.joinable())
+        rewarm_.join();
     if (pack_out_)
         std::fclose(pack_out_);
     if (pack_)
@@ -747,6 +752,99 @@ void SaveDriverVersion(ID3D11Device* dev) {
         common::WriteFile(fs::path("shader_cache") / "driver.txt", std::span((const u8*)v.data(), v.size()));
 }
 
+// Program type in a DXBC blob's SHEX/SHDR version token: 0 pixel, 1 vertex, 5 compute (~0u: not found).
+static u32 DxbcProgramType(const u8* blob, u32 size) {
+    if (size < 32 || std::memcmp(blob, "DXBC", 4))
+        return ~0u;
+    u32 n;
+    std::memcpy(&n, blob + 28, 4);
+    for (u32 c = 0; c < n && 32 + c * 4 + 4 <= size; c++) {
+        u32 off;
+        std::memcpy(&off, blob + 32 + c * 4, 4);
+        if (off + 12 > size)
+            break;
+        if (!std::memcmp(blob + off, "SHEX", 4) || !std::memcmp(blob + off, "SHDR", 4)) {
+            u32 version;
+            std::memcpy(&version, blob + off + 8, 4);
+            return version >> 16;
+        }
+    }
+    return ~0u;
+}
+
+void ShaderCache::StartDriverRewarm() {
+    if (!pack_ || std::getenv("MUA3_NO_DRIVER_WARM"))
+        return;
+    const std::string version = DriverVersion(dev_);
+    if (version.empty())
+        return;
+    const auto saved = common::ReadFile(cache_dir_ / "driver.txt");
+    if (std::string(saved.begin(), saved.end()) == version)
+        return;
+    // The pack's vertex / pixel bytecode, in pack order (append-only: the same order every launch).
+    std::vector<std::pair<size_t, u32>> blobs;
+    for (const auto& [hash, e] : pack_dxbc_) {
+        const u32 type = DxbcProgramType(pack_ + e.offset, e.size);
+        if (type == 0 || type == 1)
+            blobs.push_back({e.offset, e.size});
+    }
+    std::sort(blobs.begin(), blobs.end());
+    // Progress of an earlier launch with this driver ("<version>\n<index>"), a little before it to cover compiles
+    // the driver had not finished when that launch stopped.
+    size_t from = 0;
+    const auto prog = common::ReadFile(cache_dir_ / "driver_warm.txt");
+    const std::string p(prog.begin(), prog.end());
+    if (const size_t nl = p.find('\n'); nl != std::string::npos && p.substr(0, nl) == version)
+        from = size_t(std::max<long long>(0, std::atoll(p.c_str() + nl + 1) - 50));
+    LOG_INFO("Shader", "graphics driver {} (prepared for: {}): handing {} shaders to it again from {}, until the first "
+             "level loads", version, saved.empty() ? "none" : std::string(saved.begin(), saved.end()), blobs.size(), from);
+    rewarm_ = std::thread([this, blobs = std::move(blobs), from, version] { DriverRewarm(blobs, from, version); });
+}
+
+void ShaderCache::DriverRewarm(std::vector<std::pair<size_t, u32>> blobs, size_t from, std::string version) {
+    SetThreadDescription(GetCurrentThread(), L"ShaderDriverRewarm");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    // A level loading: its first frames create a hundred or more driver objects (the title about 40).
+    constexpr u32 kLevelLoad = 100;
+    auto save = [&](size_t i) {
+        const std::string t = fmt::format("{}\n{}", version, i);
+        common::WriteFile(cache_dir_ / "driver_warm.txt", std::span((const u8*)t.data(), t.size()));
+    };
+    size_t i = from;
+    for (; i < blobs.size(); i++) {
+        if (rewarm_stop_ || realized >= kLevelLoad || shader::GameLoading()) {
+            save(i);
+            LOG_INFO("Shader", "driver shader re-warm paused at {} of {} (a movie or level is loading); next launch "
+                     "goes on", i, blobs.size());
+            return;
+        }
+        const u8* b = pack_ + blobs[i].first;
+        const u32 n = blobs[i].second;
+        if (DxbcProgramType(b, n) == 1) {
+            ComPtr<ID3D11VertexShader> o;
+            dev_->CreateVertexShader(b, n, nullptr, &o);
+        } else {
+            ComPtr<ID3D11PixelShader> o;
+            dev_->CreatePixelShader(b, n, nullptr, &o);
+        }
+        if (i % 50 == 49)
+            save(i + 1);
+        // ~10 a second: the driver compiles each on its own threads (~0.1 s of CPU cold), about one CPU's worth
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    // all handed over: give the driver's threads time to finish before recording this driver as prepared
+    for (int s = 0; s < 60 && !rewarm_stop_ && !shader::GameLoading(); s++)
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    if (rewarm_stop_ || shader::GameLoading()) {
+        save(blobs.size() > 50 ? blobs.size() - 50 : 0);
+        return;
+    }
+    common::WriteFile(cache_dir_ / "driver.txt", std::span((const u8*)version.data(), version.size()));
+    std::error_code ec;
+    fs::remove(cache_dir_ / "driver_warm.txt", ec);
+    LOG_INFO("Shader", "driver shader re-warm done: {} shaders", blobs.size());
+}
+
 // Programs the game set up since the last frame (most at boot): each is looked up, so a program that is in neither
 // the pack nor the game's files (some are built at runtime) compiles now instead of at its first draw.
 void ShaderCache::Anticipate() {
@@ -1156,7 +1254,7 @@ void ShaderCache::Tick() {
         live_objects -= n;
         if (now % 6000 == 0 || n)
             LOG_INFO("Shader", "shader objects: {} live, {} created by draws so far, {} released as unused", live_objects,
-                     realized, released);
+                     realized.load(), released);
     }
     if (prewarm_reported_)
         return;

@@ -1,5 +1,6 @@
 #include "gpu/shader/anticipate.h"
 
+#include <atomic>
 #include <mutex>
 #include <utility>
 #include <unordered_set>
@@ -21,6 +22,14 @@ void AnticipatePrograms(std::span<const u64> data) {
         if (g_queue.size() < (1u << 14) && g_seen.insert(va).second)
             g_queue.push_back(va);
     }
+}
+
+static std::atomic<bool> g_loading{false};
+void NoteGameLoading() {
+    g_loading = true;
+}
+bool GameLoading() {
+    return g_loading;
 }
 
 std::vector<u64> TakeAnticipated() {
