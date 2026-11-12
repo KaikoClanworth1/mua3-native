@@ -85,14 +85,21 @@ public:
         if (n_ < N)
             inl_[n_] = v;
         else {
-            if (n_ == N) {
-                if (!heap_)
-                    heap_ = std::make_unique<std::vector<recomp::u64>>();
-                heap_->assign(inl_, inl_ + N);
-            }
+            if (n_ == N)
+                Spill(4 * N);
             heap_->push_back(v);
         }
         n_++;
+    }
+    // Room for n words: a list that will outgrow the inline words goes to the heap once, at its size (one
+    // allocation instead of a few growing ones).
+    void reserve(size_t n) {
+        if (n <= N)
+            return;
+        if (n_ <= N)
+            Spill(n);
+        else
+            heap_->reserve(n);
     }
     void clear() {
         n_ = 0;
@@ -101,13 +108,28 @@ public:
     }
     template <typename It>
     void assign(It a, It b) {
-        std::vector<recomp::u64> tmp(a, b); // (the source may be this object's own storage)
+        const size_t n = size_t(b - a);
+        const recomp::u64* pa = n ? &*a : nullptr;
+        if (n && pa < end() && pa + n > begin()) { // (the source is this object's own storage)
+            std::vector<recomp::u64> tmp(a, b);
+            assign(tmp.data(), tmp.data() + tmp.size());
+            return;
+        }
         clear();
-        for (recomp::u64 v : tmp)
-            push_back(v);
+        reserve(n);
+        for (size_t i = 0; i < n; i++)
+            push_back(pa[i]);
     }
 
 private:
+    // Moves the inline words (n_ <= N of them) to the heap vector, with room for `cap`.
+    void Spill(size_t cap) {
+        if (!heap_)
+            heap_ = std::make_unique<std::vector<recomp::u64>>();
+        heap_->clear();
+        heap_->reserve(cap);
+        heap_->assign(inl_, inl_ + n_);
+    }
     recomp::u32 n_ = 0;
     recomp::u64 inl_[N];
     std::unique_ptr<std::vector<recomp::u64>> heap_; // everything, once there are more than N

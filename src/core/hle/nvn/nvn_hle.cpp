@@ -865,6 +865,7 @@ void Generic(State& s) {
     u32 raw_n = 0;
     if (replay && g.raw_ptr >= 0 && s.x[g.raw_ptr]) {
         raw_n = g.raw_count >= 0 ? std::min<u32>(u32(s.x[g.raw_count]), 32) : 1;
+        c.raw.reserve(c.raw.size() + (raw_n * g.raw_elem + 7) / 8);
         for (u32 o = 0; o < raw_n * g.raw_elem; o += 8)
             c.raw.push_back(recomp::Rd<u64>(s, s.x[g.raw_ptr] + o));
     }
