@@ -387,7 +387,46 @@ public:
         }
         ring_off_ = 0;
         ring_discard_ = true; // the first upload starts it with a discard
+        geom_.Reset();
+        static const bool geom_off = [] {
+            const char* e = std::getenv("MUA3_GEOM_RING");
+            return e && e[0] == '0';
+        }();
+        if (!geom_off) {
+            D3D11_BUFFER_DESC d{kGeomBytes, D3D11_USAGE_DYNAMIC, D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER,
+                                D3D11_CPU_ACCESS_WRITE, 0, 0};
+            if (FAILED(dev_->CreateBuffer(&d, nullptr, &geom_)))
+                geom_.Reset();
+        }
+        geom_off_ = 0;
+        geom_discard_ = true;
         LOG_INFO("Renderer", "draw constant buffers: {}", ctx1_ ? "8 MB ring (no-overwrite maps, bound by offset)" : "one buffer per slot");
+    }
+    // Per-draw vertex/index data (up to kGeomMax bytes) at a byte offset of the geometry ring; nullptr when it is off
+    // or the data is larger (then the per-slot buffers are used).
+    static constexpr u32 kGeomMax = 512u << 10;
+    ID3D11Buffer* GeomAt(const void* data, u32 size, u32& offset) {
+        if (!geom_ || size > kGeomMax)
+            return nullptr;
+        const u32 n = common::AlignUp(std::max<u32>(size, 16), 16u);
+        if (geom_off_ + n > kGeomBytes) // (GeomReserve keeps this from happening inside a draw)
+            GeomReserve(kGeomBytes);
+        const D3D11_MAP mode = std::exchange(geom_discard_, false) ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE;
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (FAILED(ctx_->Map(geom_.Get(), 0, mode, 0, &m)))
+            return nullptr;
+        std::memcpy(static_cast<u8*>(m.pData) + geom_off_, data, size);
+        ctx_->Unmap(geom_.Get(), 0);
+        offset = geom_off_;
+        geom_off_ += n;
+        return geom_.Get();
+    }
+    // Room for one draw's uploads (an index list and 16 vertex streams at most): the ring wraps between draws only.
+    void GeomReserve(u32 bytes = 17 * kGeomMax) {
+        if (geom_ && geom_off_ + bytes > kGeomBytes) {
+            geom_off_ = 0;
+            geom_discard_ = true;
+        }
     }
     // Draw constant buffers come from the ring (true) and are bound with *SetConstantBuffers1.
     bool Ring() const { return ctx1_ != nullptr; }
@@ -464,6 +503,10 @@ private:
     u32 ring_off_ = 0;
     u64 ring_gen_ = 0;
     bool ring_discard_ = true; // the next map starts a new copy of the ring
+    static constexpr u32 kGeomBytes = 32u << 20;
+    ComPtr<ID3D11Buffer> geom_;
+    u32 geom_off_ = 0;
+    bool geom_discard_ = true;
     std::unordered_map<u32, Raw> raw_;
     struct RawCached {
         Raw raw;
@@ -2392,6 +2435,7 @@ void D3D11Renderer::Draw() {
             dr.count = a[0];
         }
     }
+    dc.GeomReserve(); // this draw's index and vertex uploads stay in one copy of the geometry ring
     if (indirect_quads) { // the fixed quad index list; the GPU converted the arguments
         topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
         ctx_->IASetPrimitiveTopology(topo);
@@ -2509,7 +2553,9 @@ void D3D11Renderer::Draw() {
             return;
         }
         ctx_->IASetPrimitiveTopology(topo);
-        ctx_->IASetIndexBuffer(dc.Index(indices.data(), u32(indices.size() * 4)), DXGI_FORMAT_R32_UINT, 0);
+        u32 ib_off = 0;
+        ID3D11Buffer* ib = dc.GeomAt(indices.data(), u32(indices.size() * 4), ib_off);
+        ctx_->IASetIndexBuffer(ib ? ib : dc.Index(indices.data(), u32(indices.size() * 4)), DXGI_FORMAT_R32_UINT, ib_off);
         index_count = u32(indices.size());
     }
     g_prof_ib_count += index_count;
@@ -2649,7 +2695,11 @@ void D3D11Renderer::Draw() {
         tmp.assign(size_t(size) + 64, 0);
         SyncGuest(begin, size, 5);
         g.ReadGpu(begin, tmp.data(), size);
-        vbufs[b] = dc.Vertex(b, tmp.data(), u32(tmp.size()));
+        u32 vb_off = 0;
+        if ((vbufs[b] = dc.GeomAt(tmp.data(), u32(tmp.size()), vb_off)))
+            offsets[b] = vb_off;
+        else
+            vbufs[b] = dc.Vertex(b, tmp.data(), u32(tmp.size()));
         g_prof_vb_bytes += size;
         strides[b] = stride;
         if (trace_draws_ > 0 && b == 0) {
