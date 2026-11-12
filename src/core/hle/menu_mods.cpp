@@ -20,8 +20,11 @@
 // borrows a main-list slot the game hides in the current context (HERO / INFINITY MISSION / LAB are hidden in the
 // pause menu), gets its own label and is moved to the bottom of the list; ExecuteItem runs its action instead of
 // the borrowed slot's. Added this way:
-//  - QUIT GAME at the bottom of the pause menu: the game's own label and dialog, asking to quit to the desktop;
-//    "OKAY" closes the game (the SYSTEM submenu's QUIT GAME still returns to the title screen).
+//  - QUIT GAME at the bottom of the pause menu (MUA3_PAUSE_QUIT=1): the game's own label and dialog, asking to quit
+//    to the desktop; "OKAY" closes the game (the SYSTEM submenu's QUIT GAME still returns to the title screen).
+//  - GRAPHICS in the pause menu's SYSTEM submenu, right after OPTIONS: SAVE or LOAD (hidden there) is borrowed; its
+//    label is drawn over GText_HERO_gray_out / GText_INFINITY_MISSION_gray_out (HERO and INFINITY MISSION are never
+//    greyed out in this menu: their state is shown or hidden), and it opens OPTIONS as the GRAPHICS page.
 #include "core/hle/menu_mods.h"
 
 #include <algorithm>
@@ -68,10 +71,13 @@ constexpr u64 kTexOff = 0x1a3cb20, kTexGrey = 0x1a3cb4c, kTexOn = 0x1a3cb78; // 
 constexpr u32 kStrOkay = 0x3a471d, kStrCancel = 0x0cb958, kStrSelectHint = 0x3303db;
 // 01_savepoint_parts texture indices (alphabetical GText_* list of every language's texture pack)
 constexpr u32 kTexQuitGame = 19, kTexQuitGameOn = 20;
+constexpr u32 kTexHeroGrey = 3, kTexInfinityGrey = 6; // never shown by this menu: drawn as GRAPHICS (off / on)
 // menu object layout
 constexpr u64 kMainListBegin = 0xc8, kMainListEnd = 0xd0, kMainFlags = 0x180;
 constexpr u32 kEntrySize = 0x14, kEntryEnabled = 0x10, kMainPositions = 6;
 constexpr u32 kSlotSystem = 5, kHidden = 2;
+constexpr u64 kSysListBegin = 0xe0, kSysListEnd = 0xe8, kSysFlags = 0x198;
+constexpr u32 kSysPositions = 5, kSlotSave = 6, kSlotLoad = 7, kSlotOptions = 8;
 
 core::Memory* g_mem = nullptr;
 u64 g_main = 0;
@@ -80,6 +86,8 @@ u64 g_text = 0; // our UTF-16 strings in guest memory
 std::mutex g_mutex;
 std::unordered_map<u64, u32> g_borrowed; // menu object -> slot shown as QUIT GAME (absent: none)
 std::unordered_map<u64, u32> g_title_borrowed; // title menu object -> slot shown as GRAPHICS
+std::unordered_map<u64, u32> g_sys_borrowed;   // menu object -> SYSTEM submenu slot shown as GRAPHICS
+bool g_pause_quit = false;                     // MUA3_PAUSE_QUIT=1: QUIT GAME in the pause menu too
 std::atomic<bool> g_quit_pending{false}; // our dialog is up: its callback decides about the desktop
 
 // the title menu (vtable main+0x210ee80; 16 slots, 11-15 = the SYSTEM submenu: SAVE, LOAD, OPTIONS, TIPS, GALLERY)
@@ -121,6 +129,12 @@ u32 Borrowed(u64 menu) {
     std::lock_guard lk(g_mutex);
     auto it = g_borrowed.find(menu);
     return it == g_borrowed.end() ? ~0u : it->second;
+}
+
+u32 SysBorrowed(u64 menu) {
+    std::lock_guard lk(g_mutex);
+    auto it = g_sys_borrowed.find(menu);
+    return it == g_sys_borrowed.end() ? ~0u : it->second;
 }
 
 u64 Call(State& s, u64 pc, std::initializer_list<u64> args, const cpu::FunctionOverride* h = nullptr) {
@@ -198,19 +212,54 @@ void ShowQuitDialog(State& s, u64 menu) { // menu 0: no owner (the title screen)
 
 // ---- hooks
 // Refresh(this): rebuild the item lists, with QUIT GAME in a hidden main slot, moved to the bottom.
+// Moves the entry of `slot` in a menu list to just after the entry of `after` (~0u: to the end).
+void MoveEntry(u64 begin, u64 end, u32 slot, u32 after) {
+    const u32 n = u32((end - begin) / kEntrySize);
+    if (n > 16)
+        return;
+    u8 all[kEntrySize * 16];
+    g_mem->ReadBlock(begin, all, n * kEntrySize);
+    auto slot_at = [&](u32 k) { u32 v; std::memcpy(&v, all + k * kEntrySize, 4); return v; };
+    u32 from = n;
+    for (u32 k = 0; k < n; k++)
+        if (slot_at(k) == slot)
+            from = k;
+    if (from == n)
+        return;
+    u8 e[kEntrySize];
+    std::memcpy(e, all + from * kEntrySize, kEntrySize);
+    std::memmove(all + from * kEntrySize, all + (from + 1) * kEntrySize, (n - from - 1) * kEntrySize);
+    u32 to = n - 1;
+    for (u32 k = 0; k + 1 < n; k++)
+        if (slot_at(k) == after)
+            to = k + 1;
+    std::memmove(all + (to + 1) * kEntrySize, all + to * kEntrySize, (n - 1 - to) * kEntrySize);
+    std::memcpy(all + to * kEntrySize, e, kEntrySize);
+    g_mem->WriteBlock(begin, all, n * kEntrySize);
+}
+
 void Refresh(State& s) {
     const u64 menu = s.x[0];
-    u32 borrow = ~0u, shown = 0;
+    u32 borrow = ~0u, sys_borrow = ~0u, shown = 0, sys_shown = 0;
     if (IsMenu(menu)) {
-        for (u32 slot = 0; slot <= kSlotSystem; slot++) {
+        for (u32 slot = 0; slot <= 10; slot++) {
             const u32 st = u32(Call(s, g_main + kGetItemState, {menu, slot}, &g_hooks[kHState]));
-            if (st != kHidden)
-                shown++;
-            else if (slot >= 1 && slot <= 3)
-                borrow = slot; // HERO / INFINITY MISSION / LAB hidden here
+            if (slot <= kSlotSystem) {
+                if (st != kHidden)
+                    shown++;
+                else if (slot >= 1 && slot <= 3)
+                    borrow = slot; // HERO / INFINITY MISSION / LAB hidden here
+            } else if (st != kHidden) {
+                sys_shown++;
+            } else if (slot == kSlotSave || slot == kSlotLoad) {
+                sys_borrow = slot; // the pause menu hides SAVE and LOAD
+            }
         }
-        if (shown >= kMainPositions)
+        if (shown >= kMainPositions || !g_pause_quit)
             borrow = ~0u; // no free position (S.H.I.E.L.D. point menu with everything unlocked)
+        if (sys_shown >= kSysPositions ||
+            Call(s, g_main + kGetItemState, {menu, kSlotOptions}, &g_hooks[kHState]) == kHidden)
+            sys_borrow = ~0u;
     }
     {
         std::lock_guard lk(g_mutex);
@@ -218,8 +267,20 @@ void Refresh(State& s) {
             g_borrowed[menu] = borrow;
         else
             g_borrowed.erase(menu);
+        if (sys_borrow != ~0u)
+            g_sys_borrowed[menu] = sys_borrow;
+        else
+            g_sys_borrowed.erase(menu);
     }
     Original(s, kHRefresh);
+    if (sys_borrow != ~0u) {
+        // GRAPHICS goes right after OPTIONS, then the per-position enabled flags again
+        const u64 begin = R64(menu + kSysListBegin), end = R64(menu + kSysListEnd);
+        MoveEntry(begin, end, sys_borrow, kSlotOptions);
+        const u32 n = u32((end - begin) / kEntrySize);
+        for (u32 i = 0; i < kSysPositions; i++)
+            W32(menu + kSysFlags + 4 * i, i < n ? R32(begin + i * kEntrySize + kEntryEnabled) : 0);
+    }
     if (borrow == ~0u)
         return;
     // move the borrowed slot's entry to the end of the main list, then redo the per-position enabled flags
@@ -242,7 +303,7 @@ void Refresh(State& s) {
 
 // GetItemState(this, slot): the borrowed slot is shown.
 void GetItemState(State& s) {
-    if (Borrowed(s.x[0]) == u32(s.x[1]))
+    if (Borrowed(s.x[0]) == u32(s.x[1]) || SysBorrowed(s.x[0]) == u32(s.x[1]))
         return Return(s, 0);
     Original(s, kHState);
 }
@@ -250,10 +311,20 @@ void GetItemState(State& s) {
 // SetItemAppearance(this, slot, state): the borrowed slot wears the QUIT GAME label.
 void SetItemAppearance(State& s) {
     const u32 slot = u32(s.x[1]);
-    if (slot > 10 || Borrowed(s.x[0]) != slot)
+    if (slot > 10 || (Borrowed(s.x[0]) != slot && SysBorrowed(s.x[0]) != slot))
         return Original(s, kHAppearance);
     const u64 off = g_main + kTexOff + 4 * slot, grey = g_main + kTexGrey + 4 * slot, on = g_main + kTexOn + 4 * slot;
     const u32 saved[3] = {R32(off), R32(grey), R32(on)};
+    if (SysBorrowed(s.x[0]) == slot) { // GRAPHICS (a SYSTEM submenu slot: the submenu's label pane already)
+        W32(off, kTexHeroGrey);
+        W32(grey, ~0u);
+        W32(on, kTexInfinityGrey);
+        Original(s, kHAppearance);
+        W32(off, saved[0]);
+        W32(grey, saved[1]);
+        W32(on, saved[2]);
+        return;
+    }
     W32(off, kTexQuitGame);
     W32(grey, ~0u);
     W32(on, kTexQuitGameOn);
@@ -275,6 +346,12 @@ void IsSystemItem(State& s) {
 // ExecuteItem(this, slot): the borrowed slot asks to quit to the desktop.
 void ExecuteItem(State& s) {
     const u64 menu = s.x[0];
+    if (SysBorrowed(menu) == u32(s.x[1])) { // GRAPHICS: OPTIONS, shown as the GRAPHICS page
+        LOG_INFO("Menu", "GRAPHICS chosen in the pause menu");
+        graphics::OpenNext();
+        s.x[1] = kSlotOptions;
+        return Original(s, kHExecute);
+    }
     if (Borrowed(menu) != u32(s.x[1])) {
         g_quit_pending = false; // e.g. the SYSTEM submenu's QUIT GAME: its dialog returns to the title screen
         return Original(s, kHExecute);
@@ -468,11 +545,14 @@ const QuitLabel kGraphicsLabels[] = {
     {"smp", L"\u753b\u9762", L"Microsoft YaHei", true},
 };
 
-void BuildTitleLabels(const QuitLabel* labels, size_t count, const char* texture) {
-    const fs::path dir = core::Sys().Cfg().game_dir / "romfs" / "UI" / "screenlayout" / "10_title_menu_parts";
-    const std::string off = texture, on = off + "_on";
+// Draws `labels` over two textures (off, on) of every language's pack of a layout, as the game reads them.
+// `render(label, selected, w, h)` draws one in the texture's size.
+template <typename Render>
+void BuildPackLabels(const char* layout, const QuitLabel* labels, size_t count, const std::string& off,
+                     const std::string& on, Render render) {
+    const fs::path dir = core::Sys().Cfg().game_dir / "romfs" / "UI" / "screenlayout" / layout;
     for (const QuitLabel& l : std::span(labels, count)) {
-        const std::string name = std::string("10_title_menu_parts_") + l.lang + ".kslt";
+        const std::string name = std::string(layout) + "_" + l.lang + ".kslt";
         const auto d = common::ReadFile(dir / name);
         auto u32at = [&](size_t o) { u32 v = 0; if (o + 4 <= d.size()) std::memcpy(&v, &d[o], 4); return v; };
         if (d.size() < 0x40 || std::memcmp(d.data(), "TLSK3100", 8) != 0)
@@ -493,17 +573,25 @@ void BuildTitleLabels(const QuitLabel* labels, size_t count, const char* texture
             std::memcpy(&w, &d[at + 4], 2);
             std::memcpy(&h, &d[at + 6], 2);
             const u32 size = u32at(at + 0x1c);
-            const bool sel = tex == on;
-            // the game's label metrics (TEAM / TEAM_on): capitals 24 px of 44 from y 7, 34 px of 60 from y 12
-            const LabelStyle st{w, h, sel ? h * 34 / 60 : h * 24 / 44, sel ? 14 : 9, sel ? h * 12 / 60 : h * 7 / 44, sel};
-            auto px = RenderLabel(st, l.text, l.face, l.cjk);
+            auto px = render(l, tex == on, w, h);
             if (px.size() != size) {
-                LOG_WARN("Menu", "{} label for {} not drawn ({} {}x{})", texture, l.lang, tex, w, h);
+                LOG_WARN("Menu", "{} label for {} not drawn ({} {}x{})", off, l.lang, tex, w, h);
                 continue;
             }
             g_overlays.push_back({name, at + 0x48, std::move(px)});
         }
     }
+}
+
+// The title menu's labels (10_title_menu_parts): heavy italic, like the game's
+void BuildTitleLabels(const QuitLabel* labels, size_t count, const char* texture) {
+    BuildPackLabels("10_title_menu_parts", labels, count, texture, std::string(texture) + "_on",
+                    [](const QuitLabel& l, bool sel, int w, int h) {
+                        // the game's label metrics (TEAM / TEAM_on): capitals 24 px of 44 from y 7, 34 px of 60 from y 12
+                        const LabelStyle st{w, h, sel ? h * 34 / 60 : h * 24 / 44, sel ? 14 : 9,
+                                            sel ? h * 12 / 60 : h * 7 / 44, sel};
+                        return RenderLabel(st, l.text, l.face, l.cjk);
+                    });
 }
 
 } // namespace
@@ -561,9 +649,8 @@ void Install(core::Memory& mem, kernel::Kernel& kernel, u64 main_base) {
     // QUIT GAME in the pause menu too (MUA3_PAUSE_QUIT=1): the title screen's is the default
     const char* pause = std::getenv("MUA3_PAUSE_QUIT");
     const bool pause_quit = pause && pause[0] == '1';
+    g_pause_quit = pause_quit;
     for (int i = 0; i < kHookCount; i++) {
-        if (!pause_quit && i < kHQuit)
-            continue;
         g_hooks[i].pc = main_base + hooks[i].first;
         g_hooks[i].host = hooks[i].second;
         g_hooks[i].direct = i == kHExecute || i == kHShop || i == kHNotice; // also called with BL
@@ -571,11 +658,17 @@ void Install(core::Memory& mem, kernel::Kernel& kernel, u64 main_base) {
     }
     BuildTitleLabels(kQuitLabels, std::size(kQuitLabels), "GText_DLC");
     BuildTitleLabels(kGraphicsLabels, std::size(kGraphicsLabels), "GText_MAIN_MENU");
+    // the pause menu's GRAPHICS: the SYSTEM submenu's label style, stretched over the two unused grey textures
+    BuildPackLabels("01_savepoint_parts", kGraphicsLabels, std::size(kGraphicsLabels), "GText_HERO_gray_out",
+                    "GText_INFINITY_MISSION_gray_out", [](const QuitLabel& l, bool sel, int w, int h) {
+                        return RenderSystemLabel(l.text, l.face == std::wstring(L"Segoe UI Black") ? L"Segoe UI Light" : l.face,
+                                                 l.cjk, sel, w, h);
+                    });
     graphics::Install(mem, kernel, main_base);
     if (const char* e = std::getenv("MUA3_GRAPHICS_TEST"); e && e[0] == '1')
         graphics::OpenNext(); // test aid: the first OPTIONS screen opened shows the GRAPHICS page
-    LOG_INFO("Menu", "menu extensions installed: QUIT GAME and GRAPHICS on the title screen ({} label textures){}", g_overlays.size(),
-             pause_quit ? " and in the pause menu" : "");
+    LOG_INFO("Menu", "menu extensions installed: QUIT GAME and GRAPHICS on the title screen, GRAPHICS in the pause "
+             "menu ({} label textures){}", g_overlays.size(), pause_quit ? ", QUIT GAME in the pause menu" : "");
 }
 
 } // namespace hle::menu

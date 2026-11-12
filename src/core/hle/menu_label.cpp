@@ -142,6 +142,23 @@ void EncodeBlock(const float px[16][4], u8 out[16]) {
         out[12 + k] = u8(cbits >> (8 * k));
 }
 
+// BC3, linear block order (as the game's packs store their label textures), of straight-alpha RGBA floats.
+std::vector<u8> EncodeBC3(const std::vector<float>& rgba, int w, int h) {
+    const int bw = (w + 3) / 4, bh = (h + 3) / 4;
+    std::vector<u8> out(size_t(bw) * bh * 16);
+    for (int by = 0; by < bh; by++)
+        for (int bx = 0; bx < bw; bx++) {
+            float px16[16][4];
+            for (int k = 0; k < 16; k++) {
+                const int x = std::min(bx * 4 + k % 4, w - 1), y = std::min(by * 4 + k / 4, h - 1);
+                for (int c = 0; c < 4; c++)
+                    px16[k][c] = rgba[(size_t(y) * w + x) * 4 + c];
+            }
+            EncodeBlock(px16, &out[(size_t(by) * bw + bx) * 16]);
+        }
+    return out;
+}
+
 } // namespace
 
 std::vector<u8> RenderLabel(const LabelStyle& st, const std::wstring& text, const wchar_t* face, bool cjk) {
@@ -209,20 +226,64 @@ std::vector<u8> RenderLabel(const LabelStyle& st, const std::wstring& text, cons
             rgba[i * 4 + 3] = std::clamp(A, 0.0f, 1.0f) * 255;
         }
     }
-    // BC3, linear block order (as the game's packs store their label textures)
-    const int bw = (st.w + 3) / 4, bh = (st.h + 3) / 4;
-    std::vector<u8> out(size_t(bw) * bh * 16);
-    for (int by = 0; by < bh; by++)
-        for (int bx = 0; bx < bw; bx++) {
-            float px16[16][4];
-            for (int k = 0; k < 16; k++) {
-                const int x = std::min(bx * 4 + k % 4, st.w - 1), y = std::min(by * 4 + k / 4, st.h - 1);
-                for (int c = 0; c < 4; c++)
-                    px16[k][c] = rgba[(size_t(y) * st.w + x) * 4 + c];
-            }
-            EncodeBlock(px16, &out[(size_t(by) * bw + bx) * 16]);
+    return EncodeBC3(rgba, st.w, st.h);
+}
+
+std::vector<u8> RenderSystemLabel(const std::wstring& text, const wchar_t* face, bool cjk, bool selected, int w, int h) {
+    // the game's metrics (GText_option / GText_option_on, 560 x 44): capitals 26 px from y 9 (white, shadow 2 px
+    // right and 4 down), or 35 px from y 5 (selected: thin, yellow, no shadow); ink from x 13
+    constexpr int kW = 560, kH = 44, kLeft = 13;
+    const int cap = selected ? 35 : 26, top = selected ? 5 : 9;
+    const int weight = cjk ? FW_NORMAL : FW_LIGHT; // the game's submenu lettering is light in both states
+    const int S = kSuper, W = kW * S, H = kH * S;
+    const std::wstring probe = cjk ? text : L"H";
+    const int test_px = 100 * S;
+    Mask t = Render(probe, face, weight, false, test_px, test_px * 4, test_px * 2, test_px / 2, test_px / 4);
+    int ix0, iy0, ix1, iy1;
+    if (!Ink(t, ix0, iy0, ix1, iy1))
+        return {};
+    const double target = cap * S * (cjk ? 1.05 : 1.0);
+    const int px = int(std::lround(test_px * target / double(iy1 - iy0 + 1)));
+    const int pad = 2 * px;
+    Mask p = Render(probe, face, weight, false, px, px * 4 + pad, px * 2 + pad, pad / 2, pad / 2);
+    if (!Ink(p, ix0, iy0, ix1, iy1))
+        return {};
+    const int top_off = iy0 - pad / 2;
+    Mask m = Render(text, face, weight, false, px, W + pad, H + pad, pad / 2, pad / 2);
+    int mx0, my0, mx1, my1;
+    if (!Ink(m, mx0, my0, mx1, my1))
+        return {};
+    const int dx = kLeft * S - mx0, dy = top * S - (pad / 2 + top_off);
+    // coverage at w x h: each texel averages the part of the 560 x 44 design it is stretched over
+    std::vector<float> cov(size_t(w) * h, 0.0f);
+    for (int y = 0; y < h; y++) {
+        const int sy0 = y * H / h, sy1 = std::max(sy0 + 1, (y + 1) * H / h);
+        for (int x = 0; x < w; x++) {
+            const int sx0 = x * W / w, sx1 = std::max(sx0 + 1, (x + 1) * W / w);
+            float sum = 0;
+            for (int sy = sy0; sy < sy1; sy++)
+                for (int sx = sx0; sx < sx1; sx++)
+                    sum += m.at(sx - dx, sy - dy);
+            cov[size_t(y) * w + x] = sum / (255.0f * (sx1 - sx0) * (sy1 - sy0));
         }
-    return out;
+    }
+    // drop shadow (unselected): the coverage moved 2 px right and 4 down (in 560 x 44 pixels), nearly black
+    const int ox = std::max(1, 2 * w / kW), oy = std::max(1, 4 * h / kH);
+    std::vector<float> rgba(cov.size() * 4);
+    for (int y = 0; y < h; y++) {
+        const float g = std::clamp(float(y * kH / h - top) / float(cap), 0.0f, 1.0f);
+        const float fill[3] = {selected ? 255.0f : 249.0f, selected ? 237 - 18 * g : 248.0f, selected ? 57 - 41 * g : 249.0f};
+        for (int x = 0; x < w; x++) {
+            const size_t i = size_t(y) * w + x;
+            const float a = cov[i];
+            const float sh = !selected && x >= ox && y >= oy ? 0.9f * cov[size_t(y - oy) * w + x - ox] * (1 - a) : 0.0f;
+            const float A = a + sh;
+            for (int c = 0; c < 3; c++)
+                rgba[i * 4 + c] = A > 0 ? (fill[c] * a + 8.0f * sh) / A : 0;
+            rgba[i * 4 + 3] = std::clamp(A, 0.0f, 1.0f) * 255;
+        }
+    }
+    return EncodeBC3(rgba, w, h);
 }
 
 } // namespace hle::menu

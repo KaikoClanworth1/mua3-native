@@ -169,6 +169,31 @@ characters the game's fonts already contain); OKAY closes the game cleanly, CANC
 With `MUA3_PAUSE_QUIT=1` the pause menu also gets a QUIT GAME (a borrowed slot, as above; the game's own label).
 The SYSTEM submenu's QUIT GAME still returns to the title screen. `MUA3_MENU_MODS=0` turns all extensions off.
 
+## GRAPHICS in the pause menu
+
+The pause menu's SYSTEM submenu (OPTIONS, TIPS, QUIT GAME; SAVE and LOAD are hidden there) gets GRAPHICS right
+after OPTIONS: Refresh borrows the hidden SAVE or LOAD slot and moves its system-list entry (+0xe0) after OPTIONS'
+(then the enabled flags at +0x198 again); ExecuteItem opens OPTIONS (slot 8) flagged for the GRAPHICS page, with its
+L/R to PC SETTINGS. Not in the S.H.I.E.L.D. point menu, where SAVE and LOAD are shown.
+
+The label: `01_savepoint_parts` has no unused texture, but GText_HERO_gray_out and GText_INFINITY_MISSION_gray_out
+(740x80) are never shown by this class (HERO's state is main+0x728870, INFINITY's main+0x728840 or a flag: shown or
+hidden, never grey). Every language's pack gets the GRAPHICS label (the title menu's words) drawn over them in the
+SYSTEM submenu's style (`RenderSystemLabel`: light upright capitals as on the 560x44 GText_option, white with a
+thin shadow / yellow when selected, stretched to 740x80, which the submenu's label pane shows at 560x44).
+
+## Menu auto-repeat (all menus)
+
+Every controller's input record is built by main+0x176940 (x0 = record, w2 = step = KTGL's present interval: 2 at
+30 fps, 1 at 60 and above). Per button (16, masks at main+0x19f7e90 per record type +0xf8): a held counter (u8
++0x34+i, total u32 +0x44+4i) grows by the step; at 16 the button repeats (bit in +0xc, "pressed or repeated", which
+the menus read through the input object's getters, e.g. main+0x7e2f20), at 20 it repeats and drops back to 16:
+first repeat after 16/60 s, then every 4/60 s. Above 60 fps that ran fps/60 times too fast.
+`hle::menu::repeat` (menu_repeat.cpp, only when fps_target > 60) gives each record 1/60 s ticks of frame time
+(KTGL +0x18): whole ticks are the step; a frame without one runs the builder with step 1 and takes the step back
+from buttons already held (their counters, and their repeat bit unless freshly pressed). `MUA3_TRACE_REPEAT=1`
+logs each repeat with its time.
+
 ## The OPTIONS screen
 
 Screen 0x5f (opened by main+0x6da8d0 and the menu's vfunc +0x3d0), class vtable main+0x2121e40. Layouts
@@ -228,8 +253,9 @@ The title screen's SYSTEM submenu (SAVE, LOAD, OPTIONS, TIPS, GALLERY; title men
   restart). The page shows the running config, except RENDER SCALE and FRAME RATE, which show the value saved in
   mua3.ini for the next start; their info line names the value running now.
 - **PC SETTINGS**: MASTER VOLUME (0-100%, live, on top of the SOUND tab's volumes), MUTE (live, mua3.ini `mute`),
-  CAMERA SPEED (10-200%, 100% = original, live: `platform::Input::SetCameraSpeed`, multiplies the CAMERA tab's
-  CONTROL SENSITIVITY), CONTROLLER TYPE (XInput / SDL) and AUDIO OUTPUT (XAudio2 / SDL / off), which apply after a
+  CAMERA SPEED (10-200%, 100% = original, live: `hle::camera_speed`; the camera update main+0x339d40 turns at
+  speed * (stick - deadzone)^2 with the speed floats in the camera parameters, so the update is wrapped and those floats
+  are scaled for its duration: speed% at every tilt; on top of the CAMERA tab's CONTROL SENSITIVITY), CONTROLLER TYPE (XInput / SDL) and AUDIO OUTPUT (XAudio2 / SDL / off), which apply after a
   restart. No language row: the INTERFACE tab's LANGUAGE SELECTION is the game's own. Hidden test instances apply
   volume changes to the ini only (they stay muted).
 
