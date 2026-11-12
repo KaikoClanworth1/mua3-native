@@ -305,7 +305,9 @@ private:
         ID3D11Buffer* buf = nullptr;
         ID3D11ShaderResourceView* raw = nullptr;
         u32 cb_size = 0; // bytes in `buf` (less than data.size() for a dynamically indexed buffer)
+        bool by_address = false; // the raw view is DrawContext::RawByAddress's (data not kept here)
     };
+    static constexpr u32 kRawByAddressMin = 16384;
     CbShadow cb_shadow_[160];
     GeomBuf* CachedIndices(u64 addr, u32 count, u32 index_size, bool strip);
     GeomBuf* CachedVertices(u64 addr, u32 size);

@@ -308,6 +308,41 @@ public:
         Write(b.buf.Get(), data, size);
         return b.srv.Get();
     }
+    // A large dynamically indexed constant buffer's raw view, kept per guest address: `src` is uploaded only when it
+    // differs from the last upload of that address (`changed`).
+    ID3D11ShaderResourceView* RawByAddress(u64 addr, const u8* src, u32 size, u64 frame, bool& changed) {
+        RawCached& e = raw_by_addr_[addr];
+        e.last_use = frame;
+        changed = !e.raw.srv || e.data.size() != size || std::memcmp(src, e.data.data(), size) != 0;
+        if (changed) {
+            const u32 n = std::max<u32>(16, common::AlignUp(size, 16));
+            if (!e.raw.buf || e.raw.size < n) {
+                e.raw.buf.Reset();
+                e.raw.srv.Reset();
+                e.raw.size = std::max<u32>(u32(common::AlignUp(n, 1 << 16)), 1 << 16);
+                D3D11_BUFFER_DESC d{e.raw.size, D3D11_USAGE_DYNAMIC, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_WRITE,
+                                    D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0};
+                dev_->CreateBuffer(&d, nullptr, &e.raw.buf);
+                D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+                sv.Format = DXGI_FORMAT_R32_TYPELESS;
+                sv.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+                sv.BufferEx = {0, e.raw.size / 4, D3D11_BUFFEREX_SRV_FLAG_RAW};
+                dev_->CreateShaderResourceView(e.raw.buf.Get(), &sv, &e.raw.srv);
+            }
+            e.data.assign(src, src + size);
+            std::vector<u8> pad;
+            if (n != size) { // (sizes are 16-byte multiples in practice)
+                pad.assign(n, 0);
+                std::memcpy(pad.data(), src, size);
+            }
+            Write(e.raw.buf.Get(), n != size ? pad.data() : src, n);
+        }
+        return e.raw.srv.Get();
+    }
+    // Drops the per-address raw buffers no draw used for `idle` frames.
+    void TrimRawByAddress(u64 frame, u64 idle) {
+        std::erase_if(raw_by_addr_, [&](auto& kv) { return frame - kv.second.last_use > idle; });
+    }
     ID3D11Buffer* Vertex(u32 slot, const void* data, u32 size) {
         auto& b = vbufs_[slot];
         if (!b.buf || b.size < size) {
@@ -365,6 +400,12 @@ private:
     ID3D11DeviceContext* ctx_ = nullptr;
     std::unordered_map<u32, Cb> cbufs_;
     std::unordered_map<u32, Raw> raw_;
+    struct RawCached {
+        Raw raw;
+        std::vector<u8> data; // contents of the last upload
+        u64 last_use = 0;
+    };
+    common::U64Map<RawCached> raw_by_addr_;
     std::unordered_map<u32, Cb> vbufs_;
     ComPtr<ID3D11Buffer> index_;
     u32 index_size_ = 0;
@@ -2710,6 +2751,27 @@ void D3D11Renderer::Draw() {
             // the shader reads statically (the translator declares it that size).
             const u32 cb_size = dyn ? u32(common::AlignUp(std::max<u32>(std::min<u32>(size, s->info.cbuf_rows[i] * 16u), 16u), 16))
                                     : size;
+            // Large ones (64 KB windows several draws a frame bind in turn) keep a raw buffer per address.
+            if (dyn && src && !trace_draw_ && size >= kRawByAddressMin) {
+                bool changed;
+                raws[i] = dc.RawByAddress(b.address, src, size, frame_counter_, changed);
+                if (!changed && sh.by_address && sh.addr == b.address && sh.cb_size >= cb_size) {
+                    cbs[i] = sh.buf;
+                    g_prof_cb_same++;
+                    continue;
+                }
+                cbs[i] = dc.Constant(stage_index * 32 + i, src, cb_size);
+                sh.addr = b.address;
+                sh.data.clear();
+                sh.buf = cbs[i];
+                sh.raw = nullptr;
+                sh.cb_size = cb_size;
+                sh.by_address = true;
+                g_prof_cb_bytes += cb_size + (changed ? size : 0);
+                g_prof_cb_uploads++;
+                g_prof_cb_dyn_bytes += cb_size + (changed ? size : 0);
+                continue;
+            }
             if (src && !trace_draw_ && sh.addr == b.address && sh.data.size() == size && (!dyn || sh.raw) &&
                 sh.cb_size >= cb_size && std::memcmp(src, sh.data.data(), size) == 0) {
                 cbs[i] = sh.buf;
@@ -2731,6 +2793,7 @@ void D3D11Renderer::Draw() {
             sh.buf = cbs[i];
             sh.raw = nullptr;
             sh.cb_size = cb_size;
+            sh.by_address = false;
             g_prof_cb_bytes += cb_size + (dyn ? size : 0);
             g_prof_cb_uploads++;
             if (dyn)
@@ -2992,6 +3055,7 @@ void D3D11Renderer::Present(const PresentInfo& p) {
     }
     PollReadbacks(false);
     std::erase_if(gbufs_, [&](auto& b) { return !b->in_flight && frame_counter_ - b->last_use > 600; });
+    g_dc->TrimRawByAddress(frame_counter_, 600);
     active_stale_ = true;
     for (auto* cache : {&index_cache_, &vertex_cache_})
         std::erase_if(*cache, [&](auto& kv) {
