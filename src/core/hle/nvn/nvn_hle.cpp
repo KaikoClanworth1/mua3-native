@@ -761,10 +761,29 @@ void MaybeProfileRecorder() {
     if (++calls == 20000 && !started.exchange(true))
         common::StartSamplingProfiler(GetCurrentThread(), "NVN recorder 0", 10, 0);
 }
+// ---- decode thread (MUA3_NVN_DECODE, below): the game's render thread hands NVN commands, recording boundaries,
+// submits, fences and presents to a ring; the decode thread records them into the same lists and feeds the renderer.
+int DecodeMode();       // 0 direct (or decode failed), 1 ring, 2 verify (direct, plus the ring path compared)
+bool DecodeVerifying(); // (mode 2)
+bool DecodeCommand(State& s, int fn, int mode); // a Generic call: true = recorded through the ring
+void DecodeBegin(u64 cb);
+void DecodeEnd(u64 cb, u64 handle);
+void DecodeNest(u64 cb, u64 count, const u64* handles, size_t n);
+void DecodeSubmit(const std::vector<u64>& handles);
+void DecodeFence(u64 seq);
+void DecodePresent(const gpu::PresentInfo& p);
+void VerifyPush(const std::vector<ReplaySpan>& flat);
+void FenceDone(u64 seq);
+void BeginRecord(Recording& rec, u64 cb);
+void EndRecord(Recording& rec, u64 cb, u64 handle);
+void NestRecord(Recording& rec, Command&& c);
+std::vector<ReplaySpan> SubmitHandles(Recording& rec, State* s, const std::vector<u64>& handles, bool live);
 template <int I>
 void Generic(State& s) {
     if (ProfileAt() >= 0)
         MaybeProfileRecorder();
+    if (const int dm = DecodeMode(); dm && DecodeCommand(s, I, dm))
+        return Return(s, 0);
     const u64 cycles0 = g_record_cost ? __rdtsc() : 0;
     const GenericSlot& g = g_generic[I];
     // Commands append to the calling thread's current command buffer without the lock (each command buffer is
@@ -972,8 +991,16 @@ void NestCommands(State& s) {
     u64 obj, r;
     if (!Through(s, W, obj, r))
         return;
-    auto& rec = Rec();
+    const int dm = DecodeMode();
+    if (dm)
+        DecodeNest(cb, count, c.extra.data(), c.extra.size());
+    if (dm == 1)
+        return;
+    NestRecord(Rec(), std::move(c));
+}
+void NestRecord(Recording& rec, Command&& c) {
     std::lock_guard lk(rec.mutex);
+    const u64 cb = c.x[0];
     rec.open[cb].push_back(std::move(c));
     rec.recorded++;
 }
@@ -981,7 +1008,13 @@ void CommandBufferBeginRecording(State& s) {
     u64 cb, r;
     if (!Through(s, kCommandBufferBeginRecording, cb, r))
         return;
-    auto& rec = Rec();
+    const int dm = DecodeMode();
+    if (dm)
+        DecodeBegin(cb);
+    if (dm != 1)
+        BeginRecord(Rec(), cb);
+}
+void BeginRecord(Recording& rec, u64 cb) {
     std::lock_guard lk(rec.mutex);
     auto& open = rec.open[cb];
     open.clear();
@@ -993,7 +1026,13 @@ void CommandBufferEndRecording(State& s) {
     u64 cb, handle;
     if (!Through(s, kCommandBufferEndRecording, cb, handle))
         return;
-    auto& rec = Rec();
+    const int dm = DecodeMode();
+    if (dm)
+        DecodeEnd(cb, handle);
+    if (dm != 1)
+        EndRecord(Rec(), cb, handle);
+}
+void EndRecord(Recording& rec, u64 cb, u64 handle) {
     std::lock_guard lk(rec.mutex);
     rec.ends++;
     rec.empty_ends += rec.open[cb].empty();
@@ -1147,19 +1186,15 @@ void ResolveFrame(Recording& rec, std::ofstream& f, State& s, const std::vector<
     f << fmt::format("# {} draws resolved, {} render targets not in the texture model\n", draws, unresolved_rt);
 }
 // void nvnQueueSubmitCommands(NVNqueue*, int numCommands, const NVNcommandHandle* handles)
-void QueueSubmitCommands(State& s) {
-    const u64 count = u32(s.x[1]), array = s.x[2];
-    std::vector<u64> handles;
-    for (u64 i = 0; i < count && i < 256; i++)
-        handles.push_back(recomp::Rd<u64>(s, array + i * 8));
-    // Observed before the driver runs: the submit makes a GPU syscall that can hand the rest of the call to the JIT.
-    const u64 queue = s.x[0];
+// A submit's command lists to the renderer: `rec` is the recorder they were recorded in (the decode thread's own one in
+// MUA3_NVN_DECODE=verify), `s` the game's State when on its thread (frame dump only). `live`: hand them to the sink
+// and keep the statistics; otherwise only the flattened spans are returned (verify).
+std::vector<ReplaySpan> SubmitHandles(Recording& rec_, State* s, const std::vector<u64>& handles, bool live) {
     const u64 submit_t0 = NowNs();
-
     std::vector<ReplaySpan> flat;
     auto* sink = g_sink.load();
     {
-    auto& rec = Rec();
+    auto& rec = rec_;
     std::lock_guard lk(rec.mutex);
     // MUA3_NVN_DUMP=<seconds>: write the first large submit after that time's command stream (and the state objects it binds) to nvn_frame.txt
     static const u64 dump_at = [] {
@@ -1172,7 +1207,7 @@ void QueueSubmitCommands(State& s) {
     for (u64 h : handles)
         if (auto it = rec.handles.find(h); it != rec.handles.end() && it->second)
             top += it->second->size();
-    if (dump_at && !dumped && top >= 100 &&
+    if (s && dump_at && !dumped && top >= 100 &&
         std::chrono::steady_clock::now() - t0 > std::chrono::seconds(dump_at)) {
         dumped = true;
         std::ofstream f("nvn_frame.txt");
@@ -1237,7 +1272,7 @@ void QueueSubmitCommands(State& s) {
                            60;
         {
             std::ofstream r("nvn_draws.txt");
-            ResolveFrame(rec, r, s, handles);
+            ResolveFrame(rec, r, *s, handles);
         }
         LOG_INFO("NVN", "wrote nvn_frame.txt");
     }
@@ -1319,7 +1354,7 @@ void QueueSubmitCommands(State& s) {
                     work.emplace_back(nested, depth + 1);
         }
     }
-    if (++rec.submits % 600 == 0) {
+    if (live && ++rec.submits % 600 == 0) {
         LOG_INFO("NVN", "recorded stream, per submit: {:.0f} commands, {:.0f} draws ({:.0f} indirect), {:.1f} "
                         "dispatches; {} unrecorded handles (recorded {}, begins {}, ends {}, empty {}); submit {:.2f} ms, "
                         "recording {:.0f} Mcycles",
@@ -1335,10 +1370,32 @@ void QueueSubmitCommands(State& s) {
                  double(in_raw) / 600, double(on_heap) / 600);
     }
     }
+    if (!live)
+        return flat;
+    if (DecodeVerifying())
+        VerifyPush(flat);
     if (sink && *sink)
         (*sink)(std::move(flat));
     g_submit_ns.fetch_add(NowNs() - submit_t0, std::memory_order_relaxed);
     TimelineEvent("submit", flat.size());
+    return {};
+}
+// void nvnQueueSubmitCommands(NVNqueue*, int numCommands, const NVNcommandHandle* handles)
+void QueueSubmitCommands(State& s) {
+    const u64 count = u32(s.x[1]), array = s.x[2];
+    std::vector<u64> handles;
+    for (u64 i = 0; i < count && i < 256; i++)
+        handles.push_back(recomp::Rd<u64>(s, array + i * 8));
+    const int dm = DecodeMode();
+    // verify: both paths in one order, or two threads submitting at once queue in opposite orders and look different
+    static std::mutex verify_order;
+    std::unique_lock<std::mutex> order(verify_order, std::defer_lock);
+    if (dm == 2)
+        order.lock();
+    if (dm != 1)
+        SubmitHandles(Rec(), &s, handles, true);
+    if (dm)
+        DecodeSubmit(handles);
     Return(s, 0); // the host renders it; the driver's queue never runs
 }
 
@@ -1376,6 +1433,13 @@ u64 HostFence(u64 sync) {
         if (sync)
             q.syncs[sync] = seq;
     }
+    if (DecodeMode() == 1) // after the submits before it: the decode thread issues it in order
+        return DecodeFence(seq), seq;
+    FenceDone(seq);
+    return seq;
+}
+// The GPU-thread job that completes fence `seq` (queued after the submits before it).
+void FenceDone(u64 seq) {
     gpu::G().SubmitHost([seq] {
         auto& hq = HQ();
         TimelineEvent("fence-done", seq);
@@ -1385,7 +1449,6 @@ u64 HostFence(u64 sync) {
         }
         hq.cv.notify_all();
     });
-    return seq;
 }
 // void nvnQueueFenceSync(NVNqueue*, NVNsync*, NVNsyncCondition, int flags)
 void QueueFenceSync(State& s) {
@@ -1489,7 +1552,11 @@ void QueuePresentTexture(State& s) {
     TextureInfo t;
     if (tex && QueryTexture(tex, t)) {
         auto& g = gpu::G();
-        g.QueuePresent({g.As().Translate(t.gpu), t.width, t.height, t.width * 4, 1});
+        const gpu::PresentInfo p{g.As().Translate(t.gpu), t.width, t.height, t.width * 4, 1};
+        if (DecodeMode() == 1) // after this frame's submit: the decode thread hands it on in order
+            DecodePresent(p);
+        else
+            g.QueuePresent(p);
     }
     hle::LimitFrameRate(); // mua3.ini fps_limit below the game's own rate (a compare otherwise)
     TimelineEvent("present", index);
@@ -1572,6 +1639,518 @@ const Entry kHostFunctions[] = {
 #undef NVN_RECORD
 };
 #undef NVN_ENTRY
+
+// ---- decode thread (MUA3_NVN_DECODE=1: ring, =verify: direct plus the ring path compared, unset/0: direct)
+// The game's render thread copies each host command's registers and the guest memory the recorder reads (temporaries
+// on its stack) into a ring, along with recording boundaries, submits, fences and presents in call order, and goes
+// on; the decode thread records them into the same lists and hands submits, fence completions and presents to the GPU
+// thread in that order. Calls that return values, run the driver or set state objects stay on the game's thread
+// after the ring has drained. Anything wrong on the decode side is logged once and the session goes back to direct.
+extern "C" __declspec(dllimport) long __stdcall SetThreadDescription(void*, const wchar_t*);
+extern "C" __declspec(dllimport) int __stdcall GetThreadPriority(void*);
+extern "C" __declspec(dllimport) int __stdcall SetThreadPriority(void*, int);
+constexpr auto kDecodeTimeout = std::chrono::seconds(10); // (decode thread stuck: go back to direct, never hang)
+int ReadDecodeConfig() {
+    if (std::getenv("MUA3_NVN_DUMP")) // (the frame dump reads the game's memory at submit time)
+        return 0;
+    const char* e = std::getenv("MUA3_NVN_DECODE");
+    if (!e || !*e || std::string_view(e) == "0")
+        return 0;
+    return std::string_view(e) == "verify" ? 2 : 1;
+}
+const int g_decode_cfg = ReadDecodeConfig();
+std::atomic<bool> g_decode_failed{false};
+enum DecodeOp : u64 { kDecCommand = 1, kDecBegin, kDecEnd, kDecNest, kDecSubmit, kDecFence, kDecPresent, kDecWrap };
+struct DecodeRing {
+    static constexpr u64 kWords = 1 << 20; // 8 MB: ~10 frames of calls
+    std::unique_ptr<u64[]> buf{new u64[kWords]};
+    static constexpr u64 kPublishWords = 1024; // (published in batches: one shared-line handover per batch, not per call)
+    alignas(64) std::atomic<u64> head{0}; // words published (game's render thread)
+    u64 written = 0;                      // words written, published or not (under g_push_lock)
+    alignas(64) std::atomic<u64> tail{0}; // words processed (decode thread)
+    alignas(64) std::atomic<bool> consumer_idle{false}, producer_waiting{false};
+    std::atomic<u64> busy{0}, busy_since{0}, entries{0}; // (diagnostics: the entry being decoded, since when)
+    std::mutex mutex;
+    std::condition_variable wake_consumer, wake_producer;
+};
+void DecodeLoop(DecodeRing& r);
+DecodeRing& Ring() {
+    static DecodeRing* r = [] {
+        auto* ring = new DecodeRing;
+        // the game's render thread's own priority: busy shader compile threads at load must not starve its recorder
+        const int priority = GetThreadPriority(GetCurrentThread());
+        std::thread([ring, priority] {
+            SetThreadDescription(GetCurrentThread(), L"NVN decode");
+            SetThreadPriority(GetCurrentThread(), priority);
+            DecodeLoop(*ring);
+        }).detach();
+        LOG_INFO("NVN", "decode thread: {}", g_decode_cfg == 2 ? "verify (direct, ring path compared)" : "on");
+        return ring;
+    }();
+    return *r;
+}
+void DecodeFail(const char* why) {
+    if (!g_decode_failed.exchange(true))
+        LOG_ERROR("NVN", "decode thread: {}; recording on the game's thread from now on", why);
+}
+// Queues one entry: header word (op | fn << 8 | payload words << 32 | replay << 63), then `a` and `b`.
+// (more than one guest thread makes NVN calls at boot: pushes are serialized, in call order)
+struct PushLock {
+    std::atomic_flag& f;
+    explicit PushLock(std::atomic_flag& flag) : f(flag) {
+        while (f.test_and_set(std::memory_order_acquire))
+            _mm_pause();
+    }
+    ~PushLock() { f.clear(std::memory_order_release); }
+};
+std::atomic_flag g_push_lock = ATOMIC_FLAG_INIT;
+// Makes everything written visible to the decode thread and wakes it if it sleeps (under g_push_lock).
+void DecodePublish(DecodeRing& r) {
+    if (r.head.load(std::memory_order_relaxed) == r.written)
+        return;
+    r.head.store(r.written, std::memory_order_seq_cst);
+    if (r.consumer_idle.load(std::memory_order_seq_cst)) {
+        std::lock_guard lk(r.mutex);
+        r.wake_consumer.notify_one();
+    }
+}
+// Waits (game's thread) until the decode thread has processed everything queued. False after kDecodeTimeout.
+bool DecodeDrain() {
+    DecodeRing& r = Ring();
+    u64 h;
+    {
+        PushLock pl(g_push_lock);
+        DecodePublish(r);
+        h = r.written;
+    }
+    for (int k = 0; k < 4000; k++) {
+        if (r.tail.load(std::memory_order_acquire) >= h)
+            return true;
+        _mm_pause();
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    std::unique_lock lk(r.mutex);
+    while (r.tail.load(std::memory_order_acquire) < h) {
+        r.producer_waiting.store(true);
+        if (r.tail.load(std::memory_order_acquire) >= h)
+            break;
+        r.wake_producer.wait_for(lk, std::chrono::milliseconds(1));
+        if (std::chrono::steady_clock::now() - t0 > kDecodeTimeout) {
+            r.producer_waiting.store(false);
+            const u64 busy = r.busy.load(), since = r.busy_since.load();
+            LOG_ERROR("NVN", "decode thread: drain timed out: {} words behind; on entry op {} fn {} for {:.0f} ms ({} entries done)",
+                      h - r.tail.load(), busy & 0xFF, (busy >> 8) & 0xFFFF,
+                      since ? double(NowNs() - since) / 1e6 : 0.0, r.entries.load());
+            return false;
+        }
+    }
+    r.producer_waiting.store(false);
+    return true;
+}
+int DecodeMode() {
+    if (!g_decode_cfg)
+        return 0;
+    if (g_decode_failed.load(std::memory_order_relaxed)) {
+        static std::atomic<bool> drained{false}; // (whatever was queued before the failure still goes first)
+        if (!drained.exchange(true) && !DecodeDrain())
+            LOG_ERROR("NVN", "decode thread: not draining; continuing without it");
+        return 0;
+    }
+    return g_decode_cfg;
+}
+bool DecodeVerifying() {
+    return DecodeMode() == 2;
+}
+void DecodePush(u64 op, u64 fn, bool replay, const u64* a, u32 na, const u64* b = nullptr, u32 nb = 0) {
+    DecodeRing& r = Ring();
+    PushLock pl(g_push_lock);
+    const u64 len = 1 + u64(na) + nb, h = r.written, pos = h % DecodeRing::kWords;
+    const bool wrap = pos + len > DecodeRing::kWords;
+    const u64 need = len + (wrap ? DecodeRing::kWords - pos : 0);
+    auto room = [&] { return DecodeRing::kWords - (h - r.tail.load(std::memory_order_acquire)) >= need; };
+    if (!room()) { // full: only the game's thread waits, never the decode thread
+        DecodePublish(r);
+        for (int k = 0; k < 4000 && !room(); k++)
+            _mm_pause();
+        const auto t0 = std::chrono::steady_clock::now();
+        std::unique_lock lk(r.mutex);
+        while (!room()) {
+            r.producer_waiting.store(true);
+            if (room())
+                break;
+            r.wake_producer.wait_for(lk, std::chrono::milliseconds(1));
+            if (std::chrono::steady_clock::now() - t0 > kDecodeTimeout) {
+                r.producer_waiting.store(false);
+                return DecodeFail("ring full for 10 s");
+            }
+        }
+        r.producer_waiting.store(false);
+    }
+    u64 at = h;
+    if (wrap) {
+        r.buf[pos] = kDecWrap;
+        at += DecodeRing::kWords - pos;
+    }
+    u64* w = &r.buf[at % DecodeRing::kWords];
+    w[0] = op | fn << 8 | u64(na + nb) << 32 | u64(replay) << 63;
+    std::memcpy(w + 1, a, na * 8);
+    if (nb)
+        std::memcpy(w + 1 + na, b, nb * 8);
+    r.written = at + len;
+    // submits, fences and presents go at once (the GPU thread waits for them); everything else in batches
+    if ((op >= kDecSubmit && op <= kDecPresent) || r.written - r.head.load(std::memory_order_relaxed) >= DecodeRing::kPublishWords)
+        DecodePublish(r);
+}
+// A Generic call on the game's thread. Host commands are copied to the ring with the guest memory the recorder would
+// read, in the order it reads it; everything else runs directly once the ring has drained.
+bool DecodeCommand(State& s, int fn, int mode) {
+    const GenericSlot& g = g_generic[fn];
+    if (g.kind != Kind::Command || !g.host || g.objects) {
+        if (!DecodeDrain())
+            DecodeFail("not draining");
+        return false;
+    }
+    u64 mem[256];
+    u32 nm = 0;
+    const bool replay = g_sink.load() != nullptr;
+    if (g.rts) {
+        for (u64 i = 0; i < u32(s.x[1]) && i < 8; i++)
+            mem[nm++] = recomp::Rd<u64>(s, s.x[2] + i * 8);
+        if (mode == 1 && replay) {
+            for (u32 i = 0; i < nm; i++)
+                EnsureTexture(s, mem[i]);
+            EnsureTexture(s, s.x[4]);
+        }
+    }
+    if (g.shaders) {
+        const u32 at = nm;
+        for (u64 i = 0; i < u32(s.x[1]) && i < 8; i++) {
+            mem[nm++] = recomp::Rd<u64>(s, s.x[2] + i * 16);
+            mem[nm++] = recomp::Rd<u64>(s, s.x[2] + i * 16 + 8);
+        }
+        if (mode == 1)
+            gpu::shader::AnticipatePrograms(std::span<const u64>(mem + at, nm - at));
+    }
+    if (replay)
+        for (int k = 0; k < 2; k++)
+            if (g.copy_region[k] >= 0) {
+                const u64 r = s.x[g.copy_region[k]];
+                for (u32 o = 0; o < 24; o += 8)
+                    mem[nm++] = r ? recomp::Rd<u64>(s, r + o) : 0;
+            }
+    if (replay)
+        for (int k = 0; k < 2; k++)
+            if (g.copy_view[k] >= 0) {
+                const u64 v = s.x[g.copy_view[k]];
+                for (u32 o = 0; o < 40; o += 8)
+                    mem[nm++] = v ? recomp::Rd<u64>(s, v + o) : 0;
+            }
+    if (replay && g.raw_ptr >= 0 && s.x[g.raw_ptr]) {
+        const u32 raw_n = g.raw_count >= 0 ? std::min<u32>(u32(s.x[g.raw_count]), 32) : 1;
+        for (u32 o = 0; o < raw_n * g.raw_elem && nm < 256; o += 8)
+            mem[nm++] = recomp::Rd<u64>(s, s.x[g.raw_ptr] + o);
+    }
+    u64 regs[10];
+    std::memcpy(regs, s.x, 64);
+    regs[8] = u64(u32(s.v[0].lo)) | u64(u32(s.v[1].lo)) << 32;
+    regs[9] = u64(u32(s.v[2].lo)) | u64(u32(s.v[3].lo)) << 32;
+    DecodePush(kDecCommand, u64(fn), replay, regs, 10, mem, nm);
+    return mode == 1;
+}
+void DecodeBegin(u64 cb) {
+    DecodePush(kDecBegin, 0, false, &cb, 1);
+}
+void DecodeEnd(u64 cb, u64 handle) {
+    const u64 a[2] = {cb, handle};
+    DecodePush(kDecEnd, 0, false, a, 2);
+}
+void DecodeNest(u64 cb, u64 count, const u64* handles, size_t n) {
+    const u64 a[2] = {cb, count};
+    DecodePush(kDecNest, 0, false, a, 2, handles, u32(n));
+}
+void DecodeSubmit(const std::vector<u64>& handles) {
+    DecodePush(kDecSubmit, 0, false, handles.data(), u32(handles.size()));
+}
+void DecodeFence(u64 seq) {
+    DecodePush(kDecFence, 0, false, &seq, 1);
+}
+void DecodePresent(const gpu::PresentInfo& p) {
+    const u64 a[3] = {p.cpu_addr, u64(p.width) | u64(p.height) << 32, u64(p.stride) | u64(p.format) << 32};
+    DecodePush(kDecPresent, 0, false, a, 3);
+}
+
+// verify: the direct path's submits, compared with the decode thread's own recording of the same calls
+Recording& VRec() {
+    static Recording r;
+    return r;
+}
+struct VerifyQueue {
+    std::mutex mutex;
+    std::deque<std::vector<ReplaySpan>> submits;
+};
+VerifyQueue& VQ() {
+    static VerifyQueue q;
+    return q;
+}
+void VerifyPush(const std::vector<ReplaySpan>& flat) {
+    auto& q = VQ();
+    std::lock_guard lk(q.mutex);
+    if (q.submits.size() < 64)
+        q.submits.push_back(flat);
+}
+std::string CompareCommands(const Command& a, const Command& b) {
+    if (a.fn != b.fn || a.name != b.name)
+        return fmt::format("command {} vs {}", a.name, b.name);
+    for (int k = 0; k < 8; k++)
+        if (a.x[k] != b.x[k])
+            return fmt::format("x[{}] {:#x} vs {:#x}", k, a.x[k], b.x[k]);
+    for (int k = 0; k < 4; k++)
+        if (a.v[k] != b.v[k])
+            return fmt::format("v[{}] {:#x} vs {:#x}", k, a.v[k], b.v[k]);
+    auto words = [](const auto& w) {
+        std::string t;
+        for (u64 v : w)
+            t += fmt::format(" {:#x}", v);
+        return t;
+    };
+    if (!std::equal(a.extra.begin(), a.extra.end(), b.extra.begin(), b.extra.end()))
+        return fmt::format("{} extra:{} vs{}", a.name, words(a.extra), words(b.extra));
+    if (!std::equal(a.raw.begin(), a.raw.end(), b.raw.begin(), b.raw.end()))
+        return fmt::format("{} raw:{} vs{}", a.name, words(a.raw), words(b.raw));
+    if (a.objects.size() != b.objects.size())
+        return fmt::format("objects ({} vs {})", a.objects.size(), b.objects.size());
+    for (size_t i = 0; i < a.objects.size(); i++) {
+        const auto &oa = a.objects[i], &ob = b.objects[i];
+        if (oa.size() != ob.size())
+            return fmt::format("object {} calls ({} vs {})", i, oa.size(), ob.size());
+        for (size_t j = 0; j < oa.size(); j++)
+            if (oa[j].name != ob[j].name || std::memcmp(oa[j].x, ob[j].x, sizeof(oa[j].x)) ||
+                std::memcmp(oa[j].v, ob[j].v, sizeof(oa[j].v)) || oa[j].handles != ob[j].handles)
+                return fmt::format("object {} call {}", i, j);
+    }
+    return {};
+}
+void VerifySubmit(const std::vector<ReplaySpan>& decoded) {
+    static u64 submits = 0, identical = 0, mismatches = 0;
+    static bool reported = false;
+    std::vector<ReplaySpan> direct;
+    {
+        auto& q = VQ();
+        std::lock_guard lk(q.mutex);
+        if (q.submits.empty()) {
+            if (!reported)
+                LOG_ERROR("NVN", "decode verify: no direct submit to compare with"), reported = true;
+            return;
+        }
+        direct = std::move(q.submits.front());
+        q.submits.pop_front();
+    }
+    submits++;
+    std::vector<const Command*> a, b;
+    for (const auto& sp : direct)
+        for (size_t i = sp.begin; i < sp.end; i++)
+            a.push_back(&(*sp.list)[i]);
+    for (const auto& sp : decoded)
+        for (size_t i = sp.begin; i < sp.end; i++)
+            b.push_back(&(*sp.list)[i]);
+    std::string why;
+    size_t at = 0;
+    for (; at < a.size() && at < b.size() && why.empty(); at++)
+        why = CompareCommands(*a[at], *b[at]);
+    if (why.empty() && a.size() != b.size())
+        why = fmt::format("{} vs {} commands", a.size(), b.size()), at = std::min(a.size(), b.size()) + 1;
+    if (why.empty())
+        identical++;
+    else if (mismatches++ < 8)
+        LOG_ERROR("NVN", "decode verify: submit {} differs at command {} of {}: {} (x {:#x} {:#x} {:#x})", submits, at - 1,
+                  a.size(), why, at && at <= a.size() ? a[at - 1]->x[1] : 0, at && at <= a.size() ? a[at - 1]->x[2] : 0,
+                  at && at <= a.size() ? a[at - 1]->x[3] : 0);
+    if (submits % 600 == 0)
+        LOG_INFO("NVN", "decode verify: {} of {} submits identical", identical, submits);
+}
+
+// The decode thread's side of a command: what Generic's fast path does on the game's thread, from the copied words.
+struct DecodeCtx {
+    u64 cb = 0;
+    std::vector<Command>* list = nullptr;
+    u64 recorded = 0, heads = 0, bt[3] = {};
+};
+void DecodeRecordCommand(Recording& rec, DecodeCtx& d, int I, bool replay, const u64* w, u32 n, bool live) {
+    const GenericSlot& g = g_generic[I];
+    const u64* x = w;
+    const u64* mem = w + 10;
+    u32 m = 0;
+    if (d.cb != x[0] || !d.list) {
+        std::lock_guard lk(rec.mutex);
+        d.list = &rec.open[x[0]];
+        d.cb = x[0];
+    }
+    auto& list = *d.list;
+    if (g.tex_bind && !list.empty() && (x[1] | x[2]) >> 32 == 0) {
+        Command& b = list.back();
+        if (b.fn == I) {
+            const u32 k = b.v[3];
+            const u64 w0 = x[1] << 32 | x[2];
+            if (k < 3) {
+                b.x[2 + 2 * k] = w0;
+                b.x[3 + 2 * k] = x[3];
+            } else {
+                b.raw.push_back(w0);
+                b.raw.push_back(x[3]);
+            }
+            b.v[3] = k + 1;
+            if (live && (++d.bt[k < 3 ? 0 : k < 5 ? 1 : 2], ((d.bt[0] + d.bt[1] + d.bt[2]) & 1023) == 0)) {
+                for (int j = 0; j < 3; j++)
+                    g_bt_batched[j].fetch_add(d.bt[j], std::memory_order_relaxed);
+                d.bt[0] = d.bt[1] = d.bt[2] = 0;
+            }
+            return;
+        }
+    }
+    if (live && list.size() == list.capacity())
+        g_list_grows.fetch_add(1, std::memory_order_relaxed);
+    Command& c = list.emplace_back();
+    c.fn = I;
+    c.name = g.name;
+    std::memcpy(c.x, x, 64);
+    c.v[0] = u32(x[8]), c.v[1] = u32(x[8] >> 32), c.v[2] = u32(x[9]), c.v[3] = u32(x[9] >> 32);
+    if (g.tex_bind) {
+        c.v[3] = 1;
+        if (live && (++d.heads & 1023) == 0)
+            g_bt_heads.fetch_add(1024, std::memory_order_relaxed);
+    }
+    if (g.rts)
+        for (u64 i = 0; i < u32(x[1]) && i < 8; i++)
+            c.extra.push_back(mem[m++]);
+    if (g.shaders)
+        for (u64 i = 0; i < u32(x[1]) && i < 8; i++) {
+            c.extra.push_back(mem[m++]);
+            c.extra.push_back(mem[m++]);
+        }
+    if (g.program && replay && x[1]) { // (state object shadows live in the game-thread recorder, set in call order)
+        auto& sh = Rec();
+        std::lock_guard lk(sh.mutex);
+        if (auto it = sh.shadow.find(x[1]); it != sh.shadow.end())
+            for (const Command& sc : it->second)
+                if (g_generic[sc.fn].shaders && sc.extra.size() >= 2)
+                    c.extra.assign(sc.extra.begin(), sc.extra.begin() + 2);
+    }
+    if (replay)
+        for (int k = 0; k < 2; k++)
+            if (g.copy_region[k] >= 0)
+                for (u32 o = 0; o < 24; o += 8)
+                    c.raw.push_back(mem[m++]);
+    if (replay)
+        for (int k = 0; k < 2; k++)
+            if (g.copy_view[k] >= 0)
+                for (u32 o = 0; o < 40; o += 8)
+                    c.raw.push_back(mem[m++]);
+    if (replay && g.raw_ptr >= 0 && x[g.raw_ptr]) {
+        c.raw.reserve(c.raw.size() + (n - 10 - m));
+        while (10 + m < n)
+            c.raw.push_back(mem[m++]);
+    }
+    if (live && (++d.recorded & 4095) == 0)
+        rec.recorded.fetch_add(4096, std::memory_order_relaxed);
+}
+void DecodeEntry(DecodeCtx& d, u64 h, const u64* p) {
+    const u64 op = h & 0xFF, fn = (h >> 8) & 0xFFFF;
+    const u32 n = u32(h >> 32) & 0x7FFFFFFF;
+    const bool replay = (h >> 63) != 0, live = g_decode_cfg == 1;
+    Recording& rec = live ? Rec() : VRec();
+    switch (op) {
+    case kDecCommand:
+        return DecodeRecordCommand(rec, d, int(fn), replay, p, n, live);
+    case kDecBegin:
+        return BeginRecord(rec, p[0]);
+    case kDecEnd:
+        return EndRecord(rec, p[0], p[1]);
+    case kDecNest: {
+        Command c;
+        c.x[0] = p[0], c.x[1] = p[1];
+        for (u32 i = 2; i < n; i++)
+            c.extra.push_back(p[i]);
+        return NestRecord(rec, std::move(c));
+    }
+    case kDecSubmit: {
+        const std::vector<u64> handles(p, p + n);
+        if (live)
+            SubmitHandles(rec, nullptr, handles, true);
+        else
+            VerifySubmit(SubmitHandles(rec, nullptr, handles, false));
+        return;
+    }
+    case kDecFence:
+        if (live)
+            FenceDone(p[0]);
+        return;
+    case kDecPresent:
+        if (live)
+            gpu::G().QueuePresent({p[0], u32(p[1]), u32(p[1] >> 32), u32(p[2]), u32(p[2] >> 32)});
+        return;
+    default:
+        throw std::runtime_error(fmt::format("bad ring entry {:#x}", h));
+    }
+}
+void DecodeLoop(DecodeRing& r) {
+    DecodeCtx d;
+    u64 t = 0;
+    for (;;) {
+        u64 h = r.head.load(std::memory_order_acquire);
+        if (t == h) {
+            // idle: spin briefly (the next call is usually microseconds away), then sleep until woken
+            for (int k = 0; k < 2000 && t == h; k++) {
+                _mm_pause();
+                h = r.head.load(std::memory_order_acquire);
+            }
+            if (t == h) {
+                std::unique_lock lk(r.mutex);
+                r.consumer_idle.store(true, std::memory_order_seq_cst);
+                r.wake_consumer.wait_for(lk, std::chrono::milliseconds(50),
+                                         [&] { return r.head.load(std::memory_order_seq_cst) != t; });
+                r.consumer_idle.store(false);
+                continue;
+            }
+        }
+        // a published batch; tail goes back to the game's thread at the end of it (and every few thousand words of a
+        // long one, so a full ring frees up while it is decoded)
+        r.busy_since.store(NowNs(), std::memory_order_relaxed);
+        u64 stored = t, entries = 0;
+        while (t != h) {
+            const u64 pos = t % DecodeRing::kWords, hw = r.buf[pos];
+            if ((hw & 0xFF) == kDecWrap) {
+                t += DecodeRing::kWords - pos;
+                continue;
+            }
+            const u32 n = u32(hw >> 32) & 0x7FFFFFFF;
+            r.busy.store(hw, std::memory_order_relaxed);
+            try {
+                DecodeEntry(d, hw, &r.buf[pos + 1]);
+            } catch (const std::exception& e) {
+                DecodeFail(e.what());
+            }
+            entries++;
+            t += 1 + n;
+            if (t == h || t - stored >= 4096) {
+                stored = t;
+                r.tail.store(t, std::memory_order_seq_cst);
+                if (r.producer_waiting.load(std::memory_order_seq_cst)) {
+                    std::lock_guard lk(r.mutex);
+                    r.wake_producer.notify_all();
+                }
+            }
+        }
+        if (stored != t) { // (the batch ended on a wrap marker)
+            r.tail.store(t, std::memory_order_seq_cst);
+            if (r.producer_waiting.load(std::memory_order_seq_cst)) {
+                std::lock_guard lk(r.mutex);
+                r.wake_producer.notify_all();
+            }
+        }
+        r.busy_since.store(0, std::memory_order_relaxed);
+        r.entries.fetch_add(entries, std::memory_order_relaxed);
+    }
+}
 
 } // namespace
 
