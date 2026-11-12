@@ -12,6 +12,7 @@
 #include <imgui_impl_dx11.h>
 #include <imgui_impl_sdl3.h>
 
+#include "platform/bug_capture.h"
 #include "platform/platform.h"
 
 #pragma comment(lib, "d3d11.lib")
@@ -219,6 +220,8 @@ bool Display::PumpEvents() {
         case SDL_EVENT_KEY_DOWN:
             if ((e.key.key == SDLK_RETURN && (e.key.mod & SDL_KMOD_ALT)) || e.key.key == SDLK_F11)
                 ToggleFullscreen();
+            if (e.key.key == SDLK_F4 && !e.key.repeat) // bug capture (when [debug] bug_capture=1)
+                bugcap::Request();
             if (e.key.key == SDLK_F12 && !e.key.repeat) { // screenshot of the window as shown
                 std::error_code ec;
                 fs::create_directories("screenshots", ec);

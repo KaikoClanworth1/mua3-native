@@ -1,0 +1,84 @@
+# F4 bug capture
+
+A debug key for players helping with testing: press **F4** at a broken moment and the game writes a folder that
+the developers can load and inspect later. It is not an emulator save state: the game's code runs natively, so its
+threads, stacks and the Direct3D state can't be saved and restored. The capture holds the nearest game save
+instead, plus everything needed to look at that frame offline.
+
+## Turning it on
+
+The key is off unless `mua3.ini` (in the game folder) has:
+
+```ini
+[debug]
+bug_capture=1
+```
+
+When the setting is off, nothing happens and nothing is done each frame. When it is on, the renderer checks one
+pointer per draw. The game keeps the section when it rewrites the ini (for example after a settings change).
+Test instances can also take a capture through the command channel: `inst.ps1 cmd <i> capture`.
+
+When the folder is written, a "Capture saved" message shows at the top of the screen for a few seconds.
+
+## What it writes: `bug_captures\YYYY-MM-DD_HHMMSS\`
+
+| File | Contents |
+|---|---|
+| `info.txt` | Build version, time, stage (for example `ST020`) and stage file, the last scenario file, the characters loaded this run (party, bosses, summons), the save's chapter and date, key settings, and the frame-capture summary |
+| `save\` | Copies of the game's save files (`save00`, `savedatainfo`), read from the save folder. The user's save is never written to |
+| `screenshot.bmp` | The captured game frame, at render size |
+| `window.bmp` | The window as shown, overlays included |
+| `log_last_30s.txt` | The last 30 seconds of `mua3.log` |
+| `frame\` | The graphics capture (see below) |
+
+### The save
+
+The game is not asked to save. Calling its save routine from outside its own flow (for example during the Sandman
+fight, where it refuses to save) could corrupt the user's real save, and that save is the folder the game writes to.
+So the capture copies the latest save the game wrote itself: the last checkpoint or autosave before the capture.
+`info.txt` gives the stage the player was in at capture time, which can be later than the save.
+
+**Loading it** (test instances, under the test lock):
+
+```
+powershell -File build\testinst\inst.ps1 tocapture <i> "<path>\bug_captures\<folder>"
+```
+
+This copies the capture's `save\` into the test instance, boots it, chooses CONTINUE on the title screen, waits for
+a stage to load, and then waits for gameplay. The script prints which stage it reached.
+
+### The graphics capture (`frame\`)
+
+It records one whole frame: every draw, compute dispatch and clear from one present to the next, in submission
+order. The total size is capped at 512 MB: 224 MB for textures, 64 MB for guest buffers and 224 MB for target images.
+Anything over a cap is still listed in `events.jsonl`, but without a file, and the summary gives the size skipped.
+
+- `events.jsonl` has one JSON object per line:
+  - **draw**:
+    - `state` is the index into `states.bin`.
+    - It has topology, first/count, indirect, the five program addresses, and the colour and depth targets as
+      `[slot, addr, format, w, h]`.
+    - `cb` lists the constant buffers as `[stage, slot, addr, size, file]`, `vb` the vertex streams as
+      `[stream, addr, size, stride, file]`, and `ib` the index buffer as `[addr, format, file]`.
+    - `tex` lists each texture with stage, slot, handle, address, format, type, size, the 8 TIC words, and its file.
+    - Draws the renderer submitted also have `drawn: true` and the `vs`/`ps` shader hashes (the `shader_dump` /
+      shader pack hash). Draws without `drawn` were skipped by the renderer.
+  - **dispatch**: program, offset, grid, block, shared memory size, constant buffers, and the texture and sampler
+    pool addresses.
+  - **clear**: the colour target and colour, or the depth and stencil values.
+  - **present**: the presented surface.
+- `states.bin`: each draw's `gpu::DrawState` (`src/gpu/draw_state.h`), back to back. `README.txt` gives the struct
+  size for that build. A replayer built from the same source can `memcpy` them straight back.
+- `buf\`: guest memory, deduplicated by content hash: constant buffers (`cb_`, up to 64 KB each), vertex streams
+  (`vb_`, up to 8 MB each) and index ranges (`ib_`).
+- `tex\`: each texture as the frame first sampled it: DDS files with a DX10 header in the host DXGI format.
+  Render targets read as textures are included, with `_rt` in the name.
+- `rt\`: the final contents of every colour target the frame wrote, as BMPs.
+- `shaders\`: the guest Maxwell programs the frame used, `<hash>.vs.bin` / `<hash>.ps.bin`. They are copied from
+  `shader_dump`, so `shadertool` reads them the same way.
+
+## Code
+
+- `src/platform/bug_capture.cpp`: the key, the folder, the save copy, the log and location, and the message.
+- `src/gpu/d3d11/frame_capture.cpp`: the frame recorder. The renderer calls it from `Draw`, `Dispatch`,
+  `ClearColor`, `ClearDepthStencil` and `Present`, only while `capture_` is set.

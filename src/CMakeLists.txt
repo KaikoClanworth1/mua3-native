@@ -65,7 +65,7 @@ else()
 endif()
 target_link_libraries(nxcore PUBLIC nxrecomp)
 
-add_library(platform STATIC platform/display.cpp platform/input.cpp platform/audio.cpp platform/platform.h ${D3D11_SOURCES})
+add_library(platform STATIC platform/display.cpp platform/input.cpp platform/audio.cpp platform/bug_capture.cpp platform/platform.h ${D3D11_SOURCES})
 target_link_libraries(platform PUBLIC nxcore imgui SDL3::SDL3-static d3d11 dxgi d3dcompiler xinput xaudio2 winmm)
 
 add_executable(mua3 app/main.cpp app/alloc_trace.cpp)

@@ -34,6 +34,7 @@ struct Config {
     bool docked = true;
     int language = 1; // 1 = American English
     int log_level = 2; // 0 trace .. 4 error
+    bool bug_capture = false; // [debug] F4 writes a bug capture folder (platform/bug_capture.cpp)
 
     bool Load(const fs::path& ini);
     bool Save(const fs::path& ini) const;

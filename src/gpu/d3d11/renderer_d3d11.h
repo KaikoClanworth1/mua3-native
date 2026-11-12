@@ -10,6 +10,7 @@
 #include <wrl/client.h>
 
 #include "gpu/d3d11/post_aa.h"
+namespace gpu { class FrameCapture; }
 #include "gpu/d3d11/gpu_passes.h"
 #include "gpu/renderer.h"
 
@@ -130,6 +131,8 @@ public:
     std::mutex shot_mutex_;
     fs::path shot_path_;
     std::atomic<bool> dump_surfaces_{false};
+    // F4 bug capture: records the next whole frame while set (frame_capture.h); cleared by Present when written.
+    std::atomic<FrameCapture*> capture_{nullptr};
     // Debug: log the raw texel at (x, y) of surface `gpu_va` at the next present (mua3_cmd "pixel").
     void ReadPixel(u64 gpu_va, u32 x, u32 y) { std::lock_guard l(pixel_mutex_); pixel_reqs_.push_back({gpu_va, x, y}); }
     std::atomic<int> trace_draws_{0}; // debug: log the next N draws into the presented surface

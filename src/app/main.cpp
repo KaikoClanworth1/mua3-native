@@ -24,6 +24,7 @@
 #include "core/hle/hid.h"
 #include "core/hle/menu_graphics.h"
 #include "gpu/d3d11/renderer_d3d11.h"
+#include "platform/bug_capture.h"
 #include "gpu/d3d11/shader_cache.h"
 #include "core/cpu/cpu.h"
 #include "gpu/shader/harvest.h"
@@ -249,6 +250,8 @@ void PollCommandFile(platform::Input* input) {
                 u32 x = 0, y = 0;
                 std::istringstream(line) >> c >> va >> x >> y;
                 g_renderer->ReadPixel(std::strtoull(va.c_str(), nullptr, 16), x, y);
+            } else if (cmd == "capture") { // the F4 bug capture (needs [debug] bug_capture=1)
+                platform::bugcap::Request();
             } else if (cmd == "dumprt" && g_renderer) {
                 g_renderer->dump_surfaces_ = true;
             } else if (cmd == "tracedraws" && g_renderer) {
@@ -693,7 +696,11 @@ int main(int argc, char** argv) {
     display.frame_source = [&](u32& w, u32& h) { return renderer.LatestFrame(w, h); };
 
     bool show_overlay = cfg.show_debug_overlay;
-    display.draw_overlay = [&] { DrawOverlay(cfg, input, show_overlay); };
+    display.draw_overlay = [&] {
+        DrawOverlay(cfg, input, show_overlay);
+        platform::bugcap::DrawToast();
+    };
+    platform::bugcap::Init(cfg.bug_capture, cfg.save_dir);
 
     sys.Start();
     // Test aid: MUA3_PROFILE=<delay seconds> samples the GPU thread for 10 s.
@@ -728,6 +735,7 @@ int main(int argc, char** argv) {
         if (autopress_after == 0 && !g_script_active && !test_instance) // the test aids drive player 1 themselves
             input.Update(display.Focused());
         PollCommandFile(&input);
+        platform::bugcap::Poll(renderer, display);
         display.BeginFrame();
         display.EndFrame();
         // Present when the game has a new frame (in step with its frame rate, no beat against a separate UI

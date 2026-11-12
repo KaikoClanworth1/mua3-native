@@ -19,6 +19,7 @@
 
 #include "core/memory.h"
 #include "core/system.h"
+#include "gpu/d3d11/frame_capture.h"
 #include "gpu/d3d11/shader_cache.h"
 #include "gpu/d3d11/texture_cache.h"
 #include "gpu/formats.h"
@@ -814,6 +815,8 @@ void D3D11Renderer::ClearColor(u32 rt, const float color[4]) {
     std::lock_guard ctx_lock(ContextMutex());
     gpu_passes_.Mark(3, [] { return std::string("clears"); });
     clears++;
+    if (FrameCapture* c = capture_.load(std::memory_order_relaxed); c && c->Recording())
+        c->Clear(fmt::format("\"rt\":{},\"color\":[{},{},{},{}]", rt, color[0], color[1], color[2], color[3]));
     if (Surface* s = GetColorSurface(rt)) {
         ctx_->ClearRenderTargetView(s->rtv.Get(), color);
         s->write_serial = ++surface_writes_;
@@ -824,6 +827,9 @@ void D3D11Renderer::ClearDepthStencil(bool depth, bool stencil, float depth_valu
     std::lock_guard ctx_lock(ContextMutex());
     gpu_passes_.Mark(3, [] { return std::string("clears"); });
     clears++;
+    if (FrameCapture* c = capture_.load(std::memory_order_relaxed); c && c->Recording())
+        c->Clear(fmt::format("\"depth\":{},\"stencil\":{},\"value\":{},\"stencil_value\":{}", depth, stencil,
+                             depth_value, stencil_value));
     if (Surface* s = GetDepthSurface()) {
         const UINT flags = (depth ? D3D11_CLEAR_DEPTH : 0) | (stencil ? D3D11_CLEAR_STENCIL : 0);
         ctx_->ClearDepthStencilView(s->dsv.Get(), flags, depth_value, stencil_value);
@@ -1613,6 +1619,8 @@ static std::vector<u8> ReadBufferNow(ID3D11Device* dev, ID3D11DeviceContext* ctx
 void D3D11Renderer::Dispatch(const ComputeLaunch& l) {
     std::lock_guard ctx_lock(ContextMutex());
     gpu_passes_.Mark(1, [] { return std::string("compute dispatches"); });
+    if (FrameCapture* c = capture_.load(std::memory_order_relaxed); c && c->Recording())
+        c->Dispatch(l);
     auto& g = G();
     auto& dc = *g_dc;
     // ---- program and launch shape
@@ -2024,6 +2032,12 @@ void D3D11Renderer::Draw() {
         std::fill(std::begin(last_rtvs_), std::end(last_rtvs_), reinterpret_cast<ID3D11RenderTargetView*>(~uintptr_t(0)));
         last_dsv_ = reinterpret_cast<ID3D11DepthStencilView*>(~uintptr_t(0));
     }
+    FrameCapture* const cap = [&] { // F4 bug capture (null unless a frame is being recorded)
+        FrameCapture* c = capture_.load(std::memory_order_relaxed);
+        return c && c->Recording() ? c : nullptr;
+    }();
+    if (cap)
+        cap->BeginDraw(m);
     if (!readbacks_.empty() && ++draws_since_poll_ >= 32) {
         draws_since_poll_ = 0;
         PollReadbacks(false);
@@ -2974,6 +2988,8 @@ void D3D11Renderer::Draw() {
             if (frame_counter_ - recent_wanted_ <= 120)
                 NoteTexture(srvs[t.slot], tic.Address(), tic.Width(), tic.Height(), tic.Format(),
                             FindSurfaceByGpu(tic.Address()) != nullptr);
+            if (cap)
+                cap->Texture(is_vs, t.slot, handle, tic, srvs[t.slot], FindSurfaceByGpu(tic.Address()) != nullptr);
             if (trace_draw_)
                 LOG_INFO("Renderer", "    {} tex slot {} handle {:#x} tic {} addr {:#x} fmt {:#x} type {} {}x{} w0 {:#x} swz {:#x} srgb {} mips {} {}", is_vs ? "VS" : "PS",
                          t.slot, handle, tic_idx, tic.Address(), tic.Format(), tic.Type(), tic.Width(), tic.Height(), tic.w[0], swz, tic.Srgb(), tic.MaxMip(),
@@ -3062,6 +3078,8 @@ void D3D11Renderer::Draw() {
         dev_->CreateQuery(&qd, &pick_query);
         ctx_->Begin(pick_query.Get());
     }
+    if (cap)
+        cap->Submit(vs->hash, ps ? ps->hash : 0, index_count);
     Prof(kProfSubmit);
     if (indirect_quads)
         ctx_->DrawIndexedInstancedIndirect(quad_args_buf_.Get(), 0);
@@ -3239,6 +3257,8 @@ void D3D11Renderer::Present(const PresentInfo& p) {
             shot_path_.clear();
         }
     }
+    if (FrameCapture* c = capture_.load(); c && c->Present(*this, s, p.cpu_addr))
+        capture_ = nullptr; // written: the bug capture thread frees it
     presented_cpu_.insert(p.cpu_addr);
     {
         std::vector<PixelReq> reqs;

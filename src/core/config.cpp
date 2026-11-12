@@ -70,6 +70,7 @@ bool Config::Load(const fs::path& ini) {
     get_b("docked", docked);
     get_i("language", language);
     get_i("log_level", log_level);
+    get_b("bug_capture", bug_capture);
     return true;
 }
 
@@ -89,6 +90,8 @@ bool Config::Save(const fs::path& ini) const {
       << "\n[audio]\naudio_backend=" << int(audio) << "\nvolume=" << volume << "\nmute=" << mute << "\n[input]\ninput_backend="
       << int(input) << "\ncamera_speed=" << camera_speed << "\n[system]\ndocked=" << docked << "\nlanguage=" << language << "\nlog_level=" << log_level
       << "\n";
+    if (bug_capture) // (only written when on: release players never see the section)
+        f << "[debug]\nbug_capture=1\n";
     return bool(f);
 }
 
