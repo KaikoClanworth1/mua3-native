@@ -1,3 +1,4 @@
+#include <array>
 #include <set>
 #include <cstdlib>
 // Maxwell SASS -> HLSL (Shader Model 5.0) translator.
@@ -2160,6 +2161,35 @@ float4 ApplySwizzle(float4 v, uint s) {
     // Textures. D3D11 has only 16 sampler registers: with at most 16 textures each gets its own (in use order),
     // otherwise textures past slot 15 share s15. Sampler names stay per texture slot and map onto registers.
     const bool own_samplers = res_.textures.size() <= 16;
+    // Past 16 textures, a shadow texture never shares s15: one register cannot hold both a comparison and a plain
+    // sampler state (FXC rejects the pair, and the renderer binds only one of them). It takes a register no texture
+    // uses, else the highest one a plain texture holds (that texture moves to the shared s15).
+    std::vector<u32> sreg_of(res_.textures.size());
+    if (!own_samplers) {
+        std::array<int, 16> owner;
+        owner.fill(-1);
+        for (size_t ti = 0; ti < res_.textures.size(); ti++) {
+            sreg_of[ti] = std::min<u32>(res_.textures[ti].slot, 15);
+            if (sreg_of[ti] < 15)
+                owner[sreg_of[ti]] = int(ti);
+        }
+        for (size_t ti = 0; ti < res_.textures.size(); ti++) {
+            if (!res_.textures[ti].shadow || sreg_of[ti] < 15)
+                continue;
+            int r = 14;
+            while (r >= 0 && owner[r] >= 0)
+                r--;
+            if (r < 0) { // all taken: the highest register held by a plain texture
+                for (r = 14; r >= 0 && res_.textures[owner[r]].shadow; r--) {
+                }
+                if (r < 0)
+                    continue; // (15 shadow textures already: stays on s15)
+                sreg_of[owner[r]] = 15;
+            }
+            owner[r] = int(ti);
+            sreg_of[ti] = u32(r);
+        }
+    }
     for (size_t ti = 0; ti < res_.textures.size(); ti++) {
         auto& t = res_.textures[ti];
         const char* type = "Texture2D";
@@ -2171,7 +2201,7 @@ float4 ApplySwizzle(float4 v, uint s) {
         case TexDim::Buffer: type = "Buffer"; break;
         }
         head += fmt::format("{}<float4> tex{} : register(t{});\n", type, t.slot, t.slot);
-        const u32 sreg = own_samplers ? u32(ti) : std::min<u32>(t.slot, 15);
+        const u32 sreg = own_samplers ? u32(ti) : sreg_of[ti];
         t.sampler = sreg;
         if (declared_smp_.insert(sreg).second)
             head += fmt::format("SamplerState smp_r{} : register(s{});\n", sreg, sreg);
