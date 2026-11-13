@@ -1660,7 +1660,7 @@ int ReadDecodeConfig() {
 }
 const int g_decode_cfg = ReadDecodeConfig();
 std::atomic<bool> g_decode_failed{false};
-enum DecodeOp : u64 { kDecCommand = 1, kDecBegin, kDecEnd, kDecNest, kDecSubmit, kDecFence, kDecPresent, kDecWrap };
+enum DecodeOp : u64 { kDecCommand = 1, kDecBegin, kDecEnd, kDecNest, kDecSubmit, kDecFence, kDecPresent, kDecWrap, kDecBindRun };
 struct DecodeRing {
     static constexpr u64 kWords = 1 << 20; // 8 MB: ~10 frames of calls
     std::unique_ptr<u64[]> buf{new u64[kWords]};
@@ -1714,12 +1714,14 @@ void DecodePublish(DecodeRing& r) {
         r.wake_consumer.notify_one();
     }
 }
+void FlushBindRunLocked(DecodeRing& r); // (BindTexture run collected on the game's thread, below)
 // Waits (game's thread) until the decode thread has processed everything queued. False after kDecodeTimeout.
 bool DecodeDrain() {
     DecodeRing& r = Ring();
     u64 h;
     {
         PushLock pl(g_push_lock);
+        FlushBindRunLocked(r);
         DecodePublish(r);
         h = r.written;
     }
@@ -1761,9 +1763,41 @@ int DecodeMode() {
 bool DecodeVerifying() {
     return DecodeMode() == 2;
 }
+// BindTexture calls in a row (same command buffer, stage and slot within 32 bits) collected on the game's thread and
+// queued as one kDecBindRun entry: cb, the first bind's x[4..7] and float registers (what the direct recorder keeps
+// of them), then (stage << 32 | slot, handle) per bind. Under g_push_lock; flushed before anything else is queued.
+struct BindRun {
+    u64 cb = 0;
+    int fn = -1;
+    bool replay = false;
+    u32 n = 0;                 // binds
+    u64 head[7]{};             // cb, x[4..7], v01, v23 of the first bind
+    u64 pairs[2 * 256]{};
+};
+BindRun g_bind_run;
+bool DecodeRunsOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("MUA3_NVN_DECODE_RUNS");
+        return !(e && *e == '0');
+    }();
+    return on;
+}
+void DecodePushLocked(DecodeRing& r, u64 op, u64 fn, bool replay, const u64* a, u32 na, const u64* b, u32 nb);
+void FlushBindRunLocked(DecodeRing& r) {
+    BindRun& br = g_bind_run;
+    if (!br.n)
+        return;
+    const u32 n = br.n;
+    br.n = 0;
+    DecodePushLocked(r, kDecBindRun, u64(br.fn), br.replay, br.head, 7, br.pairs, 2 * n);
+}
 void DecodePush(u64 op, u64 fn, bool replay, const u64* a, u32 na, const u64* b = nullptr, u32 nb = 0) {
     DecodeRing& r = Ring();
     PushLock pl(g_push_lock);
+    FlushBindRunLocked(r);
+    DecodePushLocked(r, op, fn, replay, a, na, b, nb);
+}
+void DecodePushLocked(DecodeRing& r, u64 op, u64 fn, bool replay, const u64* a, u32 na, const u64* b, u32 nb) {
     const u64 len = 1 + u64(na) + nb, h = r.written, pos = h % DecodeRing::kWords;
     const bool wrap = pos + len > DecodeRing::kWords;
     const u64 need = len + (wrap ? DecodeRing::kWords - pos : 0);
@@ -1810,9 +1844,28 @@ bool DecodeCommand(State& s, int fn, int mode) {
             DecodeFail("not draining");
         return false;
     }
+    const bool replay = g_sink.load() != nullptr;
+    if (g.tex_bind && (s.x[1] | s.x[2]) >> 32 == 0 && DecodeRunsOn()) {
+        DecodeRing& r = Ring();
+        PushLock pl(g_push_lock);
+        BindRun& br = g_bind_run;
+        if (br.n && (br.cb != s.x[0] || br.fn != fn || br.replay != replay || br.n == 256))
+            FlushBindRunLocked(r);
+        if (!br.n) {
+            br.cb = s.x[0], br.fn = fn, br.replay = replay;
+            br.head[0] = s.x[0];
+            for (int k = 0; k < 4; k++)
+                br.head[1 + k] = s.x[4 + k];
+            br.head[5] = u64(u32(s.v[0].lo)) | u64(u32(s.v[1].lo)) << 32;
+            br.head[6] = u64(u32(s.v[2].lo)) | u64(u32(s.v[3].lo)) << 32;
+        }
+        br.pairs[2 * br.n] = s.x[1] << 32 | s.x[2];
+        br.pairs[2 * br.n + 1] = s.x[3];
+        br.n++;
+        return mode == 1;
+    }
     u64 mem[256];
     u32 nm = 0;
-    const bool replay = g_sink.load() != nullptr;
     if (g.rts) {
         for (u64 i = 0; i < u32(s.x[1]) && i < 8; i++)
             mem[nm++] = recomp::Rd<u64>(s, s.x[2] + i * 8);
@@ -2061,6 +2114,14 @@ void DecodeEntry(DecodeCtx& d, u64 h, const u64* p) {
     switch (op) {
     case kDecCommand:
         return DecodeRecordCommand(rec, d, int(fn), replay, p, n, live);
+    case kDecBindRun: { // one BindTexture command per bind, as the game made them (the recorder merges the run)
+        u64 regs[10] = {p[0], 0, 0, 0, p[1], p[2], p[3], p[4], p[5], p[6]};
+        for (u32 i = 7; i + 1 < n; i += 2) {
+            regs[1] = p[i] >> 32, regs[2] = p[i] & 0xFFFFFFFFu, regs[3] = p[i + 1];
+            DecodeRecordCommand(rec, d, int(fn), replay, regs, 10, live);
+        }
+        return;
+    }
     case kDecBegin:
         return BeginRecord(rec, p[0]);
     case kDecEnd:
@@ -2098,10 +2159,14 @@ void DecodeLoop(DecodeRing& r) {
     for (;;) {
         u64 h = r.head.load(std::memory_order_acquire);
         if (t == h) {
-            // idle: spin briefly (the next call is usually microseconds away), then sleep until woken
-            for (int k = 0; k < 2000 && t == h; k++) {
+            // idle: spin a while by the clock (the next batch is usually well under 150 us away; waking a sleeping
+            // decode thread cost the game's render thread ~2%), then sleep until woken
+            const u64 spin_until = NowNs() + 150000;
+            for (int k = 0; t == h; k++) {
                 _mm_pause();
                 h = r.head.load(std::memory_order_acquire);
+                if ((k & 63) == 63 && NowNs() > spin_until)
+                    break;
             }
             if (t == h) {
                 std::unique_lock lk(r.mutex);
