@@ -215,7 +215,14 @@ struct DriverConstants {
 };
 
 // MUA3_PROFILE: time spent per Draw() section and bytes uploaded, logged every few seconds at Present.
+// Section times come from one frame in MUA3_PROFILE_EVERY (default 8): timing every draw cost the GPU thread ~9%.
 static const bool g_profile = std::getenv("MUA3_PROFILE") != nullptr;
+static const u32 g_prof_every = [] {
+    const char* e = std::getenv("MUA3_PROFILE_EVERY");
+    return e ? std::max(1, std::atoi(e)) : 8;
+}();
+static bool g_prof_timing = false; // this frame is timed
+static u32 g_prof_timed = 0;       // timed frames since the last report
 enum ProfSection { kProfShaders, kProfState, kProfIndex, kProfVertex, kProfCbufs, kProfTextures, kProfResources, kProfSubmit, kProfCount };
 static const char* const kProfNames[kProfCount] = {"shaders", "state", "index", "vertex", "cbufs", "textures", "other", "submit"};
 static u64 g_prof_ns[kProfCount], g_prof_vb_bytes, g_prof_cb_bytes, g_prof_ib_count, g_prof_draws;
@@ -253,13 +260,24 @@ CpuSpan::~CpuSpan() {
         *acc += ProfNow() - t0;
 }
 static void Prof(int section) {
-    if (!g_profile)
+    if (!g_prof_timing)
         return;
     const u64 now = ProfNow();
     if (g_prof_section >= 0)
         g_prof_ns[g_prof_section] += now - g_prof_last;
     g_prof_section = section;
     g_prof_last = now;
+}
+
+// At Present: ends this frame's timing and picks whether the next frame is timed.
+static void ProfFrame(u64 frame) {
+    if (!g_profile)
+        return;
+    if (g_prof_timing && g_prof_section >= 0)
+        g_prof_ns[g_prof_section] += ProfNow() - g_prof_last;
+    g_prof_section = -1;
+    g_prof_timing = frame % g_prof_every == 0;
+    g_prof_timed += g_prof_timing;
 }
 
 // Debug switches that change depth state per pixel shader: those draws can't reuse the last state object.
@@ -3167,10 +3185,12 @@ void D3D11Renderer::Draw() {
             u32 tsc[8];
             g.ReadGpu(tsc_base + u64(tsc_idx) * 32, tsc, 32);
             u32 swz = 0xB1A;
-            const u64 tg0 = g_profile ? ProfNow() : 0;
+            const u64 tg0 = g_prof_timing ? ProfNow() : 0;
             srvs[t.slot] = textures_->Get(tic, t, swz);
+            if (g_prof_timing)
+                g_prof_tex_get_ns += ProfNow() - tg0;
             if (g_profile)
-                g_prof_tex_get_ns += ProfNow() - tg0, g_prof_tex_calls++;
+                g_prof_tex_calls++;
             if (frame_counter_ - recent_wanted_ <= 120)
                 NoteTexture(srvs[t.slot], tic.Address(), tic.Width(), tic.Height(), tic.Format(),
                             FindSurfaceByGpu(tic.Address()) != nullptr);
@@ -3182,10 +3202,10 @@ void D3D11Renderer::Draw() {
                          FindSurfaceByGpu(tic.Address()) ? "(render target)" : "");
             drv.swizzle[t.slot][0] = swz;
             drv.swizzle[t.slot][1] = TextureScale(tic.Address(), t.dim == shader::TexDim::Tex2D && !t.array);
-            const u64 ts0 = g_profile ? ProfNow() : 0;
+            const u64 ts0 = g_prof_timing ? ProfNow() : 0;
             if (t.sampler < 16)
                 smps[t.sampler] = textures_->GetSampler(tsc, t.shadow);
-            if (g_profile)
+            if (g_prof_timing)
                 g_prof_tex_samp_ns += ProfNow() - ts0;
         }
         StageBinds& sb = binds_[is_vs ? 0 : 1];
@@ -3357,10 +3377,12 @@ void D3D11Renderer::Present(const PresentInfo& p) {
     // Per frame, draws may wait this long for shaders the game just asked for: a bytecode cache hit makes it, a real
     // compile (FXC, tens to hundreds of ms) leaves the draw out for a frame or two instead of freezing the game.
     shader_wait_ns_ = kShaderWaitBudgetNs;
+    ProfFrame(frame_counter_);
     if (g_profile && frame_counter_ % 150 == 0) {
         std::string line;
+        const double timed = std::max<u32>(g_prof_timed - g_prof_timing, 1); // (the frame just picked has not run)
         for (int i = 0; i < kProfCount; i++)
-            line += fmt::format(" {} {:.2f}", kProfNames[i], g_prof_ns[i] / 150e6);
+            line += fmt::format(" {} {:.2f}", kProfNames[i], g_prof_ns[i] / timed / 1e6);
         static u64 last_reuploads = 0;
         LOG_INFO("Profile", "per frame (ms):{} | draws {} vb {:.1f} MB cb {:.1f} MB indices {}k | tex reuploads {:.1f} geom {}/{}",
                  line, g_prof_draws / 150, g_prof_vb_bytes / 150 / 1048576.0, g_prof_cb_bytes / 150 / 1048576.0,
@@ -3395,13 +3417,14 @@ void D3D11Renderer::Present(const PresentInfo& p) {
         static u64 last_uploads = 0, last_unchanged = 0;
         LOG_INFO("Profile", "  textures: {} lookups/frame, Get {:.2f} ms, samplers {:.2f} ms, uploads {:.1f}/frame, "
                             "CPU-written but unchanged {:.1f}/frame",
-                 g_prof_tex_calls / 150, g_prof_tex_get_ns / 150e6, g_prof_tex_samp_ns / 150e6,
+                 g_prof_tex_calls / 150, g_prof_tex_get_ns / timed / 1e6, g_prof_tex_samp_ns / timed / 1e6,
                  (textures_->uploads - last_uploads) / 150.0, (textures_->unchanged_rewrites - last_unchanged) / 150.0);
         last_uploads = textures_->uploads;
         last_unchanged = textures_->unchanged_rewrites;
         g_prof_tex_get_ns = g_prof_tex_samp_ns = g_prof_tex_calls = 0;
         std::memset(g_prof_ns, 0, sizeof(g_prof_ns));
         std::memset(g_hitch_prof, 0, sizeof(g_hitch_prof));
+        g_prof_timed = g_prof_timing; // (the frame about to run counts toward the next report)
         g_prof_vb_bytes = g_prof_cb_bytes = g_prof_ib_count = g_prof_draws = 0;
     }
     // Copy this frame's compute results back (applied to guest memory once the copies land, a frame or so later;
