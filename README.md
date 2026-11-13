@@ -83,6 +83,14 @@ src/
 scripts/     fetch-deps.sh, recomp_libbuild.py, make_release.ps1 (the release package), bench.ps1, make_icon.ps1
 ```
 
+## Support the project
+
+If you enjoy the port and want to support its development:
+
+- [Patreon](https://www.patreon.com/c/KaikoClanworth)
+- [Ko-fi](https://ko-fi.com/kaikoclanworth)
+- [PayPal](https://www.paypal.com/donate/?hosted_button_id=MS4C2WC38N3W2)
+
 ## Legal
 
 *Marvel Ultimate Alliance 3: The Black Order* is © MARVEL, © Nintendo, developed by KOEI TECMO GAMES. This is an
