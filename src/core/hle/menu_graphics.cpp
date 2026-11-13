@@ -18,6 +18,11 @@
 // is refilled, tab 3's header lights up), A steps a row to its next value. Every change is applied at once
 // (core::System::UpdateConfig): what can change while the game runs changes now, the rest is saved to mua3.ini for
 // the next start and the row says so. Closing puts the tab back and leaves the game's own settings as they were.
+//
+// The way in: the CONTROLS tab (tab 2) of every OPTIONS screen ends with a GRAPHICS row (a button row: tab 2's row
+// table gets a 4th entry, its 4th row type is already 0). A on it turns the screen into our pages in place; B on our
+// pages comes back to CONTROLS. The title screen's GRAPHICS item opens an OPTIONS screen straight on our pages
+// (OpenNext), and there B closes the screen.
 #include "core/hle/menu_graphics.h"
 
 #include <algorithm>
@@ -50,6 +55,8 @@ constexpr u64 kDefault = 0x7c7eb0;                    // vfunc +0x1d8 (this): Y,
 constexpr u64 kShowValue = 0x7c8970;                  // (this, row): draws a row's value
 constexpr u64 kFillRows = 0x7c5900;                   // (this): lays out the current tab's rows
 constexpr u64 kRowsDone = 0x7c5d80;                   // (this): what opening does after laying out the rows
+constexpr u64 kBack = 0x7c7e40;                       // vfunc +0x230 (this): B, closes the screen
+constexpr u64 kTabNames = 0x7c5370;                   // (this): the tab headers' texts (GetString)
 constexpr u64 kPlayAnim = 0x5e4d00;                   // (animation helper, animation, 0)
 constexpr u64 kPane = 0x5f39d0;                       // (layout, pane index) -> pane
 constexpr u64 kSetVisible = 0x12f5d40;                // (pane, visible)
@@ -59,7 +66,7 @@ constexpr u64 kRowCounts = 0x1a634b2;                 // u16[5]
 constexpr u64 kRowTypes = 0x1a634ec;                  // u32[] tab 2 (the next table, the language row's, is tab 0's)
 constexpr u64 kTabAnims = 0x1a634a8, kTabOffAnims = 0x1a634ad; // u8[5]: tab_0N_ON / tab_0N_OFF animations
 constexpr u64 kPlaySound = 0x563690, kSoundGot = 0x2188cc0; // (sound player, id): what L / R play
-constexpr u32 kSoundTab = 0xba0cf4d2;
+constexpr u32 kSoundTab = 0xba0cf4d2, kSoundBack = 0x60d8ae5e;
 constexpr u32 kTab = 2;                                 // the tab whose data slot shows our pages
 constexpr u32 kPageTabs[2] = {2, 3};                    // the header each page lights up
 // options object layout
@@ -117,12 +124,16 @@ Page& Cur() { return g_pages[g_cur]; }
 std::mutex g_mutex;
 std::atomic<bool> g_open_next{false}, g_active{false};
 u64 g_page = 0; // the options object showing the page
+bool g_from_options = false; // the page was opened from the GRAPHICS row: B goes back to CONTROLS
 u64 g_saved_rows = 0, g_saved_values = 0;
+constexpr u32 kEntryRow = 3; // CONTROLS' GRAPHICS row
+u32 g_entry_info = 0;        // its info line
+u64 g_entry_rows = 0;        // CONTROLS' row table with the GRAPHICS row (guest)
 u16 g_saved_count = 0;
 u32 g_saved_types[kMaxRows]{};
 
 enum Hook {
-    kHInit, kHStore, kHCount, kHTabPrev, kHTabNext, kHDecide, kHDefault, kHString, kHookCount
+    kHInit, kHStore, kHCount, kHTabPrev, kHTabNext, kHDecide, kHDefault, kHString, kHBack, kHookCount
 };
 cpu::FunctionOverride g_hooks[kHookCount];
 
@@ -411,12 +422,8 @@ void HideOthers(State& s, u64 opt) {
                 Hide(s, tabs, kTabPanes + kPanesPerTab * t + p);
 }
 
-// Opening the OPTIONS screen: as the GRAPHICS page if asked for.
-void OptInit(State& s) {
-    const u64 opt = s.x[0];
-    RunOriginal(s, g_hooks[kHInit]);
-    if (!g_open_next.exchange(false))
-        return;
+// Our pages in the screen's tab 2 slot (the screen is open; from_options: from the GRAPHICS row).
+void EnterPage(State& s, u64 opt, bool from_options) {
     {
         std::lock_guard lk(g_mutex);
         if (g_active) // not closed the usual way: the tables still hold the page
@@ -429,31 +436,99 @@ void OptInit(State& s) {
         g_cur = 0;
         Show(Cur());
         g_page = opt;
+        g_from_options = from_options;
         g_active = true;
     }
     // show tab 2 (named GRAPHICS by the string hook) next to tab 3 (PC SETTINGS)
     g_mem->Write<u32>(opt + kObjTab, kTab);
+    if (from_options) { // the headers were named at opening: again, now as our pages
+        GuestCall(s, g_main + kTabNames, {opt});
+        if (const u64 sound = R64(g_main + kSoundGot))
+            GuestCall(s, g_main + kPlaySound, {sound + 0x168, kSoundTab});
+    }
     GuestCall(s, g_main + kPlayAnim, {opt + kObjAnims, g_mem->Read<u8>(g_main + kTabAnims + kPageTabs[0]), 0});
     GuestCall(s, g_main + kFillRows, {opt});
     GuestCall(s, g_main + kRowsDone, {opt});
     HideOthers(s, opt);
-    LOG_INFO("Menu", "Graphics page opened");
+    LOG_INFO("Menu", "Graphics page opened{}", from_options ? " from OPTIONS" : "");
+}
+
+// Our pages' data out of tab 2's slot again (g_mutex held).
+void PutTabBack() {
+    Apply(true);
+    W64(g_main + kRowsGot, g_saved_rows);
+    W64(g_main + kValuesGot, g_saved_values);
+    g_mem->Write<u16>(g_main + kRowCounts + 2 * kTab, g_saved_count);
+    for (u32 i = 0; i < kMaxRows; i++)
+        W32(g_main + kRowTypes + 4 * i, g_saved_types[i]);
+    g_active = false;
+    g_page = 0;
+    g_from_options = false;
+}
+
+// CONTROLS gets the GRAPHICS row (its row type, 0 = button, is already there): its row table with one more entry
+// and a row count of 4, once the screen is open (the opening sees the game's 3 rows
+// and closing puts them back). g_mutex held, our pages not in tab 2's slot.
+u64 g_game_rows = 0; // CONTROLS' own row table
+void RemoveEntryRow() {
+    if (g_entry_rows && R64(g_main + kRowsGot) == g_entry_rows) {
+        W64(g_main + kRowsGot, g_game_rows);
+        g_mem->Write<u16>(g_main + kRowCounts + 2 * kTab, u16(kEntryRow));
+    }
+}
+void AddEntryRow() {
+    const u64 rows = R64(g_main + kRowsGot);
+    const u16 n = g_mem->Read<u16>(g_main + kRowCounts + 2 * kTab);
+    if (rows == g_entry_rows && n == kEntryRow + 1)
+        return;
+    if (n != kEntryRow || !rows) {
+        LOG_WARN("Menu", "CONTROLS has {} rows ({:#x}): no GRAPHICS row", n, rows);
+        return;
+    }
+    g_game_rows = rows;
+    if (!g_entry_rows) {
+        g_entry_rows = Alloc(16 * (kEntryRow + 1));
+        u8 copy[16 * kEntryRow];
+        g_mem->ReadBlock(rows, copy, sizeof(copy));
+        g_mem->WriteBlock(g_entry_rows, copy, sizeof(copy));
+        W32(g_entry_rows + 16 * kEntryRow, kStrGraphics);
+        W32(g_entry_rows + 16 * kEntryRow + 4, g_entry_info);
+        // a button row shows its one choice (BUTTON SETTINGS' CONFIGURE): the same
+        W64(g_entry_rows + 16 * kEntryRow + 8, R64(rows + 16 * (kEntryRow - 1) + 8));
+        LOG_INFO("Menu", "GRAPHICS row added to OPTIONS > CONTROLS");
+    }
+    W64(g_main + kRowsGot, g_entry_rows);
+    g_mem->Write<u16>(g_main + kRowCounts + 2 * kTab, u16(kEntryRow + 1));
+}
+
+// Opening the OPTIONS screen: as the GRAPHICS page if asked for.
+void OptInit(State& s) {
+    const u64 opt = s.x[0];
+    {
+        std::lock_guard lk(g_mutex);
+        if (!g_active)
+            RemoveEntryRow(); // a screen closed without the store: the game's table again
+    }
+    RunOriginal(s, g_hooks[kHInit]);
+    {
+        std::lock_guard lk(g_mutex);
+        if (!g_active)
+            AddEntryRow();
+    }
+    if (g_open_next.exchange(false))
+        EnterPage(s, opt, false);
 }
 
 // Closing: the page puts the tab back instead of storing the game's settings.
 void OptStore(State& s) {
     {
         std::lock_guard lk(g_mutex);
-        if (!g_active || s.x[0] != g_page)
+        if (!g_active || s.x[0] != g_page) {
+            RemoveEntryRow();
             return RunOriginal(s, g_hooks[kHStore]);
-        Apply(true);
-        W64(g_main + kRowsGot, g_saved_rows);
-        W64(g_main + kValuesGot, g_saved_values);
-        g_mem->Write<u16>(g_main + kRowCounts + 2 * kTab, g_saved_count);
-        for (u32 i = 0; i < kMaxRows; i++)
-            W32(g_main + kRowTypes + 4 * i, g_saved_types[i]);
-        g_active = false;
-        g_page = 0;
+        }
+        PutTabBack();
+        RemoveEntryRow();
     }
     LOG_INFO("Menu", "Graphics page closed");
     GuestReturn(s, 0);
@@ -502,13 +577,24 @@ void SwitchPage(State& s, Hook h) {
 }
 void TabPrev(State& s) { SwitchPage(s, kHTabPrev); }
 void TabNext(State& s) { SwitchPage(s, kHTabNext); }
-// A on the page: the row's next value, wrapping round (like right).
+u32 CursorRow(State& s, u64 opt) {
+    const u64 cursor = R64(opt + 0xb0);
+    return cursor ? u32(GuestCall(s, R64(R64(cursor) + 0x58), {cursor})) : ~0u;
+}
+bool OnEntryRow(State& s, u64 opt) {
+    return !OnPage(opt) && R32(opt + kObjTab) == kTab && CursorRow(s, opt) == kEntryRow;
+}
+
+// A on the GRAPHICS row: our pages, in place. A on our pages: the row's next value, wrapping round (like right).
 void Decide(State& s) {
     const u64 opt = s.x[0];
-    if (!OnPage(opt))
-        return RunOriginal(s, g_hooks[kHDecide]);
-    const u64 cursor = R64(opt + 0xb0);
-    const u32 row = cursor ? u32(GuestCall(s, R64(R64(cursor) + 0x58), {cursor})) : ~0u;
+    if (!OnPage(opt)) {
+        if (!OnEntryRow(s, opt) || R32(opt + kObjState) != kStateIdle)
+            return RunOriginal(s, g_hooks[kHDecide]);
+        EnterPage(s, opt, true);
+        return GuestReturn(s, 0);
+    }
+    const u32 row = CursorRow(s, opt);
     if (row < Cur().rows.size()) {
         u8 v[16];
         g_mem->ReadBlock(Cur().values, v, sizeof(v));
@@ -516,6 +602,38 @@ void Decide(State& s) {
         g_mem->WriteBlock(Cur().values, v, sizeof(v));
         GuestCall(s, g_main + kShowValue, {opt, row});
     }
+    GuestReturn(s, 0);
+}
+
+// B on our pages opened from the GRAPHICS row: back to CONTROLS (the cursor on its first row, as on a tab switch).
+void Back(State& s) {
+    const u64 opt = s.x[0];
+    if (!OnPage(opt) || !g_from_options)
+        return RunOriginal(s, g_hooks[kHBack]);
+    if (R32(opt + kObjState) != kStateIdle)
+        return GuestReturn(s, 0);
+    const int cur = g_cur;
+    {
+        std::lock_guard lk(g_mutex);
+        PutTabBack();
+    }
+    if (const u64 sound = R64(g_main + kSoundGot))
+        GuestCall(s, g_main + kPlaySound, {sound + 0x168, kSoundBack});
+    const u64 tabs = R64(opt + kObjTabLayout);
+    for (u32 t = 0; t < 5; t++) // the headers HideOthers hid
+        if (t != kPageTabs[0] && t != kPageTabs[1])
+            for (u32 p = 0; p < kPanesPerTab; p++)
+                if (const u64 pane = tabs ? GuestCall(s, g_main + kPane, {tabs, kTabPanes + kPanesPerTab * t + p}) : 0)
+                    GuestCall(s, g_main + kSetVisible, {pane, 1});
+    if (cur == 1) { // PC SETTINGS lit tab 3's header
+        GuestCall(s, g_main + kPlayAnim, {opt + kObjAnims, g_mem->Read<u8>(g_main + kTabOffAnims + kPageTabs[1]), 0});
+        GuestCall(s, g_main + kPlayAnim, {opt + kObjAnims, g_mem->Read<u8>(g_main + kTabAnims + kTab), 0});
+    }
+    GuestCall(s, g_main + kTabNames, {opt}); // CONTROLS and SOUND again
+    g_mem->Write<u32>(opt + kObjTab, kTab);
+    GuestCall(s, g_main + kFillRows, {opt});
+    GuestCall(s, g_main + kRowsDone, {opt});
+    LOG_INFO("Menu", "Graphics page closed, back to OPTIONS");
     GuestReturn(s, 0);
 }
 
@@ -533,10 +651,12 @@ void Watch() {
 // Y (DEFAULT) on the page: the row goes back to the launcher's default.
 void Default(State& s) {
     const u64 opt = s.x[0];
-    if (!OnPage(opt))
+    if (!OnPage(opt)) {
+        if (OnEntryRow(s, opt)) // nothing to reset on the GRAPHICS row
+            return GuestReturn(s, 0);
         return RunOriginal(s, g_hooks[kHDefault]);
-    const u64 cursor = R64(opt + 0xb0);
-    const u32 row = cursor ? u32(GuestCall(s, R64(R64(cursor) + 0x58), {cursor})) : ~0u;
+    }
+    const u32 row = CursorRow(s, opt);
     if (row < Cur().rows.size()) {
         const core::Config now = PageConfig();
         core::Config defaults;
@@ -583,7 +703,7 @@ void Install(core::Memory& mem, kernel::Kernel& kernel, u64 main_base) {
         {kTabNext, 0xa9bd57f6},   {kValuePrev, 0xa9bc5ff8}, {kValueNext, 0xa9bc5ff8},   {kDecide, 0xf81c0ff7},
         {kDefault, 0xa9bd57f6},   {kShowValue, 0xfc1b0fe8},
         {kFillRows, 0xfc170fec},  {kRowsDone, 0xfc1c0fea},  {kGetString, 0x2a0103e8},  {kRowCounts + 4, 0x40003},
-        {kRowTypes, 1},
+        {kRowTypes, 1},           {kRowTypes + 4 * kEntryRow, 0}, {kBack, 0xf81e0ff3}, {kTabNames, 0xfc1a0fe8},
     };
     for (auto [off, word] : kExpect)
         if (!mem.IsValid(main_base + off, 4) || mem.Read<u32>(main_base + off) != word) {
@@ -593,9 +713,11 @@ void Install(core::Memory& mem, kernel::Kernel& kernel, u64 main_base) {
     g_mem = &mem;
     g_main = main_base;
     BuildPages();
+    g_entry_info = Text(u"Display mode, resolution, frame rate and anti-aliasing. R: PC SETTINGS.");
     const std::pair<u64, void (*)(State&)> hooks[kHookCount] = {
         {kOptInit, OptInit},     {kOptStore, OptStore},   {kChoiceCount, ChoiceCount}, {kTabPrev, TabPrev},
         {kTabNext, TabNext},     {kDecide, Decide},       {kDefault, Default},         {kGetString, GetString},
+        {kBack, Back},
     };
     for (int i = 0; i < kHookCount; i++) {
         g_hooks[i].pc = main_base + hooks[i].first;

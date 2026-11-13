@@ -169,25 +169,18 @@ characters the game's fonts already contain); OKAY closes the game cleanly, CANC
 With `MUA3_PAUSE_QUIT=1` the pause menu also gets a QUIT GAME (a borrowed slot, as above; the game's own label).
 The SYSTEM submenu's QUIT GAME still returns to the title screen. `MUA3_MENU_MODS=0` turns all extensions off.
 
-## GRAPHICS in the pause and S.H.I.E.L.D. point menus
+## GRAPHICS in OPTIONS (pause and S.H.I.E.L.D. point menus)
 
-The pause menu's SYSTEM submenu (OPTIONS, TIPS, QUIT GAME; SAVE and LOAD are hidden there) gets GRAPHICS right
-after OPTIONS: Refresh borrows the hidden SAVE or LOAD slot and moves its system-list entry (+0xe0) after OPTIONS'
-(then the enabled flags at +0x198 again); ExecuteItem opens OPTIONS (slot 8) flagged for the GRAPHICS page, with its
-L/R to PC SETTINGS.
+The pause and S.H.I.E.L.D. point menus keep the game's own SYSTEM lists (pause: OPTIONS, TIPS, QUIT GAME;
+S.H.I.E.L.D. point: SAVE, LOAD, OPTIONS, TIPS, QUIT GAME). GRAPHICS is reached from OPTIONS instead: the CONTROLS tab
+(tab 2) ends with a **GRAPHICS** row (see "GRAPHICS" below).
 
-In the S.H.I.E.L.D. point menu (+0x17c = 0) SAVE, LOAD, OPTIONS, TUTORIAL and QUIT GAME fill all 5 submenu
-positions. A 6th position is out of reach: every cursor function bounds the position by 4 before it looks up the
-cursor animation (table main+0x1a3cac8 = `cursor_pos_01..06`, `system_cursor_pos_01..05`; sites 0x6dfc30, 0x6e01e4,
-0x6e3668, 0x6e4630, ...), and the pane table main+0x1a3cb0c has 5 entries. There TIPS (slot 9, also in the pause
-menu) is borrowed instead: SAVE, LOAD, OPTIONS, GRAPHICS, QUIT GAME. `MUA3_TEST_SHIELD_MENU=1` (test aid) builds the
+Why not a SYSTEM item: at a S.H.I.E.L.D. point (+0x17c = 0) the 5 submenu positions are full, and a 6th is out of
+reach: every cursor function bounds the position by 4 before it looks up the cursor animation (table main+0x1a3cac8 =
+`cursor_pos_01..06`, `system_cursor_pos_01..05`; sites 0x6dfc30, 0x6e01e4, 0x6e3668, 0x6e4630, ...), and the pane
+table main+0x1a3cb0c has 5 entries. (In the pause menu a hidden SAVE / LOAD slot could be borrowed; `RenderSystemLabel`
+in menu_label.cpp still draws a label in the SYSTEM submenu's style.) `MUA3_TEST_SHIELD_MENU=1` (test aid) builds the
 pause menu as the S.H.I.E.L.D. point menu.
-
-The label: `01_savepoint_parts` has no unused texture, but GText_HERO_gray_out and GText_INFINITY_MISSION_gray_out
-(740x80) are never shown by this class (HERO's state is main+0x728870, INFINITY's main+0x728840 or a flag: shown or
-hidden, never grey). Every language's pack gets the GRAPHICS label (the title menu's words) drawn over them in the
-SYSTEM submenu's style (`RenderSystemLabel`: light upright capitals as on the 560x44 GText_option, white with a
-thin shadow / yellow when selected, stretched to 740x80, which the submenu's label pane shows at 560x44).
 
 ## Menu auto-repeat (all menus)
 
@@ -265,5 +258,12 @@ The title screen's SYSTEM submenu (SAVE, LOAD, OPTIONS, TIPS, GALLERY; title men
   are scaled for its duration: speed% at every tilt; on top of the CAMERA tab's CONTROL SENSITIVITY), CONTROLLER TYPE (XInput / SDL) and AUDIO OUTPUT (XAudio2 / SDL / off), which apply after a
   restart. No language row: the INTERFACE tab's LANGUAGE SELECTION is the game's own. Hidden test instances apply
   volume changes to the ini only (they stay muted).
+
+- **From OPTIONS**: tab 2 (CONTROLS) gets a 4th row, GRAPHICS (the game's own string 0x36c4b2): its row table
+  (GOT main+0x218bd40) is copied with one more entry and its row count raised to 4; its row type (main+0x1a634ec
+  + 12) is already 0, a button. A on it (Decide, vfunc +0x228) turns the open screen into the pages in place (the
+  headers named again through main+0x7c5370, the tab sound); B there (vfunc +0x230, main+0x7c7e40) puts tab 2 back,
+  shows the other headers again and lays out CONTROLS (cursor on its first row);
+  closing OPTIONS then stores the game's settings as usual. Opened from the title screen's GRAPHICS item, B closes.
 
 `MUA3_GRAPHICS_TEST=1` (test aid) opens the first OPTIONS screen as the GRAPHICS page.
