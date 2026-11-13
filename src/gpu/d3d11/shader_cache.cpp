@@ -36,7 +36,7 @@ const char* StageTarget(shader::Stage st) {
 } // namespace
 
 
-ShaderCache::ShaderCache(ID3D11Device* dev, unsigned build_workers) : dev_(dev) {
+ShaderCache::ShaderCache(ID3D11Device* dev, unsigned build_workers) : dev_(dev), setup_(build_workers != 0) {
     LOG_INFO("Shader", "opening the shader cache");
     std::error_code ec;
     fs::create_directories(dump_dir_, ec);
@@ -68,6 +68,9 @@ ShaderCache::~ShaderCache() {
     rewarm_stop_ = true;
     if (rewarm_.joinable())
         rewarm_.join();
+    ahead_stop_ = true;
+    if (ahead_.joinable())
+        ahead_.join();
     if (pack_out_)
         std::fclose(pack_out_);
     if (pack_)
@@ -693,6 +696,11 @@ bool ShaderCache::CreateObject(HostShader& s, const std::vector<u8>& blob, std::
 void ShaderCache::Realize(HostShader* s) {
     if (s->created.load(std::memory_order_acquire))
         return;
+    if (s->creating.exchange(true, std::memory_order_acq_rel)) { // CreateObjectsAhead is making it right now
+        while (!s->created.load(std::memory_order_acquire))
+            std::this_thread::yield();
+        return;
+    }
     std::string err;
     const auto r0 = std::chrono::steady_clock::now();
     const bool made = CreateObject(*s, s->dxbc, err);
@@ -705,6 +713,35 @@ void ShaderCache::Realize(HostShader* s) {
     realized++;
     live_objects++;
     s->created.store(true, std::memory_order_release);
+}
+
+void ShaderCache::CreateObjectsAhead(std::vector<HostShader*> list) {
+    SetThreadDescription(GetCurrentThread(), L"ShaderObjectsAhead");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    const auto t0 = std::chrono::steady_clock::now();
+    u32 n = 0;
+    for (HostShader* s : list) {
+        if (ahead_stop_)
+            return;
+        // (the GPU thread may have made it at a draw meanwhile; `creating` keeps the two from both making it)
+        if (s->created.load(std::memory_order_acquire) || s->creating.exchange(true, std::memory_order_acq_rel))
+            continue;
+        std::string err;
+        if (!CreateObject(*s, s->dxbc, err)) {
+            LOG_ERROR("Shader", "{} {:016x}: {}", StageTag(s->stage), s->hash, err);
+            s->ok = false;
+            s->state = HostShader::Failed;
+        }
+        live_objects++;
+        created_ahead++;
+        s->created.store(true, std::memory_order_release);
+        // ~0.2 ms each from the driver's disk cache: a short pause now and then keeps the driver's locks free for
+        // the GPU thread
+        if (++n % 8 == 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    LOG_INFO("Shader", "driver objects created ahead: {} of the {} shaders drawn in earlier sessions in {:.2f} s", n,
+             list.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
 }
 
 // Every vertex / pixel shader's driver object created once and released: the driver compiles each in the background
@@ -1224,7 +1261,8 @@ void ShaderCache::Prewarm() {
         std::unordered_set<u64> seen;
         for (std::string line; std::getline(in, line);) {
             const u64 h = std::strtoull(line.c_str(), nullptr, 16);
-            ordered_.insert(h);
+            if (ordered_.insert(h).second)
+                drawn_order_.push_back(h);
             if (files.count(h) && seen.insert(h).second)
                 order.push_back(h);
         }
@@ -1298,9 +1336,14 @@ void ShaderCache::Tick() {
         Prewarm();
     const u32 now = ++frame;
     Anticipate();
-    if (now % 600 == 0) { // every ~5 s: release driver objects no draw has bound for a minute
+    // Every 600 frames: above kLiveObjects, release driver objects no draw has bound for 3,600 frames. (Not below
+    // it: at 220 fps a menu passes 3,600 frames in 16 s, and coming back recreated 75-85 objects in one frame.)
+    constexpr u32 kLiveObjects = 1536; // ~300 MB of driver memory
+    if (now % 600 == 0) {
         u32 n = 0;
         for (auto& [hash, sp] : shaders_) {
+            if (live_objects - n <= kLiveObjects)
+                break;
             HostShader& s = *sp;
             if (!s.created || s.state != HostShader::Ready || s.dxbc.empty() || now - s.last_used < 3600 ||
                 s.stage == shader::Stage::Compute)
@@ -1308,13 +1351,14 @@ void ShaderCache::Tick() {
             s.vs.Reset();
             s.ps.Reset();
             s.created = false;
+            s.creating = false;
             n++;
         }
         released += n;
         live_objects -= n;
         if (now % 6000 == 0 || n)
-            LOG_INFO("Shader", "shader objects: {} live, {} created by draws so far, {} released as unused", live_objects,
-                     realized.load(), released);
+            LOG_INFO("Shader", "shader objects: {} live, {} created by draws so far, {} ahead, {} released as unused",
+                     live_objects.load(), realized.load(), created_ahead.load(), released);
     }
     if (prewarm_reported_)
         return;
@@ -1338,6 +1382,26 @@ void ShaderCache::Tick() {
                            "{:.1f} s) of worker time",
                  shaders_.size(), s, failures.load(), cache_hits.load(), info_hits.load(), translate_ns / 1e9,
                  compile_ns / 1e9, create_ns / 1e9);
+        // the shaders earlier sessions drew (order.txt, in first-use order) and their integer variants
+        // (variants.txt): driver objects made now, off the GPU thread, at most kAheadObjects (~200 MB of driver
+        // memory; older caches list every program in order.txt)
+        if (!setup_ && !ahead_.joinable() && !std::getenv("MUA3_NO_OBJECTS_AHEAD")) {
+            constexpr size_t kAheadObjects = 1024;
+            std::vector<HostShader*> list;
+            auto take = [&](HostShader& s) {
+                if (list.size() < kAheadObjects && s.stage != shader::Stage::Compute &&
+                    s.state == HostShader::Ready && s.ok && !s.created && !s.dxbc.empty())
+                    list.push_back(&s);
+            };
+            for (auto& [hash, sp] : shaders_)
+                if (sp->is_variant)
+                    take(*sp);
+            for (const u64 hash : drawn_order_)
+                if (auto it = shaders_.find(hash); it != shaders_.end())
+                    take(*it->second);
+            drawn_order_ = {};
+            ahead_ = std::thread([this, list = std::move(list)]() mutable { CreateObjectsAhead(std::move(list)); });
+        }
     }
 }
 

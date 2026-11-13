@@ -27,10 +27,12 @@ struct HostShader {
     std::atomic<int> state{Pending};
     std::atomic<bool> claimed{false}; // a worker took it (urgent shaders can be queued twice)
     std::atomic<bool> slow{false};    // in the out-of-process FXC queue (minutes): draws don't wait for it
-    // The D3D object exists. Each one costs the driver ~2.8 MB, so cached bytecode nobody is waiting for is only
-    // loaded at prewarm; Draw creates the object at first use (Realize, ~0.2 ms) and objects unused for a while
-    // are released again (Tick), to be recreated from the bytecode kept in `dxbc`.
+    // The D3D object exists. Each one costs the driver ~0.2 MB (3,825 of them ~750 MB), so cached bytecode is only
+    // loaded at prewarm; the shaders drawn in earlier sessions get their objects from a background thread after
+    // the prewarm (CreateObjectsAhead), the rest at first use (Realize, ~0.2-1 ms on the GPU thread). Objects are
+    // released again (Tick) only above kLiveObjects, to be recreated from the bytecode kept in `dxbc`.
     std::atomic<bool> created{true};
+    std::atomic<bool> creating{false}; // a thread took the object's creation (cleared when it is released)
     u32 last_used = 0; // ShaderCache::frame when a draw last bound it (GPU thread)
     bool prewarm = false;             // queued by Prewarm (back of the queue) and not yet asked for by the game
     // Looked up because the game set it up, no draw has asked for it yet: a failure is logged at debug level only
@@ -113,7 +115,9 @@ public:
     u32 new_programs = 0, new_variants = 0; // first seen by a draw (not replayed by Prewarm): GPU thread
     u64 realize_ns = 0; // GPU thread time in Realize (driver shader creation)
     std::atomic<u32> realized{0};       // driver objects created by draws (the driver re-warm reads it too)
-    u32 released = 0, live_objects = 0; // driver objects released as unused / existing now
+    std::atomic<u32> created_ahead{0};  // driver objects created by CreateObjectsAhead
+    u32 released = 0;                   // driver objects released as unused
+    std::atomic<u32> live_objects{0};   // driver objects created by draws or ahead and existing now
 
 private:
     // urgent_only: serves only shaders the game has asked for (never the prewarm backlog), so a cold cache's
@@ -152,6 +156,7 @@ private:
     std::mutex hlsl_mutex_; // a base's HLSL (EnsureHlsl writes it; variants built on several workers copy it)
 
     ID3D11Device* dev_;
+    bool setup_ = false; // the setup's shader step (build_workers > 0)
     common::U64Map<std::unique_ptr<HostShader>> shaders_;
     fs::path dump_dir_ = "shader_dump";
     fs::path cache_dir_ = "shader_cache";
@@ -159,6 +164,7 @@ private:
     std::mutex mutex_;
     std::condition_variable cv_;
     std::unordered_set<u64> ordered_; // programs already listed in order.txt (first-use order for Prewarm)
+    std::vector<u64> drawn_order_;     // order.txt as read by Prewarm (CreateObjectsAhead's list)
     struct PackEntry {
         size_t offset = 0;
         u32 size = 0;
@@ -199,6 +205,12 @@ private:
     void DriverRewarm(std::vector<std::pair<size_t, u32>> blobs, size_t from, std::string version);
     std::thread rewarm_;
     std::atomic<bool> rewarm_stop_{false};
+    // After the prewarm: the driver objects of every shader drawn in an earlier session (order.txt, variants.txt),
+    // created on a low-priority thread, so a level's first frame and a return from a menu don't create dozens of
+    // them on the GPU thread (85 cost a 122 ms frame).
+    void CreateObjectsAhead(std::vector<HostShader*> list);
+    std::thread ahead_;
+    std::atomic<bool> ahead_stop_{false};
     std::deque<u64> anticipate_pending_;           // program addresses not looked up yet
     std::unordered_map<u64, u64> anticipate_seen_; // address -> hash of the header last looked up there
     u64 anticipate_taken_ = 0, anticipate_lookups_ = 0, anticipate_new_ = 0, anticipate_logged_ = 0;
