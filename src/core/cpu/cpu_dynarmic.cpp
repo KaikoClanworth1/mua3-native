@@ -1099,27 +1099,84 @@ u8* GuestPtr(State& s, u64 a) { return s.mem + a; }
 const char* GuestStr(State& s, u64 a) { return reinterpret_cast<const char*>(s.mem + a); }
 // A range outside the guest's address space would fault on the Switch; on the host it would scribble over our own
 // memory, so such calls do nothing (logged once).
-bool GuestRange(u64 a, u64 n, const char* what) {
-    if (a < core::layout::kSpaceEnd && n <= core::layout::kSpaceEnd - a)
-        return true;
+__declspec(noinline) bool GuestRangeBad(u64 a, u64 n, const char* what) {
     static std::atomic<int> logged{0};
     if (logged++ < 8)
         LOG_WARN("Recomp", "{}: guest range {:#x}+{:#x} outside the address space, skipped", what, a, n);
     return false;
 }
+// The check is inlined (the game makes very many tiny copies); only the failure is out of line.
+__forceinline bool GuestRange(u64 a, u64 n, const char* what) {
+    if (a < core::layout::kSpaceEnd && n <= core::layout::kSpaceEnd - a) [[likely]]
+        return true;
+    return GuestRangeBad(a, n, what);
+}
+// Copies of up to 64 bytes without a call: every load happens before any store, so overlapping ranges behave like
+// memmove. Returns false for longer copies.
+__forceinline bool SmallMove(u8* d, const u8* s, u64 n) {
+    if (n > 64)
+        return false;
+    if (n >= 16) {
+        if (n <= 32) {
+            const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s));
+            const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s + n - 16));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(d), a);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(d + n - 16), b);
+        } else {
+            const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s));
+            const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s + 16));
+            const __m128i c = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s + n - 32));
+            const __m128i e = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s + n - 16));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(d), a);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(d + 16), b);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(d + n - 32), c);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(d + n - 16), e);
+        }
+    } else if (n >= 8) {
+        u64 a, b;
+        std::memcpy(&a, s, 8);
+        std::memcpy(&b, s + n - 8, 8);
+        std::memcpy(d, &a, 8);
+        std::memcpy(d + n - 8, &b, 8);
+    } else if (n >= 4) {
+        u32 a, b;
+        std::memcpy(&a, s, 4);
+        std::memcpy(&b, s + n - 4, 4);
+        std::memcpy(d, &a, 4);
+        std::memcpy(d + n - 4, &b, 4);
+    } else if (n) {
+        const u8 a = s[0], b = s[n >> 1], c = s[n - 1];
+        d[0] = a;
+        d[n >> 1] = b;
+        d[n - 1] = c;
+    }
+    return true;
+}
+__forceinline void GuestMove(State& s, const char* what) {
+    const u64 dst = s.x[0], src = s.x[1], n = s.x[2];
+    if (GuestRange(dst, n, what) && GuestRange(src, n, what) && !SmallMove(s.mem + dst, s.mem + src, n))
+        std::memmove(s.mem + dst, s.mem + src, n);
+}
 } // namespace
 // Overlapping memcpy is undefined; memmove also covers callers that rely on the guest's forward copy.
-void Libc_memcpy(State& s) {
-    if (GuestRange(s.x[0], s.x[2], "memcpy") && GuestRange(s.x[1], s.x[2], "memcpy"))
-        std::memmove(GuestPtr(s, s.x[0]), GuestPtr(s, s.x[1]), s.x[2]);
-}
-void Libc_memmove(State& s) {
-    if (GuestRange(s.x[0], s.x[2], "memmove") && GuestRange(s.x[1], s.x[2], "memmove"))
-        std::memmove(GuestPtr(s, s.x[0]), GuestPtr(s, s.x[1]), s.x[2]);
-}
+void Libc_memcpy(State& s) { GuestMove(s, "memcpy"); }
+void Libc_memmove(State& s) { GuestMove(s, "memmove"); }
 void Libc_memset(State& s) {
-    if (GuestRange(s.x[0], s.x[2], "memset"))
-        std::memset(GuestPtr(s, s.x[0]), int(u8(s.x[1])), s.x[2]);
+    const u64 dst = s.x[0], n = s.x[2];
+    if (!GuestRange(dst, n, "memset"))
+        return;
+    u8* d = s.mem + dst;
+    if (n <= 32 && n >= 8) {
+        const u64 v = 0x0101010101010101ull * u8(s.x[1]);
+        std::memcpy(d, &v, 8);
+        std::memcpy(d + n - 8, &v, 8);
+        if (n > 16) {
+            std::memcpy(d + 8, &v, 8);
+            std::memcpy(d + n - 16, &v, 8);
+        }
+        return;
+    }
+    std::memset(d, int(u8(s.x[1])), n);
 }
 void Libc_memcmp(State& s) {
     const u8 *a = GuestPtr(s, s.x[0]), *b = GuestPtr(s, s.x[1]);
