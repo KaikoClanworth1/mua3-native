@@ -169,12 +169,19 @@ characters the game's fonts already contain); OKAY closes the game cleanly, CANC
 With `MUA3_PAUSE_QUIT=1` the pause menu also gets a QUIT GAME (a borrowed slot, as above; the game's own label).
 The SYSTEM submenu's QUIT GAME still returns to the title screen. `MUA3_MENU_MODS=0` turns all extensions off.
 
-## GRAPHICS in the pause menu
+## GRAPHICS in the pause and S.H.I.E.L.D. point menus
 
 The pause menu's SYSTEM submenu (OPTIONS, TIPS, QUIT GAME; SAVE and LOAD are hidden there) gets GRAPHICS right
 after OPTIONS: Refresh borrows the hidden SAVE or LOAD slot and moves its system-list entry (+0xe0) after OPTIONS'
 (then the enabled flags at +0x198 again); ExecuteItem opens OPTIONS (slot 8) flagged for the GRAPHICS page, with its
-L/R to PC SETTINGS. Not in the S.H.I.E.L.D. point menu, where SAVE and LOAD are shown.
+L/R to PC SETTINGS.
+
+In the S.H.I.E.L.D. point menu (+0x17c = 0) SAVE, LOAD, OPTIONS, TUTORIAL and QUIT GAME fill all 5 submenu
+positions. A 6th position is out of reach: every cursor function bounds the position by 4 before it looks up the
+cursor animation (table main+0x1a3cac8 = `cursor_pos_01..06`, `system_cursor_pos_01..05`; sites 0x6dfc30, 0x6e01e4,
+0x6e3668, 0x6e4630, ...), and the pane table main+0x1a3cb0c has 5 entries. There TIPS (slot 9, also in the pause
+menu) is borrowed instead: SAVE, LOAD, OPTIONS, GRAPHICS, QUIT GAME. `MUA3_TEST_SHIELD_MENU=1` (test aid) builds the
+pause menu as the S.H.I.E.L.D. point menu.
 
 The label: `01_savepoint_parts` has no unused texture, but GText_HERO_gray_out and GText_INFINITY_MISSION_gray_out
 (740x80) are never shown by this class (HERO's state is main+0x728870, INFINITY's main+0x728840 or a flag: shown or

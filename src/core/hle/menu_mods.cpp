@@ -24,7 +24,9 @@
 //    to the desktop; "OKAY" closes the game (the SYSTEM submenu's QUIT GAME still returns to the title screen).
 //  - GRAPHICS in the pause menu's SYSTEM submenu, right after OPTIONS: SAVE or LOAD (hidden there) is borrowed; its
 //    label is drawn over GText_HERO_gray_out / GText_INFINITY_MISSION_gray_out (HERO and INFINITY MISSION are never
-//    greyed out in this menu: their state is shown or hidden), and it opens OPTIONS as the GRAPHICS page.
+//    greyed out in this menu: their state is shown or hidden), and it opens OPTIONS as the GRAPHICS page. In the
+//    S.H.I.E.L.D. point menu all five submenu positions are taken (and the cursor code stops at five), so TIPS (still
+//    in the pause menu) is borrowed there.
 #include "core/hle/menu_mods.h"
 
 #include <algorithm>
@@ -74,10 +76,11 @@ constexpr u32 kTexQuitGame = 19, kTexQuitGameOn = 20;
 constexpr u32 kTexHeroGrey = 3, kTexInfinityGrey = 6; // never shown by this menu: drawn as GRAPHICS (off / on)
 // menu object layout
 constexpr u64 kMainListBegin = 0xc8, kMainListEnd = 0xd0, kMainFlags = 0x180;
+constexpr u64 kRestricted = 0x17c; // 1 = the pause menu (HERO, INFINITY MISSION, LAB, SAVE and LOAD hidden)
 constexpr u32 kEntrySize = 0x14, kEntryEnabled = 0x10, kMainPositions = 6;
 constexpr u32 kSlotSystem = 5, kHidden = 2;
 constexpr u64 kSysListBegin = 0xe0, kSysListEnd = 0xe8, kSysFlags = 0x198;
-constexpr u32 kSysPositions = 5, kSlotSave = 6, kSlotLoad = 7, kSlotOptions = 8;
+constexpr u32 kSysPositions = 5, kSlotSave = 6, kSlotLoad = 7, kSlotOptions = 8, kSlotTips = 9;
 
 core::Memory* g_mem = nullptr;
 u64 g_main = 0;
@@ -241,7 +244,11 @@ void MoveEntry(u64 begin, u64 end, u32 slot, u32 after) {
 void Refresh(State& s) {
     const u64 menu = s.x[0];
     u32 borrow = ~0u, sys_borrow = ~0u, shown = 0, sys_shown = 0;
+    bool tips_shown = false;
     if (IsMenu(menu)) {
+        static const bool shield_test = std::getenv("MUA3_TEST_SHIELD_MENU") != nullptr;
+        if (shield_test) // test aid: the pause menu is built as the S.H.I.E.L.D. point menu
+            W32(menu + kRestricted, 0);
         for (u32 slot = 0; slot <= 10; slot++) {
             const u32 st = u32(Call(s, g_main + kGetItemState, {menu, slot}, &g_hooks[kHState]));
             if (slot <= kSlotSystem) {
@@ -251,14 +258,16 @@ void Refresh(State& s) {
                     borrow = slot; // HERO / INFINITY MISSION / LAB hidden here
             } else if (st != kHidden) {
                 sys_shown++;
+                tips_shown |= slot == kSlotTips;
             } else if (slot == kSlotSave || slot == kSlotLoad) {
                 sys_borrow = slot; // the pause menu hides SAVE and LOAD
             }
         }
         if (shown >= kMainPositions || !g_pause_quit)
             borrow = ~0u; // no free position (S.H.I.E.L.D. point menu with everything unlocked)
-        if (sys_shown >= kSysPositions ||
-            Call(s, g_main + kGetItemState, {menu, kSlotOptions}, &g_hooks[kHState]) == kHidden)
+        if (sys_shown >= kSysPositions) // the S.H.I.E.L.D. point menu: all five positions are taken; TIPS (still in
+            sys_borrow = tips_shown ? kSlotTips : ~0u; // the pause menu) gives its place to GRAPHICS
+        if (Call(s, g_main + kGetItemState, {menu, kSlotOptions}, &g_hooks[kHState]) == kHidden)
             sys_borrow = ~0u;
     }
     {
@@ -347,7 +356,7 @@ void IsSystemItem(State& s) {
 void ExecuteItem(State& s) {
     const u64 menu = s.x[0];
     if (SysBorrowed(menu) == u32(s.x[1])) { // GRAPHICS: OPTIONS, shown as the GRAPHICS page
-        LOG_INFO("Menu", "GRAPHICS chosen in the pause menu");
+        LOG_INFO("Menu", "GRAPHICS chosen in the {} menu", R32(menu + kRestricted) == 1 ? "pause" : "S.H.I.E.L.D. point");
         graphics::OpenNext();
         s.x[1] = kSlotOptions;
         return Original(s, kHExecute);
