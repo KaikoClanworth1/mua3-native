@@ -16,6 +16,14 @@ function Build([string[]]$Targets) {
     if ($LASTEXITCODE) { throw "build failed: $Targets" }
 }
 
+# The build must not see a recompiled library: nxcore links nxrecomp PUBLIC, so with MUA3_RECOMP_DIR pointing at a
+# nxrecomp_full.lib every exe that links nxcore (MUA3Setup too) would carry the game's code.
+$cache = Join-Path $build 'CMakeCache.txt'
+if (Test-Path $cache) {
+    $rd = (Select-String $cache -Pattern '^MUA3_RECOMP_DIR:PATH=(.*)$').Matches | ForEach-Object { $_.Groups[1].Value }
+    if ($rd -and (Test-Path (Join-Path $rd 'nxrecomp_full.lib'))) { throw "MUA3_RECOMP_DIR ($rd) holds nxrecomp_full.lib: release builds must use a build folder without the recompiled game" }
+    if ($rd -and (Test-Path (Join-Path $rd 'recomp_table.cpp'))) { throw "MUA3_RECOMP_DIR ($rd) holds generated game code" }
+}
 # the setup without the game's icon, the tools, and the libraries mua3 links
 & cmake -S $root -B $build -DMUA3_GAME_ICON=OFF | Out-Null
 try {
@@ -65,6 +73,10 @@ https://github.com/KaikoClanworth1/mua3-native
 # nothing of the game may be in here
 $bad = Get-ChildItem $out -Recurse -File | Where-Object { $_.Name -match 'nxrecomp|recomp_\d+|\.ico$|\.nso$|\.nca$|\.keys$|^main\.bin$' -or $_.FullName -match '\\game\\|recomp_full' }
 if ($bad) { throw "game material in the package: $($bad.FullName -join ', ')" }
+# and none linked into the setup: its PDB names every library it linked
+$pdb = Join-Path $bin 'MUA3Setup.pdb'
+if ((Test-Path $pdb) -and (Select-String $pdb -Pattern 'nxrecomp_full|recomp_full\\|recomp_\d+\.obj' -SimpleMatch:$false -Quiet)) { throw 'MUA3Setup linked the recompiled game code' }
+if ((Get-Item "$out\MUA3Setup.exe").Length -gt 64MB) { throw 'MUA3Setup.exe is far larger than expected (recompiled game code linked in?)' }
 $size = (Get-ChildItem $out -Recurse -File | Measure-Object Length -Sum).Sum
 "packaged $out ($([math]::Round($size / 1MB)) MB, $((Get-ChildItem $out -Recurse -File).Count) files)"
 if ($Zip) {
