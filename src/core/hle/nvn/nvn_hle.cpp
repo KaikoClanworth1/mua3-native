@@ -1650,15 +1650,36 @@ extern "C" __declspec(dllimport) long __stdcall SetThreadDescription(void*, cons
 extern "C" __declspec(dllimport) int __stdcall GetThreadPriority(void*);
 extern "C" __declspec(dllimport) int __stdcall SetThreadPriority(void*, int);
 constexpr auto kDecodeTimeout = std::chrono::seconds(10); // (decode thread stuck: go back to direct, never hang)
+extern "C" __declspec(dllimport) int __stdcall GetProcessAffinityMask(void*, unsigned long long*, unsigned long long*);
+extern "C" __declspec(dllimport) void* __stdcall GetCurrentProcess();
+// Logical CPUs the process may run on (its affinity mask at startup).
+int ProcessCpus() {
+    unsigned long long proc = 0, sys = 0;
+    return GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) ? std::popcount(proc) : 0;
+}
+// Default: on with 12+ logical CPUs. The decode thread is one more busy thread (~75%): with all 16 CPUs of an 8-core
+// Ryzen it gave +4-14% fps in the heavy Raft fight; on 4 cores with SMT (0xFF00) it gained nothing and cost the GPU
+// thread 6-9%. MUA3_NVN_DECODE=0 / 1 / verify overrides.
 int ReadDecodeConfig() {
     if (std::getenv("MUA3_NVN_DUMP")) // (the frame dump reads the game's memory at submit time)
         return 0;
     const char* e = std::getenv("MUA3_NVN_DECODE");
-    if (!e || !*e || std::string_view(e) == "0")
+    if (!e || !*e)
+        return ProcessCpus() >= 12 ? 1 : 0;
+    if (std::string_view(e) == "0")
         return 0;
     return std::string_view(e) == "verify" ? 2 : 1;
 }
 const int g_decode_cfg = ReadDecodeConfig();
+void LogDecodeChoice() { // (once, at the first NVN call: logging is up by then)
+    static const bool once = [] {
+        const char* e = std::getenv("MUA3_NVN_DECODE");
+        LOG_INFO("NVN", "NVN decode thread: {} ({} CPUs{})", g_decode_cfg == 2 ? "verify" : g_decode_cfg ? "on" : "off",
+                 ProcessCpus(), e && *e ? ", MUA3_NVN_DECODE set" : "");
+        return true;
+    }();
+    (void)once;
+}
 std::atomic<bool> g_decode_failed{false};
 enum DecodeOp : u64 { kDecCommand = 1, kDecBegin, kDecEnd, kDecNest, kDecSubmit, kDecFence, kDecPresent, kDecWrap, kDecBindRun };
 struct DecodeRing {
@@ -1750,6 +1771,7 @@ bool DecodeDrain() {
     return true;
 }
 int DecodeMode() {
+    LogDecodeChoice();
     if (!g_decode_cfg)
         return 0;
     if (g_decode_failed.load(std::memory_order_relaxed)) {
