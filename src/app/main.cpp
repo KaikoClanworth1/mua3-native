@@ -36,6 +36,8 @@
 namespace {
 
 gpu::D3D11Renderer* g_renderer = nullptr;
+// "Graphics device was reset" toast after a device-lost recovery (platform::Display::RecoverDevice), until then.
+std::chrono::steady_clock::time_point g_device_toast_until{};
 platform::Display* g_display = nullptr;
 std::atomic<bool> g_script_active{false};
 
@@ -93,6 +95,16 @@ void DrawOverlay(const core::Config& cfg, platform::Input& input, bool& show) {
         g_stats.fps = (p - g_stats.last_presents) / dt;
         g_stats.last_presents = p;
         g_stats.t0 = now;
+    }
+    if (std::chrono::steady_clock::now() < g_device_toast_until) {
+        const ImVec2 ds = ImGui::GetIO().DisplaySize;
+        ImGui::SetNextWindowPos(ImVec2(ds.x * 0.5f, ds.y - 24 * g_ui), 0, ImVec2(0.5f, 1.0f));
+        ImGui::SetNextWindowBgAlpha(0.6f);
+        ImGui::Begin("##devicereset", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
+                         ImGuiWindowFlags_NoNav);
+        ImGui::Text("Graphics device was reset");
+        ImGui::End();
     }
     if (cfg.show_fps) {
         ImGui::SetNextWindowPos(UiVec(8, 8));
@@ -695,6 +707,13 @@ int main(int argc, char** argv) {
     display.context_mutex = &gpu::ContextMutex();
     display.context_epoch = &gpu::ContextEpoch();
     display.frame_source = [&](u32& w, u32& h) { return renderer.LatestFrame(w, h); };
+    // Device lost: the renderer drops its objects before the device is recreated and continues on the new one.
+    display.device_lost_check = [&] { return renderer.DeviceRemoved(); };
+    display.release_device = [&] { renderer.ReleaseDevice(); };
+    display.restore_device = [&](ID3D11Device* d, ID3D11DeviceContext* c) {
+        renderer.RestoreDevice(d, c);
+        g_device_toast_until = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    };
 
     bool show_overlay = cfg.show_debug_overlay;
     display.draw_overlay = [&] {
@@ -739,6 +758,8 @@ int main(int argc, char** argv) {
         platform::bugcap::Poll(renderer, display);
         display.BeginFrame();
         display.EndFrame();
+        if (display.DeviceLost()) // (recreates the device and swap chain; retried next frame if it fails)
+            display.RecoverDevice();
         // Present when the game has a new frame (in step with its frame rate, no beat against a separate UI
         // clock); the timeout keeps the UI responsive while the game shows nothing new (loading, paused).
         const bool new_frame = WaitForSingleObject(static_cast<HANDLE>(renderer.NewFrameEvent()), 50) == WAIT_OBJECT_0;

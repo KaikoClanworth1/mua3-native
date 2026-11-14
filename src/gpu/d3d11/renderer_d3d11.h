@@ -155,6 +155,15 @@ public:
     }
     void NoteTexture(ID3D11ShaderResourceView* srv, u64 addr, u32 w, u32 h, u32 fmt, bool rt);
 
+    // Device lost (platform::Display::RecoverDevice, context lock held, GPU thread between calls): ReleaseDevice drops
+    // every D3D object of the renderer and its caches; RestoreDevice continues on the new device (render targets
+    // start cleared, textures and buffers come back from guest memory on use, shaders from their bytecode).
+    void ReleaseDevice();
+    void RestoreDevice(ID3D11Device* dev, ID3D11DeviceContext* ctx);
+    // True once the device reports itself removed (checked at most once per presented frame).
+    bool DeviceRemoved() const { return device_removed_.load(std::memory_order_relaxed); }
+    std::atomic<u64> device_resets_{0};
+
     // Stats
     u64 draws_ok = 0, draws_skipped = 0, clears = 0;
 
@@ -367,6 +376,8 @@ private:
     GpuPasses gpu_passes_; // MUA3_GPU_PASSES: GPU time per pass
     fs::path passes_report_dir_; // F4 capture written: gpu_passes.txt goes there when the report is ready
     u32 frame_w_ = 0, frame_h_ = 0;
+    std::atomic<bool> device_removed_{false};
+    u64 kept_tex_stats_[4]{}; // the texture cache's counters across a device reset (uploads, reuploads, unchanged, tracked)
 
     friend class DrawContext;
 };

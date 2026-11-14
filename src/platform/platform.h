@@ -46,7 +46,25 @@ public:
     std::atomic<u64>* context_epoch = nullptr; // bumped whenever the UI used the shared context (state caches)
     fs::path capture_path; // when set, the next presented frame is saved there as a BMP (then cleared)
 
+    // Device lost (DXGI_ERROR_DEVICE_REMOVED / DEVICE_RESET / DRIVER_INTERNAL_ERROR): flagged by Present, by the
+    // renderer (device_lost_check) or by the test hook MUA3_TEST_DEVICE_LOST=<seconds>[,<seconds>...]; the UI
+    // thread then calls RecoverDevice: under context_mutex, release_device drops the renderer's objects, the device
+    // and swap chain are created again, and restore_device hands the new ones over. Returns false if no device
+    // could be created (the caller retries next frame).
+    bool DeviceLost();
+    bool RecoverDevice();
+    u32 DeviceResets() const { return device_resets_; }
+    std::function<bool()> device_lost_check;
+    std::function<void()> release_device;
+    std::function<void(ID3D11Device*, ID3D11DeviceContext*)> restore_device;
+
 private:
+    bool CreateDevice();
+    void LogRemovedReason(const char* where, long hr);
+    bool lost_ = false;
+    u32 device_resets_ = 0;
+    std::vector<double> test_lost_at_; // MUA3_TEST_DEVICE_LOST: seconds after Init
+    std::chrono::steady_clock::time_point init_time_{};
     void CreateBackbuffer();
     static bool TearingSupported();
     u32 SwapChainFlags() const;

@@ -566,6 +566,7 @@ private:
 };
 
 static std::unique_ptr<DrawContext> g_dc;
+static ID3D11Buffer* g_last_drv_cb = nullptr; // Draw: the driver constants' buffer of the last upload (g_dc's)
 
 std::recursive_mutex& ContextMutex() {
     static std::recursive_mutex m;
@@ -643,6 +644,85 @@ D3D11Renderer::D3D11Renderer(ID3D11Device* dev, ID3D11DeviceContext* ctx) : dev_
         if (SUCCEEDED(D3DCompile(src, std::strlen(src), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &code, &err)))
             dev_->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &debug_ps_);
     }
+}
+
+void D3D11Renderer::ReleaseDevice() {
+    std::lock_guard ctx_lock(ContextMutex());
+    LOG_INFO("Renderer", "device lost: releasing {} surfaces, {} compute buffers, {} index / {} vertex buffers",
+             surfaces_.size(), gbufs_.size(), index_cache_.size(), vertex_cache_.size());
+    if (FrameCapture* c = capture_.exchange(nullptr)) // (an F4 capture in progress is dropped)
+        (void)c;
+    if (textures_) { // (its counters carry over: the logs report deltas of them)
+        kept_tex_stats_[0] = textures_->uploads, kept_tex_stats_[1] = textures_->reuploads;
+        kept_tex_stats_[2] = textures_->unchanged_rewrites, kept_tex_stats_[3] = textures_->tracked_bytes;
+    }
+    textures_.reset(); // (joins its upload workers)
+    surfaces_.clear();
+    std::fill(std::begin(bound_), std::end(bound_), nullptr);
+    readbacks_.clear();
+    for (auto& b : gbufs_) // (results not copied back yet are lost: the guest keeps what it last saw)
+        b->listed = false;
+    gbufs_.clear();
+    active_.clear();
+    active_stale_ = true, active_prune_ = false, gpu_dirty_any_ = false;
+    active_lo_ = ~0ull, active_hi_ = 0;
+    query_pool_.clear();
+    mask_pool_.clear();
+    staging_pool_.clear();
+    diff_cs_.Reset(), diff_mask_.Reset(), diff_cb_.Reset(), diff_mask_uav_.Reset();
+    diff_mask_pages_ = 0;
+    quad_args_cs_.Reset(), quad_args_buf_.Reset(), quad_index_buf_.Reset(), quad_args_uav_.Reset();
+    index_cache_.clear();
+    vertex_cache_.clear();
+    for (auto& sh : cb_shadow_)
+        sh = CbShadow{};
+    std::memset(binds_, 0, sizeof(binds_));
+    InvalidateBinds();
+    InvalidatePipe();
+    std::fill(std::begin(last_rtvs_), std::end(last_rtvs_), nullptr);
+    last_dsv_ = nullptr;
+    for (auto& q : frame_queries_)
+        q.Reset();
+    debug_ps_.Reset();
+    {
+        std::lock_guard lk(recent_mutex_);
+        recent_.clear();
+    }
+    {
+        std::lock_guard lk(frame_mutex_);
+        frame_tex_.Reset(), frame_srv_.Reset(), frame_rtv_.Reset();
+        frame_w_ = frame_h_ = 0;
+    }
+    post_aa_ = PostAA{};
+    gpu_passes_.ReleaseDevice();
+    g_dc.reset();
+    g_last_drv_cb = nullptr;
+    g_seen.blend = g_seen.depth = g_seen.raster = ~0u;
+    g_seen.blend_obj = nullptr;
+    g_seen.depth_obj = nullptr;
+    g_seen.raster_obj = nullptr;
+}
+
+void D3D11Renderer::RestoreDevice(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
+    std::lock_guard ctx_lock(ContextMutex());
+    dev_ = dev;
+    ctx_ = ctx;
+    shaders_->ResetDevice(dev);
+    textures_ = std::make_unique<TextureCache>(dev, ctx, *this);
+    textures_->uploads = kept_tex_stats_[0], textures_->reuploads = kept_tex_stats_[1];
+    textures_->unchanged_rewrites = kept_tex_stats_[2], textures_->tracked_bytes = kept_tex_stats_[3];
+    gpu_passes_.Init(dev, ctx);
+    g_dc = std::make_unique<DrawContext>(dev);
+    g_dc->SetContext(ctx);
+    if (debug_mode_) {
+        const char* src = "float4 main() : SV_Target0 { return float4(1, 0, 1, 1); }";
+        ComPtr<ID3DBlob> code, err;
+        if (SUCCEEDED(D3DCompile(src, std::strlen(src), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &code, &err)))
+            dev_->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &debug_ps_);
+    }
+    device_removed_ = false;
+    device_resets_++;
+    LOG_INFO("Renderer", "device restored: caches rebuilt on the new device (textures and buffers reload from guest memory)");
 }
 
 D3D11Renderer::~D3D11Renderer() {
@@ -3238,7 +3318,7 @@ void D3D11Renderer::Draw() {
 
     // Driver constants rarely change between consecutive draws: re-upload only when they do.
     static DriverConstants last_drv;
-    static ID3D11Buffer* last_drv_cb = nullptr;
+    ID3D11Buffer*& last_drv_cb = g_last_drv_cb;
     if (!last_drv_cb || std::memcmp(&last_drv, &drv, sizeof(drv)) != 0) {
         last_drv = drv;
         last_drv_cb = dc.Constant(1000, &drv, sizeof(drv));
@@ -3355,6 +3435,8 @@ void D3D11Renderer::Present(const PresentInfo& p) {
     const u64 present_t0 = g_cpu_on ? ProfNow() : 0;
     std::lock_guard ctx_lock(ContextMutex());
     frame_counter_++;
+    if (!device_removed_.load(std::memory_order_relaxed) && dev_->GetDeviceRemovedReason() != S_OK)
+        device_removed_ = true; // (the UI thread recreates the device: platform::Display::RecoverDevice)
     shaders_->Tick();
     ReportHitch();
     // D3D11 allows 4,096 live state objects of each kind and gets very slow near that limit: draws whose depth bias
@@ -3711,6 +3793,7 @@ ID3D11ShaderResourceView* D3D11Renderer::LatestFrame(u32& w, u32& h) {
 }
 
 void D3D11Renderer::InvalidateRegion(u64 gpu_va, u64 size) {
+    std::lock_guard ctx_lock(ContextMutex());
     textures_->Invalidate(gpu_va, size);
     if (gpu_va < code_hi_ && code_lo_ < gpu_va + size) {
         shader_by_addr_.clear();
@@ -3740,15 +3823,16 @@ void D3D11Renderer::ThrottleFrames() {
     if (frame_query_count_ <= kFramesInFlight)
         return;
     // The query ended kFramesInFlight presents ago must have completed before this frame's successor is recorded.
-    ID3D11Query* old = frame_queries_[(frame_query_count_ - 1 - kFramesInFlight) % kRing].Get();
-    if (!old)
-        return;
+    const u64 slot = (frame_query_count_ - 1 - kFramesInFlight) % kRing;
     const u64 t0 = ProfNow();
     for (u32 spin = 0;; spin++) {
         BOOL done = FALSE;
         HRESULT hr;
         {
             std::lock_guard lk(ContextMutex()); // never held while sleeping: other threads need the context
+            ID3D11Query* old = frame_queries_[slot].Get(); // (re-read: a device reset replaces the queries)
+            if (!old)
+                break;
             hr = ctx_->GetData(old, &done, sizeof(done), 0);
         }
         if (hr != S_FALSE)

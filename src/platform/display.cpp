@@ -75,6 +75,33 @@ bool Display::Init(const core::Config& cfg, const char* title) {
         LOG_ERROR("Display", "SDL_CreateWindow failed: {}", SDL_GetError());
         return false;
     }
+    tearing_ = TearingSupported();
+    live_cfg_ = &cfg;
+    if (!CreateDevice())
+        return false;
+    init_time_ = std::chrono::steady_clock::now();
+    if (const char* e = std::getenv("MUA3_TEST_DEVICE_LOST"))
+        for (const char* p = e; *p;) {
+            char* end = nullptr;
+            const double v = std::strtod(p, &end);
+            if (end == p)
+                break;
+            test_lost_at_.push_back(v);
+            p = *end == ',' ? end + 1 : end;
+        }
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::GetIO().IniFilename = nullptr;
+    ImGui::StyleColorsDark();
+    ImGui_ImplSDL3_InitForD3D(window_);
+    ImGui_ImplDX11_Init(device_, ctx_);
+    if (cfg.fullscreen)
+        ToggleFullscreen();
+    return true;
+}
+
+// The device, its immediate context and the swap chain (at Init, and again after the device was lost).
+bool Display::CreateDevice() {
     HWND hwnd = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(window_), SDL_PROP_WINDOW_WIN32_HWND_POINTER,
                                              nullptr);
     DXGI_SWAP_CHAIN_DESC sd{};
@@ -87,7 +114,6 @@ bool Display::Init(const core::Config& cfg, const char* title) {
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     // Waitable: the UI thread waits for a free frame slot before it draws, outside Present (which holds the D3D
     // device lock the GPU thread needs). Tearing (when the system allows it): vsync off shows frames at once.
-    tearing_ = TearingSupported();
     sd.Flags = SwapChainFlags();
     const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
     UINT dflags = 0;
@@ -116,7 +142,6 @@ bool Display::Init(const core::Config& cfg, const char* title) {
         SafeRelease(dxgi);
     }
     CreateBackbuffer();
-    live_cfg_ = &cfg;
     {
         IDXGISwapChain2* sc2 = nullptr;
         if (SUCCEEDED(swapchain_->QueryInterface(__uuidof(IDXGISwapChain2), (void**)&sc2))) {
@@ -124,7 +149,8 @@ bool Display::Init(const core::Config& cfg, const char* title) {
             frame_wait_ = sc2->GetFrameLatencyWaitableObject();
             sc2->Release();
         }
-        LOG_INFO("Display", "vsync {}, tearing {}", cfg.vsync ? "on" : "off", tearing_ ? "supported" : "not supported");
+        LOG_INFO("Display", "vsync {}, tearing {}", live_cfg_ && live_cfg_->vsync ? "on" : "off",
+                 tearing_ ? "supported" : "not supported");
     }
     {
         ID3D10Multithread* mt = nullptr;
@@ -133,15 +159,68 @@ bool Display::Init(const core::Config& cfg, const char* title) {
             mt->Release();
         }
     }
+    return true;
+}
 
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-    ImGui::GetIO().IniFilename = nullptr;
-    ImGui::StyleColorsDark();
-    ImGui_ImplSDL3_InitForD3D(window_);
+void Display::LogRemovedReason(const char* where, long hr) {
+    const HRESULT reason = device_ ? device_->GetDeviceRemovedReason() : E_FAIL;
+    LOG_ERROR("Display", "graphics device lost ({}: {:#x}, removed reason {:#x}): recreating it", where, u32(hr), u32(reason));
+}
+
+bool Display::DeviceLost() {
+    if (lost_)
+        return true;
+    if (!test_lost_at_.empty() &&
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - init_time_).count() >= test_lost_at_.front()) {
+        test_lost_at_.erase(test_lost_at_.begin());
+        LOG_WARN("Display", "test: simulating a lost graphics device (MUA3_TEST_DEVICE_LOST)");
+        lost_ = true;
+    } else if (device_lost_check && device_lost_check()) {
+        LogRemovedReason("renderer", device_ ? device_->GetDeviceRemovedReason() : E_FAIL);
+        lost_ = true;
+    }
+    return lost_;
+}
+
+bool Display::RecoverDevice() {
+    std::unique_lock<std::recursive_mutex> lk;
+    if (context_mutex)
+        lk = std::unique_lock(*context_mutex);
+    if (release_device)
+        release_device();
+    ImGui_ImplDX11_Shutdown();
+    SafeRelease(frame_srv_);
+    SafeRelease(frame_tex_);
+    frame_w_ = frame_h_ = 0;
+    {
+        std::lock_guard fl(frame_mutex_);
+        if (!pending_frame_.empty())
+            frame_dirty_ = true; // (uploaded again to the new texture)
+    }
+    SafeRelease(opaque_blend_);
+    SafeRelease(rtv_);
+    if (frame_wait_)
+        CloseHandle(frame_wait_);
+    frame_wait_ = nullptr;
+    if (ctx_) {
+        ctx_->ClearState();
+        ctx_->Flush();
+    }
+    SafeRelease(swapchain_);
+    SafeRelease(ctx_);
+    SafeRelease(device_);
+    if (!CreateDevice()) {
+        LOG_ERROR("Display", "graphics device lost: no new device yet, retrying");
+        return false;
+    }
     ImGui_ImplDX11_Init(device_, ctx_);
-    if (cfg.fullscreen)
-        ToggleFullscreen();
+    if (restore_device)
+        restore_device(device_, ctx_);
+    if (context_epoch)
+        (*context_epoch)++;
+    lost_ = false;
+    device_resets_++;
+    LOG_INFO("Display", "graphics device recreated (reset {} this session)", device_resets_);
     return true;
 }
 
@@ -382,7 +461,12 @@ void Display::EndFrame() {
     // frame slot). VSync (mua3.ini / the in-game Graphics menu, read live): the next vblank; off: at once, with
     // tearing where the system allows it (else DWM composes at sync interval 0 without tearing).
     const bool vsync = live_cfg_ ? live_cfg_->vsync : true;
-    swapchain_->Present(vsync ? 1 : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    const HRESULT hr = swapchain_->Present(vsync ? 1 : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET || hr == DXGI_ERROR_DRIVER_INTERNAL_ERROR) {
+        if (!lost_)
+            LogRemovedReason("Present", hr);
+        lost_ = true;
+    }
 }
 
 void Display::PaceFrame() {

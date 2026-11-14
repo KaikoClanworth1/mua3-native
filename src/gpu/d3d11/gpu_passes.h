@@ -19,6 +19,16 @@ class GpuPasses {
 public:
     bool On() const { return on_; }
     void Init(ID3D11Device* dev, ID3D11DeviceContext* ctx);
+    // Device lost: drops the queries (Init again on the new device); a running report is abandoned.
+    void ReleaseDevice() {
+        for (auto& s : slots_)
+            s = Slot{};
+        created_ = open_ = false;
+        on_ = false;
+        report_frames_ = 0;
+        key_ = ~0ull;
+        dev_ = nullptr, ctx_ = nullptr;
+    }
     // A new pass starts here (no-op if `key` is the current pass). `describe` is called once per new key.
     void Mark(u64 key, const std::function<std::string()>& describe);
     void CountDraw() { draws_++; }
