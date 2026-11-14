@@ -6,6 +6,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -57,7 +58,7 @@ struct HostShader {
     shader::TranslateOptions opt; // compute: workgroup shape and shared memory from the launch
     std::vector<u8> cbuf1;        // compute: constant buffer 1 at first launch (opt.cbuf1 points here)
     std::vector<u8> code; // guest program (kept until compiled)
-    std::vector<u8> dxbc; // vertex shaders keep their bytecode for input layouts
+    std::vector<u8> dxbc; // bytecode, kept: input layouts (vertex), recreation (released, ResetDevice)
     bool is_variant = false; // vertex shader re-declared for integer vertex attributes (info.hlsl is final)
     bool translated = false;
     bool no_cache = false; // built from a debug override: never read or write the bytecode cache
@@ -111,6 +112,12 @@ public:
     bool WaitReady(HostShader* s, std::chrono::nanoseconds budget);
     // Creates the D3D object of a Ready shader whose bytecode was only loaded (created == false). GPU thread.
     void Realize(HostShader* s);
+    // Moves the cache to a new device after the old one was lost (device removed / reset): waits for any object
+    // creation in flight, drops every D3D object made on the old device (vertex / pixel ones are made again at
+    // their next draw, compute ones right here from their kept bytecode). Translations stay. Display thread, with
+    // the GPU thread paused between draws (no Get / Realize / Tick running).
+    void ResetDevice(ID3D11Device* dev);
+    u32 device_resets = 0;
     std::atomic<u32> frame{0}; // Tick count, for HostShader::last_used
     u32 new_programs = 0, new_variants = 0; // first seen by a draw (not replayed by Prewarm): GPU thread
     u64 realize_ns = 0; // GPU thread time in Realize (driver shader creation)
@@ -156,6 +163,7 @@ private:
     std::mutex hlsl_mutex_; // a base's HLSL (EnsureHlsl writes it; variants built on several workers copy it)
 
     ID3D11Device* dev_;
+    std::shared_mutex device_mutex_; // shared: any Create*Shader on dev_; exclusive: ResetDevice
     bool setup_ = false; // the setup's shader step (build_workers > 0)
     common::U64Map<std::unique_ptr<HostShader>> shaders_;
     fs::path dump_dir_ = "shader_dump";

@@ -3,6 +3,7 @@
 #include <chrono>
 #include <unordered_set>
 #include <fstream>
+#include <shared_mutex>
 #include "gpu/d3d11/shader_cache.h"
 #include "gpu/dxbc/dxbc.h"
 #include "gpu/gpu.h"
@@ -535,7 +536,13 @@ bool ShaderCache::Compile(HostShader& s, const std::string& hlsl, std::string& e
             LOG_INFO("Shader", "using override {}", ovr.string());
         }
         if (dxbc::CompileHlsl(src, dxbc::Stage::Compute, blob, derr)) {
-            const HRESULT hr = dev_->CreateComputeShader(blob.data(), blob.size(), nullptr, &s.cs);
+            HRESULT hr;
+            {
+                std::shared_lock dl(device_mutex_);
+                hr = dev_->CreateComputeShader(blob.data(), blob.size(), nullptr, &s.cs);
+                if (SUCCEEDED(hr))
+                    s.dxbc = blob; // (ResetDevice recreates it from this)
+            }
             if (SUCCEEDED(hr)) {
                 s.direct_dxbc = true;
                 if (std::getenv("MUA3_DXBC_VERIFY")) {
@@ -676,6 +683,7 @@ bool ShaderCache::Compile(HostShader& s, const std::string& hlsl, std::string& e
 
 bool ShaderCache::CreateObject(HostShader& s, const std::vector<u8>& blob, std::string& err) {
     HRESULT hr;
+    std::shared_lock dl(device_mutex_); // (ResetDevice swaps the device only between creations)
     const auto k0 = std::chrono::steady_clock::now(); // the driver builds its native code here
     if (s.stage == shader::Stage::Vertex)
         hr = dev_->CreateVertexShader(blob.data(), blob.size(), nullptr, &s.vs);
@@ -683,8 +691,8 @@ bool ShaderCache::CreateObject(HostShader& s, const std::vector<u8>& blob, std::
         hr = dev_->CreateComputeShader(blob.data(), blob.size(), nullptr, &s.cs);
     else
         hr = dev_->CreatePixelShader(blob.data(), blob.size(), nullptr, &s.ps);
-    if (&blob != &s.dxbc && s.stage != shader::Stage::Compute)
-        s.dxbc = blob; // kept: input layouts (vertex), and recreation after the object was released as unused
+    if (&blob != &s.dxbc)
+        s.dxbc = blob; // kept: input layouts (vertex), recreation after the object was released, ResetDevice
     create_ns += u64((std::chrono::steady_clock::now() - k0).count());
     if (FAILED(hr)) {
         err = fmt::format("Create shader failed {:#x}", u32(hr));
@@ -742,6 +750,45 @@ void ShaderCache::CreateObjectsAhead(std::vector<HostShader*> list) {
     }
     LOG_INFO("Shader", "driver objects created ahead: {} of the {} shaders drawn in earlier sessions in {:.2f} s", n,
              list.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+}
+
+void ShaderCache::ResetDevice(ID3D11Device* dev) {
+    const auto t0 = std::chrono::steady_clock::now();
+    // Every Create*Shader (workers, CreateObjectsAhead, the driver re-warm, Realize) holds device_mutex_ shared: once
+    // this has it, none is in flight on the old device, and those that follow use the new one.
+    std::unique_lock dl(device_mutex_);
+    dev_ = dev;
+    u32 dropped = 0, compute = 0, lost = 0;
+    for (auto& [hash, sp] : shaders_) {
+        HostShader& s = *sp;
+        s.cs_ref.Reset();
+        if (s.stage == shader::Stage::Compute) {
+            if (!s.cs)
+                continue; // not built yet (its worker creates it on the new device) or failed
+            s.cs.Reset();
+            if (!s.dxbc.empty() && SUCCEEDED(dev_->CreateComputeShader(s.dxbc.data(), s.dxbc.size(), nullptr, &s.cs))) {
+                compute++;
+            } else {
+                LOG_ERROR("Shader", "cs {:016x}: not recreated on the new device", hash);
+                s.ok = false;
+                s.state = HostShader::Failed;
+                lost++;
+            }
+            continue;
+        }
+        if (s.vs || s.ps) { // made again from the kept bytecode at its next draw (Realize), as after Tick's release
+            s.vs.Reset();
+            s.ps.Reset();
+            s.created = false;
+            s.creating = false;
+            dropped++;
+        }
+    }
+    live_objects = 0;
+    device_resets++;
+    LOG_WARN("Shader", "device reset: {} vertex / pixel objects dropped (made again at their next draw), {} compute "
+             "shaders recreated, {} lost, in {:.1f} ms", dropped, compute, lost,
+             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
 }
 
 // Every vertex / pixel shader's driver object created once and released: the driver compiles each in the background
@@ -872,6 +919,7 @@ void ShaderCache::DriverRewarm(std::vector<std::pair<size_t, u32>> blobs, size_t
         }
         const u8* b = pack_ + blobs[i].first;
         const u32 n = blobs[i].second;
+        std::shared_lock dl(device_mutex_);
         if (DxbcProgramType(b, n) == 1) {
             ComPtr<ID3D11VertexShader> o;
             dev_->CreateVertexShader(b, n, nullptr, &o);
@@ -879,6 +927,7 @@ void ShaderCache::DriverRewarm(std::vector<std::pair<size_t, u32>> blobs, size_t
             ComPtr<ID3D11PixelShader> o;
             dev_->CreatePixelShader(b, n, nullptr, &o);
         }
+        dl.unlock();
         if (i % 50 == 49)
             save(i + 1);
         // ~10 a second: the driver compiles each on its own threads (~0.1 s of CPU cold), about one CPU's worth
