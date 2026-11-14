@@ -802,7 +802,7 @@ struct Emitter {
     u32* ic_count = nullptr;
     std::string ic_array;
     std::string IcSite() { return "CallIc(s, " + ic_array + "[" + std::to_string((*ic_count)++) + "])"; }
-    // Function-wide register promotion: the guest registers, SP, NZCV and the instruction count a function touches
+    // Function-wide register promotion: the guest registers, SP and NZCV a function touches
     // live in locals for the whole function (MSVC cannot keep s.x[] in host registers: guest stores may alias the
     // State). They are loaded once on entry, stay in locals across the function's own gotos, and are written back
     // (@FLUSH@) before anything that leaves the function or lets other code see the State (calls, Dispatch, SVCs,
@@ -951,7 +951,7 @@ struct Emitter {
             t += "s.sp = x_sp; ";
         if (nz_dirty && (mask >> kNzBit & 1))
             t += "s.nzcv = nzcv; ";
-        return t + "s.icount = ic;";
+        return t;
     }
     // after_call would skip x19-x29 and SP (AAPCS64 callee-saved), but a BL target is not always an ABI function
     // (machine-outlined code may write them), so calls reload everything too until callees are summarised.
@@ -966,7 +966,7 @@ struct Emitter {
             t += std::string(declare ? "u64 x_sp" : "x_sp") + " = s.sp; ";
         if (nz_used)
             t += std::string(declare ? "u32 nzcv" : "nzcv") + " = s.nzcv; ";
-        return t + (declare ? "u64 ic = s.icount;" : "ic = s.icount;");
+        return t;
     }
     // The function's declarations and entry loads, and its body with the placeholders expanded.
     std::string Declarations() const { return "  " + ExpandLoad(true) + "\n"; }
@@ -1343,7 +1343,6 @@ struct Emitter {
         sh = Shape(b);
         is_call = sh.has_push_rsb && !sh.has_svc;
         names.clear();
-        o << "  ic += " << b.CycleCount() << ";\n";
         for (const auto& in : b) {
             o << "  ";
             Inst(in);
@@ -1785,7 +1784,10 @@ int main(int argc, char** argv) {
             cur << "#define gm s.mem\n#define hp s.halt\n";
         cur << "void f_" << std::hex << f.entry << std::dec << "(State& s) {\n  if (!ok_" << std::hex << f.entry << std::dec
             << " || reinterpret_cast<u64>(_AddressOfReturnAddress()) < s.stack_limit) return;\n"
-               "  bool cbit = false;\n" << (nogm ? "" : "  u8* const gm = s.mem; volatile u32* const hp = s.halt;\n")
+               // One count per function entry: all the runtime needs to tell a function that ran from one that refused
+               // (RunNativeChain's progress check). A per-block count kept in a local cost ~10% of the hot functions'
+               // instructions and spills (its write-backs and reloads around every call).
+               "  s.icount++;\n  bool cbit = false;\n" << (nogm ? "" : "  u8* const gm = s.mem; volatile u32* const hp = s.halt;\n")
             << em.Declarations();
         // Resume points: call-return blocks (the JIT can come back into this function after a callee it ran) and the
         // blocks after SVCs (a thread halted inside an SVC continues there).
