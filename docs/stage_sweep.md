@@ -100,6 +100,11 @@ Other output:
   shader lines behind the counts), `new_order.txt` / `new_variants.txt`, its screenshots and any crash files.
 - **Prewarm lists:** `build\testinst\sweep\new_order.txt` and `new_variants.txt` collect every new program and variant
   in the game's own `shader_dump` line formats, deduplicated. `new_by_checkpoint.csv` says where each was found.
+  `build\testinst\sweep\programs\` holds each new program's guest code, copied from the instance's `shader_dump` under
+  the same names: `<hash>.vs.bin`, `.ps.bin` or `.cs.bin`, plus `<hash>.cs.opt` / `.opt` (compute launch options,
+  BRX jump tables) when there. A program the game builds at runtime that isn't in `romfs/SHADER` can only be
+  prewarmed with its bytes. `programs\missing.txt` lists hashes whose program file wasn't found. `-Programs` copies
+  them again for everything in `new_order.txt`.
 
 Usage notes:
 
