@@ -71,6 +71,7 @@ bool Config::Load(const fs::path& ini) {
     get_i("language", language);
     get_i("log_level", log_level);
     get_b("bug_capture", bug_capture);
+    get_b("stage_select", stage_select);
     return true;
 }
 
@@ -82,7 +83,7 @@ bool Config::Save(const fs::path& ini) const {
       << "game_dir=" << game_dir.string() << "\n"
       << "isos_dir=" << isos_dir.string() << "\n"
       << "keys_dir=" << keys_dir.string() << "\n"
-      << "save_dir=" << save_dir.string() << "\n"
+      << "save_dir=" << (user_save_dir.empty() ? save_dir : user_save_dir).string() << "\n"
       << "[video]\n"
       << "width=" << width << "\nheight=" << height << "\nfullscreen=" << fullscreen
       << "\nborderless=" << borderless << "\nvsync=" << vsync << "\nresolution_scale=" << resolution_scale
@@ -90,8 +91,8 @@ bool Config::Save(const fs::path& ini) const {
       << "\n[audio]\naudio_backend=" << int(audio) << "\nvolume=" << volume << "\nmute=" << mute << "\n[input]\ninput_backend="
       << int(input) << "\ncamera_speed=" << camera_speed << "\n[system]\ndocked=" << docked << "\nlanguage=" << language << "\nlog_level=" << log_level
       << "\n";
-    if (bug_capture) // (only written when on: release players never see the section)
-        f << "[debug]\nbug_capture=1\n";
+    if (bug_capture || stage_select) // (only written when on: release players never see the section)
+        f << "[debug]\n" << (bug_capture ? "bug_capture=1\n" : "") << (stage_select ? "stage_select=1\n" : "");
     return bool(f);
 }
 

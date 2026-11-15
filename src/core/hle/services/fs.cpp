@@ -11,6 +11,7 @@
 #include "core/hle/video_output.h"
 #include "gpu/shader/anticipate.h"
 #include "core/system.h"
+#include "core/kernel/kernel.h"
 
 namespace hle {
 
@@ -356,6 +357,12 @@ public:
                 video::OnMovieRead(e.host, 0), gpu::shader::NoteGameLoading();
             if (!e.logged.exchange(true)) {
                 LOG_INFO("romfs", "open {} ({} bytes)", e.host.lexically_relative(root_).generic_string(), e.size);
+                // debug aid: MUA3_TRACE_OPEN=<text> logs the guest call stack of the first read of each RomFS file
+                // whose path contains <text>
+                static const char* trace_open = std::getenv("MUA3_TRACE_OPEN");
+                if (trace_open && e.host.generic_string().find(trace_open) != std::string::npos)
+                    if (kernel::Thread* t = kernel::CurrentThread())
+                        core::Sys().Kern().DumpThreadState(t, true);
                 WIN32_FILE_ATTRIBUTE_DATA a{};
                 const bool found = GetFileAttributesExW(e.host.c_str(), GetFileExInfoStandard, &a) != 0;
                 const u64 real = (u64(a.nFileSizeHigh) << 32) | a.nFileSizeLow;

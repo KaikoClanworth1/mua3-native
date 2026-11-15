@@ -35,6 +35,9 @@ struct Config {
     int language = 1; // 1 = American English
     int log_level = 2; // 0 trace .. 4 error
     bool bug_capture = false; // [debug] F4 writes a bug capture folder (platform/bug_capture.cpp)
+    bool stage_select = false; // [debug] allows --chapter / --stage (app/debug_chapter.cpp)
+    // Not stored: set while --chapter plays from its own save folder; Save() writes this as save_dir instead.
+    fs::path user_save_dir;
 
     bool Load(const fs::path& ini);
     bool Save(const fs::path& ini) const;

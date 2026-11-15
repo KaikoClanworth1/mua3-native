@@ -25,6 +25,7 @@
 #include "core/hle/hid.h"
 #include "core/hle/menu_graphics.h"
 #include "gpu/d3d11/renderer_d3d11.h"
+#include "app/debug_chapter.h"
 #include "platform/bug_capture.h"
 #include "gpu/d3d11/shader_cache.h"
 #include "core/cpu/cpu.h"
@@ -582,6 +583,9 @@ int main(int argc, char** argv) {
     bool headless = false;
     int autopress_after = 0; // test aid: tap A every 3 s after N seconds (headless)
     fs::path input_script;   // test aid: timed button presses ("<seconds> <BUTTON>[+BUTTON] [hold ms]" per line)
+    int debug_chapter = -1;  // debug: --chapter N / --stage ST0N0 (app/debug_chapter.cpp)
+    fs::path save_template;  // debug: seeds an empty debug_save
+    std::string bad_stage;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--trace")
@@ -598,11 +602,23 @@ int main(int argc, char** argv) {
             autopress_after = std::atoi(argv[++i]);
         else if (a == "--input-script" && i + 1 < argc)
             input_script = fs::u8path(argv[++i]);
+        else if (a == "--chapter" && i + 1 < argc)
+            debug_chapter = std::atoi(argv[++i]);
+        else if (a == "--stage" && i + 1 < argc) {
+            debug_chapter = app::debug_chapter::ChapterOfStage(argv[++i]);
+            bad_stage = debug_chapter < 0 ? argv[i] : "";
+        }
+        else if (a == "--save-template" && i + 1 < argc)
+            save_template = fs::u8path(argv[++i]);
     }
     common::SetLogLevel(common::LogLevel(std::clamp(cfg.log_level, 0, 5)));
     common::RotateLog("mua3", 5); // the previous run's log goes to logs/
     common::SetLogFile("mua3.log");
     LOG_INFO("Main", "MUA3 Native {}", common::Version());
+    if (debug_chapter >= 0)
+        app::debug_chapter::Prepare(cfg, debug_chapter, save_template);
+    else if (!bad_stage.empty())
+        LOG_WARN("Debug", "--stage {}: takes ST010 .. ST120 (the first stage of story chapters 1-12); use --chapter <N> for others", bad_stage);
     timeBeginPeriod(1);
     StartAllocTrace(); // MUA3_TRACE_VALLOC (diagnostic)
     // The exe names its PDB without a path (/PDBALTPATH): let in-process symbol lookups (profilers, stack dumps)
