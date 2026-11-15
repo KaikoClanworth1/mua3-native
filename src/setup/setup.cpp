@@ -370,6 +370,7 @@ struct Wizard {
     int workers = 0;   // 0 = automatic
     int memory_gb = 0; // 0 = automatic
     bool repair = false; // an existing install is being updated / repaired
+    bool register_apps = true; // false for --prepare: the launcher that ran it manages the install, not Windows Apps
     int desktop_w = 0, desktop_h = 0; // the main monitor (the game's first window size)
 
     // build
@@ -1272,7 +1273,8 @@ void BuildThread(Wizard& w, std::vector<fs::path> files, fs::path keys) {
             Log(w, "Could not copy the setup into the install folder: " + ec.message());
     }
     setup::SaveInstalled(in);
-    setup::RegisterUninstall(in, setup::FolderBytes(w.install_dir));
+    if (w.register_apps)
+        setup::RegisterUninstall(in, setup::FolderBytes(w.install_dir));
     w.built_minutes = std::chrono::duration<double>(Clock::now() - w.started).count() / 60.0;
     Log(w, fmt::format("Installed to {} in {:.0f} minutes.", w.install_dir.string(), w.built_minutes));
     (void)self;
@@ -1834,6 +1836,98 @@ void ReportPage(Wizard& w, bool& quit) {
     }
 }
 
+// ---- --prepare: the same install and build with no window, for launchers (RecompLauncher) and scripts
+//   MUA3Setup.exe --prepare --game <base .nsp/.xci> [--update <.nsp>] [--dlc <.nsp>]... --keys <prod.keys>
+//                 [--install <folder>] (default: this setup's folder) [--jobs <n>] (default: automatic)
+//   (each also as one argument: --game=<path>)
+// Prints "progress <0..1> <step>" lines on stdout and exits 0 when the game is built. Exit codes: 2 a missing or
+// wrong argument, 3 no C++ build tools, 4 the install or build failed. Nothing else changes without --prepare.
+void Out(const std::string& s) {
+    const HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (h && h != INVALID_HANDLE_VALUE) {
+        const std::string line = s + "\n";
+        DWORD n = 0;
+        WriteFile(h, line.data(), DWORD(line.size()), &n, nullptr);
+    }
+    LOG_INFO("Setup", "prepare: {}", s);
+}
+
+int RunPrepare(Wizard& w, const std::vector<std::wstring>& args) {
+    std::vector<fs::path> files;
+    fs::path keys;
+    for (size_t i = 0; i < args.size(); i++) {
+        // "--name value" or "--name=value" (one argument: a launcher leaves it out whole when an optional file is missing)
+        std::wstring a = args[i], v;
+        const size_t eq = a.find(L'=');
+        if (eq != std::wstring::npos)
+            v = a.substr(eq + 1), a.resize(eq);
+        else if (i + 1 < args.size() && a != L"--prepare")
+            v = args[++i];
+        if (v.empty())
+            continue;
+        if (a == L"--game" || a == L"--update" || a == L"--dlc")
+            files.push_back(fs::path(v));
+        else if (a == L"--keys")
+            keys = fs::path(v);
+        else if (a == L"--install")
+            w.install_dir = fs::path(v);
+        else if (a == L"--jobs")
+            w.workers = std::max(0, _wtoi(v.c_str()));
+    }
+    std::error_code ec;
+    if (files.empty()) {
+        Out("error No game file: pass --game <your .nsp or .xci>");
+        return 2;
+    }
+    for (auto& f : files)
+        if (!fs::exists(f, ec)) {
+            Out("error Not found: " + f.string());
+            return 2;
+        }
+    if (keys.empty()) {
+        const auto found = setup::FindKeys();
+        if (!found.empty())
+            keys = found.front();
+    }
+    if (keys.empty() || !fs::exists(keys, ec)) {
+        Out("error No prod.keys: pass --keys <your prod.keys>");
+        return 2;
+    }
+    const builder::Toolchain tc = builder::FindToolchain();
+    if (!tc.ok) {
+        Out("error " + tc.problem);
+        return 3;
+    }
+    w.register_apps = false;
+    w.desktop_w = GetSystemMetrics(SM_CXSCREEN), w.desktop_h = GetSystemMetrics(SM_CYSCREEN);
+    LOG_INFO("Setup", "prepare: {} files into {}, keys {}", files.size(), w.install_dir.string(), keys.string());
+
+    w.working = true;
+    w.started = Clock::now();
+    for (auto& t : w.step_start)
+        t = w.started;
+    w.worker = std::thread([&w, files, keys] { BuildThread(w, files, keys); });
+    int last_step = -1, last_pct = -1;
+    auto last_out = Clock::now();
+    while (w.working) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        const int step = std::min(w.step.load(), int(Step::Count) - 1);
+        const float total = Overall(w, w.step.load(), nullptr);
+        const int pct = int(total * 1000);
+        if (step != last_step || (pct != last_pct && Clock::now() - last_out > std::chrono::seconds(2))) {
+            Out(fmt::format("progress {:.3f} {}", total, kStepNames[step]));
+            last_step = step, last_pct = pct, last_out = Clock::now();
+        }
+    }
+    w.worker.join();
+    if (w.failed) {
+        Out("error " + w.error);
+        return 4;
+    }
+    Out("progress 1 Ready to play");
+    return 0;
+}
+
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
@@ -1850,18 +1944,27 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     if (const char* sdk = std::getenv("MUA3_SETUP_SDK")) // developers: a release's sdk folder
         w.sdk_dir = fs::u8path(sdk);
     // command line: --uninstall (Windows Apps), --crash-report (the game, after a crash)
-    bool want_uninstall = false, want_report = false;
+    bool want_uninstall = false, want_report = false, want_prepare = false;
+    std::vector<std::wstring> args;
     {
         int argc = 0;
         wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        for (int i = 1; i < argc; i++)
+            args.push_back(argv[i]);
         for (int i = 1; i < argc; i++) {
             const std::wstring a = argv[i];
-            if (a == L"--uninstall")
+            if (a == L"--prepare")
+                want_prepare = true;
+            else if (a == L"--uninstall")
                 want_uninstall = true;
             else if (a == L"--crash-report")
                 want_report = true, i++;
         }
         LocalFree(argv);
+    }
+    if (want_prepare) {
+        w.install_dir = setup::SetupDir();
+        return RunPrepare(w, args);
     }
     w.installed = setup::FindInstalled();
     if (!w.installed) // run from an install folder whose Apps entry is gone
