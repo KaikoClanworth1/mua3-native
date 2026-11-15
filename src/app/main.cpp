@@ -585,7 +585,8 @@ int main(int argc, char** argv) {
     fs::path input_script;   // test aid: timed button presses ("<seconds> <BUTTON>[+BUTTON] [hold ms]" per line)
     int debug_chapter = -1;  // debug: --chapter N / --stage ST0N0 (app/debug_chapter.cpp)
     fs::path save_template;  // debug: seeds an empty debug_save
-    std::string bad_stage;
+    std::string bad_stage, bad_checkpoint;
+    int debug_section = 0, debug_point = 0; // debug: --checkpoint S:P (DataSavePoint.bin section and point)
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--trace")
@@ -608,6 +609,10 @@ int main(int argc, char** argv) {
             debug_chapter = app::debug_chapter::ChapterOfStage(argv[++i]);
             bad_stage = debug_chapter < 0 ? argv[i] : "";
         }
+        else if (a == "--checkpoint" && i + 1 < argc) {
+            if (!app::debug_chapter::ParseCheckpoint(argv[++i], debug_section, debug_point))
+                bad_checkpoint = argv[i];
+        }
         else if (a == "--save-template" && i + 1 < argc)
             save_template = fs::u8path(argv[++i]);
     }
@@ -615,8 +620,11 @@ int main(int argc, char** argv) {
     common::RotateLog("mua3", 5); // the previous run's log goes to logs/
     common::SetLogFile("mua3.log");
     LOG_INFO("Main", "MUA3 Native {}", common::Version());
+    if (!bad_checkpoint.empty())
+        LOG_WARN("Debug", "--checkpoint {}: takes <section>:<point> (DataSavePoint.bin numbering), e.g. 1:0",
+                 bad_checkpoint);
     if (debug_chapter >= 0)
-        app::debug_chapter::Prepare(cfg, debug_chapter, save_template);
+        app::debug_chapter::Prepare(cfg, debug_chapter, debug_section, debug_point, save_template);
     else if (!bad_stage.empty())
         LOG_WARN("Debug", "--stage {}: takes ST010 .. ST120 (the first stage of story chapters 1-12); use --chapter <N> for others", bad_stage);
     timeBeginPeriod(1);
