@@ -1,5 +1,7 @@
 # MUA3 Native
 
+<a href="https://recomplauncher.com"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
+
 A native Windows port of *Marvel Ultimate Alliance 3: The Black Order* (Nintendo Switch), made by **static
 recompilation**: the game's AArch64 code is translated to C++ and compiled for x64 ahead of time, the Switch OS
 services it calls are implemented natively, and its NVN graphics calls are rendered with Direct3D 11. No emulator
@@ -26,17 +28,23 @@ the frame rate is limited by the render thread in large fights, a few shaders fa
 
 ## Playing (release download)
 
-1. Download `MUA3Native-v…-win64.zip` from [Releases](https://github.com/KaikoClanworth1/mua3-native/releases) and
-   unzip it anywhere (about 25 GB free is needed for the game and the build).
-2. Run `MUA3Launcher.exe` → **Install**: choose your `prod.keys`, add the base game, the 4.0.1 update and any DLC
-   (`.nsp` / `.xci`), install.
-3. **Step 5, Build the game**: if asked, install Microsoft's free
-   [Build Tools for Visual Studio 2026](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio)
-   with "Desktop development with C++". Then press **Build the game**: the launcher unpacks the game's code from
-   your install, translates it to C++ and compiles your own `mua3.exe` (about an hour on 8 cores, ~5 GB).
-4. **Play**.
+You need your Switch dump of the base game (`.nsp` / `.xci`), the 4.0.1 update (`.nsp`), any DLC, and your console's
+`prod.keys`. The game is compiled on your PC, so install Microsoft's free
+[Build Tools for Visual Studio 2026](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio)
+with "Desktop development with C++" first (tick "C++ Clang Compiler for Windows" too: a much faster build).
 
-The release contains only this project's code (the launcher, the recompiler and the port's libraries); the game is
+1. Download `MUA3Native-v…-Windows-x64.zip` from [Releases](https://github.com/KaikoClanworth1/mua3-native/releases)
+   and unzip it anywhere (about 25 GB free is needed for the game and the build).
+2. Run `MUA3Setup.exe`: it finds your game files and `prod.keys` (or browse / drop them on the window), asks where to
+   install, and **Build the game** installs the game data, translates and compiles your own `mua3.exe` and prepares
+   its shaders.
+3. **Play**. Every setting is in the game (title screen > SYSTEM > GRAPHICS).
+
+Or install it with [RecompLauncher](https://recomplauncher.com): it reads `recomplauncher.json` from the release,
+asks for your game files and keys, runs the same setup without a window (`MUA3Setup.exe --prepare`) and shows the
+game's settings on its page.
+
+The release contains only this project's code (the setup, the recompiler and the port's libraries); the game is
 built from your copy on your PC.
 
 ## Building from source

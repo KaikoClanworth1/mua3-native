@@ -1,0 +1,177 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "name": "MUA3 Native",
+  "repo": "KaikoClanworth1/mua3-native",
+  "inputs": [
+    {
+      "id": "game",
+      "label": "Your Marvel Ultimate Alliance 3: The Black Order base game for Switch (.nsp or .xci).",
+      "role": "game",
+      "formats": [{ "type": "file", "extensions": ["nsp", "xci"], "requires": ["keys"] }]
+    },
+    {
+      "id": "update",
+      "label": "The game's 4.0.1 update (.nsp).",
+      "role": "update",
+      "formats": [{ "type": "file", "extensions": ["nsp"], "requires": ["keys"] }]
+    },
+    {
+      "id": "dlc",
+      "label": "The Expansion Pass or other DLC (.nsp), if you have it.",
+      "role": "dlc",
+      "optional": true,
+      "formats": [{ "type": "file", "extensions": ["nsp"], "requires": ["keys"] }]
+    },
+    {
+      "id": "keys",
+      "label": "Your Switch's prod.keys.",
+      "role": "key",
+      "shared": "switch.prod-keys"
+    }
+  ],
+  "prepare": {
+    "program": ["MUA3Setup.exe"],
+    "args": ["--prepare", "--game={input:game}", "--update={input:update}", "--dlc={input:dlc}", "--keys={input:keys}", "--install={install}"],
+    "label": "Installing the game data and building the game on your PC (needs Microsoft's free Build Tools for Visual Studio 2026)",
+    "timeout": 21600,
+    "done": ["{install}/mua3.exe"]
+  },
+  "start": {
+    "program": ["mua3.exe"]
+  },
+  "config": [
+    {
+      "id": "main",
+      "format": "ini",
+      "file": [{ "path": "{install}/mua3.ini" }]
+    }
+  ],
+  "saves": ["{install}/save", "{install}/mua3.ini"],
+  "folders": {
+    "saves": [{ "path": "{install}/save" }],
+    "logs": [{ "path": "{install}" }],
+    "screenshots": [{ "path": "{install}/screenshots" }]
+  },
+  "exit_codes": {
+    "2": "The setup didn't get your game file or prod.keys. Pick them again on the game's page.",
+    "3": "The game is built on your PC and needs Microsoft's free Build Tools for Visual Studio 2026 (workload: Desktop development with C++). Install them, then run the setup again.",
+    "4": "Installing or building the game failed. The details are in setup.log in your AppData\\Local\\MUA3Native folder."
+  },
+  "looks": {
+    "graphics": "d3d11"
+  },
+  "groups": [{ "id": "Picture" }, { "id": "Sound" }, { "id": "Controls" }],
+  "settings": [
+    {
+      "id": "window", "label": "Window", "group": "Picture",
+      "help": "Fullscreen fills your screen. Windowed uses the window size below. F11 switches in the game.",
+      "choices": [
+        { "label": "Fullscreen", "set": { "video/fullscreen": "1" } },
+        { "label": "Windowed", "set": { "video/fullscreen": "0" } }
+      ],
+      "defaults": { "video/fullscreen": "0" }
+    },
+    {
+      "id": "resolution", "label": "Resolution", "group": "Picture",
+      "help": "The size of the game's picture. The game draws at this size, sharp at any of them.",
+      "choices": [
+        { "label": "1280 x 720", "set": { "video/width": "1280", "video/height": "720" } },
+        { "label": "1600 x 900", "set": { "video/width": "1600", "video/height": "900" } },
+        { "label": "1920 x 1080", "set": { "video/width": "1920", "video/height": "1080" } },
+        { "label": "2560 x 1440", "set": { "video/width": "2560", "video/height": "1440" } },
+        { "label": "3440 x 1440", "set": { "video/width": "3440", "video/height": "1440" } },
+        { "label": "3840 x 2160", "set": { "video/width": "3840", "video/height": "2160" } }
+      ],
+      "defaults": { "video/width": "1920", "video/height": "1080" }
+    },
+    {
+      "id": "render_scale", "label": "Render scale", "group": "Picture",
+      "help": "How large the game draws before fitting your screen. Auto matches your resolution.",
+      "choices": [
+        { "label": "Auto", "set": { "video/resolution_scale": "0" } },
+        { "label": "1x (1080p)", "set": { "video/resolution_scale": "1" } },
+        { "label": "2x (1440p / 4K)", "set": { "video/resolution_scale": "2" } },
+        { "label": "3x", "set": { "video/resolution_scale": "3" } },
+        { "label": "4x", "set": { "video/resolution_scale": "4" } }
+      ],
+      "defaults": { "video/resolution_scale": "0" },
+      "advanced": true
+    },
+    {
+      "id": "frame_rate", "label": "Frame rate", "group": "Picture",
+      "help": "30 is the console's own. Higher rates use patched timing and are still experimental. Applies after a restart.",
+      "choices": [
+        { "label": "30 (console)", "set": { "video/fps_target": "30" } },
+        { "label": "60", "set": { "video/fps_target": "60" } },
+        { "label": "120", "set": { "video/fps_target": "120" } },
+        { "label": "144", "set": { "video/fps_target": "144" } },
+        { "label": "165", "set": { "video/fps_target": "165" } },
+        { "label": "240", "set": { "video/fps_target": "240" } }
+      ],
+      "defaults": { "video/fps_target": "60" }
+    },
+    {
+      "id": "vsync", "label": "V-Sync", "group": "Picture",
+      "help": "On waits for your screen's refresh, so there's no tearing. Off shows each frame as soon as it's ready.",
+      "choices": [
+        { "label": "On", "set": { "video/vsync": "1" } },
+        { "label": "Off", "set": { "video/vsync": "0" } }
+      ],
+      "defaults": { "video/vsync": "1" }
+    },
+    {
+      "id": "anti_aliasing", "label": "Anti-aliasing", "group": "Picture",
+      "help": "Smooths jagged edges. FXAA costs almost nothing. SSAA is sharpest and needs a fast graphics card.",
+      "choices": [
+        { "label": "Off", "set": { "video/anti_aliasing": "0" } },
+        { "label": "FXAA", "set": { "video/anti_aliasing": "1" } },
+        { "label": "SSAA 2x", "set": { "video/anti_aliasing": "2" } },
+        { "label": "SSAA 3x", "set": { "video/anti_aliasing": "3" } },
+        { "label": "SSAA 4x", "set": { "video/anti_aliasing": "4" } }
+      ],
+      "defaults": { "video/anti_aliasing": "0" }
+    },
+    {
+      "id": "show_fps", "label": "Show FPS", "group": "Picture",
+      "help": "The frame rate in a corner of the game.",
+      "choices": [
+        { "label": "On", "set": { "video/show_fps": "1" } },
+        { "label": "Off", "set": { "video/show_fps": "0" } }
+      ],
+      "defaults": { "video/show_fps": "1" }
+    },
+    {
+      "id": "volume", "label": "Master volume", "group": "Sound",
+      "help": "The game's overall volume.",
+      "slider": { "key": "audio/volume", "min": 0, "max": 100, "step": 10, "format": "%d" }
+    },
+    {
+      "id": "mute", "label": "Mute", "group": "Sound",
+      "help": "Silences the game and keeps the volume.",
+      "choices": [
+        { "label": "Off", "set": { "audio/mute": "0" } },
+        { "label": "On", "set": { "audio/mute": "1" } }
+      ],
+      "defaults": { "audio/mute": "0" }
+    },
+    {
+      "id": "camera_speed", "label": "Camera speed", "group": "Controls",
+      "help": "How fast the right stick turns the camera, in percent of the game's own speed.",
+      "slider": { "key": "input/camera_speed", "min": 10, "max": 200, "step": 10, "format": "%d" }
+    },
+    {
+      "id": "controller", "label": "Controller support", "group": "Controls",
+      "help": "Xbox works with Xbox pads. Any controller adds PlayStation, Switch Pro and others through SDL.",
+      "choices": [
+        { "label": "Xbox (XInput)", "set": { "input/input_backend": "0" } },
+        { "label": "Any controller (SDL)", "set": { "input/input_backend": "1" } }
+      ],
+      "defaults": { "input/input_backend": "0" }
+    }
+  ],
+  "actions": [
+    { "id": "saves", "label": "Saves", "help": "Your save files.", "open": "saves" },
+    { "id": "screenshots", "label": "Screenshots", "help": "Pictures taken with F12.", "open": "screenshots" }
+  ]
+}
