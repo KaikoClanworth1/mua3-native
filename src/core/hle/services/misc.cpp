@@ -1,5 +1,7 @@
 // Small system services: lm, apm, set, time, pl, acc, aoc, nifm, pctl, friend, prepo, csrng, fatal...
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <ctime>
 #include <random>
 
@@ -370,14 +372,37 @@ public:
 };
 
 // ---------------------------------------------------------------- aoc:u
+// Add-on content the player installed: game_dir/aoc/<data id>.romfs (fs OpenDataStorageByDataId serves the same files).
+// Only those are listed, so a game without the DLC never asks for storage that isn't there (it aborts if it does).
+std::vector<u32> InstalledAddOns(u64 program_id) {
+    const u64 base = program_id + 0x1000;
+    std::vector<u32> out;
+    std::error_code ec;
+    for (auto& e : fs::directory_iterator(core::Sys().Cfg().game_dir / "aoc", ec)) {
+        if (e.path().extension() != ".romfs")
+            continue;
+        const u64 id = std::strtoull(e.path().stem().string().c_str(), nullptr, 16);
+        if (id > base && id - base < 0x1000)
+            out.push_back(u32(id - base));
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
 class AocService final : public Service {
 public:
     AocService() : Service("aoc:u") {
-        Reg(2, "CountAddOnContent", [](Request& r) { r.Push<u32>(1); });
+        Reg(2, "CountAddOnContent", [](Request& r) {
+            const auto n = InstalledAddOns(r.k.program_id).size();
+            LOG_INFO("aoc", "CountAddOnContent: {}", n);
+            r.Push<u32>(u32(n));
+        });
         Reg(3, "ListAddOnContent", [](Request& r) {
             const u32 offset = r.ArgAt<u32>(0);
-            u32 idx = 1;
-            r.Push<u32>(offset == 0 && r.OutSize() >= 4 ? u32(r.WriteOut(&idx, 4) / 4) : 0);
+            const auto all = InstalledAddOns(r.k.program_id);
+            const size_t room = r.OutSize() / 4;
+            const size_t n = offset < all.size() ? std::min(room, all.size() - offset) : 0;
+            r.Push<u32>(n ? u32(r.WriteOut(all.data() + offset, n * 4) / 4) : 0);
         });
         Reg(5, "GetAddOnContentBaseId", [](Request& r) { r.Push<u64>(r.k.program_id + 0x1000); });
         Ok(7, "PrepareAddOnContent");
