@@ -27,6 +27,7 @@
 #include "launcher/report.h"
 #include "loader/installer.h"
 #include "platform/platform.h"
+#include "core/hle/mods.h"
 #include "setup/install_ops.h"
 
 namespace {
@@ -335,7 +336,7 @@ bool BeginPanel(const char* id, ImVec2 size, ImVec2 pad = ImVec2(16, 12)) {
 void EndPanel() { ImGui::EndChild(); }
 
 // ---- the wizard
-enum class Page { Files, Build, Done, Installed, Uninstalled, Report };
+enum class Page { Files, Build, Done, Installed, Uninstalled, Report, Mods };
 enum class Step { Read, Translate, Compile, Link, Shaders, Count };
 constexpr const char* kStepNames[] = {"Read your game files", "Translate the game to PC code", "Compile",
                                       "Put the game together", "Prepare the shaders"};
@@ -398,6 +399,11 @@ struct Wizard {
     bool open_uninstall = false;
     bool keep_saves = true;
     bool auto_uninstall = false; // (developer test: MUA3_SETUP_DO_UNINSTALL presses Uninstall)
+
+    // -- Mods page (the installed game's mods\ folder and [mods] enabled in its mua3.ini)
+    std::vector<hle::mods::Mod> mods;
+    bool mods_on = true, mods_dirty = false;
+    std::string mods_note;
     std::vector<std::string> uninstall_left;
 
     // report
@@ -1701,6 +1707,8 @@ void UninstallModal(Wizard& w) {
     ImGui::PopStyleVar();
 }
 
+void OpenModsPage(Wizard& w);
+
 void InstalledPage(Wizard& w, bool& quit) {
     const auto& in = *w.installed;
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1765,9 +1773,206 @@ void InstalledPage(Wizard& w, bool& quit) {
                 w.Add(f);
         w.page = Page::Files;
     }
+    if (exe && card("mods", "Mods", "Turn mods on or off and set their load order.", false))
+        OpenModsPage(w);
     if (card("uninstall", "Uninstall", "Remove the game from this PC. You can keep your saves.", false))
         w.open_uninstall = true;
     UninstallModal(w);
+}
+
+// ---- page: mods (docs/mods.md). The list and order.txt are the game's own code (hle::mods), read here for the
+// installed game's folder; [mods] enabled is its mua3.ini. Nothing runs: changes apply at the next start.
+fs::path ModsFolder(const Wizard& w) { return w.installed->dir / "mods"; }
+
+void OpenModsPage(Wizard& w) {
+    w.mods = hle::mods::Scan(false, ModsFolder(w));
+    core::Config c;
+    c.Load(w.installed->dir / "mua3.ini");
+    w.mods_on = c.mods_enabled;
+    w.mods_dirty = false;
+    w.mods_note.clear();
+    w.page = Page::Mods;
+}
+
+bool SaveMods(Wizard& w) {
+    const fs::path ini = w.installed->dir / "mua3.ini";
+    core::Config c;
+    c.Load(ini);
+    c.mods_enabled = w.mods_on;
+    c.Save(ini);
+    hle::mods::EnsureFolder(ModsFolder(w));
+    const bool ok = hle::mods::SaveOrder(w.mods, ModsFolder(w));
+    LOG_INFO("Setup", "mods saved: {} ({} mods, mods {})", ok ? "ok" : "FAILED", w.mods.size(), w.mods_on ? "on" : "off");
+    w.mods_dirty = !ok;
+    w.mods_note = ok ? "Saved. The changes apply the next time the game starts." : "Could not write mods\\order.txt.";
+    return ok;
+}
+
+// A small square button with an up or down chevron.
+bool ArrowButton(const char* id, bool up, bool enabled) {
+    const ImVec2 p = ImGui::GetCursorScreenPos(), sz = S(30, 30);
+    ImGui::BeginDisabled(!enabled);
+    const bool pressed = ImGui::InvisibleButton(id, sz);
+    ImGui::EndDisabled();
+    const bool hov = enabled && ImGui::IsItemHovered();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p, ImVec2(p.x + sz.x, p.y + sz.y), IM_COL32(255, 255, 255, hov ? 34 : 16), S(7));
+    const ImU32 c = enabled ? (hov ? col::text : col::dim) : col::faint;
+    const float cx = p.x + sz.x * 0.5f, cy = p.y + sz.y * 0.5f, d = up ? -1.0f : 1.0f;
+    const ImVec2 v[3] = {ImVec2(cx - S(5), cy - d * S(2.5f)), ImVec2(cx, cy + d * S(2.5f)), ImVec2(cx + S(5), cy - d * S(2.5f))};
+    dl->AddPolyline(v, 3, c, ImDrawFlags_None, S(1.8f));
+    return pressed && enabled;
+}
+
+void ModsPage(Wizard& w) {
+    {
+        FontScope f(g_semibold, kTitle);
+        ImGui::TextUnformatted("Mods");
+    }
+    Dim("Mods made for the Switch version (retextures, data and UI files) work as they come: one folder per mod in "
+        "the mods folder. Mods lower in the list win when two change the same file. Changes apply the next time the "
+        "game starts.");
+    ImGui::Dummy(S(1, 6));
+
+    // -- master switch
+    if (BeginPanel("master", ImVec2(0, S(64)))) {
+        const float y = ImGui::GetCursorPosY();
+        ImGui::BeginGroup();
+        ImGui::TextUnformatted("Use mods");
+        Dim(w.mods_on ? "The game loads the mods that are on below." : "Off: the game starts without any mod.", false);
+        ImGui::EndGroup();
+        ImGui::SameLine(ImGui::GetWindowWidth() - S(16) - S(42));
+        ImGui::SetCursorPosY(y + S(6));
+        if (Toggle("##use", &w.mods_on))
+            w.mods_dirty = true, w.mods_note.clear();
+    }
+    EndPanel();
+    ImGui::Dummy(S(1, 4));
+
+    Label(w.mods.empty() ? "LOAD ORDER" : fmt::format("LOAD ORDER  ·  {} MODS, {} ON", w.mods.size(),
+                                                          std::count_if(w.mods.begin(), w.mods.end(),
+                                                                        [](const hle::mods::Mod& m) { return m.enabled; }))
+                                              .c_str());
+    if (w.mods.empty()) {
+        if (BeginPanel("none", ImVec2(0, S(76)))) {
+            ImGui::TextUnformatted("No mods yet");
+            Dim("Put each mod's folder in the mods folder (Open mods folder, below), then come back here.");
+        }
+        EndPanel();
+    } else {
+        ImGui::BeginDisabled(!w.mods_on);
+        int move = -1, dir = 0;
+        for (int i = 0; i < int(w.mods.size()); i++) {
+            hle::mods::Mod& m = w.mods[i];
+            ImGui::PushID(i);
+            std::string sub, warn;
+            if (m.romfs.empty())
+                warn = "No game files found in this folder: nothing to load.";
+            else
+                sub = "Game files in " + m.layout;
+            if (!m.unsupported.empty()) {
+                std::string parts;
+                for (auto& u : m.unsupported)
+                    parts += (parts.empty() ? "" : "; ") + u;
+                (warn.empty() ? warn : warn += " ") += "Not supported here: " + parts + ".";
+            }
+            const float h = S(sub.empty() || warn.empty() ? 58 : 82); // (one or two lines under the name)
+            if (BeginPanel("mod", ImVec2(0, h), ImVec2(14, 10))) {
+                const float y = ImGui::GetCursorPosY();
+                ImGui::SetCursorPosY(y + (h - S(20) - S(24)) * 0.5f);
+                {
+                    FontScope f(g_semibold, kSmall);
+                    ImGui::TextColored(V(col::faint), "%2d", i + 1);
+                }
+                ImGui::SameLine(S(14) + S(30));
+                ImGui::SetCursorPosY(y + (h - S(20) - S(24)) * 0.5f);
+                if (Toggle("##on", &m.enabled))
+                    w.mods_dirty = true, w.mods_note.clear();
+                ImGui::SameLine(0, S(16));
+                ImGui::SetCursorPosY(y);
+                ImGui::BeginGroup();
+                ImGui::PushTextWrapPos(ImGui::GetWindowWidth() - S(100));
+                ImGui::TextColored(V(m.enabled && w.mods_on ? col::text : col::dim), "%s", m.name.c_str());
+                if (!sub.empty())
+                    Dim(sub, false);
+                if (!warn.empty()) {
+                    FontScope f(g_regular, kSmall);
+                    ImGui::TextColored(V(col::amber), "%s", warn.c_str());
+                }
+                ImGui::PopTextWrapPos();
+                ImGui::EndGroup();
+                ImGui::SameLine(ImGui::GetWindowWidth() - S(14) - S(30) * 2 - S(6));
+                ImGui::SetCursorPosY(y + (h - S(20) - S(30)) * 0.5f);
+                if (ArrowButton("##up", true, i > 0))
+                    move = i, dir = -1;
+                ImGui::SetItemTooltip("Load earlier (lower in the list wins)");
+                ImGui::SameLine(0, S(6));
+                if (ArrowButton("##down", false, i + 1 < int(w.mods.size())))
+                    move = i, dir = 1;
+                ImGui::SetItemTooltip("Load later: wins over the mods above it");
+            }
+            EndPanel();
+            ImGui::PopID();
+        }
+        ImGui::EndDisabled();
+        if (move >= 0) {
+            std::swap(w.mods[move], w.mods[move + dir]);
+            w.mods_dirty = true, w.mods_note.clear();
+        }
+    }
+    ImGui::Dummy(S(1, 4));
+    {
+        FontScope f(g_regular, kSmall);
+        Dim("Code patches (exefs, .ips, .pchtxt) and cheats cannot work in this port: the game runs as native PC code. "
+            "mods\\mods.log lists what each mod changed at the last start.");
+    }
+    if (g_scroll_bottom)
+        ImGui::SetScrollY(ImGui::GetScrollMaxY());
+}
+
+// Bottom bar of the Mods page.
+void ModsBottom(Wizard& w) {
+    const float h = ImGui::GetWindowHeight();
+    ImGui::SetCursorPos(ImVec2(S(64), (h - S(44)) * 0.5f));
+    if (Button("Open mods folder", S(180, 44))) {
+        hle::mods::EnsureFolder(ModsFolder(w));
+        ShellExecuteW(nullptr, L"open", ModsFolder(w).wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+    ImGui::SameLine(0, S(12));
+    if (Button("Refresh", S(120, 44))) {
+        const bool on = w.mods_on, dirty = w.mods_dirty;
+        auto old = w.mods;
+        w.mods = hle::mods::Scan(false, ModsFolder(w));
+        for (auto& m : w.mods) // (unsaved switches and order survive a refresh)
+            for (size_t k = 0; dirty && k < old.size(); k++)
+                if (old[k].name == m.name)
+                    m.enabled = old[k].enabled;
+        if (dirty) {
+            std::stable_sort(w.mods.begin(), w.mods.end(), [&](const hle::mods::Mod& a, const hle::mods::Mod& b) {
+                auto at = [&](const std::string& n) {
+                    for (size_t k = 0; k < old.size(); k++)
+                        if (old[k].name == n)
+                            return k;
+                    return old.size();
+                };
+                return at(a.name) < at(b.name);
+            });
+        }
+        w.mods_on = on;
+    }
+    const char* note = w.mods_note.empty() ? (w.mods_dirty ? "Not saved yet." : "") : w.mods_note.c_str();
+    const ImVec2 ns = ImGui::CalcTextSize(note);
+    const float right = ImGui::GetWindowWidth() - S(64);
+    ImGui::SetCursorPos(ImVec2(right - S(140) * 2 - S(12) - S(20) - ns.x, (h - ns.y) * 0.5f));
+    ImGui::TextColored(V(w.mods_note.rfind("Saved", 0) == 0 ? col::green : col::dim), "%s", note);
+    ImGui::SetCursorPos(ImVec2(right - S(140) * 2 - S(12), (h - S(44)) * 0.5f));
+    if (Button("Back", S(140, 44))) {
+        w.page = Page::Installed;
+        w.mods_note.clear();
+    }
+    ImGui::SameLine(0, S(12));
+    if (Button("Save", S(140, 44), true, w.mods_dirty))
+        SaveMods(w);
 }
 
 void UninstalledPage(Wizard& w, bool& quit) {
@@ -1975,6 +2180,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     if (const char* pg = std::getenv("MUA3_SETUP_PAGE")) { // screenshots / tests
         const std::string s = pg;
         if (s == "files") w.page = Page::Files;
+        if (s == "mods" && w.installed) OpenModsPage(w);
     }
     if (w.page == Page::Files || w.page == Page::Installed)
         w.StartScan();
@@ -2041,7 +2247,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         TopBar(w);
         ImGui::EndChild();
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, S(64, 14));
-        const bool scrolls = w.page == Page::Files || w.page == Page::Report;
+        const bool scrolls = w.page == Page::Files || w.page == Page::Report || w.page == Page::Mods;
         ImGui::BeginChild("content", ImVec2(0, vp->Size.y - top - bottom), ImGuiChildFlags_AlwaysUseWindowPadding,
                           ImGuiWindowFlags_NoBackground | (scrolls ? 0 : ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse));
         ImGui::PopStyleVar();
@@ -2059,6 +2265,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         case Page::Installed: InstalledPage(w, quit); break;
         case Page::Uninstalled: UninstalledPage(w, quit); break;
         case Page::Report: ReportPage(w, quit); break;
+        case Page::Mods: ModsPage(w); break;
         }
         if (scrolls && ImGui::GetScrollY() < ImGui::GetScrollMaxY() - 1) { // more below: say so
             ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -2091,6 +2298,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         }
         case Page::Build: BuildBottom(w); break;
         case Page::Done: DoneBottom(w, quit); break;
+        case Page::Mods: ModsBottom(w); break;
         default: break;
         }
         ImGui::EndChild();
@@ -2184,6 +2392,26 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             if (w.page == Page::Done && page_frames == 25 && auto_dir) {
                 MakeShortcuts(w);
                 break;
+            }
+            if (w.page == Page::Mods && std::getenv("MUA3_SETUP_PAGE")) { // (MUA3_SETUP_PAGE=mods)
+                const bool edit = std::getenv("MUA3_SETUP_MODS_EDIT") && w.mods.size() >= 3;
+                if (page_frames == 30)
+                    shot(edit ? "7_mods_edited.bmp" : "7_mods.bmp");
+                if (page_frames == 34)
+                    g_scroll_bottom = true;
+                if (page_frames == 38)
+                    shot(edit ? "7_mods_edited_lower.bmp" : "7_mods_lower.bmp"), g_scroll_bottom = false;
+                if (edit && page_frames == 20) { // a test edit: the 2nd mod off, the 3rd moved up one
+                    w.mods[1].enabled = false;
+                    std::swap(w.mods[1], w.mods[2]);
+                    w.mods_dirty = true;
+                }
+                if (edit && page_frames == 40)
+                    SaveMods(w);
+                if (page_frames == 44)
+                    shot(edit ? "7_mods_saved.bmp" : "7_mods_end.bmp");
+                if (page_frames == 48)
+                    break;
             }
             if (w.page == Page::Installed && page_frames == 40) {
                 shot("4_installed.bmp");
