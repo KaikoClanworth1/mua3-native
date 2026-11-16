@@ -77,6 +77,15 @@ Settings live in `mua3.ini` and are edited in the launcher: presets (Recommended
 High refresh), resolution, camera speed, language, audio. Keys: F11 fullscreen, F12 screenshot, F1 debug overlay.
 Keyboard: WASD move, L/K/I/J = A/B/X/Y, Q/E = L/R, 1/3 = ZL/ZR, Enter = +, Tab = −. Logs go to `mua3.log`.
 
+## Mods
+
+Mods made for the Switch version (retextures, data and UI file mods, the "romfs" / LayeredFS kind) work: put each
+mod's folder into `mods\` next to `mua3.exe` and start the game. Emulator and Atmosphere layouts
+(`romfs\`, `010060700AC50000\romfs\`, `atmosphere\contents\010060700AC50000\romfs\`) are accepted as they are.
+`mods\order.txt` sets the load order (lower lines win) and turns mods off (`-` in front of a name);
+`mods\mods.log` lists what each mod replaced, added and conflicts. Code patches (exefs / IPS) and cheats cannot apply
+to the natively compiled game. Details: [docs/mods.md](docs/mods.md).
+
 ## Layout
 
 ```

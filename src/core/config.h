@@ -41,6 +41,7 @@ struct Config {
     int log_level = 2; // 0 trace .. 4 error
     bool bug_capture = false; // [debug] F4 writes a bug capture folder (platform/bug_capture.cpp)
     bool stage_select = false; // [debug] allows --chapter / --stage (app/debug_chapter.cpp)
+    bool mods_enabled = true;  // [mods] enabled: master switch for the mods folder (core/hle/mods.h, docs/mods.md)
     // Not stored: set while --chapter plays from its own save folder; Save() writes this as save_dir instead.
     fs::path user_save_dir;
 

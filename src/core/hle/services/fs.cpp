@@ -7,6 +7,7 @@
 #include <windows.h>
 
 #include "core/hle/menu_mods.h"
+#include "core/hle/mods.h"
 #include "core/hle/service.h"
 #include "core/hle/video_output.h"
 #include "gpu/shader/anticipate.h"
@@ -106,32 +107,48 @@ public:
     static constexpr const char* kIndexFile = "romfs_index.bin";
     bool Open(const fs::path& root) {
         root_ = root;
-        if (Load(root))
-            return true;
-        if (!Build(root))
-            return false;
-        Save(root);
+        if (!Load(root)) {
+            if (!Build(root))
+                return false;
+            Save(root); // the saved index is the game's files only: mods are laid over it at every launch
+        }
+        ApplyMods();
         return true;
     }
 
+    // The RomFS tree an image is made from: dirs[0] is the root; children in listing order.
+    struct Dir {
+        std::string name;
+        u32 parent = 0;
+        std::vector<u32> dirs, files;
+        u32 offset = 0;
+    };
+    struct File {
+        std::string name;
+        u32 parent = 0;
+        u64 size = 0;
+        fs::path host;
+        u32 offset = 0;
+        u64 data_off = 0;
+    };
+    struct Tree {
+        std::vector<Dir> dirs = std::vector<Dir>(1);
+        std::vector<File> files;
+    };
+
     bool Build(const fs::path& root) {
         root_ = root;
-        struct Dir {
-            std::string name;
-            u32 parent = 0;
-            std::vector<u32> dirs, files;
-            u32 offset = 0;
-        };
-        struct File {
-            std::string name;
-            u32 parent = 0;
-            u64 size = 0;
-            fs::path host;
-            u32 offset = 0;
-            u64 data_off = 0;
-        };
-        std::vector<Dir> dirs(1);
-        std::vector<File> files;
+        Tree t;
+        CollectDisk(root, t);
+        if (t.files.empty())
+            return false;
+        Emit(t);
+        return true;
+    }
+
+    static void CollectDisk(const fs::path& root, Tree& t) {
+        auto& dirs = t.dirs;
+        auto& files = t.files;
         std::vector<std::pair<u32, fs::path>> stack{{0, root}};
         std::error_code ec;
         while (!stack.empty()) {
@@ -156,8 +173,12 @@ public:
                 }
             }
         }
-        if (files.empty())
-            return false;
+    }
+
+    // Builds the image (meta_, extents_, size_) from a tree.
+    void Emit(Tree& t) {
+        auto& dirs = t.dirs;
+        auto& files = t.files;
         auto entry_size = [](const std::string& n, size_t base) { return u32(common::AlignUp(base + n.size(), 4)); };
         u32 off = 0;
         for (auto& d : dirs) {
@@ -238,12 +259,255 @@ public:
         std::memcpy(&meta_[dm_off], dir_meta.data(), dir_meta_size);
         std::memcpy(&meta_[fh_off], file_hash.data(), nfb * 4);
         std::memcpy(&meta_[fm_off], file_meta.data(), file_meta_size);
+        extents_.clear();
+        extents_.reserve(files.size());
         for (auto& f : files)
             extents_.emplace_back(f.data_off, f.size, std::move(f.host));
         size_ = data_off_ + data;
         LOG_INFO("fs", "Virtual RomFS: {} dirs, {} files, {:.2f} GB", dirs.size(), files.size(),
                  double(size_) / (1 << 30));
-        return true;
+    }
+
+    // The tree back from the image (meta_), so a saved index can take mods without scanning the game folder.
+    // Host paths are root / folders / name, as CollectDisk made them.
+    bool ParseMeta(Tree& t) const {
+        u64 hdr[10]{};
+        if (meta_.size() < sizeof(hdr))
+            return false;
+        std::memcpy(hdr, meta_.data(), sizeof(hdr));
+        const u64 dm_off = hdr[3], dm_size = hdr[4], fm_off = hdr[7], fm_size = hdr[8];
+        if (dm_off + dm_size > meta_.size() || fm_off + fm_size > meta_.size())
+            return false;
+        auto get32 = [&](u64 base, u64 size, u64 o) -> u32 {
+            if (o + 4 > size)
+                return 0xFFFFFFFF;
+            u32 v;
+            std::memcpy(&v, &meta_[size_t(base + o)], 4);
+            return v;
+        };
+        auto name_at = [&](u64 base, u64 size, u64 o, u64 hdr_size) {
+            const u32 len = get32(base, size, o + hdr_size - 4);
+            if (len > 0x300 || o + hdr_size + len > size)
+                return std::string();
+            return std::string(reinterpret_cast<const char*>(&meta_[size_t(base + o + hdr_size)]), len);
+        };
+        constexpr u32 kNone = 0xFFFFFFFF;
+        t = Tree();
+        std::vector<std::pair<u32, u32>> stack{{0u, 0u}}; // (tree dir index, meta offset)
+        std::vector<fs::path> paths{root_};
+        size_t guard = 0;
+        while (!stack.empty()) {
+            const auto [di, mo] = stack.back();
+            stack.pop_back();
+            if (++guard > 1000000)
+                return false;
+            for (u32 c = get32(dm_off, dm_size, mo + 8); c != kNone; c = get32(dm_off, dm_size, c + 4)) {
+                const u32 ni = u32(t.dirs.size());
+                Dir d;
+                d.name = name_at(dm_off, dm_size, c, 0x18);
+                d.parent = di;
+                if (d.name.empty())
+                    return false;
+                paths.push_back(paths[di] / fs::u8path(d.name));
+                t.dirs.push_back(std::move(d));
+                t.dirs[di].dirs.push_back(ni);
+                stack.emplace_back(ni, c);
+                if (t.dirs.size() > 1000000)
+                    return false;
+            }
+            for (u32 c = get32(dm_off, dm_size, mo + 12); c != kNone; c = get32(fm_off, fm_size, c + 4)) {
+                File f;
+                f.name = name_at(fm_off, fm_size, c, 0x20);
+                f.parent = di;
+                if (c + 24 > fm_size || f.name.empty())
+                    return false;
+                std::memcpy(&f.size, &meta_[size_t(fm_off + c + 16)], 8);
+                f.host = paths[di] / fs::u8path(f.name);
+                t.dirs[di].files.push_back(u32(t.files.size()));
+                t.files.push_back(std::move(f));
+                if (t.files.size() > 10000000)
+                    return false;
+            }
+        }
+        return !t.files.empty();
+    }
+
+    static std::string Lower(std::string s) {
+        for (char& c : s)
+            if (c >= 'A' && c <= 'Z')
+                c = char(c - 'A' + 'a');
+        return s;
+    }
+
+    // Lays the enabled mods over the image, in load order: a file at a path the game has (any case) replaces it,
+    // a new path is added (with its folders). Logs and reports what each mod did.
+    void ApplyMods() {
+        if (!hle::mods::Enabled()) {
+            LOG_INFO("mods", "Mods are off ([mods] enabled=0 in mua3.ini, or MUA3_MODS=0)");
+            hle::mods::SetLoaded({});
+            return;
+        }
+        auto mods = hle::mods::Scan(true);
+        std::vector<std::string> log;
+        bool any = false;
+        for (const auto& m : mods)
+            any |= m.enabled && !m.romfs.empty();
+        if (!any) {
+            for (const auto& m : mods)
+                for (const auto& u : m.unsupported)
+                    LOG_WARN("mods", "{}: not supported: {}", m.name, u);
+            if (!mods.empty())
+                LOG_INFO("mods", "{} mod folder(s), none enabled with RomFS files", mods.size());
+            hle::mods::WriteLog(mods, log);
+            hle::mods::SetLoaded(std::move(mods));
+            return;
+        }
+        Tree t;
+        if (!ParseMeta(t)) {
+            LOG_ERROR("mods", "Could not read the RomFS image back: mods not loaded");
+            hle::mods::SetLoaded({});
+            return;
+        }
+        // lookup: lower-case folder path -> dir index, and per dir lower-case name -> file / subdir index
+        std::unordered_map<std::string, u32> dir_of;
+        std::vector<std::string> dir_path(t.dirs.size());
+        for (u32 i = 1; i < t.dirs.size(); i++) // parents come before children
+            dir_path[i] = (t.dirs[i].parent ? dir_path[t.dirs[i].parent] + "/" : "") + Lower(t.dirs[i].name);
+        for (u32 i = 0; i < t.dirs.size(); i++)
+            dir_of[dir_path[i]] = i;
+        std::unordered_map<std::string, u32> file_of; // "dir/name" lower-case -> file index
+        for (u32 i = 0; i < t.files.size(); i++) {
+            const auto& f = t.files[i];
+            file_of[(f.parent ? dir_path[f.parent] + "/" : "") + Lower(f.name)] = i;
+        }
+        const size_t base_files = t.files.size();
+        std::unordered_map<std::string, std::string> owner; // lower rel -> the mod that last changed it
+        auto display = [&](u32 di, const std::string& name) {
+            std::string s;
+            for (u32 d = di; d; d = t.dirs[d].parent)
+                s = t.dirs[d].name + "/" + s;
+            return s + name;
+        };
+        for (auto& m : mods) {
+            if (!m.enabled || m.romfs.empty())
+                continue;
+            m.loaded = true;
+            for (const auto& u : m.unsupported)
+                LOG_WARN("mods", "{}: not supported: {}", m.name, u);
+            std::vector<fs::path> mod_files;
+            std::error_code ec;
+            for (auto it = fs::recursive_directory_iterator(m.romfs, ec); !ec && it != fs::recursive_directory_iterator();
+                 it.increment(ec))
+                if (it->is_regular_file(ec))
+                    mod_files.push_back(it->path());
+            std::sort(mod_files.begin(), mod_files.end());
+            for (const fs::path& host : mod_files) {
+                const fs::path rel = host.lexically_relative(m.romfs);
+                std::vector<std::string> parts;
+                for (const auto& p : rel)
+                    parts.push_back(U8(p));
+                if (parts.empty())
+                    continue;
+                const std::string fname = parts.back();
+                parts.pop_back();
+                // the folders, made where missing
+                u32 di = 0;
+                std::string dkey;
+                for (const std::string& p : parts) {
+                    dkey = dkey.empty() ? Lower(p) : dkey + "/" + Lower(p);
+                    if (auto it = dir_of.find(dkey); it != dir_of.end()) {
+                        di = it->second;
+                        continue;
+                    }
+                    const u32 ni = u32(t.dirs.size());
+                    Dir d;
+                    d.name = p;
+                    d.parent = di;
+                    t.dirs.push_back(std::move(d));
+                    t.dirs[di].dirs.push_back(ni);
+                    dir_of[dkey] = ni;
+                    di = ni;
+                }
+                const std::string key = (dkey.empty() ? "" : dkey + "/") + Lower(fname);
+                const u64 size = fs::file_size(host, ec);
+                if (ec)
+                    continue;
+                if (auto it = file_of.find(key); it != file_of.end()) {
+                    File& f = t.files[it->second];
+                    const std::string shown = display(f.parent, f.name);
+                    if (it->second < base_files)
+                        m.overrides++;
+                    else
+                        m.addons++;
+                    if (auto o = owner.find(key); o != owner.end()) {
+                        log.push_back(fmt::format("conflict: {} from '{}' is replaced by '{}'", shown, o->second, m.name));
+                        LOG_WARN("mods", "{}", log.back());
+                    } else {
+                        log.push_back(fmt::format("{}: replaces {} ({} -> {} bytes)", m.name, shown, f.size, size));
+                        LOG_INFO("mods", "{}", log.back());
+                    }
+                    f.host = host;
+                    f.size = size;
+                } else {
+                    // a file the game does not have: fine (new files are allowed), but a missing or extra .ZL_
+                    // (the game's zlib wrapper) is the usual mistake, and the game would never read it
+                    std::string hint;
+                    const std::string lf = Lower(fname);
+                    const std::string dpre = dkey.empty() ? "" : dkey + "/";
+                    if (file_of.count(dpre + lf + ".zl_"))
+                        hint = fmt::format(" (the game reads {}.ZL_: compressed)", fname);
+                    else if (lf.size() > 4 && lf.ends_with(".zl_") && file_of.count(dpre + lf.substr(0, lf.size() - 4)))
+                        hint = " (the game reads this file without .ZL_)";
+                    const u32 fi = u32(t.files.size());
+                    File f;
+                    f.name = fname;
+                    f.parent = di;
+                    f.size = size;
+                    f.host = host;
+                    t.files.push_back(std::move(f));
+                    t.dirs[di].files.push_back(fi);
+                    file_of[key] = fi;
+                    m.addons++;
+                    log.push_back(fmt::format("{}: adds {}{}", m.name, display(di, fname), hint));
+                    if (hint.empty())
+                        LOG_INFO("mods", "{}", log.back());
+                    else
+                        LOG_WARN("mods", "{}", log.back());
+                }
+                owner[key] = m.name;
+                mod_files_[key] = host;
+            }
+            LOG_INFO("mods", "Mod '{}' ({}): {} replaced, {} added", m.name, m.layout, m.overrides, m.addons);
+        }
+        // new entries listed in name order among their siblings, as the game's own folders are
+        for (auto& d : t.dirs) {
+            std::stable_sort(d.dirs.begin(), d.dirs.end(), [&](u32 a, u32 b) { return t.dirs[a].name < t.dirs[b].name; });
+            std::stable_sort(d.files.begin(), d.files.end(), [&](u32 a, u32 b) { return t.files[a].name < t.files[b].name; });
+        }
+        // files laid out in folder order (Emit gives data offsets in vector order)
+        Tree out;
+        out.dirs = t.dirs;
+        for (auto& d : out.dirs)
+            d.files.clear();
+        for (u32 di = 0; di < t.dirs.size(); di++)
+            for (u32 fi : t.dirs[di].files) {
+                out.dirs[di].files.push_back(u32(out.files.size()));
+                out.files.push_back(std::move(t.files[fi]));
+            }
+        Emit(out);
+        hle::mods::WriteLog(mods, log);
+        hle::mods::SetLoaded(std::move(mods));
+    }
+
+    // RomFS path -> the host file served for it (a mod's, or the game's own)
+    fs::path Resolve(std::string_view rel) const {
+        std::string key = Lower(std::string(rel));
+        std::replace(key.begin(), key.end(), '\\', '/');
+        while (!key.empty() && key[0] == '/')
+            key.erase(0, 1);
+        if (auto it = mod_files_.find(key); it != mod_files_.end())
+            return it->second;
+        return root_ / fs::u8path(std::string(rel));
     }
 
     u64 Size() const { return size_; }
@@ -396,6 +660,7 @@ private:
         Extent(Extent&& x) noexcept : off(x.off), size(x.size), host(std::move(x.host)) {}
     };
     fs::path root_;
+    std::unordered_map<std::string, fs::path> mod_files_; // lower-case RomFS path -> a mod's file served for it
     std::vector<u8> meta_;
     std::vector<Extent> extents_;
     u64 data_off_ = 0, size_ = 0;
@@ -694,6 +959,8 @@ public:
 };
 
 } // namespace
+
+fs::path ResolveRomfs(std::string_view rel) { return GetRomfs()->Resolve(rel); }
 
 void RegisterFs(ServiceManager& sm) {
     sm.RegisterService("fsp-srv", [] { return Make<FspSrv>(); });

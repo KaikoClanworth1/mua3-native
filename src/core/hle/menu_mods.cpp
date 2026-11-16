@@ -41,6 +41,7 @@
 #include "core/hle/menu_graphics.h"
 #include "core/hle/menu_guest.h"
 #include "core/hle/menu_label.h"
+#include "core/hle/mods.h"
 #include "core/system.h"
 
 namespace hle::menu {
@@ -482,10 +483,10 @@ const QuitLabel kGraphicsLabels[] = {
 template <typename Render>
 void BuildPackLabels(const char* layout, const QuitLabel* labels, size_t count, const std::string& off,
                      const std::string& on, Render render) {
-    const fs::path dir = core::Sys().Cfg().game_dir / "romfs" / "UI" / "screenlayout" / layout;
     for (const QuitLabel& l : std::span(labels, count)) {
         const std::string name = std::string(layout) + "_" + l.lang + ".kslt";
-        const auto d = common::ReadFile(dir / name);
+        // the file the game reads (a mod's when one replaces it): the label offsets must be the served file's
+        const auto d = common::ReadFile(hle::ResolveRomfs(std::string("UI/screenlayout/") + layout + "/" + name));
         auto u32at = [&](size_t o) { u32 v = 0; if (o + 4 <= d.size()) std::memcpy(&v, &d[o], 4); return v; };
         if (d.size() < 0x40 || std::memcmp(d.data(), "TLSK3100", 8) != 0)
             continue;

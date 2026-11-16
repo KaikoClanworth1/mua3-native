@@ -20,13 +20,17 @@ bool Config::Load(const fs::path& ini) {
     if (!f)
         return false;
     std::map<std::string, std::string> kv;
-    std::string line;
+    std::string line, section;
     while (std::getline(f, line)) {
-        if (line.empty() || line[0] == ';' || line[0] == '#' || line[0] == '[')
+        if (!line.empty() && line[0] == '[') {
+            section = Trim(line.substr(1, line.find(']') - 1));
+            continue;
+        }
+        if (line.empty() || line[0] == ';' || line[0] == '#')
             continue;
         const auto eq = line.find('=');
-        if (eq != std::string::npos)
-            kv[Trim(line.substr(0, eq))] = Trim(line.substr(eq + 1));
+        if (eq != std::string::npos) // keys are flat, except [mods] (mods.enabled)
+            kv[(section == "mods" ? "mods." : "") + Trim(line.substr(0, eq))] = Trim(line.substr(eq + 1));
     }
     auto get_i = [&](const char* k, int& v) {
         if (kv.count(k))
@@ -78,6 +82,7 @@ bool Config::Load(const fs::path& ini) {
     get_i("log_level", log_level);
     get_b("bug_capture", bug_capture);
     get_b("stage_select", stage_select);
+    get_b("mods.enabled", mods_enabled);
     return true;
 }
 
@@ -97,7 +102,7 @@ bool Config::Save(const fs::path& ini) const {
       << "\nupscaler=" << upscaler << "\nupscale_quality=" << upscale_quality << "\nsharpness=" << sharpness << "\nshow_fps=" << show_fps << "\nshow_debug_overlay=" << show_debug_overlay
       << "\n[audio]\naudio_backend=" << int(audio) << "\nvolume=" << volume << "\nmute=" << mute << "\n[input]\ninput_backend="
       << int(input) << "\ncamera_speed=" << camera_speed << "\n[system]\ndocked=" << docked << "\nlanguage=" << language << "\nlog_level=" << log_level
-      << "\n";
+      << "\n[mods]\nenabled=" << mods_enabled << "\n";
     if (bug_capture || stage_select) // (only written when on: release players never see the section)
         f << "[debug]\n" << (bug_capture ? "bug_capture=1\n" : "") << (stage_select ? "stage_select=1\n" : "");
     return bool(f);

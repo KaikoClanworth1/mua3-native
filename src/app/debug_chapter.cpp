@@ -14,6 +14,7 @@
 //
 // Only active with `[debug] stage_select=1` in mua3.ini or MUA3_DEBUG_STAGE=1 in the environment.
 #include "app/debug_chapter.h"
+#include "core/hle/mods.h"
 
 #include <algorithm>
 #include <cctype>
@@ -43,8 +44,8 @@ bool WriteFile(const fs::path& p, const std::vector<u8>& b) {
 
 // DATA/DataSavePoint.bin: u32 at +4 = count, then 44-byte records: u32 +4 chapter, +8 section, +0x10 point,
 // u8 +0x19 = 1 for a S.H.I.E.L.D. save point (0: an autosave point), u8 +0x1b = the save point's number.
-std::string DescribeCheckpoint(const fs::path& game_dir, int chapter, int section, int point) {
-    const auto d = common::ReadFile(game_dir / "romfs" / "DATA" / "DataSavePoint.bin");
+std::string DescribeCheckpoint(const core::Config& cfg, int chapter, int section, int point) {
+    const auto d = common::ReadFile(hle::mods::ResolveLoose(cfg.game_dir, "DATA/DataSavePoint.bin", cfg.mods_enabled));
     if (d.size() < 8)
         return "(DataSavePoint.bin not found: not checked)";
     const u32 n = Get32(d, 4);
@@ -134,7 +135,7 @@ bool Prepare(core::Config& cfg, int chapter, int section, int point, const fs::p
     }
     LOG_INFO("Debug", "--chapter {}: debug save set to chapter {} checkpoint {}:{} {} (was {} at {}:{}); choose "
                       "CONTINUE on the title screen",
-             chapter, chapter, section, point, DescribeCheckpoint(cfg.game_dir, chapter, section, point), was, was_s,
+             chapter, chapter, section, point, DescribeCheckpoint(cfg, chapter, section, point), was, was_s,
              was_p);
     return true;
 }
