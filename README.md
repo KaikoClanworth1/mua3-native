@@ -116,4 +116,5 @@ only with a game you own, dumped from your own console.
 
 Third-party code: [dynarmic](https://github.com/azahar-emu/dynarmic) (0BSD; its A64 decoder and IR are used by the
 recompiler), [SDL3](https://github.com/libsdl-org/SDL) (zlib), [Dear ImGui](https://github.com/ocornut/imgui) (MIT),
-[Boost](https://www.boost.org) (BSL-1.0).
+[Boost](https://www.boost.org) (BSL-1.0). Font: [Exo 2](https://github.com/googlefonts/Exo-2.0) by Natanael Gama and
+The Exo 2 Project Authors (SIL Open Font License 1.1, `third_party/fonts/exo2/`), used by the launcher.
