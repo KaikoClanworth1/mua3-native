@@ -2,6 +2,8 @@
 
 #include <cstdlib>
 #include <windows.h>
+#include <dxgi.h>
+#include <wrl/client.h>
 
 #include "dlss/mua3_dlss_api.h"
 
@@ -48,6 +50,21 @@ Module& Dll(std::string& why) {
 } // namespace
 
 Dlss::~Dlss() { Shutdown(); }
+
+bool Dlss::Likely(ID3D11Device* dev) {
+    wchar_t path[MAX_PATH];
+    const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    std::wstring dll(path, n);
+    dll.resize(dll.find_last_of(L"\\/") + 1);
+    dll += L"mua3_dlss.dll";
+    if (GetFileAttributesW(dll.c_str()) == INVALID_FILE_ATTRIBUTES)
+        return false;
+    Microsoft::WRL::ComPtr<IDXGIDevice> dd;
+    Microsoft::WRL::ComPtr<IDXGIAdapter> ad;
+    DXGI_ADAPTER_DESC desc{};
+    return dev && SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&dd))) && SUCCEEDED(dd->GetAdapter(&ad)) &&
+           SUCCEEDED(ad->GetDesc(&desc)) && desc.VendorId == 0x10DE; // (NVIDIA)
+}
 
 bool Dlss::Available(ID3D11Device* dev) {
     if (tried_)

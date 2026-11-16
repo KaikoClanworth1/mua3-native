@@ -19,6 +19,7 @@
 
 #include "core/memory.h"
 #include "core/system.h"
+#include "core/upscalers.h"
 #include "gpu/d3d11/frame_capture.h"
 #include "gpu/d3d11/shader_cache.h"
 #include "gpu/d3d11/texture_cache.h"
@@ -637,6 +638,8 @@ D3D11Renderer::D3D11Renderer(ID3D11Device* dev, ID3D11DeviceContext* ctx) : dev_
                 core::Sys().UpdateConfig([mode](core::Config& c, bool) { c.anti_aliasing = mode; });
             }
         }).detach();
+    // For the menus: DLSS offered where mua3_dlss.dll is installed on an NVIDIA GPU (NGX's own answer corrects it).
+    core::SetUpscalerAvailable(core::kUpscalerDlss, Dlss::Likely(dev_));
     if (const char* d = std::getenv("MUA3_DEBUG_PS")) {
         debug_mode_ = std::atoi(d);
         const char* src = "float4 main() : SV_Target0 { return float4(1, 0, 1, 1); }";
@@ -3941,6 +3944,8 @@ void D3D11Renderer::Present(const PresentInfo& p) {
         // FSR 1 upscales instead. Next frame's jitter: Halton (2, 3), 8 x the upscale area ratio phases.
         const bool want_dlss = hud_scale_ && core::Sys().Cfg().upscaler == 2;
         const bool temporal = want_dlss && dlss_.Available(dev_);
+        if (want_dlss)
+            core::SetUpscalerAvailable(core::kUpscalerDlss, temporal);
         if (want_dlss && !temporal && !dlss_logged_) {
             dlss_logged_ = true;
             LOG_INFO("Renderer", "DLSS: {}; FSR 1 upscales instead", dlss_.Status());

@@ -16,6 +16,8 @@ public:
     ~Dlss();
     // Loads mua3_dlss.dll and starts NGX on `dev` (once): can DLSS Super Resolution run here?
     bool Available(ID3D11Device* dev);
+    // Cheap guess without loading anything (for the menus): mua3_dlss.dll is installed and `dev` is an NVIDIA GPU.
+    static bool Likely(ID3D11Device* dev);
     // Why it is not available (or "ready"), for the log and the menu.
     const std::string& Status() const { return status_; }
 
