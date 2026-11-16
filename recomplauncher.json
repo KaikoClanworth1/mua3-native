@@ -51,7 +51,8 @@
   "folders": {
     "saves": [{ "path": "{install}/save" }],
     "logs": [{ "path": "{install}" }],
-    "screenshots": [{ "path": "{install}/screenshots" }]
+    "screenshots": [{ "path": "{install}/screenshots" }],
+    "mods": [{ "path": "{install}/mods" }]
   },
   "exit_codes": {
     "2": "The setup didn't get your game file or prod.keys. Pick them again on the game's page.",
@@ -190,6 +191,7 @@
   ],
   "actions": [
     { "id": "saves", "label": "Saves", "help": "Your save files.", "open": "saves" },
-    { "id": "screenshots", "label": "Screenshots", "help": "Pictures taken with F12.", "open": "screenshots" }
+    { "id": "screenshots", "label": "Screenshots", "help": "Pictures taken with F12.", "open": "screenshots" },
+    { "id": "mods", "label": "Mods", "help": "Put each mod in its own folder here. Order and on/off: mods/order.txt. Applies at the next launch.", "open": "mods" }
   ]
 }
