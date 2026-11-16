@@ -693,7 +693,7 @@ void Translator::TexSample(u64 insn, u32 pc, Op op) {
         const u32 mask = u32(Bits(insn, 31, 4));
         const u32 slot = TexSlot(cbuf_off, TexDim::Tex2D, false, false);
         if (query == 1) { // dimensions
-            Line(fmt::format("tex{0}.GetDimensions({1}, tmpu.x, tmpu.y, tmpu.w); tmpu.z = 1u; tmpu.xy = tmpu.xy * 3u / max(tex_swizzle[{0}].y, 3u);",
+            Line(fmt::format("tex{0}.GetDimensions({1}, tmpu.x, tmpu.y, tmpu.w); tmpu.z = 1u; tmpu.xy = tmpu.xy * 3u / (tex_swizzle[{0}].y > 1u ? tex_swizzle[{0}].y : 3u);",
                              slot, ra == RZ ? "0u" : R(ra)));
             static const char* cs = "xyzw";
             u32 r = d;
@@ -2120,18 +2120,18 @@ cbuffer Driver : register(b13) {
     float4 drv_viewport;     // x: y flip (1/-1), y: depth scale, z: depth bias, w: render scale of the bound targets
     uint4 drv_attrib[32];    // x: format register, y: unused
     uint4 drv_vbuf[16];      // x: stride, y: divisor, z: byte offset in vball (~0 = disabled), w: first element uploaded
-    uint4 tex_swizzle[32];   // x: packed swizzle, y: resolution scale of a render-target texture (0/1: none)
+    uint4 tex_swizzle[32];   // x: packed swizzle, y: resolution scale of a render-target texture, in thirds (0/1: none)
     uint4 drv_misc;          // x: base instance, y: alpha test func, z: alpha ref (float bits), w: alpha test enable
     uint4 drv_gmem[8];       // compute global memory windows: x base lo, y base hi, z size
     uint4 drv_image[8];      // compute images (SUST): base, size and layout (see ImageStore)
 };
-// Resolution scaling: render targets may be stored larger than the guest sees them, by s/3 (tex_swizzle.y in
-// thirds: 3 = 1x, 4 = 4/3, 6 = 2x). Texel fetches scale their coordinates and keep the pixel's position inside the
-// guest texel (rs_frac, set from SV_Position).
+// Resolution scaling: render targets may be stored at another size than the guest sees them, by s/3 (tex_swizzle.y
+// in thirds: 2 = 2/3 (FSR below the guest frame), 3 = 1x, 4 = 4/3, 6 = 2x). Texel fetches scale their coordinates and
+// keep the pixel's position inside the guest texel (rs_frac, set from SV_Position).
 static float2 rs_frac = float2(0, 0);
 int2 RsXY(int2 c, uint slot) {
     const uint s = tex_swizzle[slot].y;
-    return s > 3u ? int2(floor((float2(c) + rs_frac) * (float(s) / 3.0f))) : c;
+    return s > 1u && s != 3u ? int2(floor((float2(c) + rs_frac) * (float(s) / 3.0f))) : c;
 }
 float2 H2(uint v) { return float2(f16tof32(v & 0xFFFFu), f16tof32(v >> 16)); }
 uint P2(float2 v) { return f32tof16(v.x) | (f32tof16(v.y) << 16); }
@@ -2772,7 +2772,7 @@ bool Translator::Run() {
         src += "void Run() {\n" + body + "}\n";
         src += "PSOut main(PSIn i) {\n";
         src += "    frag_coord = i.pos; frag_coord.w = 1.0f / i.pos.w; front_face = i.front;\n"
-               "    if (drv_viewport.w > 1.0f) { frag_coord.xy = i.pos.xy / drv_viewport.w;"
+               "    if (drv_viewport.w != 1.0f) { frag_coord.xy = i.pos.xy / drv_viewport.w;"
                " rs_frac = frac(frag_coord.xy); }\n";
         for (u32 a : in_attrs_)
             src += fmt::format("    in_attr{0} = i.a{0};\n", a);

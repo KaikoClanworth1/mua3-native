@@ -22,7 +22,7 @@
 namespace gpu {
 
 // Bump kTranslatorVersion whenever the translator output changes, to invalidate cached bytecode.
-constexpr int kTranslatorVersion = 31; // 31: shadow textures past 16 get their own sampler register
+constexpr int kTranslatorVersion = 32; // 32: texel fetches, sizes and frag_coord scaled below 1x too (FSR)
 // Failure markers carry this: older ones (before the direct backend took over what FXC fails on) are retried once.
 constexpr u8 kFailGeneration = 2; // 2: vertex/pixel BRX programs get constant buffer 1
 
