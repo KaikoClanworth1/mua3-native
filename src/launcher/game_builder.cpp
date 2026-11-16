@@ -529,8 +529,16 @@ bool BuildGame(const Paths& p, int jobs, Progress& prog) {
         if (!res.empty())
             r << Q(res) << "\n";
         r << "/OUT:" << Q(p.work_dir / "mua3.exe") << "\n/LIBPATH:" << Q(p.sdk_dir / "lib") << "\n";
-        for (const char* o : {"main.obj", "alloc_trace.obj"})
-            r << Q(p.sdk_dir / "obj" / o) << "\n";
+        {   // every app object the release ships (main, alloc_trace, debug_chapter, ...): issue #2
+            std::vector<fs::path> objs;
+            std::error_code oec;
+            for (auto& e : fs::directory_iterator(p.sdk_dir / "obj", oec))
+                if (e.path().extension() == ".obj")
+                    objs.push_back(e.path());
+            std::sort(objs.begin(), objs.end());
+            for (auto& o : objs)
+                r << Q(o) << "\n";
+        }
         for (auto& s : shards)
             r << Q(obj / s.filename().replace_extension(".obj")) << "\n";
         if (!p.prebuilt_code.empty())

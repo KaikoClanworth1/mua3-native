@@ -44,7 +44,14 @@ $libs = @(
     "src\$cfg\nxcore.lib", "src\$cfg\platform.lib", "src\$cfg\nxloader.lib", "$cfg\imgui.lib",
     "external\SDL\$cfg\SDL3-static.lib", "external\dynarmic\externals\fmt\$cfg\fmt.lib")
 foreach ($l in $libs) { Copy-Item (Join-Path $build $l) "$out\sdk\lib" }
-foreach ($o in 'main.obj', 'alloc_trace.obj') { Copy-Item (Join-Path $build "src\mua3.dir\$cfg\$o") "$out\sdk\obj" }
+# every source of the mua3 target, read from src/CMakeLists.txt so a new one can't be left out (v0.3.1 missed
+# debug_chapter.obj: issue #2). The player's setup links every .obj in sdk\obj.
+$m = [regex]::Match((Get-Content "$root\src\CMakeLists.txt" -Raw), 'add_executable\(mua3\s+([^)]*)\)')
+if (-not $m.Success) { throw 'add_executable(mua3 ...) not found in src/CMakeLists.txt' }
+foreach ($s in ($m.Groups[1].Value -split '\s+' | Where-Object { $_ -like '*.cpp' })) {
+    $o = [IO.Path]::GetFileNameWithoutExtension($s) + '.obj'
+    Copy-Item (Join-Path $build "src\mua3.dir\$cfg\$o") "$out\sdk\obj" -ErrorAction Stop
+}
 # function lists for the recompiler: coverage seen in game runs (prof*, missing*) and the functions this compiler
 # version needs built unoptimised (noopt) or left out (skip). Addresses only.
 $work = Join-Path $build 'recomp_work'
