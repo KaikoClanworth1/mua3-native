@@ -8,7 +8,6 @@
 #include <set>
 #include <unordered_map>
 
-#include "core/system.h"
 
 namespace hle::mods {
 namespace {
@@ -110,9 +109,9 @@ struct OrderLine {
     bool enabled = true;
 };
 
-std::vector<OrderLine> ReadOrder(bool* exists) {
+std::vector<OrderLine> ReadOrder(const fs::path& dir, bool* exists) {
     std::vector<OrderLine> out;
-    std::ifstream f(ModsDir() / kOrderFile);
+    std::ifstream f(dir / kOrderFile);
     *exists = bool(f);
     std::string line;
     bool first = true;
@@ -152,14 +151,39 @@ bool g_launch_enabled = false, g_launch_set = false;
 
 fs::path ModsDir() { return "mods"; }
 
-bool Enabled() {
-    if (const char* e = std::getenv("MUA3_MODS"); e && e[0] == '0')
-        return false;
-    return core::Sys().Cfg().mods_enabled;
+void EnsureFolder(const fs::path& dir) {
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    const fs::path readme = dir / "README.txt";
+    if (fs::exists(readme, ec))
+        return;
+    std::ofstream f(readme, std::ios::binary);
+    f << "MUA3 mods\r\n"
+         "=========\r\n"
+         "\r\n"
+         "Put each mod in its own folder here; the folder name is the mod's name. Mods made for the Switch version\r\n"
+         "(retextures, data and UI files: \"romfs\" / LayeredFS mods) work as they come, in any of these layouts:\r\n"
+         "\r\n"
+         "  mods\\<Mod name>\\romfs\\...                                    (Yuzu / Ryujinx mod folders)\r\n"
+         "  mods\\<Mod name>\\010060700AC50000\\romfs\\...                   (most mod downloads)\r\n"
+         "  mods\\<Mod name>\\atmosphere\\contents\\010060700AC50000\\romfs\\... (a modded Switch's SD card)\r\n"
+         "  mods\\<Mod name>\\DATA\\, UI\\, ACTION\\, ...                      (the game's own folders)\r\n"
+         "  mods\\010060700AC50000\\<Mod name>\\romfs\\...                   (a whole emulator mods folder)\r\n"
+         "\r\n"
+         "Then start the game. Mods are read when the game starts: restart it after changing them.\r\n"
+         "\r\n"
+         "order.txt   the load order: one mod per line, mods lower in the list win when two change the same file.\r\n"
+         "            A '-' in front of a name turns that mod off. New mod folders are added at the bottom.\r\n"
+         "mods.log    what each mod replaced and added at the last start, conflicts, and parts that cannot work.\r\n"
+         "\r\n"
+         "Code patches (exefs, .ips, .pchtxt) and cheats cannot work in this port: the game runs as native PC code.\r\n"
+         "All mods off at once: [mods] enabled=0 in mua3.ini.\r\n"
+         "More: https://github.com/KaikoClanworth1/mua3-native/blob/master/docs/mods.md\r\n";
 }
 
-std::vector<Mod> Scan(bool update_order) {
-    const fs::path dir = ModsDir();
+// Enabled(): mods_enabled.cpp (it reads the running game's settings; MUA3Setup compiles this file without them)
+
+std::vector<Mod> Scan(bool update_order, const fs::path& dir) {
     std::error_code ec;
     if (update_order)
         fs::create_directories(dir, ec);
@@ -187,7 +211,7 @@ std::vector<Mod> Scan(bool update_order) {
     }
     // in order.txt's order
     bool exists = false;
-    const auto order = ReadOrder(&exists);
+    const auto order = ReadOrder(dir, &exists);
     std::vector<Mod> out;
     std::set<std::string> taken;
     bool changed = !exists;
@@ -209,14 +233,14 @@ std::vector<Mod> Scan(bool update_order) {
     changed |= !added.empty();
     out.insert(out.end(), added.begin(), added.end());
     if (update_order && changed)
-        SaveOrder(out);
+        SaveOrder(out, dir);
     return out;
 }
 
-bool SaveOrder(const std::vector<Mod>& mods) {
+bool SaveOrder(const std::vector<Mod>& mods, const fs::path& dir) {
     std::error_code ec;
-    fs::create_directories(ModsDir(), ec);
-    const fs::path path = ModsDir() / kOrderFile, tmp = ModsDir() / "order.txt.tmp";
+    fs::create_directories(dir, ec);
+    const fs::path path = dir / kOrderFile, tmp = dir / "order.txt.tmp";
     {
         std::ofstream f(tmp, std::ios::binary);
         f << "# MUA3 mods, in load order: mods lower in the list win when two change the same file.\r\n"

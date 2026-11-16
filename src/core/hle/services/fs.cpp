@@ -342,6 +342,7 @@ public:
     // Lays the enabled mods over the image, in load order: a file at a path the game has (any case) replaces it,
     // a new path is added (with its folders). Logs and reports what each mod did.
     void ApplyMods() {
+        hle::mods::EnsureFolder();
         if (!hle::mods::Enabled()) {
             LOG_INFO("mods", "Mods are off ([mods] enabled=0 in mua3.ini, or MUA3_MODS=0)");
             hle::mods::SetLoaded({});

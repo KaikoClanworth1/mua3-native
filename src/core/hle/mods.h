@@ -33,16 +33,21 @@ struct Mod {
 // The mods folder (mods\ in the working directory, next to mua3.exe and mua3.ini).
 fs::path ModsDir();
 
+// Makes mods\ and its README.txt (how to install mods) when missing. Done at every launch, mods on or off.
+void EnsureFolder(const fs::path& dir = ModsDir());
+
 // Off with [mods] enabled=0 in mua3.ini, or MUA3_MODS=0.
 bool Enabled();
 
 // Scans mods\ and reads mods\order.txt: every mod in load order, enabled or not. With `update_order`, mods not yet
 // listed are appended (on, by name), listed folders that are gone are dropped, and order.txt is rewritten when that
 // changed anything (it is created on first use).
-std::vector<Mod> Scan(bool update_order);
+std::vector<Mod> Scan(bool update_order, const fs::path& dir = ModsDir());
 
 // Writes mods\order.txt from `mods` (their order and enabled flags). For the mod list UIs.
-bool SaveOrder(const std::vector<Mod>& mods);
+// `dir` (Scan, SaveOrder, EnsureFolder): another install's mods folder (the setup: <install>\mods); these three need
+// no running game.
+bool SaveOrder(const std::vector<Mod>& mods, const fs::path& dir = ModsDir());
 
 // ---- for menus: what this launch loaded (empty before the game opened its RomFS, or with mods off)
 std::vector<Mod> Loaded();

@@ -74,6 +74,8 @@ This package contains no part of the game.
 4. Choose a desktop shortcut and a Start-menu entry, then Play. Every setting is in the game
    (title screen > SYSTEM > GRAPHICS). Run MUA3Setup.exe again, or use Windows Settings > Apps, to update,
    repair or uninstall.
+5. Mods made for the Switch version (retextures, data and UI files) go in the "mods" folder of the installed game
+   (mods\README.txt there explains it). Update, repair and uninstall leave that folder alone.
 
 https://github.com/KaikoClanworth1/mua3-native
 "@ | Set-Content "$out\READ ME FIRST.txt" -Encoding utf8
