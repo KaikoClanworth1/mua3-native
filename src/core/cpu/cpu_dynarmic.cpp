@@ -447,8 +447,14 @@ public:
             std::unique_lock lk(native_mutex_);
             native_[o.pc] = o.host;
             SetSlot(o.pc, o.host);
-            if (o.direct)
+            if (o.direct) {
                 *t.ok[i] = 0; // direct calls return at once (pc unchanged) and reach the host through the table
+                // The original (RunOriginal sets *ok for the call) can unwind to the chain mid-call (a callee that
+                // halts) and be re-entered at one of its call-return points later, after *ok is 0 again.
+                for (u32 r = 0; r < t.num_resumes; r++)
+                    if (t.resumes[r].func == i)
+                        direct_resumes_[t.resumes[r].pc] = t.ok[i];
+            }
             return;
         }
         LOG_WARN("Recomp", "no recompiled function at {:#x}: host override not applied", o.pc);
@@ -496,6 +502,11 @@ public:
             }
         }
         (void)changed;
+    }
+    u8* DirectResumeFlag(u64 pc) {
+        std::shared_lock lk(native_mutex_);
+        const auto it = direct_resumes_.find(pc);
+        return it == direct_resumes_.end() ? nullptr : it->second;
     }
     void DisableNative(u64 pc) {
         {
@@ -820,6 +831,7 @@ private:
     std::atomic<NativeMap*> map_{nullptr};
     std::deque<std::pair<std::chrono::steady_clock::time_point, NativeMap*>> retired_;
     std::unordered_map<u64, recomp::Fn> native_;
+    std::unordered_map<u64, u8*> direct_resumes_; // native_mutex_: call-return pc in a direct override's original -> its flag
     std::thread sampler_;
     std::atomic<bool> sampler_stop_{false};
     std::mutex sample_mutex_;
@@ -991,6 +1003,19 @@ void DynarmicCore::RunNativeChain(recomp::Fn fn) {
         if (s.icount == before && s.pc == at) {
             if (native_halt_)
                 break; // a halt request, not a failure
+            // Resuming inside the guest original of a direct host override (e.g. the pause menu's ExecuteItem, whose
+            // QUIT GAME case was unwound in GetString): its enable flag is 0 outside RunOriginal, so it refused.
+            if (u8* ok = factory_.DirectResumeFlag(at)) {
+                const u8 was = *ok;
+                *ok = 1;
+                fn(s);
+                *ok = was;
+                if (s.icount != before || s.pc != at) {
+                    if (native_halt_ || !(fn = CachedLookup(s.pc)))
+                        break;
+                    continue;
+                }
+            }
             static std::atomic<int> reports{0};
             if (reports++ < 10)
                 LOG_WARN("Recomp", "no progress at {:#x} (chain from {:#x}, stack {:#x}, floor {:#x})", at, pc,
