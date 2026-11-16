@@ -700,6 +700,14 @@ void D3D11Renderer::ReleaseDevice() {
     }
     post_aa_ = PostAA{};
     fsr_ = Fsr{};
+    upscale_in_.Reset();
+    dlss_.Reset();
+    temporal_ = false;
+    temporal_reset_ = true;
+    for (int i = 0; i < 3; i++)
+        comp_tex_[i].Reset(), comp_rtv_[i].Reset(), comp_srv_[i].Reset();
+    comp_in_w_ = comp_in_h_ = comp_out_w_ = comp_out_h_ = 0;
+    comp_ready_ = false;
     gpu_passes_.ReleaseDevice();
     g_dc.reset();
     g_last_drv_cb = nullptr;
@@ -791,16 +799,99 @@ void D3D11Renderer::SetResolutionScale3(u32 s) {
 
 u32 D3D11Renderer::FsrScale() const {
     const auto& cfg = core::Sys().Cfg();
-    if (cfg.upscaler != 1 || !output_h_)
+    if (cfg.upscaler < 1 || !output_h_) // (FSR 1 and DLSS render at the same scales)
         return 0;
     // Ultra Quality 1.3x, Quality 1.5x, Balanced 1.7x, Performance 2.0x, to the nearest third of the guest's frame
-    // (the scale unit shaders are built for): at 1440p that is 1080p (Ultra Quality, Quality) or 720p, at 4K 1800p,
-    // 1440p, 1440p or 1080p.
+    // (the scale unit shaders are built for; below 1x needs translator v32): at 1440p that is 1080p (Ultra Quality,
+    // Quality) or 720p, at 4K 1800p, 1440p, 1440p or 1080p, at 1080p 720p (Balanced, Performance).
     static constexpr float kRatio[4] = {1.3f, 1.5f, 1.7f, 2.0f};
     const float guest = cfg.docked ? 1080.0f : 720.0f;
     const u32 s = std::clamp<u32>(u32(std::lround(float(output_h_) / kRatio[std::clamp(cfg.upscale_quality, 0, 3)] * 3.0f / guest)),
                                   2, kMaxScale);
     return float(s) * guest / 3.0f < float(output_h_) ? s : 0;
+}
+
+u32 D3D11Renderer::HudScale() const {
+    static const bool off = [] {
+        const char* e = std::getenv("MUA3_FSR_HUD");
+        return e && e[0] == '0';
+    }();
+    const u32 fs = FsrScale();
+    if (off || !fs)
+        return 0;
+    const float guest = core::Sys().Cfg().docked ? 1080.0f : 720.0f;
+    const u32 hs = std::min<u32>(u32(std::lround(float(output_h_) * 3.0f / guest)), kMaxScale);
+    return hs > fs ? hs : 0;
+}
+
+void D3D11Renderer::UpscaleComposite() {
+    // This frame's scene: of the targets seen composited, the one written last.
+    Surface* src = nullptr;
+    for (u64 va : comp_srcs_)
+        if (Surface* c = FindSurfaceByGpu(va); c && c->srv && !c->depth && c->scale3 != hud_scale_ &&
+                                               (!src || c->write_serial > src->write_serial))
+            src = c;
+    if (!src)
+        return;
+    if (src->gpu_va != comp_src_va_)
+        comp_src_va_ = src->gpu_va, comp_ready_ = false;
+    if (comp_ready_ && comp_serial_ == src->write_serial)
+        return; // (already upscaled: a later HUD draw)
+    const u32 iw = src->Scaled(src->width), ih = src->Scaled(src->height);
+    const u32 ow = (src->width * hud_scale_ + 2) / 3, oh = (src->height * hud_scale_ + 2) / 3;
+    if (!comp_tex_[2] || comp_in_w_ != iw || comp_in_h_ != ih || comp_out_w_ != ow || comp_out_h_ != oh) {
+        for (int i = 0; i < 3; i++) {
+            comp_tex_[i].Reset(), comp_rtv_[i].Reset(), comp_srv_[i].Reset();
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = i ? ow : iw;
+            td.Height = i ? oh : ih;
+            td.MipLevels = td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; // (the scene target is float: R11G11B10)
+            td.SampleDesc.Count = 1;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET | (i == 2 ? D3D11_BIND_UNORDERED_ACCESS : 0u);
+            if (FAILED(dev_->CreateTexture2D(&td, nullptr, &comp_tex_[i])) ||
+                FAILED(dev_->CreateRenderTargetView(comp_tex_[i].Get(), nullptr, &comp_rtv_[i])) ||
+                FAILED(dev_->CreateShaderResourceView(comp_tex_[i].Get(), nullptr, &comp_srv_[i]))) {
+                comp_tex_[2].Reset();
+                comp_ready_ = false;
+                return;
+            }
+        }
+        comp_in_w_ = iw, comp_in_h_ = ih, comp_out_w_ = ow, comp_out_h_ = oh;
+        LOG_INFO("Renderer", "FSR 1: scene {}x{} -> {}x{}, HUD drawn at {}x{}", iw, ih, ow, oh, ow, oh);
+    }
+    // DLSS: the jittered scene, its depth and the camera motion vectors, accumulated at the output size.
+    if (temporal_) {
+        upscale_in_.Resolve();
+        Surface* d = upscale_in_.Noted() ? FindSurfaceByGpu(upscale_in_.DepthVa()) : nullptr;
+        if (d && d->depth && d->srv && d->Scaled(d->width) == iw && d->Scaled(d->height) == ih &&
+            upscale_in_.BuildMotion(dev_, ctx_, d->srv.Get(), iw, ih)) {
+            Dlss::Frame f;
+            f.color = src->tex.Get();
+            f.depth = d->tex.Get();
+            f.motion = upscale_in_.MotionTex();
+            f.output = comp_tex_[2].Get();
+            f.in_w = iw, f.in_h = ih, f.out_w = ow, f.out_h = oh;
+            static const float sign = std::getenv("MUA3_DLSS_JITTER_SIGN") ? float(std::atof(std::getenv("MUA3_DLSS_JITTER_SIGN"))) : 1.0f;
+            f.jitter_x = jitter_x_ * sign, f.jitter_y = jitter_y_ * sign;
+            f.reset = temporal_reset_;
+            f.quality = core::Sys().Cfg().upscale_quality;
+            ContextEpoch()++;
+            if (dlss_.Evaluate(dev_, ctx_, f)) {
+                temporal_reset_ = false;
+                comp_ready_ = true;
+                comp_serial_ = src->write_serial;
+                return;
+            }
+        }
+    }
+    ID3D11ShaderResourceView* in = src->srv.Get();
+    if (applied_aa_ == 1 && post_aa_.Fxaa(dev_, ctx_, in, comp_rtv_[0].Get(), iw, ih, false)) // (FXAA before EASU)
+        in = comp_srv_[0].Get();
+    const float stops = float(100 - std::clamp(core::Sys().Cfg().sharpness, 0, 100)) / 50.0f;
+    comp_ready_ = fsr_.Run(dev_, ctx_, in, iw, ih, comp_rtv_[1].Get(), comp_srv_[1].Get(), comp_rtv_[2].Get(), ow, oh, stops);
+    comp_serial_ = src->write_serial;
+    ContextEpoch()++;
 }
 
 u32 D3D11Renderer::ScaleFor(int anti_aliasing) const {
@@ -858,7 +949,7 @@ Surface* D3D11Renderer::GetSurface(u64 gpu_va, u32 width, u32 height, u32 format
     // maps, lookup tables and other square or tiny targets keep their size.
     const bool screen_like = width >= 240 && height >= 135 && width > height &&
                              std::abs(int(width * 9) - int(height * 16)) <= int(width * 9 / 16);
-    s->scale3 = screen_like ? res_scale_ : 3;
+    s->scale3 = !screen_like ? 3 : hud_scale_ && IsHudSurface(gpu_va) ? hud_scale_ : res_scale_;
     s->screen_like = screen_like;
     if (screen_like) { // (the game's dynamic resolution shows up as new frame-sized targets)
         static std::set<u64> sizes;
@@ -2320,6 +2411,10 @@ void D3D11Renderer::Draw() {
     auto& g = G();
     const auto& m = g.State();
     auto& dc = *g_dc;
+    // A draw into a presented target while the HUD gets its own resolution: upscale the scene it composites first
+    // (before the state caches are checked: the passes change the context's state).
+    if (hud_scale_ && m.color[0].format && present_vas_.count(m.color[0].addr))
+        UpscaleComposite();
     // Someone else used the context (UI) or a dispatch rebound resources: forget what is bound.
     if (const u64 epoch = ContextEpoch().load(); epoch != binds_epoch_) {
         binds_epoch_ = epoch;
@@ -2544,6 +2639,18 @@ void D3D11Renderer::Draw() {
     for (u32 i = 0; i < count; i++)
         rtvs[i] = colors[i] ? colors[i]->rtv.Get() : nullptr;
     ID3D11DepthStencilView* dsv = depth ? depth->dsv.Get() : nullptr;
+    // The depth the HUD draws into the presented target with (it follows that target's scale; see HudScale).
+    if (depth && colors[0] && present_vas_.count(colors[0]->gpu_va) && hud_depth_vas_.insert(depth->gpu_va).second) {
+        LOG_INFO("Renderer", "HUD depth {:#x} (presented target {:#x})", depth->gpu_va, colors[0]->gpu_va);
+        hud_dirty_ = true;
+    }
+    if (hud_scale_ && depth && colors[0] && depth->scale3 != colors[0]->scale3) {
+        static int logged = 0;
+        if (logged < 4 && ++logged)
+            LOG_WARN("Renderer", "draw with target {:#x} at scale {} and depth {:#x} at scale {}: depth left out",
+                     colors[0]->gpu_va, colors[0]->scale3, depth->gpu_va, depth->scale3);
+        dsv = nullptr;
+    }
     // Binding outputs makes D3D silently unbind those resources' SRVs: start the SRV cache over then.
     if (std::memcmp(last_rtvs_, rtvs, sizeof(rtvs)) != 0 || last_dsv_ != dsv) {
         std::memcpy(last_rtvs_, rtvs, sizeof(rtvs));
@@ -2581,11 +2688,31 @@ void D3D11Renderer::Draw() {
     const float fs = float(rscale) / 3.0f;
     D3D11_VIEWPORT vp{(tx - std::abs(sx)) * fs, (ty - std::abs(sy)) * fs, 2 * std::abs(sx) * fs, 2 * std::abs(sy) * fs,
                       0.0f, 1.0f};
+    // DLSS: the scene's draws (those into the scene depth) move by this frame's sub-pixel jitter.
+    if (temporal_ && depth && depth->gpu_va == upscale_in_.DepthVa() && rscale == res_scale_) {
+        vp.TopLeftX += jitter_x_;
+        vp.TopLeftY += jitter_y_;
+    }
     if (std::memcmp(&pipe_.vp, &vp, sizeof(vp)) != 0) {
         pipe_.vp = vp;
         ctx_->RSSetViewports(1, &vp);
     }
     const float flip = sy > 0 ? -1.0f : 1.0f;
+    // Temporal upscaler inputs (DLSS on, or their debug view): draws into a frame-sized depth vote for the camera
+    // (the first 64 bytes of their vertex constant buffer 3; see UpscaleInputs::Vote).
+    static const bool inputs_debug = UpscaleInputs::DebugMode() != 0;
+    // Programs keep the camera at different rows of their buffer: each 64-byte window of the first 10 rows votes.
+    if ((inputs_debug || temporal_) && depth && depth->screen_like && depth->width >= 1280) {
+        const ConstBufferBinding& c3 = m.cb[kCbVertex][3];
+        upscale_in_.stat_draws++;
+        float rows[40];
+        const u32 n = c3.enabled ? std::min<u32>(c3.size, sizeof(rows)) / 16 : 0;
+        if (n >= 4 && g.ReadGpu(c3.address, rows, n * 16)) {
+            upscale_in_.stat_read++;
+            for (u32 r = 0; r + 4 <= n; r++)
+                upscale_in_.Vote(depth->gpu_va, rows + r * 4, flip, sz, tz);
+        }
+    }
 
     // ---- scissor
     D3D11_RECT sr{0, 0, 16384, 16384};
@@ -3308,6 +3435,20 @@ void D3D11Renderer::Draw() {
                          FindSurfaceByGpu(tic.Address()) ? "(render target)" : "");
             drv.swizzle[t.slot][0] = swz;
             drv.swizzle[t.slot][1] = TextureScale(tic.Address(), t.dim == shader::TexDim::Tex2D && !t.array);
+            // The composite into a presented target (HUD at its own resolution): a frame-sized scene target sampled
+            // there is replaced by its upscaled copy, which has the presented target's scale.
+            if (hud_scale_ && colors[0] && colors[0]->scale3 == hud_scale_ && present_vas_.count(colors[0]->gpu_va))
+                if (const Surface* src = FindSurfaceByGpu(tic.Address());
+                    src && !src->depth && src->screen_like && src->scale3 != hud_scale_ && src->width == colors[0]->width &&
+                    src->height == colors[0]->height) {
+                    if (comp_srcs_.insert(src->gpu_va).second) // (upscaled from the next draw into a presented target on)
+                        LOG_INFO("Renderer", "upscaler: the scene {:#x} is composited into {:#x}: upscaled before the HUD",
+                                 src->gpu_va, colors[0]->gpu_va);
+                    else if (comp_ready_ && src->gpu_va == comp_src_va_ && comp_serial_ == src->write_serial) {
+                        srvs[t.slot] = comp_srv_[2].Get();
+                        drv.swizzle[t.slot][1] = hud_scale_;
+                    }
+                }
             const u64 ts0 = g_prof_timing ? ProfNow() : 0;
             if (t.sampler < 16)
                 smps[t.sampler] = textures_->GetSampler(tsc, t.shadow);
@@ -3678,7 +3819,9 @@ void D3D11Renderer::Present(const PresentInfo& p) {
         // A supersampled frame is shown at the render scale (resolved below); an upscaled one is FSR's output.
         const u32 fsr_scale = FsrScale();
         const bool fsr = fsr_scale && s->scale3 == fsr_scale;
-        const u32 ssaa = !fsr && s->scale3 > base_scale_ && s->scale3 % base_scale_ == 0 ? s->scale3 / base_scale_ : 1;
+        // (HUD at its own resolution: the scene was upscaled before the HUD, the frame is shown as it is)
+        const bool hud_split = hud_scale_ && s->scale3 == hud_scale_ && IsHudSurface(s->gpu_va);
+        const u32 ssaa = !fsr && !hud_split && s->scale3 > base_scale_ && s->scale3 % base_scale_ == 0 ? s->scale3 / base_scale_ : 1;
         const u32 out_w = s->Scaled(s->width) / ssaa, out_h = s->Scaled(s->height) / ssaa;
         if (!frame_tex_ || frame_w_ != out_w || frame_h_ != out_h || frame_dxgi_ != s->dxgi) {
             frame_tex_.Reset();
@@ -3712,11 +3855,22 @@ void D3D11Renderer::Present(const PresentInfo& p) {
         if (ssaa > 1) {
             if (post_aa_.Downsample(dev_, ctx_, s->srv.Get(), frame_rtv_.Get(), frame_w_, frame_h_, srgb, ssaa))
                 ContextEpoch()++; // (the draw state caches forget what the pass bound)
-        } else if (applied_aa_ == 1 &&
+        } else if (applied_aa_ == 1 && !hud_split &&
                    post_aa_.Fxaa(dev_, ctx_, s->srv.Get(), frame_rtv_.Get(), frame_w_, frame_h_, srgb))
             ContextEpoch()++;
         else
             ctx_->CopyResource(frame_tex_.Get(), s->tex.Get());
+        // MUA3_UPSCALE_DEBUG: the scene depth (1) or the camera motion vectors (2) in place of the frame.
+        if (UpscaleInputs::DebugMode())
+            upscale_in_.Resolve();
+        if (UpscaleInputs::DebugMode() && !upscale_in_.Noted() && frame_counter_ % 600 == 1)
+            LOG_INFO("Renderer", "upscaler inputs: no scene depth pre-pass seen this frame");
+        if (const int dbg = UpscaleInputs::DebugMode(); dbg && upscale_in_.Noted())
+            if (Surface* d = FindSurfaceByGpu(upscale_in_.DepthVa()); d && d->depth && d->srv) {
+                if (upscale_in_.BuildMotion(dev_, ctx_, d->srv.Get(), d->Scaled(d->width), d->Scaled(d->height)))
+                    upscale_in_.DrawDebug(dev_, ctx_, dbg, s->srv.Get(), d->srv.Get(), frame_rtv_.Get(), frame_w_, frame_h_);
+                ContextEpoch()++;
+            }
         // FSR 1: EASU to the output size, then RCAS (on the frame as the game finished it, HUD included: the game
         // draws its HUD into the same target as the scene).
         bool upscaled = false;
@@ -3757,6 +3911,62 @@ void D3D11Renderer::Present(const PresentInfo& p) {
             }
         }
         upscaled_ = upscaled;
+        upscale_in_.EndFrame();
+        // The presented targets and their HUD depth follow the HUD scale: learn them, and when the set or the scale
+        // changes drop them (made again at the right scale by the next frame's first use).
+        if (s->screen_like && present_vas_.insert(s->gpu_va).second) {
+            LOG_INFO("Renderer", "presented target {:#x}", s->gpu_va);
+            hud_dirty_ = true;
+        }
+        if (const u32 hs = HudScale(); hs != hud_scale_) {
+            LOG_INFO("Renderer", "HUD resolution: {}", hs ? fmt::format("{:.3g}x of the guest frame (output)", hs / 3.0) : std::string("as the scene"));
+            hud_scale_ = hs;
+            hud_dirty_ = true;
+            comp_ready_ = false;
+        }
+        if (hud_dirty_) {
+            hud_dirty_ = false;
+            const u32 want_hud = hud_scale_ ? hud_scale_ : res_scale_;
+            const size_t before = surfaces_.size();
+            std::erase_if(surfaces_, [&](const auto& kv) {
+                return IsHudSurface(kv.first) && kv.second->screen_like && kv.second->scale3 != want_hud;
+            });
+            if (surfaces_.size() != before) {
+                std::fill(std::begin(bound_), std::end(bound_), nullptr);
+                ContextEpoch()++;
+            }
+            temporal_reset_ = true;
+        }
+        // DLSS (upscaler=2) needs the HUD split (it runs at the composite); without it, or where it is unavailable,
+        // FSR 1 upscales instead. Next frame's jitter: Halton (2, 3), 8 x the upscale area ratio phases.
+        const bool want_dlss = hud_scale_ && core::Sys().Cfg().upscaler == 2;
+        const bool temporal = want_dlss && dlss_.Available(dev_);
+        if (want_dlss && !temporal && !dlss_logged_) {
+            dlss_logged_ = true;
+            LOG_INFO("Renderer", "DLSS: {}; FSR 1 upscales instead", dlss_.Status());
+        }
+        if (temporal != temporal_) {
+            LOG_INFO("Renderer", "DLSS {}", temporal ? "on (jittered scene)" : "off");
+            temporal_ = temporal;
+            temporal_reset_ = true;
+            jitter_index_ = 0;
+        }
+        jitter_x_ = jitter_y_ = 0;
+        if (temporal_) {
+            const float ratio = float(hud_scale_) / float(res_scale_);
+            const u32 phases = std::max<u32>(8, u32(std::ceil(8.0f * ratio * ratio)));
+            const u32 i = jitter_index_++ % phases + 1;
+            auto halton = [](u32 n, u32 base) {
+                float f = 1, r = 0;
+                for (; n; n /= base) {
+                    f /= float(base);
+                    r += f * float(n % base);
+                }
+                return r;
+            };
+            jitter_x_ = halton(i, 2) - 0.5f;
+            jitter_y_ = halton(i, 3) - 0.5f;
+        }
         SetEvent(static_cast<HANDLE>(new_frame_event_));
     }
     gpu_passes_.EndFrame();

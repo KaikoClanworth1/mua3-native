@@ -24,13 +24,14 @@ if (Test-Path $cache) {
     if ($rd -and (Test-Path (Join-Path $rd 'nxrecomp_full.lib'))) { throw "MUA3_RECOMP_DIR ($rd) holds nxrecomp_full.lib: release builds must use a build folder without the recompiled game" }
     if ($rd -and (Test-Path (Join-Path $rd 'recomp_table.cpp'))) { throw "MUA3_RECOMP_DIR ($rd) holds generated game code" }
 }
-# the setup without the game's icon, the tools, and the libraries mua3 links
-& cmake -S $root -B $build -DMUA3_GAME_ICON=OFF "-DMUA3_VERSION_NAME=v$Version" | Out-Null
+# the setup without the game's icon, the tools, and the libraries mua3 links. Without NVIDIA's DLSS SDK too
+# (MUA3_DLSS=OFF): it is proprietary, and the packaged libraries must link on a PC that does not have it.
+& cmake -S $root -B $build -DMUA3_GAME_ICON=OFF "-DMUA3_VERSION_NAME=v$Version" -DMUA3_DLSS=OFF | Out-Null
 try {
     Build @('MUA3Setup', 'recomp', 'nxcore', 'platform', 'nxloader', 'imgui')
     Build @('mua3') # (only for main.obj / alloc_trace.obj: the exe itself is never packaged)
 } finally {
-    & cmake -S $root -B $build -DMUA3_GAME_ICON=ON "-DMUA3_VERSION_NAME=" | Out-Null # (dev builds: git describe again)
+    & cmake -S $root -B $build -DMUA3_GAME_ICON=ON "-DMUA3_VERSION_NAME=" -DMUA3_DLSS=ON | Out-Null # (dev builds: git describe again)
 }
 
 Remove-Item $out -Recurse -Force -ErrorAction SilentlyContinue
@@ -83,6 +84,12 @@ https://github.com/KaikoClanworth1/mua3-native
 # nothing of the game may be in here
 $bad = Get-ChildItem $out -Recurse -File | Where-Object { $_.Name -match 'nxrecomp|recomp_\d+|\.ico$|\.nso$|\.nca$|\.keys$|^main\.bin$' -or $_.FullName -match '\\game\\|recomp_full' }
 if ($bad) { throw "game material in the package: $($bad.FullName -join ', ')" }
+# NVIDIA's DLSS SDK (third_party/dlss: headers, nvsdk_ngx*.lib, nvngx_dlss.dll) is never packaged, nor linked into the
+# packaged libraries.
+$nv = Get-ChildItem $out -Recurse -File | Where-Object { $_.Name -match '^(nvngx|nvsdk)' -or $_.FullName -match '\\third_party\\dlss\\' }
+if ($nv) { throw "NVIDIA DLSS SDK files in the package: $($nv.FullName -join ', ')" }
+$nvlinked = Get-ChildItem $out -Recurse -File -Include *.lib, *.obj, *.exe | Where-Object { Select-String $_.FullName -Pattern 'NVSDK_NGX_D3D11_Init' -SimpleMatch -Quiet }
+if ($nvlinked) { throw "DLSS (NVIDIA's NGX) is built into packaged files: $($nvlinked.FullName -join ', ')" }
 # and none linked into the setup: its PDB names every library it linked
 $pdb = Join-Path $bin 'MUA3Setup.pdb'
 if ((Test-Path $pdb) -and (Select-String $pdb -Pattern 'nxrecomp_full|recomp_full\\|recomp_\d+\.obj' -SimpleMatch:$false -Quiet)) { throw 'MUA3Setup linked the recompiled game code' }

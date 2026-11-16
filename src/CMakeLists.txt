@@ -90,12 +90,36 @@ file(WRITE ${CMAKE_BINARY_DIR}/generated/ffx_fsr1_embed.h
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${FFX_FSR1_DIR}/ffx_a.h ${FFX_FSR1_DIR}/ffx_fsr1.h)
 target_include_directories(platform PRIVATE ${CMAKE_BINARY_DIR}/generated)
 
+# NVIDIA DLSS Super Resolution: mua3_dlss.dll (src/dlss), which the game loads at run time (gpu/d3d11/dlss.cpp), so
+# the game and its libraries never link NVIDIA's code. NVIDIA's SDK is proprietary and never committed: the DLL is
+# built only when third_party/dlss (git-ignored) holds its headers (include/) and static-CRT import library
+# (lib/nvsdk_ngx_s.lib, from github.com/NVIDIA/DLSS); lib/nvngx_dlss.dll, if there, is copied next to it.
+#   MUA3_DLSS=OFF leaves it out even then (release packages).
+option(MUA3_DLSS "Build mua3_dlss.dll when NVIDIA's SDK is in third_party/dlss" ON)
+set(DLSS_DIR ${CMAKE_SOURCE_DIR}/third_party/dlss)
+if(MUA3_DLSS AND EXISTS ${DLSS_DIR}/include/nvsdk_ngx.h AND EXISTS ${DLSS_DIR}/lib/nvsdk_ngx_s.lib)
+    add_library(mua3_dlss SHARED dlss/mua3_dlss.cpp dlss/mua3_dlss_api.h)
+    target_include_directories(mua3_dlss PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${DLSS_DIR}/include)
+    target_link_libraries(mua3_dlss PRIVATE ${DLSS_DIR}/lib/nvsdk_ngx_s.lib d3d11)
+    set_target_properties(mua3_dlss PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    if(EXISTS ${DLSS_DIR}/lib/nvngx_dlss.dll)
+        add_custom_command(TARGET mua3_dlss POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                           ${DLSS_DIR}/lib/nvngx_dlss.dll $<TARGET_FILE_DIR:mua3_dlss>)
+    endif()
+    message(STATUS "DLSS: mua3_dlss.dll is built (NVIDIA SDK in third_party/dlss)")
+else()
+    message(STATUS "DLSS: mua3_dlss.dll not built (no NVIDIA SDK in third_party/dlss)")
+endif()
+
 add_executable(mua3 app/main.cpp app/alloc_trace.cpp app/debug_chapter.cpp)
 target_link_libraries(mua3 PRIVATE nxcore platform dbghelp)
 # incremental-link thunks would sit between every pair of recompiled functions
 # /PDBALTPATH: the exe names its PDB without a path, so copies of the game load the PDB next to them (and a running
 # copy does not lock the build's PDB).
 target_link_options(mua3 PRIVATE /INCREMENTAL:NO /PDBALTPATH:mua3.pdb)
+if(TARGET mua3_dlss)
+    add_dependencies(mua3 mua3_dlss) # (built with the game: it loads it from its own folder)
+endif()
 
 add_executable(MUA3Launcher WIN32 launcher/launcher.cpp launcher/game_builder.cpp launcher/report.cpp)
 target_link_libraries(MUA3Launcher PRIVATE nxloader platform windowscodecs)

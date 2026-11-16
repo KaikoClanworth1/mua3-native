@@ -24,7 +24,7 @@ struct Config {
     int anti_aliasing = 0; // 0 off, 1 FXAA, 2/3/4 SSAA 2x/3x/4x per axis (x the render scale, capped at 4x); read live
     // Upscaler (read live): 0 off, 1 AMD FSR 1 (the game renders below the output size, EASU upscales the finished frame
     // to it, RCAS sharpens). Replaces SSAA while on; FXAA still runs before the upscale.
-    int upscaler = 0;
+    int upscaler = 0; // 0 off, 1 FSR 1, 2 DLSS (FSR 1 where DLSS is unavailable)
     int upscale_quality = 1; // 0 Ultra Quality (1.3x), 1 Quality (1.5x), 2 Balanced (1.7x), 3 Performance (2.0x)
     int sharpness = 80;      // RCAS, 0-100
     int swap_interval = 0; // 0: the game's own (MUA3 asks for 2 = 30 fps); 1 presents every vblank

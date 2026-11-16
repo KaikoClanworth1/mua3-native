@@ -11,6 +11,8 @@
 
 #include "gpu/d3d11/post_aa.h"
 #include "gpu/d3d11/fsr.h"
+#include "gpu/d3d11/upscale_inputs.h"
+#include "gpu/d3d11/dlss.h"
 namespace gpu { class FrameCapture; }
 #include "gpu/d3d11/gpu_passes.h"
 #include "gpu/renderer.h"
@@ -363,6 +365,33 @@ private:
     int applied_upscaler_ = 0, applied_quality_ = -1;
     bool upscaled_ = false; // the frame shown is FSR's output (fsr_out_srv_), not frame_srv_
     Fsr fsr_;
+    UpscaleInputs upscale_in_; // depth, camera and motion vectors for temporal upscalers
+    // HUD at the output resolution while upscaling: the presented targets (and the depth the HUD draws with) are made
+    // at hud_scale_, everything else at the internal scale. The game's single composite draw from its scene target
+    // (comp_src_va_) into the presented target then samples the upscaled scene instead (comp_srv_), and the HUD
+    // draws after it at full resolution. 0 = off (the final frame is upscaled at present, HUD included).
+    u32 HudScale() const;
+    bool IsHudSurface(u64 gpu_va) const { return present_vas_.count(gpu_va) || hud_depth_vas_.count(gpu_va); }
+    void UpscaleComposite(); // (at the start of a draw into a presented target)
+    u32 hud_scale_ = 0;
+    bool hud_dirty_ = false;
+    std::set<u64> present_vas_, hud_depth_vas_;
+    std::set<u64> comp_srcs_;            // scene targets seen composited (the game alternates two)
+    u64 comp_src_va_ = 0, comp_serial_ = 0; // the one upscaled this frame: the most recently written
+    ComPtr<ID3D11Texture2D> comp_tex_[3]; // FXAA (internal size), EASU and RCAS output (output size)
+    ComPtr<ID3D11RenderTargetView> comp_rtv_[3];
+    ComPtr<ID3D11ShaderResourceView> comp_srv_[3];
+    u32 comp_in_w_ = 0, comp_in_h_ = 0, comp_out_w_ = 0, comp_out_h_ = 0;
+    bool comp_ready_ = false; // comp_srv_[2] holds the upscaled comp_src_va_ at comp_serial_
+    // DLSS (upscaler=2): the scene is drawn with a sub-pixel jitter (Halton 2,3, as a D3D11 viewport offset on the
+    // draws into the scene depth), DLSS accumulates it at the composite. Off: FSR 1 there instead.
+    Dlss dlss_;
+    bool Temporal() const { return temporal_; }
+    bool temporal_ = false;     // this frame's scene draws are jittered for DLSS
+    bool temporal_reset_ = true; // DLSS has no usable history (first frame, new sizes, a cut)
+    u32 jitter_index_ = 0;
+    float jitter_x_ = 0, jitter_y_ = 0; // this frame's offset, input pixels
+    bool dlss_logged_ = false;
     ComPtr<ID3D11ShaderResourceView> frame_raw_srv_; // frame_tex_ through a non-sRGB view (FSR reads gamma-encoded values)
     ComPtr<ID3D11Texture2D> fsr_tex_[2];             // EASU output, RCAS output (the output size)
     ComPtr<ID3D11RenderTargetView> fsr_rtv_[2];

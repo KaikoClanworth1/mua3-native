@@ -60,7 +60,7 @@ bool Config::Load(const fs::path& ini) {
     get_i("anti_aliasing", anti_aliasing);
     anti_aliasing = std::clamp(anti_aliasing, 0, 4);
     get_i("upscaler", upscaler);
-    upscaler = std::clamp(upscaler, 0, 1);
+    upscaler = std::clamp(upscaler, 0, 2);
     get_i("upscale_quality", upscale_quality);
     upscale_quality = std::clamp(upscale_quality, 0, 3);
     get_i("sharpness", sharpness);

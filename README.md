@@ -116,5 +116,11 @@ only with a game you own, dumped from your own console.
 
 Third-party code: [dynarmic](https://github.com/azahar-emu/dynarmic) (0BSD; its A64 decoder and IR are used by the
 recompiler), [SDL3](https://github.com/libsdl-org/SDL) (zlib), [Dear ImGui](https://github.com/ocornut/imgui) (MIT),
-[Boost](https://www.boost.org) (BSL-1.0). Font: [Exo 2](https://github.com/googlefonts/Exo-2.0) by Natanael Gama and
-The Exo 2 Project Authors (SIL Open Font License 1.1, `third_party/fonts/exo2/`), used by the launcher.
+[Boost](https://www.boost.org) (BSL-1.0), AMD [FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) and
+[FSR 3.1](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) (MIT, `third_party/ffx_fsr1`, `third_party/ffx_fsr3`).
+Font: [Exo 2](https://github.com/googlefonts/Exo-2.0) by Natanael Gama and The Exo 2 Project Authors (SIL Open Font
+License 1.1, `third_party/fonts/exo2/`), used by the launcher.
+
+NVIDIA DLSS: the optional DLSS upscaler (`mua3_dlss.dll`) uses NVIDIA's DLSS SDK, which is proprietary and not part of
+this repository: builds include it only where the SDK is placed in `third_party/dlss`. NVIDIA, DLSS and the NVIDIA
+logo are trademarks of NVIDIA Corporation. AMD FidelityFX and FSR are trademarks of Advanced Micro Devices, Inc.
