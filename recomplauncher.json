@@ -133,6 +133,24 @@
       "defaults": { "video/anti_aliasing": "0" }
     },
     {
+      "id": "upscaler", "label": "Upscaler", "group": "Picture",
+      "help": "Draws the game smaller, then AMD FSR 1 sharpens it up to your resolution. Faster on weaker graphics cards; turns SSAA off.",
+      "choices": [
+        { "label": "Off", "set": { "video/upscaler": "0" } },
+        { "label": "FSR 1 Ultra Quality", "set": { "video/upscaler": "1", "video/upscale_quality": "0" } },
+        { "label": "FSR 1 Quality", "set": { "video/upscaler": "1", "video/upscale_quality": "1" } },
+        { "label": "FSR 1 Balanced", "set": { "video/upscaler": "1", "video/upscale_quality": "2" } },
+        { "label": "FSR 1 Performance", "set": { "video/upscaler": "1", "video/upscale_quality": "3" } }
+      ],
+      "defaults": { "video/upscaler": "0", "video/upscale_quality": "1" }
+    },
+    {
+      "id": "sharpness", "label": "FSR sharpness", "group": "Picture",
+      "help": "How much FSR sharpens the upscaled picture.",
+      "slider": { "key": "video/sharpness", "min": 0, "max": 100, "step": 10, "format": "%d" },
+      "advanced": true
+    },
+    {
       "id": "show_fps", "label": "Show FPS", "group": "Picture",
       "help": "The frame rate in a corner of the game.",
       "choices": [
