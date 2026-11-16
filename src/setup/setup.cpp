@@ -830,8 +830,15 @@ void FilesPage(Wizard& w) {
             dl->AddCircle(ImVec2(p.x + S(9), p.y + S(10)), S(9), col::amber, 0, S(1.6f));
         ImGui::SetCursorScreenPos(ImVec2(p.x + S(28), p.y));
         ImGui::BeginGroup();
+        ImGui::PushTextWrapPos(ImGui::GetWindowWidth() - S(112)); // (clear of the button)
         ImGui::TextUnformatted(ok ? "prod.keys found" : "prod.keys needed");
-        Dim(ok ? Short(w.keys.parent_path(), 44) : "From your own Switch (Lockpick_RCM). Read where they are, never copied.", true);
+        const float room = ImGui::GetWindowWidth() - S(112) - ImGui::GetCursorPosX();
+        constexpr const char* kSample = "C:\\Users\\Player\\AppData\\Roaming";
+        const float ch = ImGui::CalcTextSize(kSample).x / float(std::strlen(kSample)) * 1.1f; // (a path's average letter)
+        Dim(ok ? Short(w.keys.parent_path(), std::clamp(int(room / ch), 24, 60))
+               : "From your own Switch (Lockpick_RCM). Read where they are, never copied.",
+            true);
+        ImGui::PopTextWrapPos();
         ImGui::EndGroup();
         ImGui::SameLine(ImGui::GetWindowWidth() - S(100));
         ImGui::SetCursorPosY(S(22));
@@ -936,39 +943,26 @@ void FilesPage(Wizard& w) {
         ImGui::PopStyleVar();
     }
     ImGui::EndGroup();
-    {
-        FontScope f(g_regular, kSmall);
-        Dim(fmt::format("Build files: about {} in {} while it builds; {} stays when it is done (the compiled code), so "
-                        "updates only compile what changed.",
-                        setup::Gb(setup::kBuildFilesBytes), Short(w.build_dir, 52), setup::Gb(setup::kBuildFilesKeptBytes)));
-        if (!w.repair && Link("Change the build files folder##build")) {
-            const auto d = FileDialog(true, false, L"Choose a folder for the build files", {}, w.build_dir);
-            if (!d.empty())
-                w.build_dir = d[0] / "MUA3 build files";
-        }
-    }
-    ImGui::Dummy(S(1, 4));
+    ImGui::Dummy(S(1, 2));
 
-    // -- note + workers / memory
+    // -- build files + note (left), workers / memory (right): one row
     const float combos_w = S(200) * 2 + S(16);
     const float note_w = ImGui::GetContentRegionAvail().x - combos_w - S(24);
     const float combos_x = ImGui::GetCursorPosX() + note_w + S(24);
     const float combos_y = ImGui::GetCursorPosY();
     ImGui::BeginGroup();
     {
-        const ImVec2 p = ImGui::GetCursorScreenPos();
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        dl->AddCircleFilled(ImVec2(p.x + S(8), p.y + S(26)), S(8), Alpha(col::accent, 70));
-        {
-            FontScope f(g_semibold, kSmall);
-            dl->AddText(ImVec2(p.x + S(6), p.y + S(18)), col::text, "i");
-        }
-        ImGui::SetCursorScreenPos(ImVec2(p.x + S(26), p.y + S(16)));
-        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + note_w - S(30));
         FontScope f(g_regular, kSmall);
-        Dim("Builds run at low priority: your PC stays usable. Nothing of the game is downloaded, everything comes "
-            "from your own files.");
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + note_w);
+        Dim(fmt::format("Build files: about {} in {} while it builds; {} stays (the compiled code), so updates only "
+                        "compile what changed. Builds run at low priority: your PC stays usable.",
+                        setup::Gb(setup::kBuildFilesBytes), Short(w.build_dir, 40), setup::Gb(setup::kBuildFilesKeptBytes)));
         ImGui::PopTextWrapPos();
+        if (!w.repair && Link("Change the build files folder##build")) {
+            const auto d = FileDialog(true, false, L"Choose a folder for the build files", {}, w.build_dir);
+            if (!d.empty())
+                w.build_dir = d[0] / "MUA3 build files";
+        }
     }
     ImGui::EndGroup();
     ImGui::SameLine(combos_x);
@@ -2007,8 +2001,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         int ww = int(S(960)), wh = int(S(620));
         if (usable.w > 0)
             ww = std::min(ww, usable.w - 40), wh = std::min(wh, usable.h - 60);
-        SDL_SetWindowSize(win, ww, wh);
         SDL_SetWindowMinimumSize(win, int(S(860)), int(S(560)));
+        if (const char* sz = std::getenv("MUA3_SETUP_WINDOW")) // (developer test: "WxH" in UI units)
+            if (int x = 0, y = 0; std::sscanf(sz, "%dx%d", &x, &y) == 2)
+                ww = int(S(float(x))), wh = int(S(float(y)));
+        SDL_SetWindowSize(win, ww, wh);
         SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED_DISPLAY(SDL_GetDisplayForWindow(win)),
                               SDL_WINDOWPOS_CENTERED_DISPLAY(SDL_GetDisplayForWindow(win)));
     }
@@ -2062,6 +2059,23 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         case Page::Installed: InstalledPage(w, quit); break;
         case Page::Uninstalled: UninstalledPage(w, quit); break;
         case Page::Report: ReportPage(w, quit); break;
+        }
+        if (scrolls && ImGui::GetScrollY() < ImGui::GetScrollMaxY() - 1) { // more below: say so
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+            dl->PushClipRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y), false);
+            const float y1 = wp.y + ws.y, y0 = y1 - S(56);
+            dl->AddRectFilledMultiColor(ImVec2(wp.x, y0), ImVec2(wp.x + ws.x, y1), Alpha(col::bg_bottom, 0),
+                                        Alpha(col::bg_bottom, 0), col::bg_bottom, col::bg_bottom);
+            FontScope f(g_regular, kSmall);
+            const char* more = "More below";
+            const ImVec2 ts = ImGui::CalcTextSize(more);
+            const float tx = wp.x + (ws.x - ts.x - S(18)) * 0.5f, ty = y1 - ts.y - S(8);
+            dl->AddText(ImVec2(tx, ty), col::dim, more);
+            const float cx = tx + ts.x + S(11), cy = ty + ts.y * 0.5f; // a small down chevron
+            const ImVec2 chevron[3] = {ImVec2(cx - S(4), cy - S(2)), ImVec2(cx, cy + S(2)), ImVec2(cx + S(4), cy - S(2))};
+            dl->AddPolyline(chevron, 3, col::dim, ImDrawFlags_None, S(1.5f));
+            dl->PopClipRect();
         }
         ImGui::EndChild();
         ImGui::BeginChild("bottom", ImVec2(0, bottom), ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
