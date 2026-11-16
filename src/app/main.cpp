@@ -703,6 +703,7 @@ int main(int argc, char** argv) {
     }
     LOG_INFO("Display", "output {} px high, internal render scale {:.3g}x{}", display.PixelHeight(), scale3 / 3.0,
              cfg.resolution_scale <= 0 ? " (auto)" : "");
+    renderer.SetOutputHeight(display.PixelHeight()); // (the upscaler's target, upscaler=1)
     renderer.SetResolutionScale3(scale3);
     hle::menu::graphics::SetRenderScale(scale3); // the GRAPHICS page shows the render size
     gpu::G().SetRenderer(&renderer);

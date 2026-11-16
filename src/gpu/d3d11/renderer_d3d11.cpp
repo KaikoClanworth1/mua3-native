@@ -690,10 +690,16 @@ void D3D11Renderer::ReleaseDevice() {
     }
     {
         std::lock_guard lk(frame_mutex_);
-        frame_tex_.Reset(), frame_srv_.Reset(), frame_rtv_.Reset();
+        frame_tex_.Reset(), frame_srv_.Reset(), frame_rtv_.Reset(), frame_raw_srv_.Reset();
         frame_w_ = frame_h_ = 0;
+        for (int i = 0; i < 2; i++)
+            fsr_tex_[i].Reset(), fsr_rtv_[i].Reset(), fsr_srv_[i].Reset();
+        fsr_out_srv_.Reset();
+        fsr_w_ = fsr_h_ = 0;
+        upscaled_ = false;
     }
     post_aa_ = PostAA{};
+    fsr_ = Fsr{};
     gpu_passes_.ReleaseDevice();
     g_dc.reset();
     g_last_drv_cb = nullptr;
@@ -776,10 +782,30 @@ constexpr u32 kMaxScale = 12; // (in thirds: 4x)
 void D3D11Renderer::SetResolutionScale3(u32 s) {
     base_scale_ = std::clamp<u32>(s, 3, kMaxScale);
     applied_aa_ = core::Sys().Cfg().anti_aliasing;
+    applied_upscaler_ = core::Sys().Cfg().upscaler;
+    applied_quality_ = core::Sys().Cfg().upscale_quality;
     res_scale_ = ScaleFor(applied_aa_);
+    if (const u32 fs = FsrScale())
+        LOG_INFO("Renderer", "FSR 1: rendering at {:.3g}x of the guest frame, upscaled to {} px high", fs / 3.0, output_h_);
+}
+
+u32 D3D11Renderer::FsrScale() const {
+    const auto& cfg = core::Sys().Cfg();
+    if (cfg.upscaler != 1 || !output_h_)
+        return 0;
+    // Ultra Quality 1.3x, Quality 1.5x, Balanced 1.7x, Performance 2.0x, to the nearest third of the guest's frame
+    // (the scale unit shaders are built for): at 1440p that is 1080p (Ultra Quality, Quality) or 720p, at 4K 1800p,
+    // 1440p, 1440p or 1080p.
+    static constexpr float kRatio[4] = {1.3f, 1.5f, 1.7f, 2.0f};
+    const float guest = cfg.docked ? 1080.0f : 720.0f;
+    const u32 s = std::clamp<u32>(u32(std::lround(float(output_h_) / kRatio[std::clamp(cfg.upscale_quality, 0, 3)] * 3.0f / guest)),
+                                  2, kMaxScale);
+    return float(s) * guest / 3.0f < float(output_h_) ? s : 0;
 }
 
 u32 D3D11Renderer::ScaleFor(int anti_aliasing) const {
+    if (const u32 fs = FsrScale()) // (no supersampling while upscaling)
+        return fs;
     u32 f = SsaaFactor(anti_aliasing);
     while (f > 1 && base_scale_ * f > kMaxScale)
         f--;
@@ -3543,8 +3569,11 @@ void D3D11Renderer::Present(const PresentInfo& p) {
         }
     }
     textures_->NextFrame();
-    if (const int aa = core::Sys().Cfg().anti_aliasing; aa != applied_aa_)
-        ApplyAntiAliasing(aa);
+    if (const auto& vc = core::Sys().Cfg();
+        vc.anti_aliasing != applied_aa_ || vc.upscaler != applied_upscaler_ || vc.upscale_quality != applied_quality_) {
+        applied_upscaler_ = vc.upscaler, applied_quality_ = vc.upscale_quality;
+        ApplyAntiAliasing(vc.anti_aliasing); // (the internal scale follows: SSAA or the upscaler's)
+    }
     Surface* s = FindSurfaceByCpu(p.cpu_addr);
     last_present_cpu_ = p.cpu_addr;
     {
@@ -3646,8 +3675,10 @@ void D3D11Renderer::Present(const PresentInfo& p) {
     if (s) {
         D3D11_TEXTURE2D_DESC desc;
         s->tex->GetDesc(&desc);
-        // A supersampled frame is shown at the render scale (resolved below).
-        const u32 ssaa = s->scale3 > base_scale_ && s->scale3 % base_scale_ == 0 ? s->scale3 / base_scale_ : 1;
+        // A supersampled frame is shown at the render scale (resolved below); an upscaled one is FSR's output.
+        const u32 fsr_scale = FsrScale();
+        const bool fsr = fsr_scale && s->scale3 == fsr_scale;
+        const u32 ssaa = !fsr && s->scale3 > base_scale_ && s->scale3 % base_scale_ == 0 ? s->scale3 / base_scale_ : 1;
         const u32 out_w = s->Scaled(s->width) / ssaa, out_h = s->Scaled(s->height) / ssaa;
         if (!frame_tex_ || frame_w_ != out_w || frame_h_ != out_h || frame_dxgi_ != s->dxgi) {
             frame_tex_.Reset();
@@ -3668,6 +3699,11 @@ void D3D11Renderer::Present(const PresentInfo& p) {
             sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
             sv.Texture2D.MipLevels = 1;
             dev_->CreateShaderResourceView(frame_tex_.Get(), &sv, &frame_srv_);
+            sv.Format = s->dxgi == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB   ? DXGI_FORMAT_R8G8B8A8_UNORM
+                        : s->dxgi == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ? DXGI_FORMAT_B8G8R8A8_UNORM
+                                                                     : s->dxgi;
+            frame_raw_srv_.Reset();
+            dev_->CreateShaderResourceView(frame_tex_.Get(), &sv, &frame_raw_srv_);
             frame_w_ = out_w;
             frame_h_ = out_h;
         }
@@ -3681,6 +3717,46 @@ void D3D11Renderer::Present(const PresentInfo& p) {
             ContextEpoch()++;
         else
             ctx_->CopyResource(frame_tex_.Get(), s->tex.Get());
+        // FSR 1: EASU to the output size, then RCAS (on the frame as the game finished it, HUD included: the game
+        // draws its HUD into the same target as the scene).
+        bool upscaled = false;
+        if (fsr && output_h_ > frame_h_) {
+            const u32 fh = output_h_, fw = u32((u64(frame_w_) * fh + frame_h_ / 2) / frame_h_);
+            if (!fsr_tex_[1] || fsr_w_ != fw || fsr_h_ != fh || fsr_dxgi_ != s->dxgi) {
+                D3D11_TEXTURE2D_DESC td;
+                frame_tex_->GetDesc(&td);
+                td.Width = fw;
+                td.Height = fh;
+                td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+                D3D11_SHADER_RESOURCE_VIEW_DESC raw{};
+                frame_raw_srv_->GetDesc(&raw);
+                D3D11_RENDER_TARGET_VIEW_DESC rv{};
+                rv.Format = raw.Format;
+                rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+                for (int i = 0; i < 2; i++) {
+                    fsr_tex_[i].Reset(), fsr_rtv_[i].Reset(), fsr_srv_[i].Reset();
+                    dev_->CreateTexture2D(&td, nullptr, &fsr_tex_[i]);
+                    if (fsr_tex_[i]) {
+                        dev_->CreateRenderTargetView(fsr_tex_[i].Get(), &rv, &fsr_rtv_[i]);
+                        dev_->CreateShaderResourceView(fsr_tex_[i].Get(), &raw, &fsr_srv_[i]);
+                    }
+                }
+                D3D11_SHADER_RESOURCE_VIEW_DESC shown{};
+                frame_srv_->GetDesc(&shown);
+                fsr_out_srv_.Reset();
+                if (fsr_tex_[1])
+                    dev_->CreateShaderResourceView(fsr_tex_[1].Get(), &shown, &fsr_out_srv_);
+                fsr_w_ = fw, fsr_h_ = fh, fsr_dxgi_ = s->dxgi;
+                LOG_INFO("Renderer", "FSR 1: {}x{} -> {}x{}", frame_w_, frame_h_, fw, fh);
+            }
+            const float stops = float(100 - std::clamp(core::Sys().Cfg().sharpness, 0, 100)) / 50.0f;
+            if (fsr_out_srv_ && fsr_.Run(dev_, ctx_, frame_raw_srv_.Get(), frame_w_, frame_h_, fsr_rtv_[0].Get(),
+                                         fsr_srv_[0].Get(), fsr_rtv_[1].Get(), fsr_w_, fsr_h_, stops)) {
+                ContextEpoch()++;
+                upscaled = true;
+            }
+        }
+        upscaled_ = upscaled;
         SetEvent(static_cast<HANDLE>(new_frame_event_));
     }
     gpu_passes_.EndFrame();
@@ -3787,6 +3863,11 @@ void D3D11Renderer::NoteTexture(ID3D11ShaderResourceView* srv, u64 addr, u32 w, 
 }
 
 ID3D11ShaderResourceView* D3D11Renderer::LatestFrame(u32& w, u32& h) {
+    if (upscaled_ && fsr_out_srv_) {
+        w = fsr_w_;
+        h = fsr_h_;
+        return fsr_out_srv_.Get();
+    }
     w = frame_w_;
     h = frame_h_;
     return frame_srv_.Get();

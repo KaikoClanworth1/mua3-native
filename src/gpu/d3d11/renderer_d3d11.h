@@ -10,6 +10,7 @@
 #include <wrl/client.h>
 
 #include "gpu/d3d11/post_aa.h"
+#include "gpu/d3d11/fsr.h"
 namespace gpu { class FrameCapture; }
 #include "gpu/d3d11/gpu_passes.h"
 #include "gpu/renderer.h"
@@ -70,6 +71,8 @@ public:
     // supersampling (anti_aliasing 2-4) multiplies it.
     void SetResolutionScale3(u32 scale3);
     void SetResolutionScale(u32 s) { SetResolutionScale3(std::max<u32>(s, 1) * 3); }
+    // Pixels high the frame is shown at (the window's output): the upscaler's target size. 0 = unknown (no upscaling).
+    void SetOutputHeight(u32 h) { output_h_ = h; }
     ShaderCache* Shaders() { return shaders_.get(); }
     void Present(const PresentInfo& p) override;
     void InvalidateRegion(u64 gpu_va, u64 size) override;
@@ -353,6 +356,20 @@ private:
     u32 base_scale_ = 3; // the render scale in thirds (resolution_scale / auto)
     int applied_aa_ = 0; // anti_aliasing as last applied
     u32 ScaleFor(int anti_aliasing) const;
+    // The internal scale (thirds) the upscaler renders at for the output height and upscale_quality, 0 when it is off
+    // or would not render below the output.
+    u32 FsrScale() const;
+    u32 output_h_ = 0;
+    int applied_upscaler_ = 0, applied_quality_ = -1;
+    bool upscaled_ = false; // the frame shown is FSR's output (fsr_out_srv_), not frame_srv_
+    Fsr fsr_;
+    ComPtr<ID3D11ShaderResourceView> frame_raw_srv_; // frame_tex_ through a non-sRGB view (FSR reads gamma-encoded values)
+    ComPtr<ID3D11Texture2D> fsr_tex_[2];             // EASU output, RCAS output (the output size)
+    ComPtr<ID3D11RenderTargetView> fsr_rtv_[2];
+    ComPtr<ID3D11ShaderResourceView> fsr_srv_[2];
+    ComPtr<ID3D11ShaderResourceView> fsr_out_srv_; // the RCAS output as the display samples it (like frame_srv_)
+    u32 fsr_w_ = 0, fsr_h_ = 0;
+    DXGI_FORMAT fsr_dxgi_ = DXGI_FORMAT_UNKNOWN;
     void ApplyAntiAliasing(int anti_aliasing);
     void* new_frame_event_ = nullptr;
 

@@ -55,6 +55,12 @@ bool Config::Load(const fs::path& ini) {
     get_i("swap_interval", swap_interval);
     get_i("anti_aliasing", anti_aliasing);
     anti_aliasing = std::clamp(anti_aliasing, 0, 4);
+    get_i("upscaler", upscaler);
+    upscaler = std::clamp(upscaler, 0, 1);
+    get_i("upscale_quality", upscale_quality);
+    upscale_quality = std::clamp(upscale_quality, 0, 3);
+    get_i("sharpness", sharpness);
+    sharpness = std::clamp(sharpness, 0, 100);
     get_b("show_fps", show_fps);
     get_b("show_debug_overlay", show_debug_overlay);
     int a = int(audio), in = int(input);
@@ -87,7 +93,8 @@ bool Config::Save(const fs::path& ini) const {
       << "[video]\n"
       << "width=" << width << "\nheight=" << height << "\nfullscreen=" << fullscreen
       << "\nborderless=" << borderless << "\nvsync=" << vsync << "\nresolution_scale=" << resolution_scale
-      << "\nfps_limit=" << fps_limit << "\nfps_target=" << fps_target << "\nswap_interval=" << swap_interval << "\nanti_aliasing=" << anti_aliasing<< "\nshow_fps=" << show_fps << "\nshow_debug_overlay=" << show_debug_overlay
+      << "\nfps_limit=" << fps_limit << "\nfps_target=" << fps_target << "\nswap_interval=" << swap_interval << "\nanti_aliasing=" << anti_aliasing
+      << "\nupscaler=" << upscaler << "\nupscale_quality=" << upscale_quality << "\nsharpness=" << sharpness << "\nshow_fps=" << show_fps << "\nshow_debug_overlay=" << show_debug_overlay
       << "\n[audio]\naudio_backend=" << int(audio) << "\nvolume=" << volume << "\nmute=" << mute << "\n[input]\ninput_backend="
       << int(input) << "\ncamera_speed=" << camera_speed << "\n[system]\ndocked=" << docked << "\nlanguage=" << language << "\nlog_level=" << log_level
       << "\n";
