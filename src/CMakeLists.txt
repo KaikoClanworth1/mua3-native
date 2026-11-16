@@ -11,6 +11,11 @@ target_include_directories(nxloader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # Version shown in the launcher, logs, crash files and problem reports: git describe at configure time.
 execute_process(COMMAND git describe --tags --always --dirty WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
                 OUTPUT_VARIABLE MUA3_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+# Release builds (scripts/make_release.ps1 -Version x.y.z) name their version: "v0.3.2", not "v0.3.2-5-gc88a84f-dirty".
+set(MUA3_VERSION_NAME "" CACHE STRING "Version shown by release builds (empty: git describe)")
+if(MUA3_VERSION_NAME)
+    set(MUA3_VERSION "${MUA3_VERSION_NAME}")
+endif()
 if(NOT MUA3_VERSION)
     set(MUA3_VERSION "dev")
 endif()

@@ -25,12 +25,12 @@ if (Test-Path $cache) {
     if ($rd -and (Test-Path (Join-Path $rd 'recomp_table.cpp'))) { throw "MUA3_RECOMP_DIR ($rd) holds generated game code" }
 }
 # the setup without the game's icon, the tools, and the libraries mua3 links
-& cmake -S $root -B $build -DMUA3_GAME_ICON=OFF | Out-Null
+& cmake -S $root -B $build -DMUA3_GAME_ICON=OFF "-DMUA3_VERSION_NAME=v$Version" | Out-Null
 try {
     Build @('MUA3Setup', 'recomp', 'nxcore', 'platform', 'nxloader', 'imgui')
     Build @('mua3') # (only for main.obj / alloc_trace.obj: the exe itself is never packaged)
 } finally {
-    & cmake -S $root -B $build -DMUA3_GAME_ICON=ON | Out-Null
+    & cmake -S $root -B $build -DMUA3_GAME_ICON=ON "-DMUA3_VERSION_NAME=" | Out-Null # (dev builds: git describe again)
 }
 
 Remove-Item $out -Recurse -Force -ErrorAction SilentlyContinue

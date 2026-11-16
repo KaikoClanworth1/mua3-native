@@ -988,7 +988,8 @@ void ModsSection(ImDrawList* dl, const Layout& L) {
             sx += ImGui::CalcTextSize(sub.c_str()).x;
             std::string warn;
             if (r.counted && r.lost > 0 && r.mod.enabled)
-                warn = fmt::format(" · {} file{} replaced by {}", r.lost, r.lost == 1 ? "" : "s", r.lost_to);
+                warn = r.lost == r.files ? fmt::format(" · overridden by {}", r.lost_to)
+                                         : fmt::format(" · {} of them overridden by {}", r.lost, r.lost_to);
             if (!r.mod.unsupported.empty())
                 warn += std::string(" · ") + (r.mod.unsupported.size() == 1 ? "1 part" : fmt::format("{} parts", r.mod.unsupported.size())) +
                         " not supported here (code patches / cheats)";
@@ -1004,7 +1005,9 @@ void ModsSection(ImDrawList* dl, const Layout& L) {
                     ImGui::BeginTooltip();
                     ImGui::PushTextWrapPos(U(460));
                     if (r.lost > 0)
-                        ImGui::Text("%d of its files are replaced by %s (lower in the list wins).", r.lost, r.lost_to.c_str());
+                        ImGui::Text("%s overridden by %s: the lower mod in the list wins.",
+                                    r.lost == r.files ? "All its files are" : fmt::format("{} of its files are", r.lost).c_str(),
+                                    r.lost_to.c_str());
                     for (auto& u : r.mod.unsupported)
                         ImGui::Text("Not supported: %s", u.c_str());
                     ImGui::PopTextWrapPos();
