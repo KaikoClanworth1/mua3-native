@@ -29,6 +29,8 @@
 #include "platform/platform.h"
 #include "core/hle/mods.h"
 #include "setup/install_ops.h"
+#include "setup/launcher.h"
+#include "setup/ui_util.h"
 
 namespace {
 
@@ -118,98 +120,9 @@ struct FontScope {
     ~FontScope() { ImGui::PopFont(); }
 };
 
-struct Texture {
-    ID3D11ShaderResourceView* srv = nullptr;
-    int w = 0, h = 0;
-};
-
-Texture LoadImageTexture(ID3D11Device* dev, const fs::path& path) {
-    Texture t;
-    IWICImagingFactory* wic = nullptr;
-    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))))
-        return t;
-    IWICBitmapDecoder* dec = nullptr;
-    IWICBitmapFrameDecode* frame = nullptr;
-    IWICFormatConverter* conv = nullptr;
-    if (SUCCEEDED(wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &dec)) &&
-        SUCCEEDED(dec->GetFrame(0, &frame)) && SUCCEEDED(wic->CreateFormatConverter(&conv)) &&
-        SUCCEEDED(conv->Initialize(frame, GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0,
-                                   WICBitmapPaletteTypeCustom))) {
-        UINT w = 0, h = 0;
-        conv->GetSize(&w, &h);
-        std::vector<u8> px(size_t(w) * h * 4);
-        conv->CopyPixels(nullptr, w * 4, UINT(px.size()), px.data());
-        D3D11_TEXTURE2D_DESC td{};
-        td.Width = w;
-        td.Height = h;
-        td.MipLevels = 1;
-        td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        td.SampleDesc.Count = 1;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        D3D11_SUBRESOURCE_DATA sd{px.data(), w * 4, 0};
-        ID3D11Texture2D* tex = nullptr;
-        if (SUCCEEDED(dev->CreateTexture2D(&td, &sd, &tex))) {
-            dev->CreateShaderResourceView(tex, nullptr, &t.srv);
-            tex->Release();
-            t.w = int(w), t.h = int(h);
-        }
-    }
-    if (conv) conv->Release();
-    if (frame) frame->Release();
-    if (dec) dec->Release();
-    wic->Release();
-    return t;
-}
-
-HWND g_hwnd = nullptr;
-
-std::vector<fs::path> FileDialog(bool folder, bool multi, const wchar_t* title,
-                                 std::vector<std::pair<std::wstring, std::wstring>> filters, const fs::path& start) {
-    std::vector<fs::path> out;
-    IFileOpenDialog* dlg = nullptr;
-    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg))))
-        return out;
-    DWORD opts = 0;
-    dlg->GetOptions(&opts);
-    opts |= FOS_FORCEFILESYSTEM | (folder ? FOS_PICKFOLDERS : FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST) | (multi ? FOS_ALLOWMULTISELECT : 0);
-    dlg->SetOptions(opts);
-    dlg->SetTitle(title);
-    std::vector<COMDLG_FILTERSPEC> spec;
-    for (auto& f : filters)
-        spec.push_back({f.first.c_str(), f.second.c_str()});
-    if (!spec.empty())
-        dlg->SetFileTypes(UINT(spec.size()), spec.data());
-    std::error_code ec;
-    fs::path dir = start;
-    while (!dir.empty() && !fs::is_directory(dir, ec) && dir != dir.parent_path())
-        dir = dir.parent_path();
-    IShellItem* item = nullptr;
-    if (!dir.empty() && SUCCEEDED(SHCreateItemFromParsingName(fs::absolute(dir).wstring().c_str(), nullptr, IID_PPV_ARGS(&item)))) {
-        dlg->SetFolder(item);
-        item->Release();
-    }
-    if (SUCCEEDED(dlg->Show(g_hwnd))) {
-        IShellItemArray* items = nullptr;
-        if (SUCCEEDED(dlg->GetResults(&items))) {
-            DWORD n = 0;
-            items->GetCount(&n);
-            for (DWORD i = 0; i < n; i++) {
-                IShellItem* it = nullptr;
-                PWSTR path = nullptr;
-                if (SUCCEEDED(items->GetItemAt(i, &it)) && SUCCEEDED(it->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
-                    out.emplace_back(path);
-                    CoTaskMemFree(path);
-                }
-                if (it)
-                    it->Release();
-            }
-            items->Release();
-        }
-    }
-    dlg->Release();
-    return out;
-}
+using ui::FileDialog;
+using ui::LoadImageTexture;
+using ui::Texture;
 
 // Languages the game ships, in the set service's numbering (mua3.ini [system] language).
 constexpr std::pair<int, const char*> kLanguages[] = {
@@ -336,7 +249,7 @@ bool BeginPanel(const char* id, ImVec2 size, ImVec2 pad = ImVec2(16, 12)) {
 void EndPanel() { ImGui::EndChild(); }
 
 // ---- the wizard
-enum class Page { Files, Build, Done, Installed, Uninstalled, Report, Mods };
+enum class Page { Files, Build, Done, Installed, Uninstalled, Report, Mods, Launcher };
 enum class Step { Read, Translate, Compile, Link, Shaders, Count };
 constexpr const char* kStepNames[] = {"Read your game files", "Translate the game to PC code", "Compile",
                                       "Put the game together", "Prepare the shaders"};
@@ -590,6 +503,10 @@ void StartBuild(Wizard& w);
 
 // Files dropped on the window (SDL delivers them through the event queue the display pumps).
 bool DropWatch(void*, SDL_Event* e) {
+    if (e->type == SDL_EVENT_DROP_FILE && e->drop.data && g_w && g_w->page == Page::Launcher) {
+        launcher::Drop(fs::u8path(e->drop.data));
+        return true;
+    }
     if (e->type == SDL_EVENT_DROP_FILE && e->drop.data && g_w) {
         const fs::path p = fs::u8path(e->drop.data);
         std::error_code ec;
@@ -1268,9 +1185,10 @@ void BuildThread(Wizard& w, std::vector<fs::path> files, fs::path keys) {
     if (!fs::equivalent(setup::SetupDir(), w.install_dir, ec)) {
         wchar_t exe[MAX_PATH];
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
-        fs::copy_file(exe, w.install_dir / "MUA3Setup.exe", fs::copy_options::overwrite_existing, ec);
+        fs::copy_file(exe, w.install_dir / setup::kLauncherExe, fs::copy_options::overwrite_existing, ec);
         if (ec)
-            Log(w, "Could not copy the setup into the install folder: " + ec.message());
+            Log(w, "Could not copy the launcher into the install folder: " + ec.message());
+        fs::remove(w.install_dir / "MUA3Setup.exe", ec); // (an older install's copy)
     }
     setup::SaveInstalled(in);
     if (w.register_apps)
@@ -1533,8 +1451,8 @@ void MakeShortcuts(Wizard& w) {
     if (w.finished_shortcuts)
         return;
     w.finished_shortcuts = true;
-    const fs::path exe = w.install_dir / "mua3.exe", ico = w.install_dir / "mua3.ico";
-    const fs::path icon = fs::exists(ico) ? ico : exe;
+    const fs::path exe = w.install_dir / setup::kLauncherExe, ico = w.install_dir / "mua3.ico";
+    const fs::path icon = fs::exists(ico) ? ico : w.install_dir / "mua3.exe";
     const std::wstring desc = L"Marvel Ultimate Alliance 3: The Black Order";
     std::error_code ec;
     for (auto [want, lnk] : {std::pair{w.want_desktop, setup::DesktopShortcut()}, std::pair{w.want_start_menu, setup::StartMenuShortcut()}}) {
@@ -1620,6 +1538,58 @@ void DonePage(Wizard& w) {
         Dim(w.done_note);
 }
 
+// ---- the launcher (launcher.cpp): the installed game's main menu
+launcher::Host g_host;
+
+void EnterLauncher(Wizard& w) {
+    if (auto in = setup::LoadInstalled(w.installed ? w.installed->dir : w.install_dir))
+        w.installed = in;
+    if (!w.installed)
+        return;
+    g_host.installed = *w.installed;
+    g_host.dev = w.display->Device();
+    g_host.window = w.display->Window();
+    g_host.version = common::Version();
+    g_host.ui = g_ui;
+    std::error_code ec;
+    fs::current_path(w.installed->dir, ec); // (report::NewestCrash and the game's own paths are relative to it)
+    launcher::Open(g_host);
+    w.page = Page::Launcher;
+    // a 16:9 window (the game's menus' shape)
+    SDL_Window* win = w.display->Window();
+    SDL_Rect usable{};
+    SDL_GetDisplayUsableBounds(SDL_GetDisplayForWindow(win), &usable);
+    int ww = int(S(1120)), wh = int(S(630));
+    if (usable.w > 0)
+        ww = std::min(ww, usable.w - 40), wh = std::min(wh, usable.h - 60);
+    if (const char* sz = std::getenv("MUA3_SETUP_WINDOW")) // (developer test: "WxH" in UI units)
+        if (int x = 0, y = 0; std::sscanf(sz, "%dx%d", &x, &y) == 2)
+            ww = int(S(float(x))), wh = int(S(float(y)));
+    SDL_SetWindowSize(win, ww, wh);
+    SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED_DISPLAY(SDL_GetDisplayForWindow(win)),
+                          SDL_WINDOWPOS_CENTERED_DISPLAY(SDL_GetDisplayForWindow(win)));
+    SDL_SetWindowTitle(win, "Marvel Ultimate Alliance 3");
+}
+
+void StartRepair(Wizard& w) {
+    const auto& in = *w.installed;
+    w.repair = true;
+    w.install_dir = in.dir;
+    if (!fs::exists(w.sdk_dir / "tools" / "recomp.exe") && fs::exists(in.source_dir / "sdk" / "tools" / "recomp.exe"))
+        w.sdk_dir = in.source_dir / "sdk";
+    if (!in.build_dir.empty())
+        w.build_dir = in.build_dir;
+    w.language = in.language;
+    if (!in.keys.empty() && fs::exists(in.keys))
+        w.keys = in.keys;
+    w.want_desktop = in.desktop;
+    w.want_start_menu = in.start_menu;
+    for (auto& f : in.files)
+        if (fs::exists(f))
+            w.Add(f);
+    w.page = Page::Files;
+}
+
 void DoneBottom(Wizard& w, bool& quit) {
     const ImVec2 o = ImGui::GetWindowPos();
     const float wd = ImGui::GetWindowWidth(), ht = ImGui::GetWindowHeight();
@@ -1632,10 +1602,7 @@ void DoneBottom(Wizard& w, bool& quit) {
     ImGui::SameLine(0, S(12));
     if (Button("Play", btn, true)) {
         MakeShortcuts(w);
-        if (LaunchGame(w.install_dir))
-            quit = true;
-        else
-            w.done_note = "Could not start " + (w.install_dir / "mua3.exe").string();
+        EnterLauncher(w);
     }
 }
 
@@ -1695,6 +1662,7 @@ void UninstallModal(Wizard& w) {
             if (fs::equivalent(setup::SetupDir(), w.installed->dir, ec))
                 SelfDeleteLater(w.installed->dir);
             else {
+                fs::remove(w.installed->dir / setup::kLauncherExe, ec);
                 fs::remove(w.installed->dir / "MUA3Setup.exe", ec);
                 fs::remove(w.installed->dir, ec); // (only when empty)
             }
@@ -1752,27 +1720,10 @@ void InstalledPage(Wizard& w, bool& quit) {
         ImGui::PopID();
         return pressed;
     };
-    if (exe && card("play", "Play", "Start the game. Settings are in the game: SYSTEM > GRAPHICS.", true)) {
-        if (LaunchGame(in.dir))
-            quit = true;
-    }
-    if (card("update", "Update or repair", "Add an update or DLC, change the language, or build the game again.", false)) {
-        w.repair = true;
-        w.install_dir = in.dir;
-        if (!fs::exists(w.sdk_dir / "tools" / "recomp.exe") && fs::exists(in.source_dir / "sdk" / "tools" / "recomp.exe"))
-            w.sdk_dir = in.source_dir / "sdk";
-        if (!in.build_dir.empty())
-            w.build_dir = in.build_dir;
-        w.language = in.language;
-        if (!in.keys.empty() && fs::exists(in.keys))
-            w.keys = in.keys;
-        w.want_desktop = in.desktop;
-        w.want_start_menu = in.start_menu;
-        for (auto& f : in.files)
-            if (fs::exists(f))
-                w.Add(f);
-        w.page = Page::Files;
-    }
+    if (exe && card("play", "Play", "Open the launcher: play, mods and settings.", true))
+        EnterLauncher(w);
+    if (card("update", "Update or repair", "Add an update or DLC, change the language, or build the game again.", false))
+        StartRepair(w);
     if (exe && card("mods", "Mods", "Turn mods on or off and set their load order.", false))
         OpenModsPage(w);
     if (card("uninstall", "Uninstall", "Remove the game from this PC. You can keep your saves.", false))
@@ -2177,11 +2128,25 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         w.page = Page::Installed;
         w.open_uninstall = want_uninstall;
     }
+    // Run as the installed launcher (MUA3 Launcher.exe, or from the install folder): the launcher, not the wizard.
+    bool as_launcher = false;
+    {
+        wchar_t self[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, self, MAX_PATH);
+        std::error_code e2;
+        as_launcher = !want_uninstall && !want_report && w.installed && fs::exists(w.installed->dir / "mua3.exe", e2) &&
+                      (_wcsicmp(fs::path(self).filename().c_str(), fs::u8path(setup::kLauncherExe).c_str()) == 0 ||
+                       fs::equivalent(setup::SetupDir(), w.installed->dir, e2));
+        if (const char* pg = std::getenv("MUA3_SETUP_PAGE"); pg && std::string(pg).rfind("launcher", 0) == 0 && w.installed)
+            as_launcher = true;
+    }
     if (const char* pg = std::getenv("MUA3_SETUP_PAGE")) { // screenshots / tests
         const std::string s = pg;
         if (s == "files") w.page = Page::Files;
         if (s == "mods" && w.installed) OpenModsPage(w);
     }
+    if (w.page == Page::Mods && as_launcher) // (the launcher has its own MODS)
+        as_launcher = false;
     if (w.page == Page::Files || w.page == Page::Installed)
         w.StartScan();
 
@@ -2196,7 +2161,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     SDL_Window* win = display.Window();
     if (const SDL_DisplayMode* d = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay()))
         w.desktop_w = d->w, w.desktop_h = d->h;
-    g_hwnd = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(win), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+    ui::g_hwnd = (HWND__*)SDL_GetPointerProperty(SDL_GetWindowProperties(win), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
     const float content = SDL_GetDisplayContentScale(SDL_GetDisplayForWindow(win));
     g_ui = std::clamp(content > 0 ? content : 1.0f, 1.0f, 3.0f);
     if (const char* ui = std::getenv("MUA3_SETUP_UI"))
@@ -2217,6 +2182,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     }
     ApplyTheme();
     LoadFonts();
+    launcher::LoadFonts();
+    if (as_launcher)
+        EnterLauncher(w);
     ImGui::GetIO().IniFilename = nullptr;
     SDL_AddEventWatch(DropWatch, nullptr);
     if (w.installed) {
@@ -2235,6 +2203,16 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 w.icon.srv->Release(), w.icon.srv = nullptr;
             w.icon = LoadImageTexture(display.Device(), w.icon_jpeg);
             display.SetIcon(w.icon_jpeg);
+        }
+        if (w.page == Page::Launcher) { // the installed game's launcher draws the whole window
+            switch (launcher::Frame(g_host)) {
+            case launcher::Action::Quit: quit = true; break;
+            case launcher::Action::UpdateRepair: StartRepair(w); break;
+            case launcher::Action::Uninstall: w.page = Page::Installed, w.open_uninstall = true; break;
+            case launcher::Action::Report: w.page = Page::Report; break;
+            default: break;
+            }
+            return;
         }
         Background();
         const ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -2413,6 +2391,26 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 if (page_frames == 48)
                     break;
             }
+            if (w.page == Page::Launcher) { // (MUA3_SETUP_PAGE=launcher): every section, and a mod install
+                const char* mod = std::getenv("MUA3_SETUP_MOD_INSTALL");
+                switch (page_frames) {
+                case 30: shot("l1_play.bmp"); break;
+                case 34: launcher::Select(1, false); break;
+                case 44: shot("l2_mods.bmp"); break;
+                case 46:
+                    if (mod)
+                        LOG_INFO("Setup", "test install: {}", launcher::InstallNow(fs::u8path(mod)));
+                    launcher::Select(1, true);
+                    break;
+                case 70: if (mod) shot("l3_mods_installed.bmp"); break;
+                case 74: launcher::Select(2, false); break;
+                case 84: shot("l4_settings.bmp"); break;
+                case 88: launcher::Select(3, false); break;
+                case 98: shot("l5_exit.bmp"); break;
+                case 102: quit = true; break;
+                default: break;
+                }
+            }
             if (w.page == Page::Installed && page_frames == 40) {
                 shot("4_installed.bmp");
             }
@@ -2435,7 +2433,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         display.BeginFrame();
         display.EndFrame();
         display.PaceFrame();
+        if (w.page == Page::Launcher && launcher::GameRunning())
+            SDL_Delay(100); // (minimised, waiting for the game)
     }
+    launcher::Shutdown();
     if (w.page == Page::Done)
         MakeShortcuts(w);
     // a build still running when the window closes stops (finished parts are kept)

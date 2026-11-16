@@ -561,7 +561,7 @@ bool RegisterUninstall(const Installed& in, u64 bytes) {
         RegSetValueExW(key, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(v.c_str()), DWORD((v.size() + 1) * sizeof(wchar_t)));
     };
     auto dword = [&](const wchar_t* name, DWORD v) { RegSetValueExW(key, name, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&v), 4); };
-    const std::wstring setup = (in.dir / "MUA3Setup.exe").wstring();
+    const std::wstring setup = (in.dir / kLauncherExe).wstring();
     str(L"DisplayName", L"Marvel Ultimate Alliance 3: The Black Order (MUA3 Native)");
     str(L"DisplayIcon", (in.dir / "mua3.ico").wstring());
     str(L"DisplayVersion", fs::u8path(common::Version()).wstring());
@@ -610,7 +610,7 @@ std::vector<std::string> Uninstall(const Installed& in, bool keep_saves) {
     // What setup and the game wrote in the install folder. Anything else the player put there stays.
     if (!in.dir.empty() && (fs::exists(in.dir / "mua3.exe", ec) || fs::exists(in.dir / kSetupIni, ec))) {
         for (const char* p : {"mua3.exe", "mua3.ini", "mua3.ico", "mua3.log", "mua3.pdb", "setup.ini", "game",
-                              "shader_cache", "shader_dump", "logs", "crash", "romfs_index.bin", "launcher.log"})
+                              "shader_cache", "shader_dump", "logs", "crash", "romfs_index.bin", "launcher.log", ".mod_install"})
             remove_all(in.dir / p);
         for (auto it = fs::directory_iterator(in.dir, ec); !ec && it != fs::directory_iterator(); it.increment(ec)) {
             const std::string n = Lower(it->path().filename().string());
@@ -621,7 +621,8 @@ std::vector<std::string> Uninstall(const Installed& in, bool keep_saves) {
         if (!keep_saves)
             for (const char* p : {"save", "screenshots"})
                 remove_all(in.dir / p);
-        // MUA3Setup.exe itself is removed by the caller after this process ends (it may be running from here).
+        // The launcher (MUA3 Launcher.exe) is removed by the caller after this process ends (it may be running from
+        // here). mods\ stays: the player's own mods.
     }
     return left;
 }

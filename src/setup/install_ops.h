@@ -19,6 +19,8 @@ enum class Verdict { Supported, WrongVersion, WrongGame, Unknown };
 
 constexpr u32 kSupportedUpdate = 524288; // v524288 = update 4.0.1, the version the port is built for
 constexpr const char* kSupportedUpdateName = "4.0.1";
+// The setup's own exe, installed next to mua3.exe: it opens as the launcher there (shortcuts, Apps entry).
+constexpr const char* kLauncherExe = "MUA3 Launcher.exe";
 
 struct GameFile {
     fs::path path;
