@@ -1182,13 +1182,21 @@ void BuildThread(Wizard& w, std::vector<fs::path> files, fs::path keys) {
     in.desktop = w.want_desktop;
     in.start_menu = w.want_start_menu;
     const fs::path self = setup::SetupDir() / "MUA3Setup.exe";
-    if (!fs::equivalent(setup::SetupDir(), w.install_dir, ec)) {
+    {
+        // The install always gets "MUA3 Launcher.exe", also when setup runs from the install folder itself
+        // (--prepare from RecompLauncher): only a copy onto the running exe is skipped.
         wchar_t exe[MAX_PATH];
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
-        fs::copy_file(exe, w.install_dir / setup::kLauncherExe, fs::copy_options::overwrite_existing, ec);
-        if (ec)
-            Log(w, "Could not copy the launcher into the install folder: " + ec.message());
-        fs::remove(w.install_dir / "MUA3Setup.exe", ec); // (an older install's copy)
+        const fs::path running = exe, launcher = w.install_dir / setup::kLauncherExe;
+        if (!fs::equivalent(running, launcher, ec)) {
+            fs::copy_file(running, launcher, fs::copy_options::overwrite_existing, ec);
+            if (ec)
+                Log(w, "Could not copy the launcher into the install folder: " + ec.message());
+        }
+        // an older install's MUA3Setup.exe goes, but never the running one (a launcher may call it again)
+        const fs::path old = w.install_dir / "MUA3Setup.exe";
+        if (!fs::equivalent(running, old, ec))
+            fs::remove(old, ec);
     }
     setup::SaveInstalled(in);
     if (w.register_apps)
