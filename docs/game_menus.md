@@ -246,13 +246,21 @@ The title screen's SYSTEM submenu (SAVE, LOAD, OPTIONS, TIPS, GALLERY; title men
   main+0x1a634a8 / 0x1a634ad), the new page's tables installed in tab 2's slot, FillRows 0x7c5900, the tab sound
   (0x563690 with GOT main+0x2188cc0 +0x168, hash 0xba0cf4d2) and RowsDone 0x7c5d80. Each page has at most 8 rows
   (tab 2's row-type table).
-- **Settings**: DISPLAY MODE, RESOLUTION, RENDER SCALE, FRAME RATE, FPS LIMIT, VSYNC, SHOW FPS, ANTI-ALIASING
+- **Settings**: DISPLAY MODE, RESOLUTION, RENDER SCALE, UPSCALER, FSR SHARPNESS, ANTI-ALIASING, FRAME RATE, VSYNC
   (mua3.ini [video], the launcher's choices). Every change goes through `core::System::UpdateConfig`: the running
-  config (FPS limit, show FPS, VSync, window mode and size: the main loop applies them; anti-aliasing, OFF / FXAA:
-  the renderer reads it at every present) and mua3.ini (also render scale and frame rate, which apply after a
+  config (VSync, window mode and size: the main loop applies them; upscaler, sharpness and anti-aliasing: the
+  renderer reads them at every present) and mua3.ini (also render scale and frame rate, which apply after a
   restart). The page shows the running config, except RENDER SCALE and FRAME RATE, which show the value saved in
   mua3.ini for the next start; their info line names the value running now.
-- **PC SETTINGS**: MASTER VOLUME (0-100%, live, on top of the SOUND tab's volumes), MUTE (live, mua3.ini `mute`),
+- **UPSCALER**: OFF / FSR ULTRA QUALITY / FSR QUALITY / FSR BALANCED / FSR PERFORMANCE = `upscaler` 0 or 1 and
+  `upscale_quality` 0-3 (FSR 1, live). **FSR SHARPNESS** (`sharpness`, 0-100% in steps of 10, 80% default; another
+  ini value is shown as is) is greyed while the upscaler is off (row grey main+0x7caf30 / ungrey 0x7cb230, flag
+  this+0x1ac + 4 * slot; A and LEFT/RIGHT do nothing on it). FSR and SSAA do not mix: picking FSR turns SSAA 2X into
+  FXAA, picking SSAA 2X turns FSR off (left / right, vfuncs +0x1b8 / +0x1c0, are wrapped: the row's new value is
+  read back, or taken as the arrow's wrapped step when the game stores it later; then the other row is set and drawn
+  with ShowValue main+0x7c8970, a hook on which is not reached from the game's direct calls; A and Y run the same
+  check). The cursor skips the greyed row.
+- **PC SETTINGS**: FPS LIMIT and SHOW FPS (live; here because a page holds 8 rows), MASTER VOLUME (0-100%, live, on top of the SOUND tab's volumes), MUTE (live, mua3.ini `mute`),
   CAMERA SPEED (10-200%, 100% = original, live: `hle::camera_speed`; the camera update main+0x339d40 turns at
   speed * (stick - deadzone)^2 with the speed floats in the camera parameters, so the update is wrapped and those floats
   are scaled for its duration: speed% at every tilt; on top of the CAMERA tab's CONTROL SENSITIVITY), CONTROLLER TYPE (XInput / SDL) and AUDIO OUTPUT (XAudio2 / SDL / off), which apply after a

@@ -52,7 +52,10 @@ constexpr u64 kTabPrev = 0x7c81e0, kTabNext = 0x7c8320; // vfuncs +0x1e8 / +0x1f
 constexpr u64 kValuePrev = 0x7c8480, kValueNext = 0x7c9400; // vfuncs +0x1b8 / +0x1c0 (this): left / right
 constexpr u64 kDecide = 0x7c7c10;                     // vfunc +0x228 (this): A on a row
 constexpr u64 kDefault = 0x7c7eb0;                    // vfunc +0x1d8 (this): Y, asks to reset the row
-constexpr u64 kShowValue = 0x7c8970;                  // (this, row): draws a row's value
+constexpr u64 kShowValue = 0x7c8970;                  // (this, slot): draws a row's value (after every change)
+constexpr u64 kGreyRow = 0x7caf30;                    // (this, slot, string hash, 0): a row greyed out (tab 1's way)
+constexpr u64 kUngreyRow = 0x7cb230;                  // (this, slot, 0): back to normal
+constexpr u64 kObjRowOff = 0x1ac;                     // u32 per visible row: 1 = greyed out (left / right do nothing)
 constexpr u64 kFillRows = 0x7c5900;                   // (this): lays out the current tab's rows
 constexpr u64 kRowsDone = 0x7c5d80;                   // (this): what opening does after laying out the rows
 constexpr u64 kBack = 0x7c7e40;                       // vfunc +0x230 (this): B, closes the screen
@@ -87,8 +90,12 @@ constexpr int kRates[] = {30, 60, 72, 90, 120, 144, 165, 240}; // as the launche
 constexpr int kLimits[] = {0, 30, 60, 72, 90, 120, 144, 165, 240};
 
 constexpr u32 kMaxRows = 8; // tab 2's row-type table has room for 8 (the next table is tab 0's)
-enum GraphicsRows { kRowMode, kRowResolution, kRowScale, kRowRate, kRowLimit, kRowVsync, kRowShowFps, kRowAa, kGraphicsRows };
-enum PcRows { kRowVolume, kRowMute, kRowCamera, kRowController, kRowAudio, kPcRows };
+// A page shows at most 8 rows (FillRows lays out 8 and does not scroll), so FPS LIMIT and SHOW FPS live on PC SETTINGS.
+enum GraphicsRows {
+    kRowMode, kRowResolution, kRowScale, kRowUpscaler, kRowSharpness, kRowAa, kRowRate, kRowVsync, kGraphicsRows
+};
+enum PcRows { kRowLimit, kRowShowFps, kRowVolume, kRowMute, kRowCamera, kRowController, kRowAudio, kPcRows };
+enum Aa { kAaOff, kAaFxaa, kAaSsaa2 }; // anti_aliasing: 2-4 = SSAA 2X-4X
 static_assert(kGraphicsRows <= kMaxRows && kPcRows <= kMaxRows);
 constexpr int kCameraSpeeds[] = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200};
 const char16_t* const kControllerNames[] = {u"XBOX (XINPUT)", u"ANY CONTROLLER (SDL)"};
@@ -133,9 +140,12 @@ u16 g_saved_count = 0;
 u32 g_saved_types[kMaxRows]{};
 
 enum Hook {
-    kHInit, kHStore, kHCount, kHTabPrev, kHTabNext, kHDecide, kHDefault, kHString, kHBack, kHookCount
+    kHInit, kHStore, kHCount, kHTabPrev, kHTabNext, kHDecide, kHDefault, kHString, kHBack, kHValuePrev, kHValueNext, kHookCount
 };
 cpu::FunctionOverride g_hooks[kHookCount];
+bool OnPage(u64 opt);
+void UpdateGrey(State& s, u64 opt, int upscaler = -1);
+void Exclude(State& s, u64 opt, u32 row, u8 value);
 
 u64 R64(u64 a) { return g_mem->Read<u64>(a); }
 u32 R32(u64 a) { return g_mem->Read<u32>(a); }
@@ -161,7 +171,8 @@ u32 Text(const std::u16string& t, size_t room = 0) {
 }
 std::u16string U16(const std::string& s) { return std::u16string(s.begin(), s.end()); }
 
-u32 g_custom_res = 0, g_custom_limit = 0, g_custom_volume = 0, g_custom_camera = 0; // rewritable value texts
+u32 g_custom_res = 0, g_custom_limit = 0, g_custom_volume = 0, g_custom_camera = 0,
+    g_custom_sharpness = 0, g_sharpness_off = 0; // rewritable value texts; the greyed FSR SHARPNESS text
 // the restart rows' info lines (they name the value running now)
 u32 g_scale_info = 0, g_rate_info = 0, g_controller_info = 0, g_audio_info = 0;
 const std::u16string kScaleInfo = u"The resolution the game renders at. AUTO matches your display.";
@@ -218,32 +229,45 @@ void BuildPages() {
     g_scale_info = Text(kScaleInfo, kInfoRoom);
     add(Text(u"RENDER SCALE"), g_scale_info, kArrows,
         {kStrAuto, Text(kScaleNames[1]), Text(kScaleNames[2]), Text(kScaleNames[3]), Text(kScaleNames[4])});
+    add(Text(u"UPSCALER"),
+        Text(u"AMD FSR 1: renders below the output size and upscales (faster).\r\n"
+             u"ULTRA QUALITY renders the most pixels, PERFORMANCE the fewest. No SSAA."),
+        kArrows, {kStrOff, Text(u"FSR ULTRA QUALITY"), Text(u"FSR QUALITY"), Text(u"FSR BALANCED"),
+                  Text(u"FSR PERFORMANCE")});
+    std::vector<u32> sharp;
+    for (int v = 0; v <= 100; v += 10)
+        sharp.push_back(Text(U16(v == 80 ? "80% (DEFAULT)" : fmt::format("{}%", v))));
+    g_custom_sharpness = Text(u"", 8);
+    g_sharpness_off = Text(u"Pick an FSR upscaler first.");
+    sharp.push_back(g_custom_sharpness);
+    add(Text(u"FSR SHARPNESS"), Text(u"How much FSR sharpens the upscaled picture. Used only while FSR is on."),
+        kArrows, sharp);
+    add(Text(u"ANTI-ALIASING"),
+        Text(u"Smooths jagged edges. FXAA costs nothing; SSAA renders more pixels (high VRAM).\r\n"
+             u"SSAA multiplies the render scale (4X in total at most). With FSR on: OFF or FXAA."),
+        kArrows, {kStrOff, Text(u"FXAA"), Text(u"SSAA 2X"), Text(u"SSAA 3X"), Text(u"SSAA 4X")});
     std::vector<u32> rates;
     for (int r : kRates)
         rates.push_back(Text(U16(r == 30 ? "30 (ORIGINAL)" : r > 60 ? fmt::format("{} (EXPERIMENTAL)", r)
                                                                    : std::to_string(r))));
     g_rate_info = Text(kRateInfo, kInfoRoom);
     add(Text(u"FRAME RATE"), g_rate_info, kArrows, rates);
-    std::vector<u32> limits;
-    for (int l : kLimits)
-        limits.push_back(l == 0 ? kStrOff : Text(U16(std::to_string(l))));
-    g_custom_limit = Text(u"", 8);
-    limits.push_back(g_custom_limit);
-    add(Text(u"FPS LIMIT"), Text(u"Caps how fast frames are shown. OFF = no cap."), kArrows, limits);
     add(Text(u"VSYNC"), Text(u"Synchronizes frames with the display to prevent tearing."), kTwoChoices,
         {kStrOn, kStrOff});
-    add(Text(u"SHOW FPS"), Text(u"Shows the frame rate in the corner of the screen."), kTwoChoices,
-        {kStrOn, kStrOff});
-    add(Text(u"ANTI-ALIASING"),
-        Text(u"Smooths jagged edges. FXAA costs nothing; SSAA renders more pixels (high VRAM).\r\n"
-             u"SSAA multiplies the render scale (4X in total at most)."),
-        kArrows, {kStrOff, Text(u"FXAA"), Text(u"SSAA 2X"), Text(u"SSAA 3X"), Text(u"SSAA 4X")});
     Finish(*page);
     // PC SETTINGS
     page = &g_pages[1];
     page->title = Text(u"PC SETTINGS");
     page->to = ToPc;
     page->from = FromPc;
+    std::vector<u32> limits;
+    for (int l : kLimits)
+        limits.push_back(l == 0 ? kStrOff : Text(U16(std::to_string(l))));
+    g_custom_limit = Text(u"", 8);
+    limits.push_back(g_custom_limit);
+    add(Text(u"FPS LIMIT"), Text(u"Caps how fast frames are shown. OFF = no cap."), kArrows, limits);
+    add(Text(u"SHOW FPS"), Text(u"Shows the frame rate in the corner of the screen."), kTwoChoices,
+        {kStrOn, kStrOff});
     std::vector<u32> volumes;
     for (int v = 0; v <= 100; v += 10)
         volumes.push_back(Text(U16(fmt::format("{}%", v))));
@@ -292,13 +316,18 @@ void ToGraphics(const core::Config& c, u8* v) {
     v[kRowResolution] = u8(res);
     v[kRowScale] = u8(std::clamp(c.resolution_scale, 0, 4));
     v[kRowRate] = u8(IndexOf(kRates, c.fps_target, 1));
-    PutString(g_custom_limit, U16(std::to_string(c.fps_limit)), 8);
-    v[kRowLimit] = u8(IndexOf(kLimits, c.fps_limit, int(std::size(kLimits))));
     v[kRowVsync] = c.vsync ? 0 : 1;
-    v[kRowShowFps] = c.show_fps ? 0 : 1;
-    v[kRowAa] = u8(std::clamp(c.anti_aliasing, 0, 4));
+    v[kRowUpscaler] = c.upscaler == 1 ? u8(1 + std::clamp(c.upscale_quality, 0, 3)) : 0;
+    PutString(g_custom_sharpness, U16(fmt::format("{}%", c.sharpness)), 8);
+    v[kRowSharpness] = u8(c.sharpness % 10 == 0 ? std::clamp(c.sharpness, 0, 100) / 10 : 11);
+    // the renderer runs no SSAA while FSR upscales: the row shows what runs
+    const int aa = std::clamp(c.anti_aliasing, 0, 4);
+    v[kRowAa] = u8(c.upscaler == 1 && aa >= kAaSsaa2 ? kAaFxaa : aa);
 }
 void ToPc(const core::Config& c, u8* v) {
+    PutString(g_custom_limit, U16(std::to_string(c.fps_limit)), 8);
+    v[kRowLimit] = u8(IndexOf(kLimits, c.fps_limit, int(std::size(kLimits))));
+    v[kRowShowFps] = c.show_fps ? 0 : 1;
     PutString(g_custom_volume, U16(fmt::format("{}%", c.volume)), 8);
     v[kRowVolume] = u8(c.volume % 10 == 0 ? std::clamp(c.volume, 0, 100) / 10 : 11);
     v[kRowMute] = c.mute ? 0 : 1;
@@ -313,11 +342,13 @@ void FromGraphics(core::Config& c, bool running, const u8* v) {
     c.fullscreen = v[kRowMode] == 1;
     if (v[kRowResolution] < std::size(kResolutions))
         std::tie(c.width, c.height) = kResolutions[v[kRowResolution]];
-    if (v[kRowLimit] < std::size(kLimits))
-        c.fps_limit = kLimits[v[kRowLimit]];
     c.vsync = v[kRowVsync] == 0;
-    c.show_fps = v[kRowShowFps] == 0;
     c.anti_aliasing = std::min<int>(v[kRowAa], 4);
+    c.upscaler = v[kRowUpscaler] >= 1 && v[kRowUpscaler] <= 4 ? 1 : 0; // live, like the anti-aliasing
+    if (c.upscaler)
+        c.upscale_quality = v[kRowUpscaler] - 1;
+    if (v[kRowSharpness] <= 10)
+        c.sharpness = v[kRowSharpness] * 10;
     if (running)
         return;
     c.resolution_scale = std::min<int>(v[kRowScale], 4);
@@ -325,6 +356,9 @@ void FromGraphics(core::Config& c, bool running, const u8* v) {
         c.fps_target = kRates[v[kRowRate]];
 }
 void FromPc(core::Config& c, bool running, const u8* v) {
+    if (v[kRowLimit] < std::size(kLimits))
+        c.fps_limit = kLimits[v[kRowLimit]];
+    c.show_fps = v[kRowShowFps] == 0;
     if (v[kRowVolume] <= 10)
         c.volume = v[kRowVolume] * 10;
     c.mute = v[kRowMute] == 0;
@@ -368,11 +402,14 @@ void WriteRestartInfo() {
     if (const u32 s3 = g_scale3) {
         const u32 w = c.docked ? 1920 : 1280, h = c.docked ? 1080 : 720;
         auto dims = [&](u32 s) { return U16(fmt::format("{} x {}", (w * s + 2) / 3, (h * s + 2) / 3)); };
-        u32 f = c.anti_aliasing >= 2 && c.anti_aliasing <= 4 ? u32(c.anti_aliasing) : 1;
+        u32 f = c.upscaler != 1 && c.anti_aliasing >= 2 && c.anti_aliasing <= 4 ? u32(c.anti_aliasing) : 1;
         while (f > 1 && s3 * f > 12)
             f--;
-        size = u"\r\nRenders at " + dims(s3) +
-               (f > 1 ? u" (" + dims(s3 * f) + u" with SSAA " + U16(std::to_string(f)) + u"X)" : u"") + u" now.";
+        size = c.upscaler == 1 ? std::u16string(u"\r\nFSR is on: the UPSCALER sets the render size.")
+                               : u"\r\nRenders at " + dims(s3) +
+                                     (f > 1 ? u" (" + dims(s3 * f) + u" with SSAA " + U16(std::to_string(f)) + u"X)"
+                                            : u"") +
+                                     u" now.";
     }
     PutString(g_scale_info,
               kScaleInfo + u"\r\nApplies after a restart (running now: " +
@@ -450,6 +487,7 @@ void EnterPage(State& s, u64 opt, bool from_options) {
     GuestCall(s, g_main + kFillRows, {opt});
     GuestCall(s, g_main + kRowsDone, {opt});
     HideOthers(s, opt);
+    UpdateGrey(s, opt);
     LOG_INFO("Menu", "Graphics page opened{}", from_options ? " from OPTIONS" : "");
 }
 
@@ -548,6 +586,22 @@ void Blocked(State& s, Hook h) {
         return GuestReturn(s, 0);
     RunOriginal(s, g_hooks[h]);
 }
+// FSR SHARPNESS is greyed out while the UPSCALER is OFF (the way the CAMERA tab greys a row; rows sit at their own
+// slot, the page does not scroll).
+void UpdateGrey(State& s, u64 opt, int upscaler) {
+    if (!OnPage(opt) || g_cur != 0)
+        return;
+    const bool fsr = (upscaler >= 0 ? upscaler : g_mem->Read<u8>(Cur().values + kRowUpscaler)) != 0;
+    const bool grey = R32(opt + kObjRowOff + 4 * kRowSharpness) != 0;
+    if (fsr && grey) {
+        GuestCall(s, g_main + kUngreyRow, {opt, kRowSharpness, 0});
+        W32(opt + kObjRowOff + 4 * kRowSharpness, 0);
+    } else if (!fsr && !grey) {
+        GuestCall(s, g_main + kGreyRow, {opt, kRowSharpness, g_sharpness_off, 0});
+        W32(opt + kObjRowOff + 4 * kRowSharpness, 1);
+    }
+}
+
 // L / R on the page: the other page, the way the game switches tabs (header animations, rows laid out again, the
 // tab sound).
 void SwitchPage(State& s, Hook h) {
@@ -572,6 +626,7 @@ void SwitchPage(State& s, Hook h) {
         GuestCall(s, g_main + kPlaySound, {sound + 0x168, kSoundTab});
     GuestCall(s, g_main + kRowsDone, {opt});
     HideOthers(s, opt);
+    UpdateGrey(s, opt);
     LOG_INFO("Menu", "{} page shown", to == 0 ? "GRAPHICS" : "PC SETTINGS");
     GuestReturn(s, 0);
 }
@@ -595,12 +650,13 @@ void Decide(State& s) {
         return GuestReturn(s, 0);
     }
     const u32 row = CursorRow(s, opt);
-    if (row < Cur().rows.size()) {
+    if (row < Cur().rows.size() && !R32(opt + kObjRowOff + 4 * row)) {
         u8 v[16];
         g_mem->ReadBlock(Cur().values, v, sizeof(v));
         v[row] = u8((v[row] + 1) % Cur().rows[row].choices.size());
         g_mem->WriteBlock(Cur().values, v, sizeof(v));
         GuestCall(s, g_main + kShowValue, {opt, row});
+        Exclude(s, opt, row, v[row]);
     }
     GuestReturn(s, 0);
 }
@@ -637,6 +693,43 @@ void Back(State& s) {
     GuestReturn(s, 0);
 }
 
+// A row's value changed to `value` (on the game's thread; an arrow row may store it only at the end of its
+// animation): FSR and SSAA exclude each other (picking FSR turns SSAA into FXAA, picking SSAA turns FSR off), and
+// FSR SHARPNESS follows the UPSCALER.
+void Exclude(State& s, u64 opt, u32 row, u8 value) {
+    if (!OnPage(opt) || g_cur != 0 || (row != kRowUpscaler && row != kRowAa))
+        return;
+    const u64 v = Cur().values;
+    u8 fsr = row == kRowUpscaler ? value : g_mem->Read<u8>(v + kRowUpscaler);
+    const u8 aa = row == kRowAa ? value : g_mem->Read<u8>(v + kRowAa);
+    if (fsr != 0 && aa >= kAaSsaa2) {
+        const u32 other = row == kRowUpscaler ? kRowAa : kRowUpscaler;
+        g_mem->Write<u8>(v + other, other == kRowAa ? u8(kAaFxaa) : u8(0));
+        GuestCall(s, g_main + kShowValue, {opt, other});
+        if (other == kRowUpscaler)
+            fsr = 0;
+    }
+    UpdateGrey(s, opt, fsr);
+}
+// Left / right on a row: the row's new value (read back, or the step the game makes: arrows wrap round).
+void Step(State& s, Hook h, int dir) {
+    const u64 opt = s.x[0];
+    const u32 row = OnPage(opt) ? CursorRow(s, opt) : ~0u;
+    const bool ours = row < Cur().rows.size() && !R32(opt + kObjRowOff + 4 * row);
+    const u8 before = ours ? g_mem->Read<u8>(Cur().values + row) : 0;
+    RunOriginal(s, g_hooks[h]);
+    if (!ours)
+        return;
+    u8 now = g_mem->Read<u8>(Cur().values + row);
+    if (now == before) {
+        const int n = int(Cur().rows[row].choices.size());
+        now = u8(n ? (before + dir + n) % n : before);
+    }
+    Exclude(s, opt, row, now);
+}
+void ValuePrev(State& s) { Step(s, kHValuePrev, -1); }
+void ValueNext(State& s) { Step(s, kHValueNext, 1); }
+
 // While the page is open its value bytes are watched (an arrow row commits its new value some frames after the
 // key, at the end of its animation): a change applies at once.
 void Watch() {
@@ -668,6 +761,7 @@ void Default(State& s) {
         ToPage(Cur(), now); // the custom value texts
         g_mem->WriteBlock(Cur().values, v, sizeof(v));
         GuestCall(s, g_main + kShowValue, {opt, row});
+        Exclude(s, opt, row, v[row]);
     }
     GuestReturn(s, 0);
 }
@@ -704,6 +798,7 @@ void Install(core::Memory& mem, kernel::Kernel& kernel, u64 main_base) {
         {kDefault, 0xa9bd57f6},   {kShowValue, 0xfc1b0fe8},
         {kFillRows, 0xfc170fec},  {kRowsDone, 0xfc1c0fea},  {kGetString, 0x2a0103e8},  {kRowCounts + 4, 0x40003},
         {kRowTypes, 1},           {kRowTypes + 4 * kEntryRow, 0}, {kBack, 0xf81e0ff3}, {kTabNames, 0xfc1a0fe8},
+        {kGreyRow, 0xfc1c0fe8},   {kUngreyRow, 0xfc1c0fe8},
     };
     for (auto [off, word] : kExpect)
         if (!mem.IsValid(main_base + off, 4) || mem.Read<u32>(main_base + off) != word) {
@@ -717,7 +812,7 @@ void Install(core::Memory& mem, kernel::Kernel& kernel, u64 main_base) {
     const std::pair<u64, void (*)(State&)> hooks[kHookCount] = {
         {kOptInit, OptInit},     {kOptStore, OptStore},   {kChoiceCount, ChoiceCount}, {kTabPrev, TabPrev},
         {kTabNext, TabNext},     {kDecide, Decide},       {kDefault, Default},         {kGetString, GetString},
-        {kBack, Back},
+        {kBack, Back},           {kValuePrev, ValuePrev}, {kValueNext, ValueNext},
     };
     for (int i = 0; i < kHookCount; i++) {
         g_hooks[i].pc = main_base + hooks[i].first;
