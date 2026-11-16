@@ -577,6 +577,9 @@ int main(int argc, char** argv) {
     // The launcher's last build step: every shader translated and compiled before the first launch.
     if (argc == 3 && std::string(argv[1]) == "--build-shaders")
         return gpu::BuildShadersAhead(fs::u8path(argv[2]));
+    // Developer check of the motion-vector shader variants: `--test-motion <shader_dump dir> [programs, 0 = all]`.
+    if ((argc == 3 || argc == 4) && std::string(argv[1]) == "--test-motion")
+        return gpu::TestMotionVectors(fs::u8path(argv[2]), argc == 4 ? std::atoi(argv[3]) : 0);
     core::Config cfg;
     cfg.Load("mua3.ini");
     int watch_seconds = 0;

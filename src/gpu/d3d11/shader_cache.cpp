@@ -1,5 +1,9 @@
+#include <algorithm>
 #include <bit>
+#include <cstddef>
 #include <cstring>
+#include <mutex>
+#include <thread>
 #include <chrono>
 #include <unordered_set>
 #include <fstream>
@@ -693,6 +697,8 @@ bool ShaderCache::CreateObject(HostShader& s, const std::vector<u8>& blob, std::
         hr = dev_->CreatePixelShader(blob.data(), blob.size(), nullptr, &s.ps);
     if (&blob != &s.dxbc)
         s.dxbc = blob; // kept: input layouts (vertex), recreation after the object was released, ResetDevice
+    if (s.key[6]) // a motion-vector variant has them if its signature names VELPREV (cached bytecode included)
+        s.velocity = std::search(blob.begin(), blob.end(), std::begin("VELPREV"), std::end("VELPREV") - 1) != blob.end();
     create_ns += u64((std::chrono::steady_clock::now() - k0).count());
     if (FAILED(hr)) {
         err = fmt::format("Create shader failed {:#x}", u32(hr));
@@ -1104,10 +1110,170 @@ HostShader* ShaderCache::Queue(shader::Stage stage, u64 hash, const u8* code, si
     return raw;
 }
 
-HostShader* ShaderCache::GetVariant(HostShader* base, const VariantKey& v) {
-    if (!base || !(v.attr_uint | v.attr_sint | v.attr_snorm10 | v.tex_uint | v.tex_sint) || base->state != HostShader::Ready)
+namespace {
+
+bool IsIdent(char c) { return std::isalnum(u8(c)) || c == '_'; }
+
+// Per-object motion vectors (VariantKey::velocity), added to a translated vertex or pixel shader's HLSL. Returns false
+// (src then partly edited: the caller keeps its copy) when the program cannot take them.
+//  Vertex: Run's body again as RunPrev, with the game's constant buffers 3..12 read from last frame's bytes (raw views
+//   pcb<i> at t48+i; 0-2 are the driver's, the program's constants and the texture handles, the same both frames).
+//   RunPrev runs first and keeps only its position; every static is reset and Run runs as before. The position goes
+//   out as VELPREV in ATTR29's register: SV_Position and 30 ATTRs fill 31 of the 32 output registers, and the pixel
+//   shader's front-face input takes the 32nd input, so there is no register to add (no MUA3 program writes ATTR29).
+//  Pixel: VELPREV in, SV_Target7 = (last frame's pixel) - (this pixel without the jitter), in host pixels, y down.
+bool AddMotionVectors(std::string& src, shader::Stage stage) {
+    if (stage == shader::Stage::Vertex) {
+        const size_t run = src.find("void Run() {\n");
+        const size_t vsin = run == std::string::npos ? run : src.find("}\nstruct VSIn {", run);
+        const size_t statics = src.find("static bool return_flag = false;");
+        if (vsin == std::string::npos || statics == std::string::npos || statics > run ||
+            src.find("o_attr29.") != std::string::npos)
+            return false;
+        const std::string_view body(src.data() + run + 13, vsin - (run + 13));
+        // last frame's constant buffers: c<i>[row].<comp> -> pcb<i>.Load(byte), CbufLoad<i>( -> PCbufLoad<i>(
+        std::string prev;
+        prev.reserve(body.size() + body.size() / 8);
+        u32 used = 0, used_dyn = 0;
+        for (size_t i = 0; i < body.size();) {
+            const bool word = i == 0 || !IsIdent(body[i - 1]);
+            if (word && body[i] == 'c' && i + 1 < body.size() && std::isdigit(u8(body[i + 1]))) {
+                size_t j = i + 1;
+                u32 slot = 0;
+                while (j < body.size() && std::isdigit(u8(body[j])) && slot < 100)
+                    slot = slot * 10 + u32(body[j++] - '0');
+                if (slot >= 3 && slot <= 12 && j + 1 < body.size() && body[j] == '[' && std::isdigit(u8(body[j + 1]))) {
+                    size_t k = j + 1;
+                    u32 row = 0;
+                    while (k < body.size() && std::isdigit(u8(body[k])))
+                        row = row * 10 + u32(body[k++] - '0');
+                    const char* comps = "xyzw";
+                    const char* c = k + 2 < body.size() && body[k] == ']' && body[k + 1] == '.' && body[k + 2]
+                                        ? std::strchr(comps, body[k + 2]) : nullptr;
+                    if (c && (k + 3 >= body.size() || !IsIdent(body[k + 3]))) {
+                        prev += fmt::format("pcb{}.Load({}u)", slot, row * 16 + u32(c - comps) * 4);
+                        used |= 1u << slot;
+                        i = k + 3;
+                        continue;
+                    }
+                }
+            }
+            if (word && body.compare(i, 8, "CbufLoad") == 0) {
+                size_t j = i + 8;
+                u32 slot = 0;
+                while (j < body.size() && std::isdigit(u8(body[j])) && slot < 100)
+                    slot = slot * 10 + u32(body[j++] - '0');
+                if (slot >= 3 && slot <= 12 && j < body.size() && body[j] == '(') {
+                    prev += fmt::format("PCbufLoad{}(", slot);
+                    used_dyn |= 1u << slot;
+                    i = j + 1;
+                    continue;
+                }
+            }
+            prev += body[i++];
+        }
+        // statics with an initializer go back to it between the two runs (inputs such as vin<i> and vertex_id have none)
+        std::string reset;
+        for (size_t at = statics; at < run;) {
+            size_t eol = src.find('\n', at);
+            if (eol == std::string::npos || eol > run)
+                eol = run;
+            std::string_view line(src.data() + at, eol - at);
+            at = eol + 1;
+            if (line.rfind("static ", 0) != 0)
+                continue;
+            line.remove_prefix(7);
+            const size_t semi = line.find(';'), sp = line.find(' ');
+            if (semi == std::string_view::npos || sp == std::string_view::npos || sp > semi)
+                continue;
+            std::string_view decls = line.substr(sp + 1, semi - sp - 1);
+            int depth = 0;
+            size_t from = 0;
+            for (size_t q = 0; q <= decls.size(); q++) {
+                const char ch = q < decls.size() ? decls[q] : ',';
+                depth += ch == '(' ? 1 : ch == ')' ? -1 : 0;
+                if (ch != ',' || depth)
+                    continue;
+                std::string_view d = decls.substr(from, q - from);
+                from = q + 1;
+                while (!d.empty() && d.front() == ' ')
+                    d.remove_prefix(1);
+                const size_t eq = d.find(" = ");
+                if (eq != std::string_view::npos && d.substr(0, eq).find('[') == std::string_view::npos)
+                    reset += fmt::format("    {} = {};\n", d.substr(0, eq), d.substr(eq + 3));
+            }
+        }
+        const std::string out_decl = "    float4 a29 : ATTR29;\n};\n";
+        const std::string main_run = "    Run();\n    VSOut o;\n    o.pos = o_pos;\n";
+        const std::string out_copy = "    o.a29 = o_attr29;\n";
+        const size_t vsout = src.find("struct VSOut {\n");
+        const size_t od = vsout == std::string::npos ? vsout : src.find(out_decl, vsout);
+        const size_t mr = src.find(main_run, vsin), oc = src.find(out_copy, vsin);
+        if (od == std::string::npos || mr == std::string::npos || oc == std::string::npos || od > run)
+            return false;
+        // (back to front, so the earlier offsets stay valid)
+        src.replace(oc, out_copy.size(), "    o.a29 = vel_prev;\n");
+        src.replace(mr, main_run.size(),
+                    "    RunPrev();\n    float4 vel_prev = o_pos; // last frame's position (only y flipped like o.pos)\n"
+                    "    vel_prev.y *= drv_viewport.x;\n    ResetStatics();\n" + main_run);
+        src.insert(vsin + 2, "void RunPrev() {\n" + prev + "}\nvoid ResetStatics() {\n" + reset + "}\n");
+        src.replace(od, out_decl.size(), "    float4 a29 : VELPREV;\n};\n");
+        std::string views = "// last frame's constant buffers (motion vectors)\n";
+        for (u32 i = 3; i <= 12; i++) {
+            if (!((used | used_dyn) >> i & 1))
+                continue;
+            views += fmt::format("ByteAddressBuffer pcb{0} : register(t{1});\n", i, 48 + i);
+            if (used_dyn >> i & 1)
+                views += fmt::format("uint PCbufLoad{0}(uint a) {{ return pcb{0}.Load(a & 0xFFFCu); }}\n", i);
+        }
+        src.insert(vsout, views);
+        return true;
+    }
+    if (stage != shader::Stage::Fragment || src.find("SV_Target7") != std::string::npos ||
+        src.find("in_attr29") != std::string::npos)
+        return false;
+    const size_t psin = src.find("struct PSIn {\n");
+    const size_t a29 = psin == std::string::npos ? psin : src.find(" a29 : ATTR29;\n", psin);
+    const size_t psout = src.find("struct PSOut {\n");
+    const size_t mainp = src.find("PSOut main(PSIn i) {\n");
+    const size_t out = mainp == std::string::npos ? mainp : src.find("    PSOut o;\n", mainp);
+    if (a29 == std::string::npos || psout == std::string::npos || out == std::string::npos || a29 > psout)
+        return false;
+    const size_t line = src.rfind('\n', a29) + 1;
+    src.replace(out, 13,
+                "    // motion: where this pixel was last frame minus where it is without the jitter (host pixels, y down)\n"
+                "    float4 vel_vp = float4(asfloat(vel_params.Load(0u)), asfloat(vel_params.Load(4u)),"
+                " asfloat(vel_params.Load(8u)), asfloat(vel_params.Load(12u)));\n"
+                "    float2 vel_jit = float2(asfloat(vel_params.Load(16u)), asfloat(vel_params.Load(20u)));\n"
+                "    float4 vel_out = float4(65504.0f, 65504.0f, 0.0f, 1.0f); // (behind the camera last frame: none)\n"
+                "    if (i.a29.w > 0.0f) {\n"
+                "        float2 vel_ndc = i.a29.xy / i.a29.w;\n"
+                "        float2 vel_was = (vel_vp.xy - vel_jit) + float2(vel_ndc.x * 0.5f + 0.5f, 0.5f - vel_ndc.y * 0.5f) * vel_vp.zw;\n"
+                "        vel_out.xy = vel_was - (i.pos.xy - vel_jit);\n"
+                "    }\n"
+                "    PSOut o;\n    o.c7 = vel_out;\n");
+    src.insert(psout + 15, "    float4 c7 : SV_Target7;\n");
+    src.replace(line, a29 + 15 - line, "    float4 a29 : VELPREV;\n");
+    src.insert(psin, "ByteAddressBuffer vel_params : register(t47); // motion vectors: viewport and jitter\n");
+    return true;
+}
+
+} // namespace
+
+HostShader* ShaderCache::GetVariant(HostShader* base, const VariantKey& key_in) {
+    if (!base || base->state != HostShader::Ready)
         return base;
-    const u64 key = base->hash ^ (Hash64(&v, sizeof(v)) * 0x9E3779B97F4A7C15ull);
+    VariantKey v = key_in;
+    // A pixel shader already writing RT7 has no room for the motion output.
+    if (v.velocity && base->stage == shader::Stage::Fragment && (base->info.rt_mask & 0x80))
+        v.velocity = 0;
+    if (!(v.attr_uint | v.attr_sint | v.attr_snorm10 | v.tex_uint | v.tex_sint | v.velocity))
+        return base;
+    // (hashed without the velocity field, so every variant keyed before it existed keeps its hash)
+    u64 vh = Hash64(&v, offsetof(VariantKey, velocity));
+    if (v.velocity)
+        vh = ~vh ^ 0x56454C4F43495459ull;
+    const u64 key = base->hash ^ (vh * 0x9E3779B97F4A7C15ull);
     auto it = shaders_.find(key);
     if (it != shaders_.end()) {
         HostShader* found = it->second.get();
@@ -1125,7 +1291,7 @@ HostShader* ShaderCache::GetVariant(HostShader* base, const VariantKey& v) {
     s->is_variant = true;
     s->prewarm = replaying_; // replayed from variants.txt: part of the backlog until a draw asks for it
     s->base = base;
-    s->key = {v.attr_uint, v.attr_sint, v.attr_scaled, v.attr_snorm10, v.tex_uint, v.tex_sint};
+    s->key = {v.attr_uint, v.attr_sint, v.attr_scaled, v.attr_snorm10, v.tex_uint, v.tex_sint, v.velocity};
     s->record = !replaying_; // newly seen (not replayed from the manifest): remember it for the next prewarm
     new_variants += !replaying_;
     auto* raw = s.get();
@@ -1146,10 +1312,11 @@ void ShaderCache::BuildVariantSource(HostShader& s) {
     HostShader* base = s.base;
     VariantKey v;
     v.attr_uint = s.key[0], v.attr_sint = s.key[1], v.attr_scaled = s.key[2], v.attr_snorm10 = s.key[3];
-    v.tex_uint = s.key[4], v.tex_sint = s.key[5];
-    LOG_INFO("Shader", "variant {:016x} of {:016x} (tex uint {:#x} sint {:#x})", s.hash, base->hash, v.tex_uint, v.tex_sint);
+    v.tex_uint = s.key[4], v.tex_sint = s.key[5], v.velocity = s.key[6];
+    LOG_INFO("Shader", "variant {:016x} of {:016x} (tex uint {:#x} sint {:#x}{})", s.hash, base->hash, v.tex_uint, v.tex_sint,
+             v.velocity ? ", motion vectors" : "");
     if (s.record)
-        AppendLine(dump_dir_ / "variants.txt", fmt::format("{:016x} {:x} {:x} {:x} {:x} {:x} {:x}\n", base->hash, v.attr_uint,
+        AppendLine(dump_dir_ / (v.velocity ? "variants_vel.txt" : "variants.txt"), fmt::format("{:016x} {:x} {:x} {:x} {:x} {:x} {:x}\n", base->hash, v.attr_uint,
                                                            v.attr_sint, v.attr_scaled, v.attr_snorm10, v.tex_uint, v.tex_sint));
     // Debug overrides of the base shader apply to its variants too.
     const fs::path override_path = fs::path("shader_override") /
@@ -1230,6 +1397,13 @@ void ShaderCache::BuildVariantSource(HostShader& s) {
             src.insert(at, "asfloat(");
             at = q + 9;
         }
+    }
+    if (v.velocity) {
+        std::string with = src;
+        if (AddMotionVectors(with, s.stage))
+            src = std::move(with);
+        else // (left the plain shader: s.velocity stays false, the renderer uses camera motion for its draws)
+            LOG_INFO("Shader", "variant {:016x}: no motion vectors for this program", s.hash);
     }
 }
 
@@ -1364,15 +1538,22 @@ void ShaderCache::Prewarm() {
         }
         n++;
     }
-    std::ifstream in(dump_dir_ / "variants.txt");
-    std::unordered_set<std::string> seen;
-    for (std::string line; std::getline(in, line);) {
-        VariantKey v;
-        unsigned long long base = 0;
-        if (seen.insert(line).second &&
-            std::sscanf(line.c_str(), "%llx %x %x %x %x %x %x", &base, &v.attr_uint, &v.attr_sint, &v.attr_scaled,
-                        &v.attr_snorm10, &v.tex_uint, &v.tex_sint) == 7)
-            prewarm_variants_.emplace_back(base, v);
+    // (motion-vector variants: their own list, only while DLSS is on)
+    for (const char* list : {"variants.txt", "variants_vel.txt"}) {
+        const bool vel = list[8] == '_';
+        if (vel && !prewarm_velocity)
+            continue;
+        std::ifstream in(dump_dir_ / list);
+        std::unordered_set<std::string> seen;
+        for (std::string line; std::getline(in, line);) {
+            VariantKey v;
+            v.velocity = vel;
+            unsigned long long base = 0;
+            if (seen.insert(line).second &&
+                std::sscanf(line.c_str(), "%llx %x %x %x %x %x %x", &base, &v.attr_uint, &v.attr_sint, &v.attr_scaled,
+                            &v.attr_snorm10, &v.tex_uint, &v.tex_sint) == 7)
+                prewarm_variants_.emplace_back(base, v);
+        }
     }
     prewarm_reported_ = false;
     prewarm_total = u32(n + prewarm_variants_.size());
@@ -1630,6 +1811,134 @@ int BuildShadersAhead(const fs::path& game_dir) {
         }
     }
     return 0;
+}
+
+int TestMotionVectors(const fs::path& dump, int limit) {
+    struct Prog {
+        fs::path bin;
+        shader::Stage stage;
+    };
+    std::vector<Prog> progs;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(dump, ec)) {
+        const std::string name = e.path().filename().string();
+        if (name.size() == 23 && name.ends_with(".vs.bin"))
+            progs.push_back({e.path(), shader::Stage::Vertex});
+        else if (name.size() == 23 && name.ends_with(".ps.bin"))
+            progs.push_back({e.path(), shader::Stage::Fragment});
+    }
+    std::sort(progs.begin(), progs.end(), [](const Prog& a, const Prog& b) { return a.bin < b.bin; });
+    if (limit > 0 && progs.size() > size_t(limit)) { // an even spread over the hashes
+        std::vector<Prog> pick;
+        for (int i = 0; i < limit; i++)
+            pick.push_back(progs[size_t(i) * progs.size() / size_t(limit)]);
+        progs = std::move(pick);
+    }
+    const fs::path out_dir = "motion_test";
+    fs::create_directories(out_dir, ec);
+    std::atomic<size_t> next{0};
+    std::atomic<u32> untranslated{0}, no_motion{0}, direct_ok{0}, direct_fail{0}, fxc_ok{0}, fxc_fail{0}, loops{0},
+        no_sig{0}, base_fail{0};
+    std::mutex log_mutex;
+    auto note = [&](const Prog& p, const char* what, const std::string& hlsl, const std::string& err) {
+        const std::string stem = p.bin.filename().string().substr(0, 19);
+        common::WriteFile(out_dir / (stem + ".hlsl"), std::span(reinterpret_cast<const u8*>(hlsl.data()), hlsl.size()));
+        const std::string e = std::string(what) + ": " + err;
+        common::WriteFile(out_dir / (stem + "." + what + ".err"), std::span(reinterpret_cast<const u8*>(e.data()), e.size()));
+        std::lock_guard lk(log_mutex);
+        std::printf("%s %s: %s\n", stem.c_str(), what, err.substr(0, 160).c_str());
+        std::fflush(stdout);
+    };
+    auto worker = [&]() {
+        for (size_t i; (i = next++) < progs.size();) {
+            const Prog& p = progs[i];
+            const auto code = common::ReadFile(p.bin);
+            const fs::path opt_path = fs::path(p.bin).replace_extension(".opt");
+            const auto o = common::ReadFile(opt_path);
+            shader::TranslateOptions opt;
+            opt.cbuf1 = o.size() > 16 ? o.data() + 16 : nullptr;
+            opt.cbuf1_size = o.size() > 16 ? u32(o.size() - 16) : 0;
+            auto res = shader::Translate(p.stage, code.data(), code.size(), opt);
+            if (!res.ok) {
+                untranslated++;
+                continue;
+            }
+            std::string src = res.hlsl;
+            if ((p.stage == shader::Stage::Fragment && (res.rt_mask & 0x80)) || !AddMotionVectors(src, p.stage)) {
+                no_motion++;
+                continue;
+            }
+            {
+                // one translated example of each stage, to read: motion_test/sample.vs.hlsl and sample.ps.hlsl
+                static std::atomic<bool> wrote[2]{};
+                if (!wrote[p.stage == shader::Stage::Vertex].exchange(true))
+                    common::WriteFile(out_dir / (p.stage == shader::Stage::Vertex ? "sample.vs.hlsl" : "sample.ps.hlsl"),
+                                      std::span(reinterpret_cast<const u8*>(src.data()), src.size()));
+            }
+            const char* target = StageTarget(p.stage);
+            std::vector<u8> blob;
+            std::string derr;
+            const auto direct = [&](const std::string& h, std::vector<u8>& b, std::string& e) {
+                try {
+                    return dxbc::CompileHlsl(h, p.stage == shader::Stage::Vertex ? dxbc::Stage::Vertex : dxbc::Stage::Pixel,
+                                             b, e);
+                } catch (const std::exception& x) {
+                    e = x.what();
+                    return false;
+                }
+            };
+            const auto fxc = [&](const std::string& h, std::string& e) {
+                ComPtr<ID3DBlob> bc, errors;
+                const HRESULT hr = D3DCompile(h.data(), h.size(), nullptr, nullptr, nullptr, "main", target,
+                                              D3DCOMPILE_OPTIMIZATION_LEVEL1 | D3DCOMPILE_IEEE_STRICTNESS, 0, &bc, &errors);
+                if (FAILED(hr))
+                    e = errors ? std::string((const char*)errors->GetBufferPointer(), errors->GetBufferSize()) : "failed";
+                return SUCCEEDED(hr);
+            };
+            if (direct(src, blob, derr)) {
+                direct_ok++;
+                if (std::search(blob.begin(), blob.end(), std::begin("VELPREV"), std::end("VELPREV") - 1) == blob.end()) {
+                    no_sig++;
+                    note(p, "direct-signature", src, "no VELPREV in the signature");
+                }
+            } else {
+                std::vector<u8> b;
+                std::string e;
+                if (direct(res.hlsl, b, e)) { // (programs the plain shader already fails on are not counted)
+                    direct_fail++;
+                    note(p, "direct", src, derr);
+                } else {
+                    base_fail++;
+                }
+            }
+            if (res.uses_loop) { // (FXC can take minutes on these: the direct backend's result has to do)
+                loops++;
+                continue;
+            }
+            std::string ferr, e2;
+            if (fxc(src, ferr)) {
+                fxc_ok++;
+            } else if (fxc(res.hlsl, e2)) {
+                fxc_fail++;
+                note(p, "fxc", src, ferr);
+            } else {
+                base_fail++;
+            }
+        }
+    };
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<std::thread> threads;
+    for (unsigned i = 0; i < std::max(2u, std::thread::hardware_concurrency()); i++)
+        threads.emplace_back(worker);
+    for (auto& t : threads)
+        t.join();
+    std::printf("%zu programs: %u not translated, %u without motion vectors (ATTR29 or RT7 in use); "
+                "direct backend %u ok / %u failed (%u without VELPREV); FXC %u ok / %u failed (%u loop programs left to "
+                "the direct backend); %u failures the plain shader has too; in %.0f s\n",
+                progs.size(), untranslated.load(), no_motion.load(), direct_ok.load(), direct_fail.load(), no_sig.load(),
+                fxc_ok.load(), fxc_fail.load(), loops.load(), base_fail.load(),
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    return direct_fail || fxc_fail || no_sig ? 1 : 0;
 }
 
 } // namespace gpu

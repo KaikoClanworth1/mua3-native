@@ -68,8 +68,13 @@ struct HostShader {
     // Integer variant: built by a worker from `base`'s HLSL (re-translating the base when only its bytecode was
     // cached takes tens of milliseconds); `key` = ShaderCache::VariantKey fields; `record`: append to variants.txt.
     HostShader* base = nullptr;
-    std::array<u32, 6> key{};
+    std::array<u32, 7> key{};
     bool record = false;
+    // Motion-vector variant (VariantKey::velocity) whose bytecode carries it: the vertex shader also runs on last
+    // frame's constant buffers (t48+i) and outputs VELPREV in ATTR29's place, the pixel shader writes the motion in
+    // pixels to SV_Target7. False for a velocity variant that could not get it (it is then the plain shader): pair a
+    // velocity vertex shader only with a velocity pixel shader (VELPREV and ATTR29 do not link).
+    bool velocity = false;
 };
 
 // Translates and compiles shaders on background threads so the game never stalls on FXC.
@@ -88,12 +93,20 @@ public:
         u32 attr_uint = 0, attr_sint = 0, attr_scaled = 0; // vertex attributes (scaled = convert to float)
         u32 attr_snorm10 = 0; // A2B10G10R10 SNORM (no DXGI format): fetched as UINT, sign-extended in the shader
         u32 tex_uint = 0, tex_sint = 0;                     // texture slots with integer formats
+        // 1: per-object motion vectors (scene draws while DLSS is on). The renderer binds, for a velocity pair:
+        //   VS: last frame's bytes of each game constant buffer 3..12 the shader reads, as raw views at t(48+i)
+        //       (with none, the current data: no object motion);
+        //   PS: vel_params, a raw view at t47: float4 viewport x, y, w, h (host pixels, as set: jitter included), then
+        //       float2 jitter (host pixels, the offset added to the viewport), and an RG16F target at RT7 (blend off)
+        //       that gets (last frame's pixel - unjittered pixel), or 65504 where last frame's w <= 0.
+        u32 velocity = 0;
     };
     HostShader* GetVariant(HostShader* base, const VariantKey& v);
     // Queues every vertex/pixel program seen in earlier runs (shader_dump/*.bin) and, once their bases are built,
     // the integer variants recorded in shader_dump/variants.txt, so gameplay finds them compiled. Call before the
     // GPU thread starts; Tick() (GPU thread, once per frame) creates the variants and reports completion.
     void Prewarm();
+    bool prewarm_velocity = false; // set before Prewarm while DLSS is on: also replays shader_dump/variants_vel.txt
     // Setup step: every vertex / pixel shader's driver object created once, so the driver compiles it into its disk
     // cache (see BuildShadersAhead). Returns how many.
     u32 WarmDriverCache();
@@ -234,6 +247,11 @@ bool CompileShaderFile(const char* in_path, const char* out_path, const char* ta
 // from the game's romfs/SHADER files, compute programs from the locations in known_programs (main module and
 // romfs), plus the integer variants known to be drawn. Returns 0 when everything that could be built is built.
 int BuildShadersAhead(const fs::path& game_dir);
+// `mua3 --test-motion <shader_dump dir> [n]` (developer check): translates up to n vertex/pixel programs of the dump
+// (all with n = 0), adds the motion-vector variant's edits and compiles them with the direct backend, and those
+// without loops also with FXC; prints the counts and writes each failing program's HLSL and error to
+// motion_test/ (current directory). Returns 0 when nothing failed to compile.
+int TestMotionVectors(const fs::path& dump, int limit);
 // "<vendor id> <driver version>" of the device's adapter ("" if unknown); the setup step saves it as
 // shader_cache/driver.txt (a different driver starts with an empty shader cache).
 std::string DriverVersion(ID3D11Device* dev);
