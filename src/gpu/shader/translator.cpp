@@ -2375,7 +2375,13 @@ bool Translator::Seq(u32 first, u32 last, u32 end_target, LoopCtx ctx, u32 skip_
                     return SFail(fmt::format("loop {}..{} crosses region end {}", i, latch, last));
                 SLine("[loop] for (uint li_ = 0u; ; li_++) {");
                 sindent_++;
-                SLine("if (li_ >= 4096u) { loop_capped = true; break; }");
+                // Per loop 4096 iterations, and one budget per invocation shared by every loop: nested loops would
+                // otherwise multiply their caps (a solver that never converges on another GPU's float maths ran
+                // 4096^3 iterations, a multi-second dispatch and a driver reset, GitHub #8). Once the budget is
+                // spent, every enclosing loop also leaves at its next header.
+                SLine("loop_total_ += 1u;");
+                SLine(fmt::format("if (li_ >= 4096u || loop_total_ > {}u) {{ loop_capped = true; break; }}",
+                                  stage_ == Stage::Compute ? 65536 : 32768));
                 if (!Seq(i, loop_end, loop_end, LoopCtx{i, loop_end}, i))
                     return false;
                 SLine("break;");
@@ -2705,6 +2711,7 @@ bool Translator::Run() {
     std::string decls;
     decls += "static bool return_flag = false;\nstatic float4 tmp4;\nstatic uint4 tmpu;\nstatic uint tmpu4_[4];\nstatic bool tmpb;\n";
     decls += "static bool loop_capped = false; // a translated loop ran away (pixel shaders then output magenta)\n";
+    decls += "static uint loop_total_ = 0u; // iterations of all structured loops this invocation (see the loop cap)\n";
     for (u32 r : regs_used_)
         decls += fmt::format("static uint r{} = 0u;\n", r);
     for (u32 p : preds_used_)
