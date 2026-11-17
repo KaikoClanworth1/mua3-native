@@ -228,12 +228,16 @@ Special cases by (tab, row): tab 0 row 1 is the language selector (0x7c7b00); ta
 The title screen's SYSTEM submenu (SAVE, LOAD, OPTIONS, TIPS, GALLERY; title menu class vtable main+0x210ee80,
 16 slots, 11-15 = the submenu) ends with **GRAPHICS**:
 
-- **Item**: a main-list slot hidden on the title screen (MENU SELECT, LAB, HERO or INFINITY) is shown in the
+- **Item**: a main-list slot hidden on the title screen (LAB, HERO or INFINITY, else MENU SELECT = slot 0) is shown in the
   submenu (GetItemState vfunc +0x460 and IsSystemItem +0x490 hooked) and moved to its end (Refresh +0x448). The
   submenu has 5 position panes (`Null_cursor_sub_0N_pos` / `Null_GText_sub_0N_pos`, tables main+0x1a3d27c /
   0x1a3d23c by list index); the 6th entry uses the unused 12th main-list positions (`Null_cursor_12_pos`,
   `Null_GText_12_pos`), which the per-frame vfunc +0x3f0 (main+0x71f760) moves one step below the 5th (pane object:
   +0xd0 parent, +0xe0 world / +0xe8 local transform with the translation at +0x30, +0x104 flags, 0x10 = dirty).
+  INFINITY (slot 4), HERO SELECT (6) and LAB (7) show on the title screen once the save unlocks them (GetItemState
+  main+0x721720 asks vfuncs +0x468 / +0x470 / +0x478: story flags in the save), so a later save has none of them
+  hidden and slot 0 is used. The first Refresh after a change logs the slot states (`title menu slot states`).
+  `MUA3_TEST_TITLE_UNLOCKED=1` (test aid) shows the three as such a save does.
 - **Label**: the unused `GText_MAIN_MENU(_on)` textures, drawn as the game's own word for graphics in each
   language (GRAPHICS, AFFICHAGE, GRAFIK, ...); SetItemAppearance (+0x480) uses them for the slot.
 - **Page**: Execute (+0x4a8) opens OPTIONS the game's way, flagged to show the GRAPHICS page

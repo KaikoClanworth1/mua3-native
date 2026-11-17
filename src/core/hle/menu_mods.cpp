@@ -99,7 +99,10 @@ constexpr u64 kTitleTexOff = 0x1a3d290, kTitleTexOn = 0x1a3d2d0;       // u32[16
 constexpr u64 kTitleSysCursor = 0x1a3d27c, kTitleSysText = 0x1a3d23c; // u32[5] position panes per system position
 constexpr u64 kPane = 0x5f39d0;            // (layout, pane index) -> pane
 constexpr u32 kTitleOptions = 13, kTitleSystemPositions = 5;
-constexpr u32 kTitleBorrowable[] = {7, 6, 4}; // LAB, HERO, INFINITY: hidden on the title screen (they have labels)
+// LAB, HERO, INFINITY: hidden on the title screen until the save unlocks them (story flags), then MENU SELECT (slot 0,
+// hidden in every save seen so far): a save with all three unlocked (a finished game) still gets GRAPHICS
+constexpr u32 kTitleBorrowable[] = {7, 6, 4, 0};
+constexpr u32 kTitleUnlockable[] = {7, 6, 4};
 // 10_title_menu_parts textures: GText_MAIN_MENU(_on), used by no item, drawn as GRAPHICS
 constexpr u32 kTexMainMenu = 28, kTexMainMenuOn = 29;
 // 10_title_menu_02 panes: the SYSTEM submenu's 4th / 5th positions, and the unused 12th main-list position, which is
@@ -328,15 +331,43 @@ u32 TitleBorrowed(u64 menu) {
 }
 bool IsTitle(u64 obj) { return obj && R64(obj) == g_main + kTitleVtable; }
 
+// MUA3_TEST_TITLE_UNLOCKED=1 (test aid): LAB, HERO and INFINITY shown on the title screen, as with a save that has
+// unlocked them (story flags in the save; GetItemState slots 4 / 6 / 7 read them through vfuncs +0x468..+0x478)
+bool TestUnlocked() {
+    static const bool on = [] { const char* e = std::getenv("MUA3_TEST_TITLE_UNLOCKED"); return e && e[0] == '1'; }();
+    return on;
+}
+bool Unlockable(u32 slot) { return std::find(std::begin(kTitleUnlockable), std::end(kTitleUnlockable), slot) != std::end(kTitleUnlockable); }
+// The game's GetItemState of a slot (our borrowing aside).
+u64 GameTitleState(State& s, u64 menu, u32 slot) {
+    if (TestUnlocked() && Unlockable(slot))
+        return 0;
+    return Call(s, g_main + kTitleState, {menu, slot}, &g_hooks[kHTState]);
+}
+
 void TitleRefresh(State& s) {
     const u64 menu = s.x[0];
     u32 borrow = ~0u;
-    if (IsTitle(menu))
+    if (IsTitle(menu)) {
+        static std::string last;
+        std::string states;
+        for (u32 slot = 0; slot < 11; slot++)
+            states += char('0' + GameTitleState(s, menu, slot));
         for (u32 slot : kTitleBorrowable)
-            if (Call(s, g_main + kTitleState, {menu, slot}, &g_hooks[kHTState]) == kHidden) {
+            if (states[slot] - '0' == kHidden) {
                 borrow = slot;
                 break;
             }
+        if (states != last) { // once per change: the save decides which slots show
+            last = states;
+            if (borrow == ~0u)
+                LOG_WARN("Menu", "title menu slot states {}: no hidden slot, no GRAPHICS item (OPTIONS > CONTROLS has it)",
+                         states);
+            else
+                LOG_INFO("Menu", "title menu slot states {} (0 shown, 1 grey, 2 hidden): GRAPHICS in slot {}", states,
+                         borrow);
+        }
+    }
     {
         std::lock_guard lk(g_mutex);
         if (borrow != ~0u)
@@ -371,6 +402,8 @@ void TitleRefresh(State& s) {
 
 void TitleState(State& s) {
     if (TitleBorrowed(s.x[0]) == u32(s.x[1]))
+        return Return(s, 0);
+    if (TestUnlocked() && IsTitle(s.x[0]) && Unlockable(u32(s.x[1])))
         return Return(s, 0);
     Original(s, kHTState);
 }
