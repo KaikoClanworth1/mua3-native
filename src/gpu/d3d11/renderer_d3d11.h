@@ -392,6 +392,24 @@ private:
     u32 jitter_index_ = 0;
     float jitter_x_ = 0, jitter_y_ = 0; // this frame's offset, input pixels
     bool dlss_logged_ = false;
+    // Per-object motion (DLSS): the scene's opaque draws use velocity shader variants that run the vertex program
+    // again on last frame's vertex constants (camera and bones) and write current -> previous pixels into RT7.
+    ComPtr<ID3D11Texture2D> vel_tex_; // RG16F at the scene's internal size; 65504 = no object motion here
+    ComPtr<ID3D11RenderTargetView> vel_rtv_;
+    ComPtr<ID3D11ShaderResourceView> vel_srv_;
+    u32 vel_w_ = 0, vel_h_ = 0;
+    u64 vel_cleared_frame_ = ~0ull;
+    bool vel_written_ = false; // this frame drew velocity
+    struct DrawCbs {           // a draw's vertex constant buffers 3..12, back to back
+        u32 off[10]{}, size[10]{};
+        std::vector<u8> data;
+    };
+    std::unordered_map<u64, DrawCbs> vel_prev_cbs_, vel_cur_cbs_; // by draw (see Draw)
+    std::unordered_map<u64, u32> vel_occ_;                        // repeats of a draw key this frame
+    u64 vel_draws_ = 0, vel_matched_ = 0;                         // this frame (log)
+    std::set<u64> vel_diag_prev_[4], vel_diag_cur_[4];            // MUA3_VEL_KEYS: other match keys, for the log
+    std::unordered_map<u64, u32> vel_diag_occ_;
+    u64 vel_diag_hits_[4]{}, vel_diag_indirect_ = 0;
     ComPtr<ID3D11ShaderResourceView> frame_raw_srv_; // frame_tex_ through a non-sRGB view (FSR reads gamma-encoded values)
     ComPtr<ID3D11Texture2D> fsr_tex_[2];             // EASU output, RCAS output (the output size)
     ComPtr<ID3D11RenderTargetView> fsr_rtv_[2];

@@ -287,6 +287,7 @@ static const bool g_debug_ps_state = std::getenv("MUA3_TESTS_OFF") || std::geten
 // Direct3D state built from the DrawState, kept until its serial changes.
 struct SeenState {
     u32 blend = 0, depth = 0, raster = 0;
+    bool blend_vel = false; // the blend state has RT7 as the velocity target (no blending, RG)
     bool depth_on = false;
     float flip = 0;
     ID3D11BlendState* blend_obj = nullptr;
@@ -617,6 +618,8 @@ void BindRange(T* cur, const T* want_begin, u32 base, u32 n, Set set) {
 D3D11Renderer::D3D11Renderer(ID3D11Device* dev, ID3D11DeviceContext* ctx) : dev_(dev), ctx_(ctx) {
     new_frame_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     shaders_ = std::make_unique<ShaderCache>(dev);
+    // DLSS chosen and likely to run: also prewarm the velocity variants earlier DLSS sessions drew.
+    shaders_->prewarm_velocity = core::Sys().Cfg().upscaler == 2 && Dlss::Likely(dev);
     shaders_->Prewarm();
     textures_ = std::make_unique<TextureCache>(dev, ctx, *this);
     gpu_passes_.Init(dev, ctx);
@@ -707,6 +710,9 @@ void D3D11Renderer::ReleaseDevice() {
     dlss_.Reset();
     temporal_ = false;
     temporal_reset_ = true;
+    vel_tex_.Reset(), vel_rtv_.Reset(), vel_srv_.Reset();
+    vel_w_ = vel_h_ = 0;
+    vel_prev_cbs_.clear(), vel_cur_cbs_.clear(), vel_occ_.clear();
     for (int i = 0; i < 3; i++)
         comp_tex_[i].Reset(), comp_rtv_[i].Reset(), comp_srv_[i].Reset();
     comp_in_w_ = comp_in_h_ = comp_out_w_ = comp_out_h_ = 0;
@@ -815,6 +821,9 @@ u32 D3D11Renderer::FsrScale() const {
     return float(s) * guest / 3.0f < float(output_h_) ? s : 0;
 }
 
+// A velocity variant (ShaderCache::VariantKey::velocity): it writes the draw's motion to RT7.
+static bool IsVelocity(const HostShader* s) { return s && s->velocity; }
+
 u32 D3D11Renderer::HudScale() const {
     static const bool off = [] {
         const char* e = std::getenv("MUA3_FSR_HUD");
@@ -869,7 +878,8 @@ void D3D11Renderer::UpscaleComposite() {
         upscale_in_.Resolve();
         Surface* d = upscale_in_.Noted() ? FindSurfaceByGpu(upscale_in_.DepthVa()) : nullptr;
         if (d && d->depth && d->srv && d->Scaled(d->width) == iw && d->Scaled(d->height) == ih &&
-            upscale_in_.BuildMotion(dev_, ctx_, d->srv.Get(), iw, ih)) {
+            upscale_in_.BuildMotion(dev_, ctx_, d->srv.Get(), iw, ih,
+                                    vel_written_ && vel_w_ == iw && vel_h_ == ih ? vel_srv_.Get() : nullptr)) {
             Dlss::Frame f;
             f.color = src->tex.Get();
             f.depth = d->tex.Get();
@@ -2478,6 +2488,9 @@ void D3D11Renderer::Draw() {
     };
     HostShader* vs = load_shader(m.program[kStageVertex], shader::Stage::Vertex);
     HostShader* ps = load_shader(m.program[kStageFragment], shader::Stage::Fragment);
+    HostShader* const vs_base = vs;
+    HostShader* const ps_base = ps;
+    ShaderCache::VariantKey vs_key, ps_key; // (the integer-type variant keys; the velocity bit is added below)
     // A geometry program without any OUT (emit) instruction rasterizes nothing: MUA3 uses one to cull triangles
     // into a buffer ahead of its real draws. Drawing such a pass would leave depth the game never wrote.
     if (const u64 addr = m.program[kStageGeometry]) {
@@ -2587,12 +2600,57 @@ void D3D11Renderer::Draw() {
         }
         ShaderCache::VariantKey key = g_seen.attr_key;
         int_textures(vs, 0, key);
+        vs_key = key;
         vs = shaders_->GetVariant(vs, key);
     }
     if (ps && ps->state == HostShader::Ready) {
         ShaderCache::VariantKey key;
         int_textures(ps, 4, key);
+        ps_key = key;
         ps = shaders_->GetVariant(ps, key);
+    }
+    // DLSS per-object motion: the scene's opaque draws (into the scene depth, writing it) take the velocity variants
+    // of both programs. One not compiled yet (or none: a pixel program that already writes RT7) leaves the draw as
+    // it is, with camera motion only; a velocity pixel program never pairs with a plain vertex program.
+    // A draw is matched to last frame's by its vertex program, vertex buffer and range and how many times that
+    // repeated before it this frame (not the index buffer: the game writes index data to a new place every frame;
+    // MUA3_VEL_KEYS logs how other keys would match). Only a matched draw takes the variants: an unmatched one (a new
+    // object) leaves RT7 at "none", so it gets camera motion.
+    const bool vel_candidate = temporal_ && m.depth.enabled && m.depth.addr == upscale_in_.DepthVa() && m.depth_write &&
+                               m.depth_test;
+    u64 vel_key = 0;
+    bool vel_matched = false;
+    if (vel_candidate) {
+        vel_key = m.program[kStageVertex] * 0x9E3779B97F4A7C15ull ^ m.streams[0].addr * 31 ^
+                  ((u64(m.draw.first) << 32) | m.draw.count) ^ u64(u32(m.base_vertex)) * 0x2545F4914F6CDD1Dull ^
+                  u64(m.draw.indexed) << 63;
+        vel_key ^= u64(vel_occ_[vel_key]++) * 0xD6E8FEB86659FD93ull;
+        vel_matched = vel_prev_cbs_.count(vel_key) != 0;
+        // Diagnostics (MUA3_VEL_KEYS): how many draws other keys would match.
+        static const bool diag = std::getenv("MUA3_VEL_KEYS") != nullptr;
+        if (diag) {
+            const u64 prog = m.program[kStageVertex] * 0x9E3779B97F4A7C15ull;
+            const u64 alt[4] = {prog, prog ^ ((u64(m.draw.first) << 32) | m.draw.count), prog ^ m.index_addr * 131,
+                                prog ^ m.streams[0].addr * 31};
+            for (int a = 0; a < 4; a++) {
+                u64 k = alt[a] ^ u64(a) << 60;
+                k ^= u64(vel_diag_occ_[k]++) * 0xD6E8FEB86659FD93ull;
+                vel_diag_cur_[a].insert(k);
+                vel_diag_hits_[a] += vel_diag_prev_[a].count(k);
+            }
+            if (m.draw.indirect_args)
+                vel_diag_indirect_++;
+        }
+    }
+    bool vel = false;
+    if (vel_matched && vs_base && ps_base && vs && ps && vs->state == HostShader::Ready && ps->state == HostShader::Ready) {
+        vs_key.velocity = ps_key.velocity = 1;
+        HostShader* vvs = shaders_->GetVariant(vs_base, vs_key);
+        HostShader* vps = vvs && vvs->state == HostShader::Ready && IsVelocity(vvs) ? shaders_->GetVariant(ps_base, ps_key) : nullptr;
+        if (vps && vps->state == HostShader::Ready && IsVelocity(vps)) {
+            vs = vvs, ps = vps;
+            vel = true;
+        }
     }
     // Debug: MUA3_SKIP_PS=<hash>,<hash>... drops every draw using one of those pixel shaders.
     static const std::string skip_ps = [] {
@@ -2643,6 +2701,29 @@ void D3D11Renderer::Draw() {
     for (u32 i = 0; i < count; i++)
         rtvs[i] = colors[i] ? colors[i]->rtv.Get() : nullptr;
     ID3D11DepthStencilView* dsv = depth ? depth->dsv.Get() : nullptr;
+    // A velocity draw also writes RT7: the motion target, at the scene depth's size, cleared once a frame.
+    if (vel && depth) {
+        const u32 w = depth->Scaled(depth->width), h = depth->Scaled(depth->height);
+        if (!vel_tex_ || vel_w_ != w || vel_h_ != h) {
+            vel_tex_.Reset(), vel_rtv_.Reset(), vel_srv_.Reset();
+            D3D11_TEXTURE2D_DESC td{w, h, 1, 1, DXGI_FORMAT_R16G16_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT,
+                                    D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 0, 0};
+            if (SUCCEEDED(dev_->CreateTexture2D(&td, nullptr, &vel_tex_)))
+                dev_->CreateRenderTargetView(vel_tex_.Get(), nullptr, &vel_rtv_), dev_->CreateShaderResourceView(vel_tex_.Get(), nullptr, &vel_srv_);
+            vel_w_ = w, vel_h_ = h;
+            vel_cleared_frame_ = ~0ull;
+            LOG_INFO("Renderer", "object motion target {}x{}", w, h);
+        }
+        if (vel_rtv_) {
+            if (vel_cleared_frame_ != frame_counter_) {
+                static const float none[4] = {65504.0f, 65504.0f, 0, 0};
+                ctx_->ClearRenderTargetView(vel_rtv_.Get(), none);
+                vel_cleared_frame_ = frame_counter_;
+            }
+            rtvs[7] = vel_rtv_.Get();
+            vel_written_ = true;
+        }
+    }
     // The depth the HUD draws into the presented target with (it follows that target's scale; see HudScale).
     if (depth && colors[0] && present_vas_.count(colors[0]->gpu_va) && hud_depth_vas_.insert(depth->gpu_va).second) {
         LOG_INFO("Renderer", "HUD depth {:#x} (presented target {:#x})", depth->gpu_va, colors[0]->gpu_va);
@@ -2693,7 +2774,8 @@ void D3D11Renderer::Draw() {
     D3D11_VIEWPORT vp{(tx - std::abs(sx)) * fs, (ty - std::abs(sy)) * fs, 2 * std::abs(sx) * fs, 2 * std::abs(sy) * fs,
                       0.0f, 1.0f};
     // DLSS: the scene's draws (those into the scene depth) move by this frame's sub-pixel jitter.
-    if (temporal_ && depth && depth->gpu_va == upscale_in_.DepthVa() && rscale == res_scale_) {
+    const bool jittered = temporal_ && depth && depth->gpu_va == upscale_in_.DepthVa() && rscale == res_scale_;
+    if (jittered) {
         vp.TopLeftX += jitter_x_;
         vp.TopLeftY += jitter_y_;
     }
@@ -2737,8 +2819,9 @@ void D3D11Renderer::Draw() {
     }
 
     // ---- blend
-    if (g_seen.blend != m.blend_serial) {
+    if (g_seen.blend != m.blend_serial || g_seen.blend_vel != vel) {
         g_seen.blend = m.blend_serial;
+        g_seen.blend_vel = vel;
         D3D11_BLEND_DESC bd{};
         bd.IndependentBlendEnable = TRUE;
         for (u32 i = 0; i < 8; i++) {
@@ -2752,6 +2835,14 @@ void D3D11Renderer::Draw() {
             t.SrcBlendAlpha = AlphaFactor(BlendFactor(b.src_a));
             t.DestBlendAlpha = AlphaFactor(BlendFactor(b.dst_a));
             t.RenderTargetWriteMask = u8(m.color_mask[i]);
+        }
+        if (vel) { // RT7: the velocity variant's motion, written as is
+            auto& t = bd.RenderTarget[7];
+            t = D3D11_RENDER_TARGET_BLEND_DESC{};
+            t.SrcBlend = t.SrcBlendAlpha = D3D11_BLEND_ONE;
+            t.DestBlend = t.DestBlendAlpha = D3D11_BLEND_ZERO;
+            t.BlendOp = t.BlendOpAlpha = D3D11_BLEND_OP_ADD;
+            t.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN;
         }
         g_seen.blend_obj = dc.Cached(dc.blend, bd, [&](const D3D11_BLEND_DESC* d, ID3D11BlendState** o) {
             dev_->CreateBlendState(d, o);
@@ -3485,6 +3576,46 @@ void D3D11Renderer::Draw() {
     bind_stage(vs, 0, true);
     if (ps)
         bind_stage(ps, 4, false);
+    if (vel_candidate) {
+        // This draw's vertex constant buffers 3..12 are kept for the next frame; a velocity draw gets last frame's
+        // (pcb{i}, t51..t60).
+        DrawCbs& cur = vel_cur_cbs_[vel_key];
+        cur.data.clear();
+        for (u32 i = 0; i < 10; i++) {
+            const ConstBufferBinding& c = m.cb[kCbVertex][3 + i];
+            cur.off[i] = u32(cur.data.size());
+            cur.size[i] = c.enabled ? std::min<u32>(c.size, 0x10000) : 0;
+            if (cur.size[i]) {
+                cur.data.resize(cur.off[i] + cur.size[i]);
+                g.ReadGpuPartial(c.address, cur.data.data() + cur.off[i], cur.size[i]);
+            }
+        }
+        vel_draws_++;
+        vel_matched_ += vel_matched;
+    }
+    if (vel) {
+        const DrawCbs& cur = vel_cur_cbs_[vel_key];
+        const DrawCbs& prev = vel_prev_cbs_.find(vel_key)->second; // (vel implies matched)
+        static thread_local std::vector<u8> pad;
+        ID3D11ShaderResourceView* pcb[10]{};
+        for (u32 i = 0; i < 10; i++) {
+            if (!cur.size[i])
+                continue;
+            const u8* p = prev.data.data() + prev.off[i];
+            if (prev.size[i] < cur.size[i]) { // (as large as this frame's: reads past last frame's end give 0)
+                pad.assign(cur.size[i], 0);
+                std::memcpy(pad.data(), p, prev.size[i]);
+                p = pad.data();
+            }
+            pcb[i] = dc.RawBuffer(224 + i, p, cur.size[i]);
+        }
+        ctx_->VSSetShaderResources(51, 10, pcb);
+        // vel_params (t47): the viewport as set (jitter included), then the jitter in host pixels
+        const float params[8] = {vp.TopLeftX, vp.TopLeftY, vp.Width, vp.Height, jittered ? jitter_x_ : 0.0f,
+                                 jittered ? jitter_y_ : 0.0f, 0, 0};
+        ID3D11ShaderResourceView* pv = dc.RawBuffer(234, params, sizeof(params));
+        ctx_->PSSetShaderResources(47, 1, &pv);
+    }
     Prof(kProfResources);
 
     // Driver constants rarely change between consecutive draws: re-upload only when they do.
@@ -3871,7 +4002,8 @@ void D3D11Renderer::Present(const PresentInfo& p) {
             LOG_INFO("Renderer", "upscaler inputs: no scene depth pre-pass seen this frame");
         if (const int dbg = UpscaleInputs::DebugMode(); dbg && upscale_in_.Noted())
             if (Surface* d = FindSurfaceByGpu(upscale_in_.DepthVa()); d && d->depth && d->srv) {
-                if (upscale_in_.BuildMotion(dev_, ctx_, d->srv.Get(), d->Scaled(d->width), d->Scaled(d->height)))
+                if (upscale_in_.BuildMotion(dev_, ctx_, d->srv.Get(), d->Scaled(d->width), d->Scaled(d->height),
+                                            vel_written_ && vel_w_ == d->Scaled(d->width) ? vel_srv_.Get() : nullptr))
                     upscale_in_.DrawDebug(dev_, ctx_, dbg, s->srv.Get(), d->srv.Get(), frame_rtv_.Get(), frame_w_, frame_h_);
                 ContextEpoch()++;
             }
@@ -3916,6 +4048,24 @@ void D3D11Renderer::Present(const PresentInfo& p) {
         }
         upscaled_ = upscaled;
         upscale_in_.EndFrame();
+        // Object motion: this frame's per-draw vertex constants are the next frame's previous ones.
+        if (vel_draws_ && frame_counter_ % 600 == 1)
+            LOG_INFO("Renderer", "object motion: {} draws, {} matched to last frame ({} draws kept); other keys: program {}, "
+                     "+range {}, +index buffer {}, +vertex buffer {}; indirect {}",
+                     vel_draws_, vel_matched_, vel_cur_cbs_.size(), vel_diag_hits_[0], vel_diag_hits_[1], vel_diag_hits_[2],
+                     vel_diag_hits_[3], vel_diag_indirect_);
+        for (int a = 0; a < 4; a++) {
+            std::swap(vel_diag_prev_[a], vel_diag_cur_[a]);
+            vel_diag_cur_[a].clear();
+            vel_diag_hits_[a] = 0;
+        }
+        vel_diag_occ_.clear();
+        vel_diag_indirect_ = 0;
+        std::swap(vel_prev_cbs_, vel_cur_cbs_);
+        vel_cur_cbs_.clear();
+        vel_occ_.clear();
+        vel_draws_ = vel_matched_ = 0;
+        vel_written_ = false;
         // The presented targets and their HUD depth follow the HUD scale: learn them, and when the set or the scale
         // changes drop them (made again at the right scale by the next frame's first use).
         if (s->screen_like && present_vas_.insert(s->gpu_va).second) {

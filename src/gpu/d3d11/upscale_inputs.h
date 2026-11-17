@@ -30,7 +30,9 @@ public:
     u64 DepthVa() const { return depth_va_; }
 
     // Camera motion vectors from `depth` (w x h, the scene depth) into the texture Motion() returns.
-    bool BuildMotion(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* depth, u32 w, u32 h);
+    // `object_motion` (optional): the velocity variants' motion at the same size, used where written (not 65504).
+    bool BuildMotion(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* depth, u32 w, u32 h,
+                     ID3D11ShaderResourceView* object_motion = nullptr);
     ID3D11ShaderResourceView* Motion() const { return mv_srv_.Get(); }
     ID3D11Texture2D* MotionTex() const { return mv_tex_.Get(); }
 
@@ -44,7 +46,7 @@ public:
 
 private:
     bool Init(ID3D11Device* dev);
-    void Upload(ID3D11DeviceContext* ctx, u32 w, u32 h, float mode);
+    void Upload(ID3D11DeviceContext* ctx, u32 w, u32 h, float mode, bool object_motion = false);
     bool tried_ = false, ok_ = false;
     bool noted_ = false, have_prev_ = false;
     struct Candidate {

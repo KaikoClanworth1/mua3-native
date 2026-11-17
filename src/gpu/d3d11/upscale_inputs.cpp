@@ -12,6 +12,7 @@ namespace {
 constexpr const char kSource[] = R"(
 Texture2D<float> depth_tex : register(t0);
 Texture2D<float4> scene : register(t1);
+Texture2D<float2> object_motion : register(t2); // (velocity variants; 65504 = none: camera motion)
 SamplerState lin : register(s0);
 cbuffer C : register(b0) {
     row_major float4x4 inv_vp;  // this frame's clip -> world (homogeneous)
@@ -19,6 +20,7 @@ cbuffer C : register(b0) {
     float4 vpz;   // flip, depth scale, depth offset, debug mode
     float4 size;  // target w, h, 1/w, 1/h
     float4 dsize; // depth w, h, 1/w, 1/h
+    float4 flags; // x: object_motion is bound
 };
 
 void vs_main(uint id : SV_VertexID, out float4 pos : SV_Position) {
@@ -44,6 +46,11 @@ float2 MotionAt(float2 px) {
 }
 
 float2 ps_motion(float4 pos : SV_Position) : SV_Target {
+    if (flags.x != 0) {
+        const float2 o = object_motion.Load(int3(pos.xy, 0));
+        if (o.x < 60000.0)
+            return o;
+    }
     return MotionAt(pos.xy);
 }
 
@@ -97,8 +104,7 @@ bool Invert(const float m[16], float out[16]) {
 
 struct Constants {
     float inv_vp[16], prev_vp[16];
-    float vpz[4], size[4], dsize[4];
-    float pad[4];
+    float vpz[4], size[4], dsize[4], flags[4];
 };
 
 } // namespace
@@ -221,7 +227,7 @@ bool UpscaleInputs::Init(ID3D11Device* dev) {
     return ok_ = true;
 }
 
-void UpscaleInputs::Upload(ID3D11DeviceContext* ctx, u32 w, u32 h, float mode) {
+void UpscaleInputs::Upload(ID3D11DeviceContext* ctx, u32 w, u32 h, float mode, bool object_motion) {
     Constants c{};
     if (!Invert(vp_, c.inv_vp))
         std::memset(c.inv_vp, 0, sizeof(c.inv_vp));
@@ -229,6 +235,7 @@ void UpscaleInputs::Upload(ID3D11DeviceContext* ctx, u32 w, u32 h, float mode) {
     c.vpz[0] = flip_, c.vpz[1] = sz_ != 0 ? sz_ : 1, c.vpz[2] = tz_, c.vpz[3] = mode;
     c.size[0] = float(w), c.size[1] = float(h), c.size[2] = 1.0f / float(w), c.size[3] = 1.0f / float(h);
     c.dsize[0] = float(mv_w_), c.dsize[1] = float(mv_h_), c.dsize[2] = 1.0f / float(mv_w_), c.dsize[3] = 1.0f / float(mv_h_);
+    c.flags[0] = object_motion ? 1.0f : 0.0f;
     ctx->UpdateSubresource(cb_.Get(), 0, nullptr, &c, 0, 0);
     ctx->RSSetState(raster_.Get());
     ctx->OMSetBlendState(blend_.Get(), nullptr, 0xFFFFFFFF);
@@ -245,7 +252,8 @@ void UpscaleInputs::Upload(ID3D11DeviceContext* ctx, u32 w, u32 h, float mode) {
     ctx->RSSetViewports(1, &vp);
 }
 
-bool UpscaleInputs::BuildMotion(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* depth, u32 w, u32 h) {
+bool UpscaleInputs::BuildMotion(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* depth, u32 w, u32 h,
+                                ID3D11ShaderResourceView* object_motion) {
     if (!tried_)
         Init(dev);
     if (!ok_ || !noted_ || !depth || !w || !h)
@@ -267,15 +275,17 @@ bool UpscaleInputs::BuildMotion(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3
         mv_w_ = w, mv_h_ = h;
         LOG_INFO("Renderer", "motion vectors {}x{} (camera only)", w, h);
     }
-    Upload(ctx, w, h, 0);
-    ID3D11ShaderResourceView* null_srv[2] = {};
-    ctx->PSSetShaderResources(0, 2, null_srv);
+    Upload(ctx, w, h, 0, object_motion != nullptr);
+    ID3D11ShaderResourceView* null_srv[3] = {};
+    ctx->PSSetShaderResources(0, 3, null_srv);
     ID3D11RenderTargetView* rtv = mv_rtv_.Get();
     ctx->OMSetRenderTargets(1, &rtv, nullptr);
     ctx->PSSetShader(mv_ps_.Get(), nullptr, 0);
     ctx->PSSetShaderResources(0, 1, &depth);
+    if (object_motion)
+        ctx->PSSetShaderResources(2, 1, &object_motion);
     ctx->Draw(3, 0);
-    ctx->PSSetShaderResources(0, 1, null_srv);
+    ctx->PSSetShaderResources(0, 3, null_srv);
     ID3D11RenderTargetView* null_rtv = nullptr;
     ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
     return true;
