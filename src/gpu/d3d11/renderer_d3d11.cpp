@@ -714,10 +714,11 @@ void D3D11Renderer::ReleaseDevice() {
     gpu_passes_.ReleaseDevice();
     g_dc.reset();
     g_last_drv_cb = nullptr;
+    // Everything the draw path keeps from the old device, the input layout included: a layout kept here was bound
+    // again by the first draw on the new device with the same vertex program and format (an object of the old
+    // device: the access violation inside the driver after a device reset, GitHub #6).
+    g_seen = SeenState{};
     g_seen.blend = g_seen.depth = g_seen.raster = ~0u;
-    g_seen.blend_obj = nullptr;
-    g_seen.depth_obj = nullptr;
-    g_seen.raster_obj = nullptr;
 }
 
 void D3D11Renderer::RestoreDevice(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
