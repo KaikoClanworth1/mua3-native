@@ -55,8 +55,37 @@ std::string TitleIdFromName(const std::string& name) {
     return {};
 }
 
+// A RomFS path as a path relative to the extract folder. RomFS names come from the dump: the Expansion Pass's has a
+// top folder named "G:" (a drive letter left in by the game's tools), and dst / "G:/x" on Windows is G:\x, outside
+// the install folder; with no G: drive that threw in an extract thread and aborted the setup (issue #4). So every
+// name that Windows can't hold in a folder (':' '<' '>' '"' '|' '?' '*', '\\', control characters, "." and "..")
+// becomes a plain one.
+fs::path SafeRelative(const std::string& romfs_path) {
+    fs::path rel;
+    size_t i = 0;
+    while (i <= romfs_path.size()) {
+        size_t j = romfs_path.find('/', i);
+        if (j == std::string::npos)
+            j = romfs_path.size();
+        std::string part = romfs_path.substr(i, j - i);
+        i = j + 1;
+        if (part.empty() || part == ".")
+            continue;
+        if (part == "..")
+            part = "__";
+        for (char& c : part)
+            if (static_cast<unsigned char>(c) < 0x20 || std::strchr(":<>\"|?*\\", c))
+                c = '_';
+        rel /= fs::u8path(part);
+    }
+    return rel;
+}
+
 bool ExtractFile(const Storage& src, u64 offset, u64 size, const fs::path& dst, InstallProgress& prog) {
-    fs::create_directories(dst.parent_path());
+    std::error_code ec;
+    fs::create_directories(dst.parent_path(), ec);
+    if (ec)
+        return false;
     std::ofstream out(dst, std::ios::binary);
     if (!out)
         return false;
@@ -93,8 +122,13 @@ bool ExtractRomfs(const StoragePtr& romfs, const fs::path& dst, InstallProgress&
         pool.emplace_back([&] {
             for (size_t i; (i = next++) < files->size() && !failed;) {
                 auto& f = (*files)[i];
-                if (!ExtractFile(*romfs, f.offset, f.size, dst / fs::u8path(f.path), prog))
+                try { // (an exception here would end the setup: std::terminate)
+                    if (!ExtractFile(*romfs, f.offset, f.size, dst / SafeRelative(f.path), prog))
+                        failed = true;
+                } catch (const std::exception& e) {
+                    LOG_ERROR("Install", "{}: {}", f.path, e.what());
                     failed = true;
+                }
             }
         });
     }
@@ -304,7 +338,7 @@ bool InstallGame(const InstallOptions& opts, InstallProgress& prog, std::string&
             return false;
         }
         for (auto& e : *entries)
-            if (!ExtractFile(*pfs, e.offset, e.size, out / "exefs" / e.name, prog)) {
+            if (!ExtractFile(*pfs, e.offset, e.size, out / "exefs" / SafeRelative(e.name), prog)) {
                 error = "Failed writing ExeFS";
                 return false;
             }
