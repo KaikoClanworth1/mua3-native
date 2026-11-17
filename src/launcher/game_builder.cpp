@@ -190,30 +190,62 @@ Toolchain FindToolchain() {
         t.problem = "Microsoft C++ Build Tools are not installed.";
         return t;
     }
-    std::string out;
-    Run(L"\"" + vswhere.wstring() + L"\" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 "
-        L"-property installationPath -utf8", nullptr, {}, NORMAL_PRIORITY_CLASS, nullptr, &out);
-    while (!out.empty() && (out.back() == '\n' || out.back() == '\r'))
-        out.pop_back();
-    if (out.empty()) {
-        t.problem = "Microsoft C++ Build Tools are not installed (no Visual Studio with C++ found).";
+    auto list = [&](const wchar_t* args) {
+        std::string out;
+        Run(L"\"" + vswhere.wstring() + L"\" " + args + L" -property installationPath -utf8", nullptr, {},
+            NORMAL_PRIORITY_CLASS, nullptr, &out);
+        std::vector<fs::path> v;
+        size_t at = 0;
+        while (at < out.size()) {
+            size_t end = out.find('\n', at);
+            if (end == std::string::npos)
+                end = out.size();
+            std::string line = out.substr(at, end - at);
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+                line.pop_back();
+            if (!line.empty())
+                v.push_back(fs::u8path(line));
+            at = end + 1;
+        }
+        return v;
+    };
+    // Every Visual Studio / Build Tools with the C++ tools (also preview channels), not only the newest install: a
+    // PC can have Visual Studio 2022 with C++ next to Build Tools 2026, and "-latest" alone picked one of them.
+    const auto with_cpp = list(L"-all -prerelease -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64");
+    if (with_cpp.empty()) {
+        t.problem = list(L"-all -prerelease -products *").empty()
+                        ? "Microsoft C++ Build Tools are not installed."
+                        : "Visual Studio is installed without its C++ tools. Open the Visual Studio Installer, choose "
+                          "Modify and tick \"Desktop development with C++\".";
         return t;
     }
-    const fs::path vs = fs::u8path(out);
-    t.vcvars = vs / "VC" / "Auxiliary" / "Build" / "vcvars64.bat";
-    std::ifstream ver(vs / "VC" / "Auxiliary" / "Build" / "Microsoft.VCToolsVersion.default.txt");
-    std::string tools; // 14.51.36248: compiler 19.51
-    std::getline(ver, tools);
-    int major = 0, minor = 0;
-    std::sscanf(tools.c_str(), "%d.%d", &major, &minor);
-    t.version = tools.size() > 2 ? "19" + tools.substr(2) : tools; // tools 14.51.x = compiler 19.51.x
-    if (!fs::exists(t.vcvars) || major != 14) {
-        t.problem = "The Visual Studio installation has no usable C++ tools.";
+    Toolchain best;
+    int best_minor = -1;
+    for (const fs::path& vs : with_cpp) {
+        Toolchain c;
+        c.vcvars = vs / "VC" / "Auxiliary" / "Build" / "vcvars64.bat";
+        std::ifstream ver(vs / "VC" / "Auxiliary" / "Build" / "Microsoft.VCToolsVersion.default.txt");
+        std::string tools; // 14.51.36248: compiler 19.51
+        std::getline(ver, tools);
+        int major = 0, minor = 0;
+        std::sscanf(tools.c_str(), "%d.%d", &major, &minor);
+        c.version = tools.size() > 2 ? "19" + tools.substr(2) : tools; // tools 14.51.x = compiler 19.51.x
+        LOG_INFO("Builder", "C++ tools: {} (MSVC {})", vs.string(), c.version);
+        if (!fs::exists(c.vcvars) || major != 14 || minor <= best_minor)
+            continue;
+        best = c, best_minor = minor;
+    }
+    if (best_minor < 0) {
+        t.problem = "The Visual Studio installation has no usable C++ tools. Open the Visual Studio Installer and "
+                    "choose Repair.";
         return t;
     }
-    if (1900 + minor < kMinCompiler) {
-        t.problem = fmt::format("The C++ tools are too old (MSVC {}): Build Tools for Visual Studio 2026 or newer are needed.",
-                                t.version);
+    t = best;
+    if (1900 + best_minor < kMinCompiler) {
+        // (the prebuilt libraries come from MSVC kMinCompiler: an older linker and C++ library can't link them)
+        t.problem = fmt::format("The C++ tools are too old (MSVC {}, MSVC {}.{} or newer is needed). Open the Visual "
+                                "Studio Installer and press Update.",
+                                t.version, kMinCompiler / 100, kMinCompiler % 100);
         return t;
     }
     t.ok = true;

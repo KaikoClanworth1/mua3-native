@@ -806,7 +806,9 @@ void FilesPage(Wizard& w) {
         }
         Dim(ok ? (w.clang.empty() ? "Recommended: add \"C++ Clang Compiler for Windows\" in the Visual Studio Installer."
                                   : "Compiles the game on this PC (clang-cl: fast build, faster game).")
-               : ready ? "Free from Microsoft: \"Desktop development with C++\"." : "",
+               : ready ? (w.toolchain.problem.empty() ? std::string("Free from Microsoft: \"Desktop development with C++\".")
+                                                      : w.toolchain.problem)
+                       : "",
             true);
         ImGui::EndGroup();
         if (ready && !ok) {
@@ -946,7 +948,7 @@ void FilesPage(Wizard& w) {
     else if (w.keys.empty() || !fs::exists(w.keys))
         why = "Find your prod.keys.";
     else if (w.toolchain_ready && !w.toolchain.ok)
-        why = "Install the Microsoft C++ Build Tools.";
+        why = w.toolchain.problem.empty() ? "Install the Microsoft C++ Build Tools." : w.toolchain.problem;
     else if (!w.toolchain_ready)
         why = "Checking the C++ tools...";
     else if (!fs::exists(w.sdk_dir / "tools" / "recomp.exe"))
