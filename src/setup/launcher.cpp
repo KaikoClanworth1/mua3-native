@@ -21,6 +21,7 @@
 #include "core/hle/mods.h"
 #include "launcher/report.h"
 #include "setup/ui_util.h"
+#include "setup/updater.h"
 
 namespace launcher {
 namespace {
@@ -193,7 +194,28 @@ struct State {
     // SETTINGS
     core::Config cfg;
     int settings_sel = 0;
+
+    // a newer version of the port (checked once when the launcher opens)
+    updater::Updater update;
+    bool update_started = false; // the player asked for it (its failures show)
 } g;
+
+// RecompLauncher installs (setup --prepare in the install folder) are updated by RecompLauncher.
+bool ManagedElsewhere() {
+    std::error_code ec;
+    const setup::Installed& in = g.host->installed;
+    return !in.source_dir.empty() && fs::equivalent(in.source_dir, in.dir, ec);
+}
+
+// The update banner on PLAY: what is new and the button (height 0 when there is nothing to say).
+float UpdateBannerHeight() {
+    using S = updater::Updater::State;
+    const S st = g.update.state;
+    return st == S::Available || st == S::Downloading || st == S::Unpacking || st == S::Ready ||
+                   (st == S::Failed && g.update_started)
+               ? U(74)
+               : 0;
+}
 
 fs::path ModsDir() { return g.dir / "mods"; }
 fs::path Ini() { return g.dir / "mua3.ini"; }
@@ -720,7 +742,8 @@ void InfoRow(ImDrawList* dl, float x0, float x1, float& y, const char* label, co
 // ---- PLAY
 void PlaySection(ImDrawList* dl, const Layout& L, bool activate) {
     const bool exe = fs::exists(g.dir / "mua3.exe");
-    const ImVec2 a(L.x1 - U(520), L.y0 + U(56)), b(L.x1, L.y0 + U(56) + U(g.ended.empty() ? 384 : 458));
+    const float banner = UpdateBannerHeight();
+    const ImVec2 a(L.x1 - U(520), L.y0 + U(56)), b(L.x1, L.y0 + U(56) + U(g.ended.empty() ? 384 : 458) + banner);
     Card(dl, a, b);
     const float x0 = a.x + U(34), x1 = b.x - U(34);
     float y = a.y + U(28);
@@ -768,6 +791,62 @@ void PlaySection(ImDrawList* dl, const Layout& L, bool activate) {
         if (g.crashed) {
             Font h(g_head, 14);
             dl->AddText(ImVec2(eb.x - U(130), ea.y + U(20)), ImGui::IsItemHovered() ? col::yellow : col::yellow2, "REPORT IT >");
+        }
+        y += U(74);
+    }
+    if (banner > 0) {
+        using St = updater::Updater::State;
+        const St st = g.update.state;
+        const ImVec2 ua(x0, y), ub(x1, y + U(58));
+        dl->AddRectFilled(ua, ub, IM_COL32(20, 60, 40, 150));
+        dl->AddRect(ua, ub, Alpha(st == St::Failed ? col::red : col::green, 170));
+        std::string head, sub, err;
+        std::string ver;
+        {
+            std::lock_guard lk(g.update.mutex);
+            ver = g.update.release.version;
+            err = g.update.error;
+        }
+        const bool elsewhere = ManagedElsewhere();
+        switch (st) {
+        case St::Available:
+            head = "NEW VERSION " + ver;
+            sub = elsewhere ? "Update it in RecompLauncher." : "Downloads it and builds your game again (your saves stay).";
+            break;
+        case St::Downloading: head = fmt::format("DOWNLOADING {}  {:.0f}%", ver, g.update.progress * 100); break;
+        case St::Unpacking: head = "UNPACKING " + ver; break;
+        case St::Ready: head = "STARTING THE UPDATE"; break;
+        default: head = "UPDATE FAILED", sub = err; break;
+        }
+        {
+            Font f(g_head, 17);
+            dl->AddText(ImVec2(ua.x + U(12), ua.y + U(8)), st == St::Failed ? col::red : col::green, head.c_str());
+        }
+        if (!sub.empty()) {
+            Font f(g_body, 12.5f);
+            ImGui::PushClipRect(ua, ImVec2(ub.x - U(140), ub.y), true);
+            dl->AddText(ImVec2(ua.x + U(12), ua.y + U(32)), col::dim, sub.c_str());
+            ImGui::PopClipRect();
+        }
+        if (st == St::Downloading) {
+            const float w = (ub.x - ua.x - U(24)) * g.update.progress;
+            dl->AddRectFilled(ImVec2(ua.x + U(12), ub.y - U(14)), ImVec2(ua.x + U(12) + w, ub.y - U(9)), col::green);
+        }
+        if ((st == St::Available && !elsewhere) || st == St::Failed) {
+            ImGui::SetCursorScreenPos(ImVec2(ub.x - U(132), ua.y + U(14)));
+            const bool click = ImGui::InvisibleButton("update", ImVec2(U(120), U(30)));
+            Font h(g_head, 14);
+            dl->AddText(ImVec2(ub.x - U(128), ua.y + U(20)), ImGui::IsItemHovered() ? col::yellow : col::yellow2,
+                        st == St::Failed ? "TRY AGAIN >" : "UPDATE NOW >");
+            if (click || Pressed({ImGuiKey_GamepadFaceUp, ImGuiKey_U}, false)) {
+                if (st == St::Failed) {
+                    g.update.state = St::Idle;
+                    g.update.Check(g.host->version);
+                } else {
+                    g.update_started = true;
+                    g.update.Start(g.host->installed.source_dir);
+                }
+            }
         }
         y += U(74);
     }
@@ -1239,6 +1318,7 @@ void Open(Host& host) {
     g.mods_on = g.cfg.mods_enabled;
     ScanMods();
     ProbeGame();
+    g.update.Check(host.version);
 }
 
 Action Frame(Host& host) {
@@ -1285,6 +1365,13 @@ Action Frame(Host& host) {
         break;
     case kExit: ExitSection(dl, L); break;
     }
+    if (g.update.state == updater::Updater::State::Available && !g.update_started && std::getenv("MUA3_UPDATE_START") &&
+        !ManagedElsewhere()) { // (developer test: no click)
+        g.update_started = true;
+        g.update.Start(host.installed.source_dir);
+    }
+    if (g.update.state == updater::Updater::State::Ready && !g.game && g.update.Run())
+        act = Action::Quit; // the new setup takes over (it replaces this launcher)
     if (g.ended == "!report") {
         g.ended.clear();
         act = Action::Report;
@@ -1293,7 +1380,12 @@ Action Frame(Host& host) {
     dl->AddRectFilled(ImVec2(0, L.H - U(56)), ImVec2(L.W, L.H), IM_COL32(0, 0, 0, 140));
     {
         Font f(g_body, 12);
-        dl->AddText(ImVec2(U(40), L.H - U(36)), IM_COL32(125, 141, 176, 255), ("MUA3 Native " + host.version).c_str());
+        std::string v = "MUA3 Native " + host.version;
+        if (g.update.state == updater::Updater::State::Available) {
+            std::lock_guard lk(g.update.mutex);
+            v += "  ·  " + g.update.release.version + " available";
+        }
+        dl->AddText(ImVec2(U(40), L.H - U(36)), IM_COL32(125, 141, 176, 255), v.c_str());
     }
     float right = L.W - U(40);
     const float fy = L.H - U(28);

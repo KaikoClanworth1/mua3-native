@@ -310,6 +310,7 @@ struct Wizard {
     int workers = 0;   // 0 = automatic
     int memory_gb = 0; // 0 = automatic
     bool repair = false; // an existing install is being updated / repaired
+    bool auto_update = false; // --update (the launcher's updater): the update starts once nothing stops it
     bool register_apps = true; // false for --prepare: the launcher that ran it manages the install, not Windows Apps
     int desktop_w = 0, desktop_h = 0; // the main monitor (the game's first window size)
 
@@ -1034,8 +1035,15 @@ void FilesBottom(Wizard& w, std::vector<setup::GameFile> files) {
         why = "Not enough free space: pick another drive.";
     const ImVec2 btn = S(170, 46);
     ImGui::SetCursorScreenPos(ImVec2(o.x + wd - btn.x - S(32), o.y + (ht - btn.y) * 0.5f));
-    if (Button(w.repair ? "Update the game" : "Build the game", btn, true, why.empty())) {
+    const bool settled = !w.scanning && !w.probing && w.toolchain_ready && !w.tools_busy;
+    if (Button(w.repair ? "Update the game" : "Build the game", btn, true, why.empty()) ||
+        (w.auto_update && settled && why.empty())) {
+        w.auto_update = false;
         StartBuild(w);
+    }
+    if (w.auto_update && settled && !why.empty()) { // something to fix first: the player sees why and presses the button
+        LOG_INFO("Setup", "update waits: {}", why);
+        w.auto_update = false;
     }
     {
         const std::string t = why.empty() ? "About " + Duration(w.EstimateMinutes()) : why;
@@ -2172,7 +2180,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     if (const char* sdk = std::getenv("MUA3_SETUP_SDK")) // developers: a release's sdk folder
         w.sdk_dir = fs::u8path(sdk);
     // command line: --uninstall (Windows Apps), --crash-report (the game, after a crash)
-    bool want_uninstall = false, want_report = false, want_prepare = false;
+    bool want_uninstall = false, want_report = false, want_prepare = false, want_update = false;
     std::vector<std::wstring> args;
     {
         int argc = 0;
@@ -2185,6 +2193,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 want_prepare = true;
             else if (a == L"--uninstall")
                 want_uninstall = true;
+            else if (a == L"--update") // the launcher's updater: this (newer) package updates the install
+                want_update = true;
             else if (a == L"--crash-report")
                 want_report = true, i++;
         }
@@ -2205,6 +2215,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     } else if (w.installed && fs::exists(w.installed->dir)) {
         w.page = Page::Installed;
         w.open_uninstall = want_uninstall;
+        if (want_update) {
+            StartRepair(w);
+            w.auto_update = true;
+            LOG_INFO("Setup", "update of {} from {}", w.installed->dir.string(), setup::SetupDir().string());
+        }
     }
     // Run as the installed launcher (MUA3 Launcher.exe, or from the install folder): the launcher, not the wizard.
     bool as_launcher = false;
@@ -2212,7 +2227,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         wchar_t self[MAX_PATH]{};
         GetModuleFileNameW(nullptr, self, MAX_PATH);
         std::error_code e2;
-        as_launcher = !want_uninstall && !want_report && w.installed && fs::exists(w.installed->dir / "mua3.exe", e2) &&
+        as_launcher = !want_uninstall && !want_report && !want_update && w.installed && fs::exists(w.installed->dir / "mua3.exe", e2) &&
                       (_wcsicmp(fs::path(self).filename().c_str(), fs::u8path(setup::kLauncherExe).c_str()) == 0 ||
                        fs::equivalent(setup::SetupDir(), w.installed->dir, e2));
         if (const char* pg = std::getenv("MUA3_SETUP_PAGE"); pg && std::string(pg).rfind("launcher", 0) == 0 && w.installed)
