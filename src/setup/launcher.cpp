@@ -1370,7 +1370,7 @@ Action Frame(Host& host) {
         g.update_started = true;
         g.update.Start(host.installed.source_dir);
     }
-    if (g.update.state == updater::Updater::State::Ready && !g.game && g.update.Run())
+    if (g.update.state == updater::Updater::State::Ready && !g.game && g.update.Run(host.installed.dir))
         act = Action::Quit; // the new setup takes over (it replaces this launcher)
     if (g.ended == "!report") {
         g.ended.clear();

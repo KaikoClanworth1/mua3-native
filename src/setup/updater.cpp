@@ -269,7 +269,7 @@ void Updater::Start(const fs::path& keep) {
     });
 }
 
-bool Updater::Run() {
+bool Updater::Run(const fs::path& install_dir) {
     if (state != State::Ready)
         return false;
     fs::path exe;
@@ -281,7 +281,8 @@ bool Updater::Run() {
     sei.fMask = SEE_MASK_NOASYNC;
     sei.lpVerb = L"open";
     sei.lpFile = exe.c_str();
-    sei.lpParameters = L"--update";
+    const std::wstring args = L"--update \"" + install_dir.wstring() + L"\"";
+    sei.lpParameters = args.c_str();
     const std::wstring wd = exe.parent_path().wstring();
     sei.lpDirectory = wd.c_str();
     sei.nShow = SW_SHOWNORMAL;
@@ -291,7 +292,7 @@ bool Updater::Run() {
         state = State::Failed;
         return false;
     }
-    LOG_INFO("Update", "started {} --update", exe.string());
+    LOG_INFO("Update", "started {} --update {}", exe.string(), install_dir.string());
     return true;
 }
 

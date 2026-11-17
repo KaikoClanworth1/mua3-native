@@ -2181,6 +2181,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         w.sdk_dir = fs::u8path(sdk);
     // command line: --uninstall (Windows Apps), --crash-report (the game, after a crash)
     bool want_uninstall = false, want_report = false, want_prepare = false, want_update = false;
+    fs::path update_dir;
     std::vector<std::wstring> args;
     {
         int argc = 0;
@@ -2193,8 +2194,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 want_prepare = true;
             else if (a == L"--uninstall")
                 want_uninstall = true;
-            else if (a == L"--update") // the launcher's updater: this (newer) package updates the install
+            else if (a == L"--update") { // the launcher's updater: this (newer) package updates the install there
                 want_update = true;
+                if (i + 1 < argc && argv[i + 1][0] != L'-')
+                    update_dir = argv[++i];
+            }
             else if (a == L"--crash-report")
                 want_report = true, i++;
         }
@@ -2205,6 +2209,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         return RunPrepare(w, args);
     }
     w.installed = setup::FindInstalled();
+    if (!update_dir.empty()) // (--update: the install the launcher belongs to, whatever the Apps entry says)
+        if (auto there = setup::LoadInstalled(update_dir))
+            w.installed = there;
     if (!w.installed) // run from an install folder whose Apps entry is gone
         if (auto here = setup::LoadInstalled(setup::SetupDir()))
             w.installed = here;

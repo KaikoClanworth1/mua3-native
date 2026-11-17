@@ -1,6 +1,6 @@
 // The launcher's updater: asks GitHub for the newest release of the port, downloads its package (the same zip players
 // download by hand), unpacks it under %LOCALAPPDATA%\MUA3Native\packages\<version> and starts its MUA3Setup.exe with
-// --update, which rebuilds the installed game with the new version (the player's own game files and keys, as
+// --update <install folder>, which rebuilds the installed game with the new version (the player's own game files and keys, as
 // UPDATE OR REPAIR does). The package holds no part of the game.
 //
 // Developer tests: MUA3_UPDATE_API=<url or local .json file> replaces GitHub's answer, MUA3_UPDATE_CURRENT=<version>
@@ -44,8 +44,8 @@ struct Updater {
     // Downloads and unpacks the release found (State::Available). `keep`: a package folder still in use (the
     // install's source_dir), never removed; older packages are.
     void Start(const fs::path& keep);
-    // Runs the new setup (State::Ready) to update `install_dir`; true when it started.
-    bool Run();
+    // Runs the new setup (State::Ready) to update the install in `install_dir`; true when it started.
+    bool Run(const fs::path& install_dir);
     ~Updater();
 
 private:
