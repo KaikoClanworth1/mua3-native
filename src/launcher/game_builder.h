@@ -3,6 +3,7 @@
 // (the release's sdk/ folder). The release itself contains none of the game.
 #pragma once
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -17,10 +18,21 @@ struct Toolchain {
     fs::path vcvars;        // ...\VC\Auxiliary\Build\vcvars64.bat
     std::string version;    // cl.exe version, e.g. "19.51.36248"
     std::string problem;    // why it cannot be used (missing, too old)
+    // What Microsoft's installer can do about it (FixTools), and on which install.
+    enum class Fix { None, Install, Update, AddCpp } fix = Fix::None;
+    fs::path fix_path;      // the Visual Studio install to update or modify
+    std::string fix_product; // its product id (Microsoft.VisualStudio.Product.BuildTools, ...Community, ...)
 };
 // Minimum compiler: the one the prebuilt libraries were made with (an older linker cannot read them).
 constexpr int kMinCompiler = _MSC_VER; // e.g. 1951 = MSVC 19.51 (Visual Studio 2026)
 Toolchain FindToolchain();
+// Makes the C++ tools ready with Microsoft's own installer: installs Build Tools for Visual Studio 2026 (C++
+// workload and clang-cl; the installer is downloaded from Microsoft), updates an install whose MSVC is too old, or
+// adds the C++ workload to one without it. With clang = true and tools that work, adds clang-cl only. Shows
+// Microsoft's progress window and asks Windows for admin rights; blocks until it ends. `note` gets each stage.
+bool FixTools(const Toolchain& t, bool clang, const std::function<void(const std::string&)>& note, std::string& error);
+// The label for the setup's button ("Install for me", ...), empty when there is nothing to do.
+const char* FixLabel(const Toolchain& t);
 // clang-cl (MUA3_CLANG, LLVM's, or Visual Studio's "C++ Clang Compiler for Windows"): the game builds much faster and
 // runs a little faster with it. Empty: not installed (the build uses cl).
 fs::path FindClang(const fs::path& vcvars);

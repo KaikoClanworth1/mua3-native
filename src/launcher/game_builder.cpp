@@ -9,6 +9,7 @@
 #include <thread>
 
 #include <windows.h>
+#include <shellapi.h>
 
 #include "loader/formats.h"
 
@@ -182,74 +183,229 @@ std::vector<std::string> Progress::Tail(size_t n) {
     return {log.end() - std::min(n, log.size()), log.end()};
 }
 
+namespace {
+
+fs::path VsInstallerDir() {
+    return fs::path(_wgetenv(L"ProgramFiles(x86)") ? _wgetenv(L"ProgramFiles(x86)") : L"C:\\Program Files (x86)") /
+           "Microsoft Visual Studio" / "Installer";
+}
+
+// One Visual Studio / Build Tools install, as vswhere lists it.
+struct VsInstance {
+    fs::path path;
+    std::string product; // Microsoft.VisualStudio.Product.BuildTools, ...Community, ...
+    int major = 0;       // installationVersion: 18 = Visual Studio 2026
+    bool cpp = false;    // has the C++ x64 tools
+};
+
+std::vector<VsInstance> ListVs(const wchar_t* extra) {
+    std::string out;
+    Run(L"\"" + (VsInstallerDir() / "vswhere.exe").wstring() + L"\" -all -prerelease -products * " + extra +
+            L" -format text -utf8",
+        nullptr, {}, NORMAL_PRIORITY_CLASS, nullptr, &out);
+    std::vector<VsInstance> v;
+    size_t at = 0;
+    while (at < out.size()) {
+        size_t end = out.find('\n', at);
+        if (end == std::string::npos)
+            end = out.size();
+        std::string line = out.substr(at, end - at);
+        at = end + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+            line.pop_back();
+        const size_t c = line.find(": ");
+        if (c == std::string::npos)
+            continue;
+        const std::string key = line.substr(0, c), val = line.substr(c + 2);
+        if (key == "instanceId")
+            v.emplace_back();
+        else if (v.empty())
+            continue;
+        else if (key == "installationPath")
+            v.back().path = fs::u8path(val);
+        else if (key == "productId")
+            v.back().product = val;
+        else if (key == "installationVersion")
+            v.back().major = std::atoi(val.c_str());
+    }
+    return v;
+}
+
+constexpr int kVsMajor = 18; // Visual Studio 2026: the version whose MSVC the prebuilt libraries come from
+
+} // namespace
+
 Toolchain FindToolchain() {
     Toolchain t;
-    const fs::path vswhere = fs::path(_wgetenv(L"ProgramFiles(x86)") ? _wgetenv(L"ProgramFiles(x86)") : L"C:\\Program Files (x86)") /
-                             "Microsoft Visual Studio" / "Installer" / "vswhere.exe";
-    if (!fs::exists(vswhere)) {
+    if (!fs::exists(VsInstallerDir() / "vswhere.exe")) {
         t.problem = "Microsoft C++ Build Tools are not installed.";
+        t.fix = Toolchain::Fix::Install;
         return t;
     }
-    auto list = [&](const wchar_t* args) {
-        std::string out;
-        Run(L"\"" + vswhere.wstring() + L"\" " + args + L" -property installationPath -utf8", nullptr, {},
-            NORMAL_PRIORITY_CLASS, nullptr, &out);
-        std::vector<fs::path> v;
-        size_t at = 0;
-        while (at < out.size()) {
-            size_t end = out.find('\n', at);
-            if (end == std::string::npos)
-                end = out.size();
-            std::string line = out.substr(at, end - at);
-            while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
-                line.pop_back();
-            if (!line.empty())
-                v.push_back(fs::u8path(line));
-            at = end + 1;
-        }
-        return v;
-    };
-    // Every Visual Studio / Build Tools with the C++ tools (also preview channels), not only the newest install: a
-    // PC can have Visual Studio 2022 with C++ next to Build Tools 2026, and "-latest" alone picked one of them.
-    const auto with_cpp = list(L"-all -prerelease -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64");
-    if (with_cpp.empty()) {
-        t.problem = list(L"-all -prerelease -products *").empty()
-                        ? "Microsoft C++ Build Tools are not installed."
-                        : "Visual Studio is installed without its C++ tools. Open the Visual Studio Installer, choose "
-                          "Modify and tick \"Desktop development with C++\".";
-        return t;
-    }
+    // Every Visual Studio / Build Tools (also preview channels), not only the newest install: a PC can have Visual
+    // Studio 2022 with C++ next to Build Tools 2026, and "-latest" alone picked one of them.
+    auto all = ListVs(L"");
+    for (const auto& c : ListVs(L"-requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64"))
+        for (auto& a : all)
+            if (a.path == c.path)
+                a.cpp = true;
+    // a Visual Studio 2026 without C++ (Build Tools first) that the C++ workload can be added to
+    const VsInstance* bare = nullptr;
+    for (const auto& a : all)
+        if (!a.cpp && a.major >= kVsMajor && (!bare || a.product.find("BuildTools") != std::string::npos))
+            bare = &a;
+
     Toolchain best;
     int best_minor = -1;
-    for (const fs::path& vs : with_cpp) {
+    const VsInstance* best_vs = nullptr;
+    for (const auto& vs : all) {
+        if (!vs.cpp)
+            continue;
         Toolchain c;
-        c.vcvars = vs / "VC" / "Auxiliary" / "Build" / "vcvars64.bat";
-        std::ifstream ver(vs / "VC" / "Auxiliary" / "Build" / "Microsoft.VCToolsVersion.default.txt");
+        c.vcvars = vs.path / "VC" / "Auxiliary" / "Build" / "vcvars64.bat";
+        std::ifstream ver(vs.path / "VC" / "Auxiliary" / "Build" / "Microsoft.VCToolsVersion.default.txt");
         std::string tools; // 14.51.36248: compiler 19.51
         std::getline(ver, tools);
         int major = 0, minor = 0;
         std::sscanf(tools.c_str(), "%d.%d", &major, &minor);
         c.version = tools.size() > 2 ? "19" + tools.substr(2) : tools; // tools 14.51.x = compiler 19.51.x
-        LOG_INFO("Builder", "C++ tools: {} (MSVC {})", vs.string(), c.version);
+        LOG_INFO("Builder", "C++ tools: {} ({}, MSVC {})", vs.path.string(), vs.product, c.version);
         if (!fs::exists(c.vcvars) || major != 14 || minor <= best_minor)
             continue;
-        best = c, best_minor = minor;
+        best = c, best_minor = minor, best_vs = &vs;
     }
+    auto add_cpp_or_install = [&] {
+        if (bare)
+            t.fix = Toolchain::Fix::AddCpp, t.fix_path = bare->path, t.fix_product = bare->product;
+        else
+            t.fix = Toolchain::Fix::Install;
+    };
     if (best_minor < 0) {
-        t.problem = "The Visual Studio installation has no usable C++ tools. Open the Visual Studio Installer and "
-                    "choose Repair.";
+        t.problem = all.empty() ? "Microsoft C++ Build Tools are not installed."
+                    : bare      ? "Visual Studio is installed without its C++ tools (\"Desktop development with C++\")."
+                                : "No Visual Studio 2026 with its C++ tools is installed.";
+        add_cpp_or_install();
         return t;
     }
     t = best;
-    if (1900 + best_minor < kMinCompiler) {
+    t.fix_path = best_vs->path, t.fix_product = best_vs->product; // (for adding clang-cl to it)
+    int min_compiler = kMinCompiler;
+    if (const wchar_t* e = _wgetenv(L"MUA3_SETUP_MIN_MSVC")) // (developer test of the "too old" path, e.g. 1999)
+        min_compiler = _wtoi(e);
+    if (1900 + best_minor < min_compiler) {
         // (the prebuilt libraries come from MSVC kMinCompiler: an older linker and C++ library can't link them)
-        t.problem = fmt::format("The C++ tools are too old (MSVC {}, MSVC {}.{} or newer is needed). Open the Visual "
-                                "Studio Installer and press Update.",
-                                t.version, kMinCompiler / 100, kMinCompiler % 100);
+        t.problem = fmt::format("The C++ tools are too old (MSVC {}, MSVC {}.{} or newer is needed).", t.version,
+                                min_compiler / 100, min_compiler % 100);
+        if (best_vs->major >= kVsMajor)
+            t.fix = Toolchain::Fix::Update;
+        else
+            add_cpp_or_install();
         return t;
     }
     t.ok = true;
     return t;
+}
+
+const char* FixLabel(const Toolchain& t) {
+    switch (t.fix) {
+    case Toolchain::Fix::Install: return "Install for me";
+    case Toolchain::Fix::Update: return "Update for me";
+    case Toolchain::Fix::AddCpp: return "Add C++ for me";
+    default: return "";
+    }
+}
+
+namespace {
+
+// Starts a program the way Explorer would (so Windows asks for admin rights when it needs them), and waits.
+int RunElevatable(const fs::path& exe, const std::wstring& args, std::string& error) {
+    SHELLEXECUTEINFOW sei{sizeof(sei)};
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    sei.lpFile = exe.c_str();
+    sei.lpParameters = args.c_str();
+    sei.nShow = SW_SHOWNORMAL;
+    if (!ShellExecuteExW(&sei) || !sei.hProcess) {
+        const DWORD e = GetLastError();
+        error = e == ERROR_CANCELLED ? "Windows' admin prompt was declined: the C++ tools need it to install."
+                                     : fmt::format("Microsoft's installer could not start (error {}).", e);
+        return -1;
+    }
+    WaitForSingleObject(sei.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(sei.hProcess, &code);
+    CloseHandle(sei.hProcess);
+    return int(code);
+}
+
+} // namespace
+
+bool FixTools(const Toolchain& t, bool clang, const std::function<void(const std::string&)>& note, std::string& error) {
+    // the C++ workload (Build Tools: VCTools; Visual Studio: NativeDesktop) with its recommended parts (the Windows
+    // SDK), and clang-cl: the game builds about 10x faster with it
+    const std::wstring clang_parts = L" --add Microsoft.VisualStudio.Component.VC.Llvm.Clang"
+                                     L" --add Microsoft.VisualStudio.Component.VC.Llvm.ClangToolset";
+    auto workload = [](const std::string& product) {
+        return std::wstring(product.find("BuildTools") != std::string::npos ? L" --add Microsoft.VisualStudio.Workload.VCTools"
+                                                                            : L" --add Microsoft.VisualStudio.Workload.NativeDesktop") +
+               L" --includeRecommended";
+    };
+    const std::wstring quiet = L" --passive --norestart"; // Microsoft's progress window, no questions, no restart
+    const fs::path installer = VsInstallerDir() / "setup.exe";
+    fs::path exe;
+    std::wstring args;
+    switch (t.ok ? (clang ? Toolchain::Fix::AddCpp : Toolchain::Fix::None) : t.fix) {
+    case Toolchain::Fix::Install: {
+        // Microsoft's Build Tools 2026 installer (a small download that fetches the rest)
+        std::error_code ec;
+        const fs::path dir = fs::temp_directory_path(ec) / "MUA3Native";
+        fs::create_directories(dir, ec);
+        exe = dir / "vs_buildtools.exe";
+        fs::remove(exe, ec);
+        note("Downloading Microsoft's Build Tools installer");
+        wchar_t sys[MAX_PATH];
+        GetSystemDirectoryW(sys, MAX_PATH);
+        const int dl = Run(L"\"" + (fs::path(sys) / "curl.exe").wstring() + L"\" -L -f -s -o \"" + exe.wstring() +
+                               L"\" https://aka.ms/vs/18/stable/vs_buildtools.exe",
+                           nullptr, dir / "download.log", NORMAL_PRIORITY_CLASS);
+        if (dl != 0 || !fs::exists(exe, ec) || fs::file_size(exe, ec) < 100000) {
+            error = "Could not download Microsoft's Build Tools installer. Check the internet connection, or install "
+                    "\"Build Tools for Visual Studio 2026\" from visualstudio.microsoft.com.";
+            return false;
+        }
+        args = L"--wait" + quiet + workload("BuildTools") + clang_parts;
+        note("Installing Microsoft's C++ Build Tools (about 5 GB)");
+        break;
+    }
+    case Toolchain::Fix::Update:
+        exe = installer;
+        args = L"update --installPath \"" + t.fix_path.wstring() + L"\"" + quiet;
+        note("Updating Visual Studio's C++ tools");
+        break;
+    case Toolchain::Fix::AddCpp:
+        exe = installer;
+        args = L"modify --installPath \"" + t.fix_path.wstring() + L"\"" + (t.ok ? L"" : workload(t.fix_product)) +
+               clang_parts + quiet;
+        note(t.ok ? "Adding clang-cl to Visual Studio" : "Adding the C++ tools to Visual Studio");
+        break;
+    default: return true;
+    }
+    if (!fs::exists(exe)) {
+        error = "Microsoft's Visual Studio Installer was not found.";
+        return false;
+    }
+    LOG_INFO("Builder", "C++ tools fix: \"{}\" {}", exe.string(), fs::path(args).string());
+    const int code = RunElevatable(exe, args, error);
+    LOG_INFO("Builder", "C++ tools fix: exit code {}", code);
+    if (code == -1)
+        return false;
+    if (code != 0 && code != 3010) { // (3010: done, a restart is recommended)
+        error = code == 1602 || code == 5007 ? "Microsoft's installer was cancelled."
+                                             : fmt::format("Microsoft's installer stopped (code {}). Run it again, or "
+                                                           "open the Visual Studio Installer to finish.",
+                                                           code);
+        return false;
+    }
+    return true;
 }
 
 Paths DefaultPaths(const fs::path& game_dir) {

@@ -56,7 +56,7 @@
   },
   "exit_codes": {
     "2": "The setup didn't get your game file or prod.keys. Pick them again on the game's page.",
-    "3": "The game is built on your PC and needs Microsoft's free Build Tools for Visual Studio 2026 (the latest version), with the workload Desktop development with C++. If they are installed already, open the Visual Studio Installer and press Update (older 2026 versions can't link the game), or Modify and tick that workload. Then run the setup again.",
+    "3": "The game is built on your PC with Microsoft's free Build Tools for Visual Studio 2026 (Desktop development with C++), and the setup could not install or update them. Allow Windows' admin prompt and Microsoft's installer window when the setup opens them, or install them from visualstudio.microsoft.com (or press Update in the Visual Studio Installer), then run the setup again. setup.log in your AppData\\Local\\MUA3Native folder says why.",
     "4": "Installing or building the game failed. The details are in setup.log in your AppData\\Local\\MUA3Native folder."
   },
   "looks": {

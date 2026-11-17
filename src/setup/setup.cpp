@@ -276,6 +276,32 @@ struct Wizard {
     builder::Toolchain toolchain;
     fs::path clang; // clang-cl: a much faster build and a slightly faster game (empty: cl only)
     std::atomic<bool> toolchain_ready{false};
+    // "Install for me" and friends: Microsoft's installer run for the player (builder::FixTools)
+    std::thread tools_thread;
+    std::atomic<bool> tools_busy{false};
+    std::string tools_note; // (mutex) its current stage, or why it failed
+    void FixTools(bool add_clang) {
+        if (tools_busy)
+            return;
+        if (tools_thread.joinable())
+            tools_thread.join();
+        tools_busy = true;
+        tools_thread = std::thread([this, add_clang, tc = toolchain] {
+            auto note = [this](const std::string& s) {
+                std::lock_guard lk(mutex);
+                tools_note = s;
+            };
+            std::string err;
+            const bool ok = builder::FixTools(tc, add_clang, note, err);
+            LOG_INFO("Setup", "C++ tools fix: {}", ok ? "done" : err);
+            toolchain_ready = false;
+            toolchain = builder::FindToolchain();
+            clang = toolchain.ok ? builder::FindClang(toolchain.vcvars) : fs::path();
+            note(ok ? "" : err);
+            toolchain_ready = true;
+            tools_busy = false;
+        });
+    }
 
     fs::path install_dir = setup::DefaultInstallDir();
     fs::path build_dir = setup::DefaultBuildDir();
@@ -330,7 +356,7 @@ struct Wizard {
         stop = true;
         build.cancel = true;
         install.cancel = true;
-        for (auto* t : {&scan_thread, &probe_thread, &icon_thread, &worker})
+        for (auto* t : {&scan_thread, &probe_thread, &icon_thread, &worker, &tools_thread})
             if (t->joinable())
                 t->join();
     }
@@ -785,8 +811,17 @@ void FilesPage(Wizard& w) {
     if (BeginPanel("tools", ImVec2(half, tools_h))) {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 p = ImGui::GetCursorScreenPos();
-        const bool ready = w.toolchain_ready;
+        const bool busy_tools = w.tools_busy;
+        const bool ready = w.toolchain_ready && !busy_tools;
         const bool ok = ready && w.toolchain.ok;
+        std::string tools_note;
+        {
+            std::lock_guard lk(w.mutex);
+            tools_note = w.tools_note;
+        }
+        // the button: Microsoft's installer run for the player (install, update, add C++ or clang-cl)
+        const char* fix = !ready ? "" : !ok ? builder::FixLabel(w.toolchain) : w.clang.empty() ? "Add clang-cl" : "";
+        const bool button = ready && (*fix || !ok);
         if (!ready)
             Spinner(dl, ImVec2(p.x + S(9), p.y + S(10)), S(8), col::accent);
         else if (ok)
@@ -795,28 +830,42 @@ void FilesPage(Wizard& w) {
             dl->AddCircle(ImVec2(p.x + S(9), p.y + S(10)), S(9), col::amber, 0, S(1.6f));
         ImGui::SetCursorScreenPos(ImVec2(p.x + S(28), p.y));
         ImGui::BeginGroup();
-        ImGui::TextUnformatted(!ready ? "Checking..."
-                               : ok   ? ("Microsoft C++ " + w.toolchain.version + (w.clang.empty() ? "" : "  ·  clang-cl")).c_str()
-                                      : "Microsoft C++ Build Tools needed");
+        ImGui::PushTextWrapPos(button ? ImGui::GetWindowWidth() - S(176) : 0.0f);
+        ImGui::TextUnformatted(busy_tools ? "Microsoft's installer is running..."
+                               : !ready   ? "Checking..."
+                               : ok       ? ("Microsoft C++ " + w.toolchain.version + (w.clang.empty() ? "" : "  ·  clang-cl")).c_str()
+                                          : "Microsoft C++ Build Tools needed");
         if (ok && w.clang.empty())
         {
             ImGui::PushStyleColor(ImGuiCol_Text, V(col::amber));
             ImGui::TextWrapped("%s", "clang-cl not found: slower build, slightly slower game.");
             ImGui::PopStyleColor();
         }
-        Dim(ok ? (w.clang.empty() ? "Recommended: add \"C++ Clang Compiler for Windows\" in the Visual Studio Installer."
-                                  : "Compiles the game on this PC (clang-cl: fast build, faster game).")
-               : ready ? (w.toolchain.problem.empty() ? std::string("Free from Microsoft: \"Desktop development with C++\".")
-                                                      : w.toolchain.problem)
-                       : "",
-            true);
+        if (busy_tools)
+            Dim(tools_note.empty() ? std::string("Follow its window. Windows asks for admin rights.") : tools_note + "...", true);
+        else if (ready && !tools_note.empty()) { // (why the last try failed)
+            ImGui::PushStyleColor(ImGuiCol_Text, V(col::amber));
+            ImGui::TextWrapped("%s", tools_note.c_str());
+            ImGui::PopStyleColor();
+        } else
+            Dim(ok ? (w.clang.empty() ? "Recommended: \"Add clang-cl\" installs Microsoft's \"C++ Clang Compiler for Windows\"."
+                                      : "Compiles the game on this PC (clang-cl: fast build, faster game).")
+                   : ready ? (w.toolchain.problem.empty() ? std::string("Free from Microsoft: \"Desktop development with C++\".")
+                                                          : w.toolchain.problem)
+                           : "",
+                true);
+        ImGui::PopTextWrapPos();
         ImGui::EndGroup();
-        if (ready && !ok) {
-            ImGui::SameLine(ImGui::GetWindowWidth() - S(100));
+        if (button) {
+            ImGui::SameLine(ImGui::GetWindowWidth() - S(166));
             ImGui::SetCursorPosY(S(22));
-            if (Button("Get", S(84, 36)))
-                ShellExecuteW(nullptr, L"open", L"https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio",
-                              nullptr, nullptr, SW_SHOWNORMAL);
+            if (Button(*fix ? fix : "Get", S(150, 36))) {
+                if (*fix)
+                    w.FixTools(ok);
+                else
+                    ShellExecuteW(nullptr, L"open", L"https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio",
+                                  nullptr, nullptr, SW_SHOWNORMAL);
+            }
         }
     }
     EndPanel();
@@ -2001,7 +2050,8 @@ void ReportPage(Wizard& w, bool& quit) {
 //                 [--install <folder>] (default: this setup's folder) [--jobs <n>] (default: automatic)
 //   (each also as one argument: --game=<path>)
 // Prints "progress <0..1> <step>" lines on stdout and exits 0 when the game is built. Exit codes: 2 a missing or
-// wrong argument, 3 no C++ build tools, 4 the install or build failed. Nothing else changes without --prepare.
+// wrong argument, 3 no C++ build tools (after Microsoft's installer was run to install or update them, unless
+// --no-tools-install), 4 the install or build failed. Nothing else changes without --prepare.
 void Out(const std::string& s) {
     const HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
     if (h && h != INVALID_HANDLE_VALUE) {
@@ -2021,7 +2071,7 @@ int RunPrepare(Wizard& w, const std::vector<std::wstring>& args) {
         const size_t eq = a.find(L'=');
         if (eq != std::wstring::npos)
             v = a.substr(eq + 1), a.resize(eq);
-        else if (i + 1 < args.size() && a != L"--prepare")
+        else if (i + 1 < args.size() && a != L"--prepare" && a != L"--no-tools-install") // (flags without a value)
             v = args[++i];
         if (v.empty())
             continue;
@@ -2053,7 +2103,25 @@ int RunPrepare(Wizard& w, const std::vector<std::wstring>& args) {
         Out("error No prod.keys: pass --keys <your prod.keys>");
         return 2;
     }
-    const builder::Toolchain tc = builder::FindToolchain();
+    // The C++ tools: when they are missing, too old or without C++ (or without clang-cl, which makes the build about
+    // 10x faster), Microsoft's installer fixes them first (its own window and Windows' admin prompt), unless
+    // --no-tools-install.
+    builder::Toolchain tc = builder::FindToolchain();
+    const bool no_clang = tc.ok && builder::FindClang(tc.vcvars).empty();
+    if ((!tc.ok && tc.fix != builder::Toolchain::Fix::None) || no_clang) {
+        if (std::find(args.begin(), args.end(), L"--no-tools-install") != args.end()) {
+            if (!tc.ok) {
+                Out("error " + tc.problem);
+                return 3;
+            }
+        } else {
+            Out(tc.ok ? "note clang-cl is not installed: adding it (a much faster build)" : "note " + tc.problem);
+            std::string err;
+            if (!builder::FixTools(tc, no_clang, [](const std::string& s) { Out("note " + s); }, err))
+                Out("note " + err);
+            tc = builder::FindToolchain();
+        }
+    }
     if (!tc.ok) {
         Out("error " + tc.problem);
         return 3;
