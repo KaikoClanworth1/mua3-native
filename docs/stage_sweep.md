@@ -121,6 +121,34 @@ Usage notes:
 - **Safety:** the sweep holds the test lock and checks its token before every action. It never touches `GameFiles` or
   the user's save. It does not start, and it stops, when D: has less than 10 GB free.
 
+## Automated, idle-gated runs: `build\autotest\autotest.ps1`
+
+The test runner walks a queue of scenarios (`build\autotest\queue.json`):
+
+- title screen idle;
+- the GRAPHICS page;
+- ST010 combat;
+- env var A/B runs;
+- the sweep, one checkpoint at a time.
+
+It starts a game only when the PC has had no mouse or keyboard input for 10 minutes and the CPU is low.
+`build\autotest\watch.ps1` stops the game within a fraction of a second when input returns, and the run is void and
+retried later.
+
+Each run is checked from its `err.log`:
+
+- the memory slope of the `memory: process N MB private` lines;
+- `[FATAL]` / PANIC / "has no recompiled version" lines, crashes and hangs;
+- the frame times of the `display:` lines after load.
+
+Results go to `build\autotest\results\<run>\`: `summary.md`, `summary.json`, and one folder per scenario.
+`autotest.ps1 -Verdict` prints the overall verdict and exits with 0 for PASS, 1 for FAIL and 2 for INCOMPLETE.
+
+The sweep takes two parameters for this:
+
+- `-LockToken`: run under the caller's test lock;
+- `-VoidFile`: record no row for a checkpoint whose game was stopped because the user came back.
+
 ## Finding where the game loads a file: `MUA3_TRACE_OPEN`
 
 `MUA3_TRACE_OPEN=<text>` logs the guest registers and call stack for the first read of each RomFS file whose path
