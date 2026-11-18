@@ -12,6 +12,7 @@
 #include <SDL3/SDL.h>
 #include <imgui.h>
 #include <windows.h>
+#include <psapi.h>
 #include <timeapi.h>
 #include <dbghelp.h>
 
@@ -807,6 +808,27 @@ int main(int argc, char** argv) {
             if (now - t0 > std::chrono::seconds(5)) {
                 if (n)
                     LOG_INFO("Main", "display: {} frames, avg {:.2f} ms, worst {:.1f} ms, {} over 20 ms", n, sum / n, worst, late);
+                // Memory: whole-process stalls of hundreds of ms (every thread, GPU idle) on players' PCs look like
+                // paging; this line tells (process memory, page faults per second, the system's free RAM and commit).
+                {
+                    static DWORD last_faults = 0;
+                    PROCESS_MEMORY_COUNTERS_EX pm{};
+                    pm.cb = sizeof(pm);
+                    MEMORYSTATUSEX ms{};
+                    ms.dwLength = sizeof(ms);
+                    if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pm), sizeof(pm)) &&
+                        GlobalMemoryStatusEx(&ms)) {
+                        const double secs = std::chrono::duration<double>(now - t0).count();
+                        const DWORD faults = pm.PageFaultCount - last_faults;
+                        if (last_faults)
+                            LOG_INFO("Main", "memory: process {} MB private, {} MB in RAM, {:.0f} page faults/s; system RAM "
+                                             "{} of {} MB free ({}% used), commit {} of {} MB free",
+                                     pm.PrivateUsage >> 20, pm.WorkingSetSize >> 20, faults / std::max(secs, 0.001),
+                                     ms.ullAvailPhys >> 20, ms.ullTotalPhys >> 20, ms.dwMemoryLoad,
+                                     ms.ullAvailPageFile >> 20, ms.ullTotalPageFile >> 20);
+                        last_faults = pm.PageFaultCount;
+                    }
+                }
                 t0 = now;
                 worst = sum = 0;
                 n = late = 0;
