@@ -97,6 +97,13 @@ private:
         Line(fmt::format("p{} = {};", i, v));
     }
     std::string Cbuf(u32 index, u32 byte_off) {
+        // D3D11 has 14 constant buffer registers and b13 is the driver's: buffers 13+ cannot be bound. No program a
+        // draw uses reads them; the harvest finds a few non-programs that do (vs 141a406a2c4c5b79, 7ad266f7b96de330,
+        // 9d0c7582d9502fbc), which then failed to compile on an undeclared c13 / c16. They read 0.
+        if (index >= 13) {
+            res_.unimplemented.insert(fmt::format("cbuf{}", index));
+            return "0u";
+        }
         res_.cbuf_mask |= 1u << index;
         if (index < 18)
             res_.cbuf_rows[index] = cbuf_rows_[index] = std::max(cbuf_rows_[index], (byte_off >> 4) + 1);
@@ -104,6 +111,10 @@ private:
         return fmt::format("c{}[{}].{}", index, byte_off >> 4, comp[(byte_off >> 2) & 3]);
     }
     std::string CbufDyn(u32 index, const std::string& byte_addr) {
+        if (index >= 13) { // (see Cbuf)
+            res_.unimplemented.insert(fmt::format("cbuf{}", index));
+            return "0u";
+        }
         res_.cbuf_mask |= 1u << index;
         res_.cbuf_dyn_mask |= 1u << index;
         return fmt::format("CbufLoad{}({})", index, byte_addr);
@@ -945,6 +956,45 @@ bool Translator::ResolveBrx(u32 pc, u64 insn) {
         if (o == Op::IMNMX_imm) {
             bound = s32(u32(Bits(j, 20, 19)) | (Bit(j, 56) ? 0xFFF80000u : 0u));
             break;
+        }
+    }
+    if (cb_index == 1 && bound < 0) {
+        // No clamp near the BRX: the compiler can clamp an index once and reuse it for many tables further on
+        // (cs 9470967ad218b50c: the clamp at 0xa08 serves the BRX at 0xd08). Follow the table address register back
+        // through its writers (LDC <- SHL/MOV <- IMNMX) to the clamp; give up at any other kind of write.
+        auto writes = [&](u64 j, Op o, u32 reg) {
+            if (u32(Bits(j, 0, 8)) != reg)
+                return false;
+            const std::string_view n = OpName(o);
+            return !(n.rfind("ST", 0) == 0 || n.find("SETP") != std::string_view::npos || n == "BRA" || n == "BRX" ||
+                     n == "SSY" || n == "PBK" || n == "PCNT" || n == "SYNC" || n == "BRK" || n == "CONT" ||
+                     n == "EXIT" || n == "KIL" || n == "BAR" || n == "DEPBAR" || n == "MEMBAR" || n == "NOP" ||
+                     n == "RED" || n == "CCTL" || n == "CCTLL" || n == "Invalid");
+        };
+        u32 want = ~0u;
+        for (u32 q = pc; q >= 16;) { // (to the program start: one clamp at 0x998 serves a BRX at 0x3258)
+            q -= 8;
+            if (q % 32 == 0)
+                continue;
+            const u64 j = At(q);
+            const Op o = Decode(j);
+            if (want == ~0u) { // the LDC loading the target offset into the BRX register
+                if (o == Op::LDC && u32(Bits(j, 0, 8)) == ra)
+                    want = u32(Bits(j, 8, 8));
+                else if (writes(j, o, ra))
+                    break;
+                continue;
+            }
+            if (!writes(j, o, want))
+                continue;
+            if (o == Op::IMNMX_imm) {
+                bound = s32(u32(Bits(j, 20, 19)) | (Bit(j, 56) ? 0xFFF80000u : 0u));
+                break;
+            }
+            if (o == Op::SHL_imm || o == Op::MOV_reg)
+                want = u32(Bits(j, o == Op::MOV_reg ? 20 : 8, 8));
+            else
+                break;
         }
     }
     if (cb_index != 1 || bound < 0 || bound > 255 || !opt_.cbuf1)
