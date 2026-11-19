@@ -121,6 +121,32 @@ Usage notes:
 - **Safety:** the sweep holds the test lock and checks its token before every action. It never touches `GameFiles` or
   the user's save. It does not start, and it stops, when D: has less than 10 GB free.
 
+## Chapters that can't be started: 50-57, 80-83, 105, 106
+
+These chapter starts crash in every run. The cause is the game's own data, not the port, and it isn't missing DLC:
+with the Expansion Pass installed, the DLC chapters (150 and up) play normally. The chapters look unfinished or
+unused, and the game itself never starts them through CONTINUE.
+
+- DATA/DataSavePoint.bin has save points only in chapters 0-11 and 40. Every other chapter in `checkpoints.txt` is a
+  "start" row at 0:0 that the sweep adds itself.
+- The chapters that work at 0:0 (12, 13, 21-31, 41, 42, 100-104, 150+) load a STAGE .pld after their scenario files.
+  These 14 chapters load CHAPTER_NNN, MISSION_NNN_xx, DEPLOY_Chapter and their DEPLOY/ROUTE files, and then no stage.
+
+What each one does (guest addresses, main at 0x8004000):
+
+- **55, 56:** SCENARIO/DeployPosData/DEPLOY_055_00.bin and DEPLOY_056_00.bin are not in the game's RomFS (base and
+  update). nn::fs::OpenFile, called from the game's file loader at 0x9241260, aborts with result 0x2f6202 (fs
+  2002-6065, invalid mount name), and the game stops with svcBreak.
+- **105, 106:** f_8841000 at 0x88411c8 reads `[object + 0xfd8a0 + index * 0x74 + 0xbba4]`. The index comes from a
+  signed 16-bit table entry that is -1 ("no entry") for these chapters (f_83f7750). f_83c2390 uses it unsigned, so
+  the read lands about 0x74_0000_0000 past the object, at the same guest address in every run. Real hardware would
+  fault there too.
+- **50-54, 57, 80-83:** f_85d2bf0 at 0x85d2c38 reads `[[mission + 0x20] + 0x14]`, and `mission + 0x20` is null
+  because no stage was loaded.
+
+The sweep's dead-row rule does not skip them, because it only skips checkpoints that were always no_gameplay or
+no_stage, and these crash. Read their crash rows as expected.
+
 ## Automated, idle-gated runs: `build\autotest\autotest.ps1`
 
 The test runner walks a queue of scenarios (`build\autotest\queue.json`):
