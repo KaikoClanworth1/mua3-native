@@ -29,6 +29,7 @@
 #include "app/debug_chapter.h"
 #include "platform/bug_capture.h"
 #include "gpu/d3d11/shader_cache.h"
+#include "gpu/d3d11/texture_stats.h"
 #include "core/cpu/cpu.h"
 #include "gpu/shader/harvest.h"
 #include "gpu/gpu.h"
@@ -904,12 +905,23 @@ int main(int argc, char** argv) {
                         GlobalMemoryStatusEx(&ms)) {
                         const double secs = std::chrono::duration<double>(now - t0).count();
                         const DWORD faults = pm.PageFaultCount - last_faults;
+                        // texture uploads per second (#8: CPU-rewritten glyph caches uploaded again on AMD)
+                        auto& ts = gpu::g_texture_stats;
+                        const u64 tex[7] = {ts.reuploads.load(), ts.reupload_bytes.load(), ts.partial.load(),
+                                            ts.unchanged.load(), ts.uploads.load(), ts.upload_bytes.load(),
+                                            ts.staged.load()};
+                        static u64 last_tex[7]{};
+                        auto rate = [&](int i) { return double(tex[i] - last_tex[i]) / std::max(secs, 0.001); };
                         if (last_faults)
                             LOG_INFO("Main", "memory: process {} MB private, {} MB in RAM, {:.0f} page faults/s; system RAM "
-                                             "{} of {} MB free ({}% used), commit {} of {} MB free",
+                                             "{} of {} MB free ({}% used), commit {} of {} MB free | textures: {:.1f} "
+                                             "re-uploads/s ({:.1f} MB/s, {:.1f}/s partial, {:.1f}/s staged), {:.1f} unchanged rewrites/s, "
+                                             "{:.1f} new/s ({:.1f} MB/s)",
                                      pm.PrivateUsage >> 20, pm.WorkingSetSize >> 20, faults / std::max(secs, 0.001),
                                      ms.ullAvailPhys >> 20, ms.ullTotalPhys >> 20, ms.dwMemoryLoad,
-                                     ms.ullAvailPageFile >> 20, ms.ullTotalPageFile >> 20);
+                                     ms.ullAvailPageFile >> 20, ms.ullTotalPageFile >> 20, rate(0), rate(1) / (1 << 20),
+                                     rate(2), rate(6), rate(3), rate(4), rate(5) / (1 << 20));
+                        std::copy(std::begin(tex), std::end(tex), last_tex);
                         last_faults = pm.PageFaultCount;
                     }
                 }

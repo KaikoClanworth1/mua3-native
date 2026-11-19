@@ -167,6 +167,49 @@ u64 BlockLinearSize(u32 width, u32 height, u32 depth, u32 bpb, u32 bh, u32 bd) {
     return u64(gobs_x) * blocks_y * blocks_z * (512ull << (bh + bd));
 }
 
+void BlockLinearRects(u32 width, u32 height, u32 bpb, u32 bh, const std::pair<u64, u64>* ranges, size_t count,
+                      std::vector<BlockLinearRect>& out) {
+    out.clear();
+    const u32 width_bytes = width * bpb;
+    const u32 gobs_x = (width_bytes + 63) / 64;
+    const u32 gobs_y = (height + 7) / 8;
+    const u32 gobs_per_block = 1u << bh;
+    const u32 blocks_y = (gobs_y + gobs_per_block - 1) >> bh;
+    if (!gobs_x || !blocks_y)
+        return;
+    // per block row: the GOB columns [x0, x1) and the GOB rows inside the block [y0, y1) touched
+    struct Band {
+        u32 x0 = ~0u, x1 = 0, y0 = ~0u, y1 = 0;
+    };
+    std::vector<Band> bands(blocks_y);
+    const u64 gobs = u64(gobs_x) * blocks_y * gobs_per_block;
+    for (size_t i = 0; i < count; i++) {
+        const auto [off, size] = ranges[i];
+        if (!size)
+            continue;
+        const u64 g_end = std::min<u64>((off + size - 1) / 512 + 1, gobs);
+        for (u64 g = off / 512; g < g_end; g++) {
+            const u64 block = g >> bh;
+            const u32 bx = u32(block % gobs_x), by = u32(block / gobs_x), gy = u32(g & (gobs_per_block - 1));
+            Band& b = bands[by];
+            b.x0 = std::min(b.x0, bx), b.x1 = std::max(b.x1, bx + 1);
+            b.y0 = std::min(b.y0, gy), b.y1 = std::max(b.y1, gy + 1);
+        }
+    }
+    const u64 block_size = 512ull << bh;
+    for (u32 by = 0; by < blocks_y; by++) {
+        const Band& b = bands[by];
+        if (b.x1 == 0)
+            continue;
+        const u32 row0 = by * (8u << bh) + b.y0 * 8;
+        const u32 row1 = std::min(height, by * (8u << bh) + b.y1 * 8);
+        const u32 x0 = b.x0 * 64 / bpb, x1 = std::min(width, b.x1 * 64 / bpb);
+        if (row0 >= row1 || x0 >= x1)
+            continue; // (padding below or right of the image)
+        out.push_back({x0, row0, x1 - x0, row1 - row0, (u64(by) * gobs_x + b.x0) * block_size + u64(b.y0) * 512});
+    }
+}
+
 void Deswizzle(const u8* src, u8* dst, u32 width, u32 height, u32 depth, u32 bpb, u32 bh, u32 bd, u32 dst_pitch) {
     const u32 width_bytes = width * bpb;
     const u32 gobs_x = (width_bytes + 63) / 64;

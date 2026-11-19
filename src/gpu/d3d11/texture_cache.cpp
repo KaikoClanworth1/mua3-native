@@ -8,6 +8,7 @@
 #include "core/memory.h"
 #include "gpu/d3d11/renderer_d3d11.h"
 #include "gpu/d3d11/shader_cache.h"
+#include "gpu/d3d11/texture_stats.h"
 #include "gpu/formats.h"
 #include "gpu/gpu.h"
 
@@ -17,6 +18,16 @@ TextureCache::TextureCache(ID3D11Device* dev, ID3D11DeviceContext* ctx, D3D11Ren
     : dev_(dev), ctx_(ctx), r_(r) {
     const char* b = std::getenv("MUA3_TEX_BUDGET_MS");
     budget_ns_ = u64(b ? std::atof(b) : 8.0) * 1'000'000;
+    { // (#8 diagnostics: which way CPU-rewritten textures are uploaded again; Get reads the same variables)
+        const bool full = std::getenv("MUA3_TEX_FULL") != nullptr, staging = std::getenv("MUA3_TEX_STAGING") != nullptr;
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LOG_INFO("Texture", "upload path {} ({})",
+                     staging ? (full ? "staging, whole textures" : "staging") : full ? "full" : "default (partial)",
+                     staging || full ? "from env" : "no MUA3_TEX_FULL / MUA3_TEX_STAGING");
+        }
+    }
     if (budget_ns_)
         for (int i = 0; i < 2; i++)
             workers_.emplace_back([this] { AsyncWorker(); });
@@ -172,15 +183,30 @@ static void HashPages(CachedTexture& t) {
     t.page_hash.clear();
     ForEachPage(t, [&](size_t, u64 cpu, u64 n) { t.page_hash.push_back(ContentHash(G().Mem().Ptr(cpu), size_t(n))); });
 }
-// True if a dirty page's contents differ from when the texture was decoded (pages are re-hashed: call it once).
-static bool DirtyPagesChanged(CachedTexture& t) {
-    bool changed = false;
+// The dirty pages whose contents differ from when the texture was decoded, as (offset, size) in the texture: each dirty
+// page is write-tracked again first, then re-hashed (its new hash kept), so a write that lands meanwhile marks it
+// dirty again instead of being lost. Returns the bytes tracked again.
+static u64 ChangedPages(CachedTexture& t, std::vector<std::pair<u64, u64>>& out) {
+    out.clear();
+    u64 off = 0, tracked = 0;
     ForEachPage(t, [&](size_t k, u64 cpu, u64 n) {
-        if (changed || !G().Mem().ConsumeDirty(cpu, n))
+        const u64 o = off;
+        off += n;
+        if (!G().Mem().ConsumeDirty(cpu, n))
             return;
-        changed = k >= t.page_hash.size() || ContentHash(G().Mem().Ptr(cpu), size_t(n)) != t.page_hash[k];
+        G().Mem().TrackWrites(cpu, n);
+        tracked += n;
+        const u64 h = ContentHash(G().Mem().Ptr(cpu), size_t(n));
+        if (k < t.page_hash.size() && h == t.page_hash[k])
+            return;
+        if (k < t.page_hash.size())
+            t.page_hash[k] = h;
+        if (!out.empty() && out.back().first + out.back().second == o)
+            out.back().second += n;
+        else
+            out.emplace_back(o, n);
     });
-    return changed;
+    return tracked;
 }
 
 ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::TextureUse& use, u32& swizzle) {
@@ -251,14 +277,19 @@ ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::T
         CachedTexture& t = *it->second;
         // Pages written, contents as uploaded: keep it (MUA3_TEX_NOHASH=1 re-decodes on every write as before).
         static const bool no_hash = std::getenv("MUA3_TEX_NOHASH") != nullptr;
-        if (!no_hash && !t.page_hash.empty() && !DirtyPagesChanged(t)) {
-            for (auto& [a, n] : t.cpu_ranges)
-                G().Mem().TrackWrites(a, n), tracked_bytes += n;
-            t.last_use = frame_;
-            unchanged_rewrites++;
-            return t.srv.Get();
+        static thread_local std::vector<std::pair<u64, u64>> changed;
+        changed.clear();
+        if (!no_hash && !t.page_hash.empty()) {
+            tracked_bytes += ChangedPages(t, changed);
+            if (changed.empty()) {
+                t.last_use = frame_;
+                unchanged_rewrites++;
+                g_texture_stats.unchanged.fetch_add(1, std::memory_order_relaxed);
+                return t.srv.Get();
+            }
         }
         reuploads++;
+        g_texture_stats.reuploads.fetch_add(1, std::memory_order_relaxed);
         static std::map<u64, u32> logged; // (diagnostics) textures the CPU really rewrites
         if (logged.size() < 32 && logged[addr]++ == 0)
             LOG_INFO("Texture", "rewritten by the CPU: {:#x} fmt {:#x} {}x{}x{} type {} {} bytes", addr, tic.Format(),
@@ -269,15 +300,43 @@ ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::T
             D3D11_BUFFER_DESC bd;
             static_cast<ID3D11Buffer*>(t.res.Get())->GetDesc(&bd);
             static thread_local std::vector<u8> tmp;
+            // only the changed bytes (pages already tracked and hashed again by ChangedPages), unless MUA3_TEX_FULL=1
+            static const bool full_buffers = std::getenv("MUA3_TEX_FULL") != nullptr;
+            if (!full_buffers && !changed.empty()) {
+                u64 uploaded = 0;
+                for (auto& [o, n] : changed) {
+                    if (o >= bd.ByteWidth)
+                        continue;
+                    const u32 len = u32(std::min<u64>(n, bd.ByteWidth - o));
+                    tmp.resize(len);
+                    G().ReadGpuPartial(addr + o, tmp.data(), len);
+                    const D3D11_BOX box{u32(o), 0, 0, u32(o) + len, 1, 1};
+                    ctx_->UpdateSubresource(t.res.Get(), 0, &box, tmp.data(), 0, 0);
+                    uploaded += len;
+                }
+                g_texture_stats.partial.fetch_add(1, std::memory_order_relaxed);
+                g_texture_stats.reupload_bytes.fetch_add(uploaded, std::memory_order_relaxed);
+                t.last_use = frame_;
+                return t.srv.Get();
+            }
             tmp.assign(bd.ByteWidth, 0);
             G().ReadGpuPartial(addr, tmp.data(), bd.ByteWidth);
             ctx_->UpdateSubresource(t.res.Get(), 0, nullptr, tmp.data(), 0, 0);
+            g_texture_stats.reupload_bytes.fetch_add(bd.ByteWidth, std::memory_order_relaxed);
             HashPages(t);
             for (auto& [a, n] : t.cpu_ranges)
                 G().Mem().TrackWrites(a, n), tracked_bytes += n;
             t.last_use = frame_;
             return t.srv.Get();
         }
+        // Only the rewritten part (glyphs added to a 4 MB glyph cache), unless MUA3_TEX_FULL=1 (all of it, as before).
+        // MUA3_TEX_STAGING=1: through reused staging textures and CopySubresourceRegion instead of UpdateSubresource
+        // (GitHub #8: host memory grows on AMD while these are updated); with MUA3_TEX_FULL=1, all of it that way.
+        static const bool full = std::getenv("MUA3_TEX_FULL") != nullptr;
+        static const bool staging = std::getenv("MUA3_TEX_STAGING") != nullptr;
+        if (t.updatable && (staging || (!full && !changed.empty())) &&
+            UpdateRects(tic, use, t, changed, staging, full || changed.empty()))
+            return t.srv.Get();
         if (t.updatable)
             if (auto* srv = Upload(tic, use, key, &t))
                 return srv;
@@ -373,6 +432,168 @@ ID3D11ShaderResourceView* TextureCache::Placeholder(const shader::TextureUse& us
         dev_->CreateShaderResourceView(t.Get(), nullptr, &placeholder_);
     }
     return placeholder_.Get();
+}
+
+// A CPU-rewritten 2D texture (block linear, one level, updatable): only the rectangles under the changed pages are
+// decoded and updated (UpdateSubresource with a box), instead of all of it. False if it does not apply: the caller
+// uploads it whole.
+bool TextureCache::UpdateRects(const TicEntry& tic, const shader::TextureUse& use, CachedTexture& t,
+                               const std::vector<std::pair<u64, u64>>& changed, bool staging, bool whole) {
+    // (diagnostics: why a rewritten texture is uploaded whole, once per texture)
+    auto decline = [&](const char* why) {
+        static std::set<u64> said;
+        if (said.size() < 16 && said.insert(tic.Address()).second)
+            LOG_INFO("Texture", "rewritten {:#x} fmt {:#x} {}x{} type {} header {}: uploaded whole ({})", tic.Address(),
+                     tic.Format(), tic.Width(), tic.Height(), tic.Type(), tic.HeaderVersion(), why);
+        return false;
+    };
+    if (use.dim != shader::TexDim::Tex2D || use.array || tic.IsBuffer())
+        return decline("not a 2D texture");
+    const u32 type = tic.Type();
+    if (!(type == 7 || (type == 1 && tic.MaxMip() == 0)))
+        return decline("mipmapped or not 2D");
+    const TexFormatInfo fi = TicFormat(tic.Format(), tic.RType(), tic.Srgb());
+    const u32 bpb = fi.bytes_per_block;
+    if (fi.dxgi == DXGI_FORMAT_UNKNOWN || fi.astc || !bpb || 64 % bpb)
+        return decline("format");
+    D3D11_RESOURCE_DIMENSION dim{};
+    t.res->GetType(&dim);
+    if (dim != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+        return decline("resource not 2D");
+    const u32 w = tic.Width(), h = tic.Height();
+    const u32 bw = (w + fi.block_w - 1) / fi.block_w, bh = (h + fi.block_h - 1) / fi.block_h;
+    // block linear (header 3+) or pitch linear (rows tic.Pitch() bytes apart, as Upload reads them)
+    const bool block_linear = tic.HeaderVersion() >= 3;
+    const u32 src_pitch = tic.Pitch();
+    u32 bhl = tic.BlockHeight();
+    while (bhl > 0 && (8u << (bhl - 1)) >= bh)
+        bhl--;
+    if (!block_linear && src_pitch < bw * bpb)
+        return decline("pitch below the row size");
+    const u64 total = block_linear ? BlockLinearSize(bw, bh, 1, bpb, bhl, 0) : u64(src_pitch) * bh;
+    if (total != t.size)
+        return decline("size differs from the upload");
+    u64 bytes = 0;
+    for (auto& [o, n] : changed)
+        bytes += n;
+    if (bytes * 2 > total) { // most of it: one whole upload
+        if (!staging)
+            return decline("over half of it changed");
+        whole = true;
+    }
+    const u8* guest = G().GpuPtr(tic.Address(), size_t(total));
+    if (!guest)
+        return decline("guest memory not contiguous");
+    static thread_local std::vector<BlockLinearRect> rects;
+    if (whole) {
+        rects.assign(1, BlockLinearRect{0, 0, bw, bh, 0});
+    } else if (block_linear) {
+        BlockLinearRects(bw, bh, bpb, bhl, changed.data(), changed.size(), rects);
+    } else { // pitch linear: the rows under the changed bytes, whole width (`changed` is sorted, adjacent ranges merged)
+        rects.clear();
+        for (auto& [o, n] : changed) {
+            const u32 y0 = u32(o / src_pitch), y1 = u32(std::min<u64>((o + n - 1) / src_pitch + 1, bh));
+            if (y0 >= y1)
+                continue;
+            if (!rects.empty() && rects.back().y + rects.back().h >= y0)
+                rects.back().h = std::max(rects.back().h, y1 - rects.back().y);
+            else
+                rects.push_back({0, y0, bw, y1 - y0, u64(y0) * src_pitch});
+        }
+    }
+    // the rectangle's elements from guest memory into `dst` (rows `dst_pitch` bytes apart)
+    auto decode = [&](const BlockLinearRect& r, u8* dst, size_t dst_pitch) {
+        if (block_linear) {
+            Deswizzle(guest + r.src, dst, r.w, r.h, 1, bpb, bhl, 0, u32(dst_pitch));
+            return;
+        }
+        const size_t row = size_t(r.w) * bpb;
+        for (u32 y = 0; y < r.h; y++)
+            std::memcpy(dst + y * dst_pitch, guest + r.src + size_t(y) * src_pitch + size_t(r.x) * bpb, row);
+    };
+    auto box_of = [&](const BlockLinearRect& r) {
+        return D3D11_BOX{r.x * fi.block_w, r.y * fi.block_h, 0, std::min(w, (r.x + r.w) * fi.block_w),
+                         std::min(h, (r.y + r.h) * fi.block_h), 1};
+    };
+    u64 uploaded = 0;
+    if (staging) {
+        // decode straight into a staging texture of the same format and size, then copy the rectangles across
+        D3D11_MAPPED_SUBRESOURCE m{};
+        ID3D11Texture2D* st = MapStaging(static_cast<ID3D11Texture2D*>(t.res.Get()), m);
+        if (!st)
+            return false;
+        for (const BlockLinearRect& r : rects) {
+            u8* dst = static_cast<u8*>(m.pData) + size_t(r.y) * m.RowPitch + size_t(r.x) * bpb;
+            decode(r, dst, m.RowPitch);
+            uploaded += u64(r.w) * bpb * r.h;
+        }
+        ctx_->Unmap(st, 0);
+        for (const BlockLinearRect& r : rects) {
+            const D3D11_BOX box = box_of(r);
+            ctx_->CopySubresourceRegion(t.res.Get(), 0, box.left, box.top, 0, st, 0, &box);
+        }
+        g_texture_stats.staged.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        static thread_local std::vector<u8> lin;
+        for (const BlockLinearRect& r : rects) {
+            const u32 pitch = r.w * bpb;
+            if (lin.size() < size_t(pitch) * r.h)
+                lin.resize(size_t(pitch) * r.h);
+            decode(r, lin.data(), pitch);
+            const D3D11_BOX box = box_of(r);
+            ctx_->UpdateSubresource(t.res.Get(), 0, &box, lin.data(), pitch, 0);
+            uploaded += u64(pitch) * r.h;
+        }
+    }
+    if (whole) { // (the whole texture: its pages hashed and tracked again, as Upload does)
+        for (auto& [a, n] : t.cpu_ranges)
+            G().Mem().TrackWrites(a, n), tracked_bytes += n;
+        HashPages(t);
+    }
+    if (!whole)
+        g_texture_stats.partial.fetch_add(1, std::memory_order_relaxed);
+    g_texture_stats.reupload_bytes.fetch_add(uploaded, std::memory_order_relaxed);
+    t.last_use = frame_;
+    return true;
+}
+
+// A staging texture like `dst` (format, size), mapped for writing: the first of its ring the GPU is done with, a new
+// one while the ring has fewer than kStagingRing, else the next in turn (waiting for it). Null if none could be made.
+ID3D11Texture2D* TextureCache::MapStaging(ID3D11Texture2D* dst, D3D11_MAPPED_SUBRESOURCE& m) {
+    constexpr size_t kStagingRing = 8;
+    D3D11_TEXTURE2D_DESC d;
+    dst->GetDesc(&d);
+    StagingRing& ring = staging_[(u64(d.Format) << 48) ^ (u64(d.Width) << 24) ^ d.Height];
+    const size_t n = ring.tex.size();
+    for (size_t i = 0; i < n; i++) {
+        const size_t k = (ring.next + i) % n;
+        if (SUCCEEDED(ctx_->Map(ring.tex[k].Get(), 0, D3D11_MAP_WRITE, D3D11_MAP_FLAG_DO_NOT_WAIT, &m))) {
+            ring.next = k + 1;
+            return ring.tex[k].Get();
+        }
+    }
+    if (n < kStagingRing) {
+        d.MipLevels = d.ArraySize = 1;
+        d.Usage = D3D11_USAGE_STAGING;
+        d.BindFlags = 0;
+        d.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        d.MiscFlags = 0;
+        ComPtr<ID3D11Texture2D> s;
+        if (FAILED(dev_->CreateTexture2D(&d, nullptr, &s)) || FAILED(ctx_->Map(s.Get(), 0, D3D11_MAP_WRITE, 0, &m))) {
+            LOG_WARN("Texture", "staging texture {}x{} format {} could not be made", d.Width, d.Height, int(d.Format));
+            return nullptr;
+        }
+        ring.tex.push_back(s);
+        ring.next = n + 1;
+        LOG_INFO("Texture", "MUA3_TEX_STAGING: staging texture {} of {} for {}x{} format {}", n + 1, kStagingRing,
+                 d.Width, d.Height, int(d.Format));
+        return s.Get();
+    }
+    const size_t k = ring.next % n;
+    if (FAILED(ctx_->Map(ring.tex[k].Get(), 0, D3D11_MAP_WRITE, 0, &m)))
+        return nullptr;
+    ring.next = k + 1;
+    return ring.tex[k].Get();
 }
 
 ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader::TextureUse& use, u64 key, CachedTexture* reuse,
@@ -515,6 +736,7 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
     }
     // Rewritten texture we already re-created as updatable: decode straight into it.
     if (reuse) {
+        g_texture_stats.reupload_bytes.fetch_add(total, std::memory_order_relaxed);
         for (size_t i = 0; i < init.size(); i++)
             ctx_->UpdateSubresource(reuse->res.Get(), UINT(i), nullptr, init[i].pSysMem, init[i].SysMemPitch,
                                     init[i].SysMemSlicePitch);
@@ -525,6 +747,8 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
         return reuse->srv.Get();
     }
     u64 t1 = NowNs();
+    g_texture_stats.uploads.fetch_add(1, std::memory_order_relaxed);
+    g_texture_stats.upload_bytes.fetch_add(total, std::memory_order_relaxed);
     if (!async) {
         up_ns_[0] += t1 - t0;
         up_count_++;

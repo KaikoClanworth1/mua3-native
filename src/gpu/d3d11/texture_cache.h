@@ -66,6 +66,15 @@ private:
     // `out`: build the texture there instead of adding it to the cache (worker threads).
     ID3D11ShaderResourceView* Upload(const TicEntry& tic, const shader::TextureUse& use, u64 key, CachedTexture* reuse = nullptr,
                                      bool updatable = false, std::unique_ptr<CachedTexture>* out = nullptr);
+    // `staging`: through MapStaging and CopySubresourceRegion; `whole`: all of it (not only `changed`).
+    bool UpdateRects(const TicEntry& tic, const shader::TextureUse& use, CachedTexture& t,
+                     const std::vector<std::pair<u64, u64>>& changed, bool staging, bool whole);
+    struct StagingRing {
+        std::vector<ComPtr<ID3D11Texture2D>> tex;
+        size_t next = 0;
+    };
+    std::unordered_map<u64, StagingRing> staging_; // (format, width, height) -> staging textures (MUA3_TEX_STAGING)
+    ID3D11Texture2D* MapStaging(ID3D11Texture2D* dst, D3D11_MAPPED_SUBRESOURCE& m);
     // Asynchronous uploads (MUA3_TEX_BUDGET_MS per frame of synchronous upload time, default 8, 0 = all synchronous):
     // a load that brings hundreds of textures at once spreads them over a few frames instead of one long one.
     struct AsyncJob {
