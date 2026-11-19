@@ -44,6 +44,8 @@ void Shutdown();
 
 // Developer tests and screenshots: 0 PLAY, 1 MODS, 2 SETTINGS, 3 EXIT; `focus` puts the keyboard in that section.
 void Select(int section, bool focus);
+// Tests and screenshots: SETTINGS > RUN DIAGNOSTICS; with `sample_log` (a game log), its result as if a run made it.
+void OpenDiagnostics(const fs::path& sample_log);
 // Installs `path` as a mod and waits for it (developer test); returns the status line.
 std::string InstallNow(const fs::path& path);
 

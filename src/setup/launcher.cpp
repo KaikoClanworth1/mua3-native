@@ -20,6 +20,7 @@
 #include "core/config.h"
 #include "core/hle/mods.h"
 #include "launcher/report.h"
+#include "setup/diagnostics.h"
 #include "setup/ui_util.h"
 #include "setup/updater.h"
 
@@ -194,6 +195,12 @@ struct State {
     // SETTINGS
     core::Config cfg;
     int settings_sel = 0;
+
+    // SETTINGS > RUN DIAGNOSTICS
+    diag::Runner diag;
+    bool diag_open = false, diag_shown_result = false;
+    std::vector<bool> diag_pick = {true, false, false};
+    int diag_sel = 0;
 
     // a newer version of the port (checked once when the launcher opens)
     updater::Updater update;
@@ -850,7 +857,7 @@ void PlaySection(ImDrawList* dl, const Layout& L, bool activate) {
         }
         y += U(74);
     }
-    if (exe && !g.game && (BigButton(dl, "play", "PLAY", ImVec2(x0, y), ImVec2(x1, y + U(58)), g.in_section || activate) ||
+    if (exe && !g.game && !g.diag.Running() && (BigButton(dl, "play", "PLAY", ImVec2(x0, y), ImVec2(x1, y + U(58)), g.in_section || activate) ||
                            activate))
         Launch();
 }
@@ -1213,6 +1220,183 @@ void ModsSection(ImDrawList* dl, const Layout& L) {
     }
 }
 
+
+// ---- SETTINGS > RUN DIAGNOSTICS (setup/diagnostics.h)
+void DiagnosticsPanel(ImDrawList* dl, const Layout& L, float y) {
+    const auto& variants = diag::Variants();
+    const float x0 = L.x0, x1 = L.x1;
+    {
+        Font f(g_head, 20);
+        Spaced(dl, ImVec2(x0, y), col::yellow, "RUN DIAGNOSTICS", U(2));
+    }
+    y += U(34);
+    const bool running = g.diag.Running();
+    if (running) {
+        const int cur = g.diag.current, total = g.diag.total;
+        const double el = g.diag.run_elapsed;
+        std::string label, status;
+        {
+            std::lock_guard lk(g.diag.mutex);
+            status = g.diag.status;
+        }
+        if (cur >= 1 && cur <= int(variants.size()))
+            for (size_t i = 0, n = 0; i < variants.size(); i++)
+                if (g.diag_pick[i] && int(++n) == cur)
+                    label = variants[i].label;
+        {
+            Font f(g_head, 24);
+            dl->AddText(ImVec2(x0, y), col::text, fmt::format("TEST {} OF {}  ·  {}", cur, total, label).c_str());
+        }
+        y += U(40);
+        const float frac = float(std::clamp(el / diag::kScriptSeconds, 0.0, 1.0));
+        dl->AddRectFilled(ImVec2(x0, y), ImVec2(x1, y + U(10)), IM_COL32(40, 54, 96, 235), U(5));
+        dl->AddRectFilled(ImVec2(x0, y), ImVec2(x0 + (x1 - x0) * frac, y + U(10)), col::yellow, U(5));
+        y += U(22);
+        {
+            Font f(g_body, 15);
+            const int left = int(std::max(0.0, diag::kScriptSeconds - el)) + int(diag::kScriptSeconds) * (total - cur);
+            dl->AddText(ImVec2(x0, y), col::dim,
+                        fmt::format("{}  ·  about {}:{:02} left in all", status, left / 60, left % 60).c_str());
+            y += U(30);
+            dl->AddText(nullptr, 0, ImVec2(x0, y), col::faint,
+                        "The game plays by itself. Leave the mouse, keyboard and controller alone until it ends; "
+                        "the launcher comes back with the result.",
+                        nullptr, x1 - x0);
+        }
+        y += U(64);
+        if (BigButton(dl, "dcancel", "CANCEL", ImVec2(x0, y), ImVec2(x0 + U(220), y + U(50)), g.in_section) ||
+            (g.in_section && NavAccept()))
+            g.diag.Cancel();
+        return;
+    }
+    if (g.diag_shown_result) {
+        std::lock_guard lk(g.diag.mutex);
+        int passed = 0;
+        for (auto& r : g.diag.results)
+            passed += r.pass;
+        {
+            Font f(g_head, 24);
+            dl->AddText(ImVec2(x0, y), passed == int(g.diag.results.size()) ? col::green : col::red,
+                        fmt::format("{} OF {} PASSED", passed, g.diag.results.size()).c_str());
+        }
+        y += U(40);
+        for (auto& r : g.diag.results) {
+            {
+                Font f(g_head, 16);
+                dl->AddText(ImVec2(x0, y), r.pass ? col::green : col::red, r.pass ? "PASS" : "FAIL");
+                dl->AddText(ImVec2(x0 + U(64), y), col::text, r.label.c_str());
+            }
+            y += U(22);
+            std::string sub = r.slope_known ? fmt::format("memory {:+.0f} MB/min", r.slope) : std::string("memory: no reading");
+            if (r.frames)
+                sub += fmt::format("  ·  {:.1f} ms average, {:.0f} ms worst", r.avg_ms, r.worst_ms);
+            if (!r.why.empty())
+                sub += "  ·  " + r.why;
+            Font f(g_body, 13.5f);
+            dl->AddText(nullptr, 0, ImVec2(x0 + U(64), y), r.pass ? col::dim : col::amber, sub.c_str(), nullptr, x1 - x0 - U(64));
+            y += U(34);
+        }
+        y += U(8);
+        {
+            Font f(g_body, 14);
+            dl->AddText(nullptr, 0, ImVec2(x0, y), col::dim,
+                        "The report and the logs are in the folder. To send them, open a new issue on GitHub and attach "
+                        "report.txt and the logs. Nothing is sent by the launcher.",
+                        nullptr, x1 - x0);
+        }
+        y += U(56);
+        const float bw = (x1 - x0 - U(24)) / 3;
+        const char* labels[] = {"OPEN FOLDER", "REPORT IT >", "AGAIN"};
+        for (int i = 0; i < 3; i++) {
+            const ImVec2 a(x0 + i * (bw + U(12)), y), b(a.x + bw, y + U(46));
+            if (BigButton(dl, labels[i], labels[i], a, b, g.in_section && g.diag_sel == i) ||
+                (g.in_section && g.diag_sel == i && NavAccept())) {
+                if (i == 0)
+                    ShellExecuteW(nullptr, L"open", L"explorer.exe",
+                                  (L"/select,\"" + (g.diag.folder / "report.txt").wstring() + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
+                else if (i == 1) // (only opens the page: the player attaches the files and submits)
+                    ShellExecuteW(nullptr, L"open", L"https://github.com/KaikoClanworth1/mua3-native/issues/new", nullptr, nullptr,
+                                  SW_SHOWNORMAL);
+                else
+                    g.diag_shown_result = false, g.diag_sel = 0;
+            }
+        }
+        if (g.in_section) {
+            if (Pressed({ImGuiKey_LeftArrow, ImGuiKey_GamepadDpadLeft}))
+                g.diag_sel = std::max(0, g.diag_sel - 1);
+            if (Pressed({ImGuiKey_RightArrow, ImGuiKey_GamepadDpadRight}))
+                g.diag_sel = std::min(2, g.diag_sel + 1);
+        }
+        return;
+    }
+    {
+        Font f(g_body, 14.5f);
+        dl->AddText(nullptr, 0, ImVec2(x0, y), col::dim,
+                    "The game plays itself for about 6 minutes per test, with your settings, from a separate empty save "
+                    "(your saves are not touched). Afterwards you get a report to attach to a GitHub issue.",
+                    nullptr, x1 - x0);
+    }
+    y += U(62);
+    const int n = int(variants.size());
+    int picked = 0;
+    for (int i = 0; i < n; i++) {
+        const ImVec2 a(x0, y), b(x1, y + U(52));
+        const bool sel = g.in_section && g.diag_sel == i;
+        dl->AddRectFilled(a, b, sel ? IM_COL32(40, 54, 96, 235) : IM_COL32(20, 34, 70, 200));
+        if (sel)
+            dl->AddRectFilled(a, ImVec2(a.x + U(6), b.y), col::yellow);
+        ImGui::PushID(i);
+        ImGui::SetCursorScreenPos(a);
+        bool flip = ImGui::InvisibleButton("row", b - a);
+        bool on = g.diag_pick[size_t(i)];
+        flip = Toggle(dl, "##t", ImVec2(a.x + U(18), a.y + U(15)), on) || flip;
+        ImGui::PopID();
+        {
+            Font f(g_head, 16);
+            dl->AddText(ImVec2(a.x + U(76), a.y + U(7)), sel ? col::yellow : col::text, variants[size_t(i)].label);
+        }
+        {
+            Font f(g_body, 13);
+            dl->AddText(ImVec2(a.x + U(76), a.y + U(29)), col::dim, variants[size_t(i)].sub);
+        }
+        if (sel && NavAccept())
+            flip = true;
+        if (flip)
+            g.diag_pick[size_t(i)] = !on, g.diag_sel = i;
+        picked += g.diag_pick[size_t(i)];
+        y += U(58);
+    }
+    y += U(10);
+    const bool can = picked > 0 && !g.game && fs::exists(g.dir / "mua3.exe");
+    {
+        Font f(g_body, 14);
+        dl->AddText(ImVec2(x0 + U(240), y + U(15)), can ? col::dim : col::amber,
+                    g.game         ? "Close the game first."
+                    : picked == 0 ? "Pick at least one test."
+                                  : fmt::format("About {} minutes.", picked * 7).c_str());
+    }
+    const bool start_sel = g.in_section && g.diag_sel == n;
+    if ((BigButton(dl, "dstart", "START", ImVec2(x0, y), ImVec2(x0 + U(220), y + U(50)), start_sel) ||
+         (start_sel && NavAccept())) &&
+        can) {
+        std::vector<int> v;
+        for (int i = 0; i < n; i++)
+            if (g.diag_pick[size_t(i)])
+                v.push_back(i);
+        if (g.diag.Start(g.dir, g.host->version, v)) {
+            g.diag_shown_result = true; // (shown once it ends)
+            if (g.host->window)
+                SDL_MinimizeWindow(g.host->window);
+        }
+    }
+    if (g.in_section) {
+        if (NavUp())
+            g.diag_sel = std::max(0, g.diag_sel - 1);
+        if (NavDown())
+            g.diag_sel = std::min(n, g.diag_sel + 1);
+    }
+}
+
 // ---- SETTINGS (the rows come with the shared settings table; until then: the SYSTEM entries)
 Action SettingsSection(ImDrawList* dl, const Layout& L) {
     Action act = Action::None;
@@ -1222,6 +1406,10 @@ Action SettingsSection(ImDrawList* dl, const Layout& L) {
         Shadowed(dl, ImVec2(L.x0, y), col::yellow, "SETTINGS");
     }
     y += U(70);
+    if (g.diag_open || g.diag.Running()) {
+        DiagnosticsPanel(dl, L, y);
+        return act;
+    }
     {
         Font f(g_body, 15);
         dl->AddText(nullptr, 0, ImVec2(L.x0, y), col::dim,
@@ -1238,10 +1426,12 @@ Action SettingsSection(ImDrawList* dl, const Layout& L) {
     const Entry entries[] = {
         {"UPDATE OR REPAIR", "Add an update or DLC, change the language, or build the game again.", Action::UpdateRepair},
         {"REPORT A PROBLEM", "Makes a zip with the logs and crash files to send.", Action::Report},
+        {"RUN DIAGNOSTICS", "A 6-minute test run with a report to attach to a bug report.", Action::None},
         {"UNINSTALL", "Remove the game from this PC. You can keep your saves.", Action::Uninstall},
     };
-    for (int i = 0; i < 3; i++) {
-        const ImVec2 a(L.x0, y), b(L.x1, y + U(66));
+    constexpr int kEntries = int(sizeof(entries) / sizeof(entries[0]));
+    for (int i = 0; i < kEntries; i++) {
+        const ImVec2 a(L.x0, y), b(L.x1, y + U(62));
         ImGui::SetCursorScreenPos(a);
         ImGui::PushID(i);
         const bool click = ImGui::InvisibleButton("e", b - a);
@@ -1259,15 +1449,21 @@ Action SettingsSection(ImDrawList* dl, const Layout& L) {
             Font f(g_body, 13.5f);
             dl->AddText(ImVec2(a.x + U(26), a.y + U(38)), col::dim, entries[i].sub);
         }
-        if (click || (g.in_section && g.settings_sel == i && NavAccept()))
+        if (click || (g.in_section && g.settings_sel == i && NavAccept())) {
             act = entries[i].action;
-        y += U(76);
+            if (act == Action::None) { // RUN DIAGNOSTICS
+                g.diag_open = true;
+                g.diag_sel = 0;
+                g.in_section = true;
+            }
+        }
+        y += U(70);
     }
     if (g.in_section) {
         if (NavUp())
             g.settings_sel = std::max(0, g.settings_sel - 1);
         if (NavDown())
-            g.settings_sel = std::min(2, g.settings_sel + 1);
+            g.settings_sel = std::min(kEntries - 1, g.settings_sel + 1);
     }
     return act;
 }
@@ -1354,8 +1550,23 @@ Action Frame(Host& host) {
         act = Action::Quit;
     else if (activated == kMods || activated == kSettings)
         g.in_section = true;
-    if (g.in_section && !modal && NavBack())
-        g.in_section = false;
+    if (g.in_section && !modal && NavBack()) {
+        if (g.sel == kSettings && g.diag_open && !g.diag.Running())
+            g.diag_open = false;
+        else
+            g.in_section = false;
+    }
+    {
+        static bool was_running = false;
+        const bool r = g.diag.Running();
+        if (was_running && !r && host.window) {
+            SDL_RestoreWindow(host.window);
+            SDL_RaiseWindow(host.window);
+            g.sel = kSettings, g.in_section = true, g.diag_open = true, g.diag_sel = 0;
+            g.cfg.Load(Ini());
+        }
+        was_running = r;
+    }
     switch (g.sel) {
     case kPlay: PlaySection(dl, L, activated == kPlay); break;
     case kMods: ModsSection(dl, L); break;
@@ -1409,9 +1620,10 @@ void Drop(const fs::path& path) {
     StartInstall(path);
 }
 
-bool GameRunning() { return g.game != nullptr; }
+bool GameRunning() { return g.game != nullptr || g.diag.Running(); }
 
 void Shutdown() {
+    g.diag.Stop(); // (ends a run it started and waits for its report)
     if (g.probe.joinable())
         g.probe.join();
     if (g.analysis.joinable())
@@ -1427,6 +1639,28 @@ void Shutdown() {
 void Select(int section, bool focus) {
     g.sel = std::clamp(section, 0, kSections - 1);
     g.in_section = focus;
+}
+
+void OpenDiagnostics(const fs::path& sample_log) {
+    g.sel = kSettings;
+    g.in_section = true;
+    g.diag_open = true;
+    g.diag_sel = 0;
+    if (sample_log.empty())
+        return;
+    std::lock_guard lk(g.diag.mutex);
+    g.diag.results.clear();
+    for (size_t i = 0; i < 2; i++) {
+        diag::RunResult r;
+        r.id = diag::Variants()[i].id, r.label = diag::Variants()[i].label;
+        r.finished = true;
+        diag::Analyze(sample_log, r);
+        LOG_INFO("Launcher", "diagnostics sample: {} {} slope {:.1f} known {} frames {} avg {:.2f} worst {:.1f} late {} errors {} why '{}'",
+                 r.label, r.pass ? "PASS" : "FAIL", r.slope, r.slope_known, r.frames, r.avg_ms, r.worst_ms, r.late, r.errors, r.why);
+        g.diag.results.push_back(r);
+    }
+    g.diag.folder = g.dir / "diag" / "sample";
+    g.diag_shown_result = true;
 }
 
 std::string InstallNow(const fs::path& path) {

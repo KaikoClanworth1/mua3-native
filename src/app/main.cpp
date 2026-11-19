@@ -336,47 +336,115 @@ u64 ParseButtons(const std::string& btns) {
     return out;
 }
 
-// Replays "<seconds> <BUTTON>[+BUTTON...] [hold_ms]" lines; buttons: A B X Y L R ZL ZR PLUS MINUS UP DOWN LEFT RIGHT.
-void RunInputScript(const fs::path& path) {
+// --diagnostics <run folder>: the launcher's scripted test run (setup/launcher.cpp). The game plays with the
+// player's own settings but from <run folder>\save, a new empty folder, so a run (NEW GAME autosaves) can never
+// write the player's save: a folder that is, holds or lies inside the configured save folder is refused, and so is
+// one that already has files. mua3.ini keeps the player's save_dir (Config::Save writes user_save_dir).
+std::wstring LowerPath(const fs::path& p) {
+    std::error_code ec;
+    fs::path full = fs::weakly_canonical(fs::absolute(p, ec), ec);
+    if (ec)
+        full = fs::absolute(p, ec).lexically_normal();
+    std::wstring s = full.wstring();
+    std::replace(s.begin(), s.end(), L'/', L'\\');
+    if (s.rfind(L"\\\\?\\", 0) == 0)
+        s.erase(0, 4);
+    CharLowerBuffW(s.data(), DWORD(s.size()));
+    while (s.size() > 3 && s.back() == L'\\')
+        s.pop_back();
+    return s;
+}
+
+// a == b, or a inside b
+bool SameOrInside(const std::wstring& a, const std::wstring& b) {
+    return a == b || (a.size() > b.size() && a.compare(0, b.size(), b) == 0 && (a[b.size()] == L'\\' || b.back() == L'\\'));
+}
+
+bool DiagnosticsSave(core::Config& cfg, const fs::path& run_dir, std::string& why) {
+    const fs::path save = run_dir / "save";
+    const std::wstring mine = LowerPath(save), real = LowerPath(cfg.save_dir), run = LowerPath(run_dir);
+    if (SameOrInside(mine, real) || SameOrInside(real, mine) || SameOrInside(real, run)) {
+        why = "the run folder " + run_dir.string() + " overlaps the save folder " + cfg.save_dir.string();
+        return false;
+    }
+    std::error_code ec;
+    if (fs::exists(save, ec) && !fs::is_empty(save, ec)) {
+        why = save.string() + " already has files (a diagnostics run starts from an empty save)";
+        return false;
+    }
+    fs::create_directories(save, ec);
+    if (ec) {
+        why = "cannot create " + save.string() + ": " + ec.message();
+        return false;
+    }
+    cfg.user_save_dir = cfg.save_dir;
+    cfg.save_dir = save;
+    LOG_INFO("Main", "diagnostics: run folder {}, save {} (the player's {} is not used)", run_dir.string(), save.string(),
+             cfg.user_save_dir.string());
+    return true;
+}
+
+// Replays timed input lines (`#` starts a comment):
+//   <seconds> <BUTTON>[+BUTTON...] [hold_ms]    buttons: A B X Y L R ZL ZR PLUS MINUS UP DOWN LEFT RIGHT
+//   <seconds> STICK|RSTICK <x> <y> [hold_ms]    tilt the left (right) stick, -32767..32767, +y = up
+//   <seconds> QUIT                              end the run (as Quit Game in the game menu)
+// The times count from the start of the run; a step that is late (an earlier hold ran over) starts at once.
+void RunInputScript(const fs::path& path, bool diagnostics) {
     std::ifstream f(path);
     struct Step {
-        double t;
-        u64 buttons;
-        int hold;
+        double t = 0;
+        u64 buttons = 0;
+        int hold = 150;
+        bool stick = false, right = false, quit = false;
+        int x = 0, y = 0;
     };
     std::vector<Step> steps;
     std::string line;
-    const std::pair<const char*, u64> names[] = {
-        {"A", hle::hid::A}, {"B", hle::hid::B}, {"X", hle::hid::X}, {"Y", hle::hid::Y}, {"L", hle::hid::L},
-        {"R", hle::hid::R}, {"ZL", hle::hid::ZL}, {"ZR", hle::hid::ZR}, {"PLUS", hle::hid::Plus},
-        {"MINUS", hle::hid::Minus}, {"UP", hle::hid::Up}, {"DOWN", hle::hid::Down}, {"LEFT", hle::hid::Left},
-        {"RIGHT", hle::hid::Right}};
     while (std::getline(f, line)) {
-        if (line.empty() || line[0] == '#')
-            continue;
+        if (const size_t h = line.find('#'); h != std::string::npos)
+            line.resize(h);
         std::istringstream ss(line);
-        Step st{0, 0, 150};
-        std::string btns;
-        ss >> st.t >> btns >> st.hold;
-        if (!st.hold)
-            st.hold = 150;
-        size_t pos = 0;
-        while (pos <= btns.size()) {
-            const size_t e = std::min(btns.find('+', pos), btns.size());
-            const std::string b = btns.substr(pos, e - pos);
-            for (auto& [n, v] : names)
-                if (b == n)
-                    st.buttons |= v;
-            pos = e + 1;
+        Step st;
+        std::string what;
+        if (!(ss >> st.t >> what))
+            continue;
+        if (what == "STICK" || what == "RSTICK") {
+            st.stick = true;
+            st.right = what == "RSTICK";
+            st.hold = 1000;
+            ss >> st.x >> st.y >> st.hold;
+            st.x = std::clamp(st.x, -32767, 32767), st.y = std::clamp(st.y, -32767, 32767);
+        } else if (what == "QUIT") {
+            st.quit = true;
+        } else {
+            st.buttons = ParseButtons(what);
+            ss >> st.hold;
         }
+        if (st.hold <= 0)
+            st.hold = 150;
         steps.push_back(st);
     }
+    LOG_INFO("Main", "input script: {} steps from {}", steps.size(), path.string());
+    if (diagnostics)
+        LOG_INFO("Main", "diagnostics: begin");
     const auto t0 = std::chrono::steady_clock::now();
     hle::hid::SetPad(0, hle::hid::PadInput{true});
     for (auto& st : steps) {
         std::this_thread::sleep_until(t0 + std::chrono::milliseconds(s64(st.t * 1000)));
-        LOG_INFO("Main", "input script: t={} buttons {:#x}", st.t, st.buttons);
-        hle::hid::SetPad(0, hle::hid::PadInput{true, st.buttons});
+        if (st.quit) {
+            LOG_INFO("Main", "input script: t={} quit", st.t);
+            if (diagnostics)
+                LOG_INFO("Main", "diagnostics: end");
+            hle::hid::SetPad(0, hle::hid::PadInput{true});
+            std::this_thread::sleep_for(std::chrono::milliseconds(300)); // (the log writer flushes these lines first)
+            core::Sys().RequestExit();
+            return;
+        }
+        hle::hid::PadInput in{true, st.buttons};
+        if (st.stick)
+            (st.right ? in.rx : in.lx) = st.x, (st.right ? in.ry : in.ly) = st.y;
+        LOG_DEBUG("Main", "input script: t={} buttons {:#x} stick {} {}", st.t, st.buttons, st.x, st.y);
+        hle::hid::SetPad(0, in);
         std::this_thread::sleep_for(std::chrono::milliseconds(st.hold));
         hle::hid::SetPad(0, hle::hid::PadInput{true});
     }
@@ -586,6 +654,7 @@ int main(int argc, char** argv) {
     int watch_seconds = 0;
     bool headless = false;
     int autopress_after = 0; // test aid: tap A every 3 s after N seconds (headless)
+    fs::path diag_dir;       // --diagnostics <run folder>: the launcher's scripted test run (DiagnosticsSave)
     fs::path input_script;   // test aid: timed button presses ("<seconds> <BUTTON>[+BUTTON] [hold ms]" per line)
     int debug_chapter = -1;  // debug: --chapter N / --stage ST0N0 (app/debug_chapter.cpp)
     fs::path save_template;  // debug: seeds an empty debug_save
@@ -607,6 +676,8 @@ int main(int argc, char** argv) {
             autopress_after = std::atoi(argv[++i]);
         else if (a == "--input-script" && i + 1 < argc)
             input_script = fs::u8path(argv[++i]);
+        else if (a == "--diagnostics" && i + 1 < argc)
+            diag_dir = fs::u8path(argv[++i]);
         else if (a == "--chapter" && i + 1 < argc)
             debug_chapter = std::atoi(argv[++i]);
         else if (a == "--stage" && i + 1 < argc) {
@@ -627,6 +698,19 @@ int main(int argc, char** argv) {
     if (!bad_checkpoint.empty())
         LOG_WARN("Debug", "--checkpoint {}: takes <section>:<point> (DataSavePoint.bin numbering), e.g. 1:0",
                  bad_checkpoint);
+    if (!diag_dir.empty()) {
+        if (debug_chapter >= 0) {
+            LOG_ERROR("Main", "--diagnostics cannot be combined with --chapter / --stage");
+            return 5;
+        }
+        std::string why;
+        if (!DiagnosticsSave(cfg, diag_dir, why)) {
+            LOG_ERROR("Main", "diagnostics refused: {}", why);
+            return 5;
+        }
+        if (input_script.empty())
+            input_script = diag_dir / "script.txt";
+    }
     if (debug_chapter >= 0)
         app::debug_chapter::Prepare(cfg, debug_chapter, debug_section, debug_point, save_template);
     else if (!bad_stage.empty())
@@ -758,7 +842,7 @@ int main(int argc, char** argv) {
     auto next_dump = std::chrono::steady_clock::now() + std::chrono::seconds(watch_seconds);
     if (!input_script.empty()) {
         autopress_after = -1; // player 1 is driven by the script
-        std::thread([input_script] { RunInputScript(input_script); }).detach();
+        std::thread([input_script, diagnostics = !diag_dir.empty()] { RunInputScript(input_script, diagnostics); }).detach();
     }
     if (autopress_after > 0) // test aid: tap A every 3 s after N seconds
         std::thread([autopress_after] {

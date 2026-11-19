@@ -124,7 +124,7 @@ endif()
 add_executable(MUA3Launcher WIN32 launcher/launcher.cpp launcher/game_builder.cpp launcher/report.cpp)
 target_link_libraries(MUA3Launcher PRIVATE nxloader platform windowscodecs)
 # The setup wizard (replaces the launcher): installs from the player's dumps, builds the game, makes the shortcuts.
-add_executable(MUA3Setup WIN32 setup/setup.cpp setup/install_ops.cpp setup/launcher.cpp setup/ui_util.cpp setup/updater.cpp
+add_executable(MUA3Setup WIN32 setup/setup.cpp setup/install_ops.cpp setup/launcher.cpp setup/diagnostics.cpp setup/ui_util.cpp setup/updater.cpp
                               launcher/game_builder.cpp launcher/report.cpp
                               core/hle/mods.cpp) # (the game's own mod list and order.txt code, for the launcher's MODS)
 # The launcher's font, Exo 2 (SIL OFL 1.1, third_party/fonts/exo2), as resources 201 / 202.

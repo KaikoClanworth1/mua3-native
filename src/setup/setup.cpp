@@ -2505,9 +2505,16 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 case 70: if (mod) shot("l3_mods_installed.bmp"); break;
                 case 74: launcher::Select(2, false); break;
                 case 84: shot("l4_settings.bmp"); break;
-                case 88: launcher::Select(3, false); break;
-                case 98: shot("l5_exit.bmp"); break;
-                case 102: quit = true; break;
+                case 86: launcher::OpenDiagnostics({}); break;
+                case 96: shot("l4b_diagnostics.bmp"); break;
+                case 98:
+                    if (const char* log = std::getenv("MUA3_SETUP_DIAG_SAMPLE"))
+                        launcher::OpenDiagnostics(fs::u8path(log));
+                    break;
+                case 108: shot("l4c_diagnostics_result.bmp"); break;
+                case 110: launcher::Select(3, false); break;
+                case 120: shot("l5_exit.bmp"); break;
+                case 124: quit = true; break;
                 default: break;
                 }
             }
