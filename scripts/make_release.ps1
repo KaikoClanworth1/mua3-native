@@ -38,7 +38,13 @@ Remove-Item $out -Recurse -Force -ErrorAction SilentlyContinue
 foreach ($d in 'sdk\include\core\cpu\recomp', 'sdk\lib', 'sdk\obj', 'sdk\recomp', 'sdk\tools') { New-Item -ItemType Directory -Force (Join-Path $out $d) | Out-Null }
 $bin = Join-Path $build "bin\$cfg"
 Copy-Item "$bin\MUA3Setup.exe" $out
-Copy-Item "$root\recomplauncher.json" $out # RecompLauncher: sets the game up from the player's files and shows its settings
+# RecompLauncher: sets the game up from the player's files and shows its settings. prepare.version is this release's
+# version: RecompLauncher re-runs prepare (rebuilding the game) only when it changes, and every release changes what
+# is built on the player's PC (runtime, recompiler lists). Without it, updated installs kept their old game (#10).
+$rl = Get-Content "$root\recomplauncher.json" -Raw
+$rl = [regex]::Replace($rl, '("prepare"\s*:\s*\{)(\s*"version"\s*:\s*"[^"]*"\s*,)?', "`$1`n    `"version`": `"$Version`",")
+if ($rl -notmatch "`"version`": `"$([regex]::Escape($Version))`"") { throw 'recomplauncher.json: prepare.version not set' }
+[IO.File]::WriteAllText((Join-Path $out 'recomplauncher.json'), $rl, (New-Object Text.UTF8Encoding($false)))
 Copy-Item "$bin\recomp.exe" "$out\sdk\tools"
 Copy-Item "$root\src\core\cpu\recomp\recomp_rt.h" "$out\sdk\include\core\cpu\recomp"
 $libs = @(
