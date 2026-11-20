@@ -196,6 +196,10 @@ It starts a game only when the PC has had no mouse or keyboard input for 10 minu
 `build\autotest\watch.ps1` stops the game within a fraction of a second when input returns, and the run is void and
 retried later.
 
+Results taken while a cl.exe build runs on the game's cores are invalid. Four cl.exe jobs (0xFF00, below normal)
+stalled ST010 combat for about 2.5 s every 3 s, with 69 display windows that had a frame over 1 s, against 1 or 2
+without load. The same exes were stall-free with no build running. Today's clang-cl builds did not do this.
+
 Each run is checked from its `err.log`:
 
 - the memory slope of the `memory: process N MB private` lines;
