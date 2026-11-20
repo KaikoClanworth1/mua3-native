@@ -62,6 +62,16 @@ HUGE_LIMIT = 60 * 60
 
 
 HUGE_MARK = '// mua3: optimise huge'
+# Files of functions no profile saw run (recomp --cold-split): clang-cl compiles them without the SLP vectorizer,
+# about 40% of its time on this code (-ftime-trace of a median shard: 12 of 29 s); everything else stays as it is.
+COLD_MARK = '// mua3: cold'
+COLD_FLAGS = '/clang:-fno-slp-vectorize'
+# A clang-cl file past CLANG_LIMIT (a few giant switch functions can take hours at /O2) is compiled again without the
+# SLP vectorizer, and past it again unoptimised, so one file never holds up the library.
+CLANG_LIMIT = int(os.environ.get('MUA3_RECOMP_CLANG_LIMIT', str(30 * 60)))
+# Objects by content (source, header, compiler and flags): a regenerated file identical to one compiled before, in
+# any output dir, is copied instead of compiled. MUA3_RECOMP_CACHE overrides the dir, '0' turns it off.
+CACHE = os.environ.get('MUA3_RECOMP_CACHE') or os.path.join(P, 'build', 'recomp_objcache')
 
 
 def find_clang():
@@ -116,42 +126,80 @@ def need(n):
     return max(1 << 30, int(os.path.getsize(os.path.join(GEN, n)) * 5 * 1024)) if is_huge(n) else 0
 
 
+# While the user is idle the build may use every CPU: the idle runner (build\autotest) keeps build\locks\idle present
+# with a timestamp it refreshes every few seconds (older than IDLE_STALE: absent). Idle: up to IDLE_JOBS jobs on all
+# CPUs, as many as free memory allows (about 1.5 GB per clang-cl job, 4 GB kept free); otherwise no new job while
+# JOBS are running, on CPUs 8-15. Running jobs are not touched (the runner re-pins them when the user returns).
+IDLE_MARK = os.path.join(P, 'build', 'locks', 'idle')
+IDLE_STALE = 10
+IDLE_JOBS = int(os.environ.get('MUA3_RECOMP_IDLE_JOBS', '12'))
+JOB_RAM = 3 << 29  # 1.5 GB
+
+
+def user_idle():
+    try:
+        t = os.path.getmtime(IDLE_MARK)
+        if os.path.isdir(IDLE_MARK):
+            t = max([t] + [os.path.getmtime(os.path.join(IDLE_MARK, n)) for n in os.listdir(IDLE_MARK)])
+        return time.time() - t <= IDLE_STALE
+    except OSError:
+        return False
+
+
+def job_limit():
+    """(jobs allowed now, CPU mask for a job starting now)"""
+    if not user_idle():
+        return JOBS, 'FF00'
+    by_ram = JOBS + max(0, int((free_ram() - (4 << 30)) // JOB_RAM))
+    return max(JOBS, min(IDLE_JOBS, by_ram)), 'FFFF'
+
+
 def compile_all(todo):
-    """cl over todo with JOBS workers; big-function files first (largest first) and together within half the RAM
-    free at the start (one may always run alone). Returns the exit codes in todo order."""
+    """cl over todo, JOBS workers (more while the user is idle, see job_limit); big-function files first (largest
+    first) and together within half the RAM free at the start (one may always run alone). Returns the exit codes in
+    todo order."""
     budget = free_ram() // 2
     req = [need(n) for n in todo]
     # the optimised big files first, then everything else largest first (no long file left to the end)
     order = sorted(range(len(todo)), key=lambda i: (-req[i], -os.path.getsize(os.path.join(GEN, todo[i]))))
     rcs = [None] * len(todo)
     lock = threading.Condition()
-    state = {'reserved': 0, 'next': list(order)}
+    state = {'reserved': 0, 'next': list(order), 'running': 0, 'limit': None}
     nbig = sum(1 for r in req if r)
     if nbig:
         log(f'{nbig} big functions to optimise, within {budget / 2**30:.1f} GB')
 
     def take():
+        """the next file and the CPU mask to run it with (None when done)"""
         with lock:
             while True:
                 if not state['next']:
                     return None
-                for i in state['next']:
-                    if not req[i] or not state['reserved'] or state['reserved'] + req[i] <= budget:
-                        state['next'].remove(i)
-                        state['reserved'] += req[i]
-                        return i
-                lock.wait()
+                limit, mask = job_limit()
+                if limit != state['limit']:
+                    log(f'jobs: {limit} ({"user idle, all CPUs" if mask == "FFFF" else "CPUs 8-15"})')
+                    state['limit'] = limit
+                if state['running'] < limit:
+                    for i in state['next']:
+                        if not req[i] or not state['reserved'] or state['reserved'] + req[i] <= budget:
+                            state['next'].remove(i)
+                            state['reserved'] += req[i]
+                            state['running'] += 1
+                            return i, mask
+                lock.wait(timeout=3)  # the idle marker is re-read every few seconds
 
     def work():
-        while (i := take()) is not None:
+        while (t := take()) is not None:
+            i, mask = t
             try:
-                rcs[i] = cl(os.path.join(GEN, todo[i]), os.path.join(OBJ, todo[i][:-4] + '.obj'))
+                rcs[i] = cl(os.path.join(GEN, todo[i]), os.path.join(OBJ, todo[i][:-4] + '.obj'), mask=mask)
             finally:
                 with lock:
                     state['reserved'] -= req[i]
+                    state['running'] -= 1
                     lock.notify_all()
 
-    ts = [threading.Thread(target=work) for _ in range(JOBS)]
+    ts = [threading.Thread(target=work) for _ in range(max(JOBS, IDLE_JOBS))]
     for t in ts:
         t.start()
     for t in ts:
@@ -174,24 +222,104 @@ def generate():
            # recomp_missing.txt files from game runs (pcs the JIT had to run), renamed missing<N>.txt
            *[a for p in sorted(n for n in os.listdir(S) if re.fullmatch(r'missing\d+\.txt', n))
              for a in ('--missing', os.path.join(S, p))], '--all', '1', '--sweep', '1',
-           '--noopt', NOOPT, '--skip', SKIP, '--nogm', NOGM, '--hugeopt', HUGEOPT]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, check=True)
+           '--noopt', NOOPT, '--skip', SKIP, '--nogm', NOGM, '--hugeopt', HUGEOPT,
+           # every block start enterable from Dispatch (no "not recompiled yet" stop at a block a register branch
+           # reaches); MUA3_RECOMP_ENTER_ALL=0 for comparison builds. The check lands in not_enterable.txt.
+           '--enter-all', os.environ.get('MUA3_RECOMP_ENTER_ALL', '1'),
+           # functions no profile saw run in files compiled without the SLP vectorizer (COLD_MARK)
+           '--cold-split', os.environ.get('MUA3_RECOMP_COLD_SPLIT', '1')]
+    os.makedirs(GEN, exist_ok=True)
+    with open(os.path.join(GEN, 'generate.log'), 'w') as out:  # the generator's counts (data scans, enter-all, ...)
+        subprocess.run(cmd, stdout=out, check=True)
 
 
-def cl(src, obj, huge=None, msvc=False):
+def is_cold(src):
+    with open(src, errors='replace') as f:
+        return f.readline().startswith(COLD_MARK)
+
+
+def cache_key(src):
+    """sha1 over everything that decides the object (None: cache off)"""
+    if CACHE == '0':
+        return None
+    import hashlib
+    h = hashlib.sha1()
+    h.update(f'{CLANG}|{CLANG_FLAGS}|{COLD_FLAGS}|{FLAGS}|{HUGE}\n'.encode())
+    with open(os.path.join(INC, 'core', 'cpu', 'recomp', 'recomp_rt.h'), 'rb') as f:
+        h.update(f.read())
+    with open(src, 'rb') as f:
+        h.update(f.read())
+    return h.hexdigest()
+
+
+def run_pinned(bat, mask):
+    """starts a .bat below normal priority on the CPUs in mask (hex); returns its Popen"""
+    # Not through cmd's start /affinity: quoting the bat path for it from Python went wrong (a "cannot find '\'"
+    # dialog per compile) and start /wait loses the exit code. The cmd starts suspended, gets its priority and CPUs,
+    # then runs; everything it starts inherits both.
+    p = subprocess.Popen(['cmd', '/c', bat], creationflags=0x4 | 0x4000)  # CREATE_SUSPENDED, BELOW_NORMAL_PRIORITY
+    k32 = ctypes.windll.kernel32
+    k32.SetProcessAffinityMask(ctypes.c_void_p(int(p._handle)), ctypes.c_size_t(int(mask, 16)))
+    ctypes.windll.ntdll.NtResumeProcess(ctypes.c_void_p(int(p._handle)))
+    return p
+
+
+def cl(src, obj, huge=None, msvc=False, mask='FF00'):
+    """compile src to obj, through the content cache"""
+    key = cache_key(src) if not msvc and huge is None else None
+    hit = os.path.join(CACHE, key + '.obj') if key else None
+    if hit and os.path.exists(hit) and os.path.getsize(hit) > 0:
+        import shutil
+        shutil.copyfile(hit, obj)
+        return 0
+    rc = cl_compile(src, obj, huge, msvc, mask)
+    if rc == 0 and hit and os.path.exists(obj) and os.path.getsize(obj) > 0:
+        import shutil
+        os.makedirs(CACHE, exist_ok=True)
+        shutil.copyfile(obj, hit + '.tmp')
+        os.replace(hit + '.tmp', hit)
+    return rc
+
+
+def kill_compiler(obj):
+    """stop only the compiler writing obj (found by its command line); the batch around it then exits by itself"""
+    q = obj.replace("'", "''")
+    subprocess.run(['powershell', '-NoProfile', '-Command',
+                    "Get-CimInstance Win32_Process -Filter \"Name='clang-cl.exe' or Name='cl.exe'\" | "
+                    f"Where-Object {{ $_.CommandLine -like '*{q}*' }} | "
+                    "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"],
+                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cl_compile(src, obj, huge=None, msvc=False, mask='FF00', tier=0):
     if CLANG and not msvc:
         tag = os.path.basename(obj).replace('.obj', '')
         bat = os.path.join(S, f'cl_{tag}.bat')
         out = os.path.join(S, f'cl_{tag}.log')
-        open(bat, 'w').write(f'@call "{VC}" >nul 2>&1\n"{CLANG}" {CLANG_FLAGS} /I "{INC}" /I "{GEN}" /Fo"{obj}" "{src}" '
+        flags = CLANG_FLAGS + (' ' + COLD_FLAGS if is_cold(src) or tier >= 1 else '')
+        if tier >= 2:
+            flags = flags.replace('/O2', '/Od')
+        open(bat, 'w').write(f'@call "{VC}" >nul 2>&1\n"{CLANG}" {flags} /I "{INC}" /I "{GEN}" /Fo"{obj}" "{src}" '
                              f'>"{out}" 2>&1\nexit /b %ERRORLEVEL%\n')
-        rc = subprocess.run(['cmd', '/c', bat]).returncode
+        t0 = time.time()
+        p = run_pinned(bat, mask)
+        try:
+            rc = p.wait(timeout=CLANG_LIMIT if tier < 2 else None)
+        except subprocess.TimeoutExpired:
+            kill_compiler(obj)  # not taskkill /T: that also took this script's console with it
+            p.wait()
+            os.remove(bat)
+            log(f'{tag}: over {CLANG_LIMIT // 60} min, compiling it again ' +
+                ('without the SLP vectorizer' if tier == 0 else 'unoptimised'))
+            return cl_compile(src, obj, huge, msvc, mask, tier + 1)
         os.remove(bat)
+        if tier or time.time() - t0 > 600:
+            log(f'{tag}: compiled in {(time.time() - t0) / 60:.1f} min (tier {tier})')
         if rc == 0:
             os.remove(out)
             return 0
         log(f'{tag}: clang-cl failed (code {rc}, {out}), compiling it with cl')
-        return cl(src, obj, huge, msvc=True)
+        return cl(src, obj, huge, msvc=True, mask=mask)
     if huge is None:
         huge = is_huge(src)
     tag = os.path.basename(obj).replace('.obj', '')
@@ -201,11 +329,11 @@ def cl(src, obj, huge=None, msvc=False):
     open(bat, 'w').write(f'@call "{VC}" >nul 2>&1\ncl {flags} /I "{INC}" /I "{GEN}" /Fo"{obj}" "{src}" >"{out}" 2>&1\n'
                          f'exit /b %ERRORLEVEL%\n')
     t0 = time.time()
-    p = subprocess.Popen(['cmd', '/c', bat])
+    p = run_pinned(bat, mask)
     try:
         rc = p.wait(timeout=HUGE_LIMIT if huge else None)
     except subprocess.TimeoutExpired:
-        subprocess.run(['taskkill', '/T', '/F', '/PID', str(p.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        kill_compiler(obj)
         p.wait()
         log(f'{tag}: over {HUGE_LIMIT // 60} min with {HUGE}, compiling it again without')
         os.remove(bat)

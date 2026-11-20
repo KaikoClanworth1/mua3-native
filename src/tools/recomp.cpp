@@ -10,6 +10,7 @@
 // With --profile (lines "<pc hex> <count>", written by MUA3_RECOMP_PROFILE), only the hottest functions covering
 // the given fraction of samples are emitted.
 #include <algorithm>
+#include <chrono>
 #include <stdexcept>
 #include <fmt/format.h>
 #include <cstdio>
@@ -128,10 +129,19 @@ struct BlockInfo {
     std::vector<std::string> unsupported_ops;
 };
 
+// Addresses outside text that code materialises with ADRP + ADD / ADR (rodata objects, jump tables): the next one
+// after a jump table bounds a table whose entry count the scan cannot find (see JumpTableTargets).
+std::set<u64> g_data_refs;
+std::vector<std::pair<u64, u64>> g_ref_sites; // (instruction, referenced address outside text)
+size_t g_jt_unbounded = 0; // jump tables read up to the next referenced address (no bound check recognised)
+
 // Switch statements compiled to a jump table ending a block:
 //   [adrp xB, page; add xB, xB, #lo] ... cmp wI/xI, #N; b.hi default ... ldrsw xT, [xB, xI, lsl #2];
 //   add xT, xT, xB (or xB, xT); br xT
 // The table holds N+1 signed 32-bit offsets from its base. Returns the targets (empty if the pattern is not found).
+// When the base is found but not the bound (the check is on a copy of the index made long before, the index comes
+// from the stack, the check sits in another block), the table is read up to the next address the code references,
+// while its entries give plausible code addresses: extra targets cost only code, a missing one stops the game.
 std::vector<u64> JumpTableTargets(u64 br) {
     std::vector<u64> out;
     const u32 w_br = Word(br);
@@ -142,7 +152,7 @@ std::vector<u64> JumpTableTargets(u64 br) {
     // "mov w8, #1"), then LDRSW xT, [xB, xI, LSL #2] shortly before that.
     auto writes = [](u32 w, u32 r) { return (w & 31) == r && (w & 0x9F000000u) != 0x14000000u; }; // rough: Rd field
     u64 add_at = 0;
-    for (u64 a = br - 4; a + 4 * 8 > br && InText(a); a -= 4) {
+    for (u64 a = br - 4; a + 4 * 24 > br && InText(a); a -= 4) {
         const u32 w = Word(a);
         if ((w & 0xFFE0FC00u) == 0x8B000000u && (w & 31) == t) {
             add_at = a;
@@ -177,7 +187,7 @@ std::vector<u64> JumpTableTargets(u64 br) {
     // check) and the base: ADRP + ADD of base_reg, or ADR. Loops keep the table base in a callee-saved register set
     // up long before, so the base search goes further back than the bound search.
     std::optional<u64> page, lo, adr;
-    std::optional<u32> count;
+    std::optional<u32> count, mask_count;
     for (u64 a = ld_at - 4; a + 4 * 600 > ld_at && InText(a); a -= 4) {
         const u32 w = Word(a);
         const bool near = a + 4 * 32 > ld_at;
@@ -185,15 +195,20 @@ std::vector<u64> JumpTableTargets(u64 br) {
             // MOV Wd, Wm (ORR Wd, WZR, Wm) / MOV Xd, Xm into the index: follow the copy
             if ((w & 0x7FE0FFE0u) == 0x2A0003E0u && (w & 31) == idx_reg)
                 idx_reg = (w >> 16) & 31;
-            // a masked index needs no bound check: AND idx, x, #(2^k - 1) / UBFX idx, x, #lsb, #k
+            // a masked index: AND idx, x, #(2^k - 1) / UBFX idx, x, #lsb, #k. Only an upper limit (the switch may
+            // also check a smaller bound on the source, "and w8, w1, #0xff; cmp w8, #6; b.hi; and x8, x1, #0xff"),
+            // so the table is read like an unbounded one, at most 2^k entries; the bound search goes on with the
+            // source register.
             else if ((w & 0x7F800000u) == 0x12000000u && (w & 31) == idx_reg) {
                 const u32 sf = w >> 31, n = (w >> 22) & 1, immr = (w >> 16) & 63, imms = (w >> 10) & 63;
-                if (immr == 0 && n == sf && imms < (sf ? 63u : 31u) && imms < 12)
-                    count = 1u << (imms + 1);
+                if (immr == 0 && n == sf && imms < (sf ? 63u : 31u) && imms < 12 && !mask_count)
+                    mask_count = 1u << (imms + 1);
+                idx_reg = (w >> 5) & 31;
             } else if ((w & 0x7F800000u) == 0x53000000u && (w & 31) == idx_reg) {
                 const u32 immr = (w >> 16) & 63, imms = (w >> 10) & 63;
-                if (imms >= immr && imms - immr < 12)
-                    count = 1u << (imms - immr + 1);
+                if (imms >= immr && imms - immr < 12 && !mask_count)
+                    mask_count = 1u << (imms - immr + 1);
+                idx_reg = (w >> 5) & 31;
             }
             // CMP Wn/Xn, #imm12 (SUBS with Rd = zr, no shift), then a B.HI or B.HS right after it
             else if ((w & 0x7FC0001Fu) == 0x7100001Fu && ((w >> 5) & 31) == idx_reg) {
@@ -232,24 +247,42 @@ std::vector<u64> JumpTableTargets(u64 br) {
         }
         if (count && (adr || (page && lo)))
             break;
-        if (!near && !count)
-            break; // no bound close to the load: not a recognisable switch
+        if (!near && !count && (adr || (page && lo)))
+            break; // base found, no bound near the load: read the table up to the next reference
     }
-    if (!count || *count == 0 || *count > 4096 || !(adr || (page && lo)))
+    if (!(adr || (page && lo)) || (count && (*count == 0 || *count > 4096)))
         return out;
     const u64 table = adr ? *adr : *page + *lo;
     const Module* m = ModOf(br);
+    const bool bounded = count.has_value();
+    if (!bounded) {
+        // up to the next referenced address (another table or object), at most 1024 entries (or the mask's limit)
+        const auto next = g_data_refs.upper_bound(table);
+        u64 limit = next == g_data_refs.end() ? 1024 : std::min<u64>((*next - table) / 4, 1024);
+        if (mask_count)
+            limit = std::min<u64>(limit, *mask_count);
+        count = u32(limit);
+    }
     for (u32 k = 0; k < *count; k++) {
         const u64 at = table + u64(k) * 4;
         if (at < m->base || at + 4 > m->base + m->image.size())
-            return {};
+            return bounded ? std::vector<u64>{} : out;
         int32_t off;
         std::memcpy(&off, m->image.data() + (at - m->base), 4);
         const u64 target = table + u64(int64_t(off));
         // a wrong base gives scattered garbage: real cases sit near their switch and start with code
-        if (!InText(target) || (target > br ? target - br : br - target) > (1u << 20) || Word(target) == 0)
-            return {};
+        if (!InText(target) || (target & 3) || (target > br ? target - br : br - target) > (1u << 20) ||
+            Word(target) == 0) {
+            if (bounded)
+                return {};
+            break; // the end of an unbounded table
+        }
         out.push_back(target);
+    }
+    if (!bounded) {
+        if (out.size() < 2)
+            return {};
+        g_jt_unbounded++;
     }
     return out;
 }
@@ -643,10 +676,14 @@ const std::set<std::string>& IntrinsicNames() {
 }
 constexpr size_t kMaxBlocks = 20000;
 
-Function Discover(u64 entry) {
+// seeds: more block starts of the function (relative-offset table targets inside it, see "data tables" in main)
+Function Discover(u64 entry, const std::vector<u64>& seeds = {}) {
     Function f{entry};
     std::set<u64> seen{entry};
     std::vector<u64> work{entry};
+    for (u64 s : seeds)
+        if (InText(s) && !g_entries.count(s) && seen.insert(s).second)
+            work.push_back(s);
     while (!work.empty() && seen.size() < kMaxBlocks) {
         const u64 pc = work.back();
         work.pop_back();
@@ -689,6 +726,14 @@ void FindEntries(u64 text_size) {
     size_t from_adrp = 0;
     for (u64 a = g_base; a < g_text_end; a += 4) {
         const u32 w = Word(a);
+        if ((w & 0x9F000000u) == 0x10000000u) { // ADR: a referenced address (a jump table next to the code)
+            const int64_t imm = int64_t(int32_t((((w >> 5) & 0x7FFFF) << 2 | ((w >> 29) & 3)) << 11) >> 11);
+            if (!InText(a + u64(imm))) {
+                g_data_refs.insert(a + u64(imm));
+                g_ref_sites.emplace_back(a, a + u64(imm));
+            }
+            continue;
+        }
         if ((w & 0x9F000000u) != 0x90000000u) // ADRP
             continue;
         const u32 rd = w & 31;
@@ -699,9 +744,17 @@ void FindEntries(u64 text_size) {
             // ADD Xd, Xrd, #imm12 (64-bit, shift 0)
             if ((x & 0xFFC00000u) == 0x91000000u && ((x >> 5) & 31) == rd) {
                 const u64 t = page + ((x >> 10) & 0xFFF);
+                if (!InText(t)) {
+                    g_data_refs.insert(t);
+                    g_ref_sites.emplace_back(b, t);
+                }
                 if (InText(t) && Word(t) != 0 && ends_function(Word(t - 4)) && g_entries.insert(t).second)
                     from_adrp++;
                 break;
+            }
+            // LDR Xt / Wt, [Xrd, #imm] (unsigned offset): a referenced data slot
+            if ((x & 0xBFC00000u) == 0xB9400000u && ((x >> 5) & 31) == rd) {
+                g_data_refs.insert(page + ((x >> 10) & 0xFFF) * ((x >> 30) & 1 ? 8 : 4));
             }
             if ((x & 31) == rd && (x & 0x9F000000u) != 0x90000000u)
                 break; // rd overwritten by something else
@@ -1390,7 +1443,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> profiles;
     double coverage = 1.0;
     size_t max_funcs = SIZE_MAX;
-    bool stats_only = false, all_funcs = false;
+    bool stats_only = false, all_funcs = false, enter_all = false, cold_split = false;
     std::set<u64> noopt_funcs, skip_funcs, nogm_funcs, hugeopt_funcs;
     int i = 2;
     for (; i + 2 < argc && argv[i][0] != '-'; i += 3) {
@@ -1434,6 +1487,10 @@ int main(int argc, char** argv) {
             g_sweep = argv[i + 1][0] != '0';
         else if (k == "--stats")
             stats_only = true;
+        else if (k == "--enter-all") // every block start becomes enterable (a resume point of one function)
+            enter_all = argv[i + 1][0] != '0';
+        else if (k == "--cold-split") // unprofiled functions in files the builders compile more cheaply
+            cold_split = argv[i + 1][0] != '0';
         else if (k == "--max-funcs")
             max_funcs = std::strtoull(argv[i + 1], nullptr, 10);
     }
@@ -1580,6 +1637,105 @@ int main(int argc, char** argv) {
             std::fclose(uf);
         }
     }
+    // Data scans for code addresses no relocation or instruction names:
+    // 1. Aligned 8-byte words outside text that already hold an address in text (the images are unrelocated, so a
+    //    pointer normally shows up only as a RELATIVE relocation, which FindEntries made an entry): new entries.
+    // 2. Relative-offset tables (the jump-table form): 32-bit words read from an address the code materialises,
+    //    which as offsets from it land inside the referencing function. Each run of 2+ such words gives block
+    //    starts of that function (splits, not entries: an entry would cut the function in two and send its own jumps
+    //    through Dispatch); --enter-all makes them enterable like every block start.
+    {
+        size_t abs_new = 0;
+        for (const auto& m : g_mods)
+            for (u64 off = (m.text_end - m.base + 7) & ~7ull; off + 8 <= m.image.size(); off += 8) {
+                u64 v;
+                std::memcpy(&v, m.image.data() + off, 8);
+                if (v && InText(v) && Word(v) != 0 && !g_entries.count(v)) {
+                    g_entries.insert(v);
+                    funcs.push_back(Discover(v));
+                    abs_new++;
+                }
+            }
+        // block -> functions holding it, for the referencing instruction's functions
+        std::vector<std::pair<u64, u32>> starts;
+        std::vector<std::pair<u64, u64>> span(funcs.size()); // [lowest block, highest block end)
+        for (u32 i = 0; i < funcs.size(); i++) {
+            span[i] = {~0ull, 0};
+            for (u64 b : funcs[i].blocks) {
+                starts.emplace_back(b, i);
+                span[i].first = std::min(span[i].first, b);
+                span[i].second = std::max(span[i].second, std::max(g_blocks[b].end, b + 4));
+            }
+        }
+        std::sort(starts.begin(), starts.end());
+        std::map<u32, std::vector<u64>> seeds;
+        size_t tables = 0, words = 0;
+        std::set<std::pair<u32, u64>> done; // (function, table) read already
+        for (auto [site, table] : g_ref_sites) {
+            const Module* m = nullptr;
+            for (const auto& mm : g_mods)
+                if (table >= mm.base && table < mm.base + mm.image.size())
+                    m = &mm;
+            if (!m || (table & 3))
+                continue;
+            auto it = std::upper_bound(starts.begin(), starts.end(), std::make_pair(site, ~0u));
+            std::set<u32> owners;
+            for (auto j = it; j != starts.begin();) {
+                --j;
+                if (site - j->first > 0x4000)
+                    break;
+                if (site < std::max(g_blocks[j->first].end, j->first + 4))
+                    owners.insert(j->second);
+            }
+            for (u32 i : owners) {
+                if (!done.emplace(i, table).second)
+                    continue;
+                std::vector<u64> got;
+                for (u32 k = 0; k < 1024; k++) {
+                    const u64 at = table + u64(k) * 4;
+                    if (at + 4 > m->base + m->image.size())
+                        break;
+                    int32_t off;
+                    std::memcpy(&off, m->image.data() + (at - m->base), 4);
+                    const u64 t = table + u64(int64_t(off));
+                    if ((t & 3) || !InText(t) || t < span[i].first || t >= span[i].second || Word(t) == 0)
+                        break;
+                    got.push_back(t);
+                }
+                // a switch's cases sit close together; a table whose targets spread wider is data that happened to
+                // land inside a big function (it grew a few subsdk1 functions past 1 MB of C++ each)
+                if (got.size() < 2 || *std::max_element(got.begin(), got.end()) -
+                                          *std::min_element(got.begin(), got.end()) > 0x4000)
+                    continue;
+                tables++;
+                for (u64 t : got)
+                    if (!std::binary_search(funcs[i].blocks.begin(), funcs[i].blocks.end(), t) && !g_entries.count(t)) {
+                        seeds[i].push_back(t);
+                        words++;
+                    }
+            }
+        }
+        size_t grown = 0, rejected = 0, before_blocks = 0, after_blocks = 0;
+        for (auto& [i, s] : seeds) {
+            std::sort(s.begin(), s.end());
+            s.erase(std::unique(s.begin(), s.end()), s.end());
+            Function f = Discover(funcs[i].entry, s);
+            // more than twice the blocks (and 512 more): the seeds led into code that isn't this function's
+            if (f.blocks.size() > 2 * funcs[i].blocks.size() + 512) {
+                rejected++;
+                continue;
+            }
+            before_blocks += funcs[i].blocks.size();
+            f.weight = funcs[i].weight;
+            after_blocks += f.blocks.size();
+            funcs[i] = std::move(f);
+            grown++;
+        }
+        std::printf("data scans: %zu entries from absolute pointers in data; %zu relative tables inside their function, "
+                    "%zu new block starts; %zu functions grown (%zu -> %zu blocks), %zu kept as they were (seeds "
+                    "more than doubled them)\n",
+                    abs_new, tables, words, grown, before_blocks, after_blocks, rejected);
+    }
     size_t nblocks = 0;
     for (auto& f : funcs)
         nblocks += f.blocks.size();
@@ -1688,6 +1844,15 @@ int main(int argc, char** argv) {
     constexpr size_t kSplitMin = 300'000, kSplitMax = 1'000'000;
     bool bucket_used = false;
     size_t split_funcs = 0, huge_marked = 0;
+    // --cold-split: functions no profile saw run (weight 0) go to recomp_<shard>_0.cpp (no function lives at 0), and
+    // the cold ones big enough for a file of their own get the same mark: the builders compile those files without
+    // the SLP vectorizer, about 40% of clang's time on this code, and keep the profiled functions' flags as they are.
+    // Only with profiles (without them every function would count as cold).
+    static constexpr const char* kColdMark = "// mua3: cold";
+    const bool split_cold = cold_split && !samples.empty();
+    std::ostringstream cold;
+    std::set<u64> cold_called;
+    size_t hot_bytes = 0, cold_bytes = 0;
     auto flush = [&] {
         if (!bucket_used)
             return;
@@ -1706,6 +1871,20 @@ int main(int argc, char** argv) {
         f << "alignas(64) u64 " << ic << "[" << std::max<u32>(shard_ic, 1) << "] = {};\nextern const u32 " << ic
           << "_n = " << shard_ic << ";\n}\n";
         ic_shards.emplace_back(ic, shard_ic);
+        // the shard's functions no profile saw run, in a file of their own the builders compile more cheaply
+        if (cold.tellp() > 0) {
+            const std::string cname = Emitter::fmt("recomp_%llx_0.cpp", cur_bucket);
+            written.insert(cname);
+            ChangedFile cf(out / cname);
+            cf << kColdMark << "\n#include \"core/cpu/recomp/recomp_rt.h\"\n#pragma warning(disable : 4102 4189 4100)\n"
+                  "namespace recomp {\nextern u64 " << ic << "[];\n";
+            for (u64 c : cold_called)
+                cf << "void f_" << std::hex << c << std::dec << "(State& s);\n";
+            cf << cold.str() << "}\n";
+        }
+        cold.str("");
+        cold.clear();
+        cold_called.clear();
         cur.str("");
         cur.clear();
         called.clear();
@@ -1729,6 +1908,143 @@ int main(int argc, char** argv) {
                         n++;
         }
         std::printf("%zu jump targets outside their function become resume points\n", n);
+    }
+    // Functions that can be entered at all: not skipped, a supported first block, not a host C library routine
+    // (those have no blocks of their own to resume in).
+    auto emits_blocks = [&](const Function& f) {
+        return g_blocks[f.entry].supported && !skip_funcs.count(f.entry) && !g_intrinsics.count(f.entry);
+    };
+    // --enter-all: every block start of an emitted function can be entered from Dispatch, so no register branch
+    // (an unresolved switch, a pointer into the middle of a function) can reach code the table does not know. A block
+    // the usual rules leave unenterable becomes a resume point of one function holding it: the coldest by profile
+    // weight, then one that already has a resume switch, then the smallest.
+    std::unordered_map<u64, u64> force_owner; // block -> entry of the function where it becomes a resume point
+    auto resumes_of = [&](const Function& f) {
+        // Resume points: call-return blocks (the JIT can come back into this function after a callee it ran), the
+        // blocks after SVCs (a thread halted inside an SVC continues there), jump targets reached from elsewhere,
+        // and the blocks --enter-all assigns to this function.
+        // A function with an unrecognised switch: every block is a resume point (the switch's targets are unknown,
+        // and the same code may also be reached from a function that split it off).
+        // (loop heads are not resume points: without the JIT only a thread stop leaves at a back edge, and with
+        // it the JIT runs from there; the extra entry edges into loops would cost the optimizer)
+        std::vector<u64> resume;
+        bool switchy = false;
+        for (u64 b : f.blocks)
+            switchy |= g_blocks[b].switch_like;
+        auto own = [&](u64 r) { return std::binary_search(f.blocks.begin(), f.blocks.end(), r); };
+        for (u64 b : f.blocks) {
+            const auto fo = force_owner.find(b);
+            for (const u64 r : {g_blocks[b].ret, g_blocks[b].svc_next, g_extra_resume.count(b) ? b : 0,
+                                g_jt_targets.count(b) ? b : 0, g_ext_targets.count(b) ? b : 0, switchy ? b : 0,
+                                fo != force_owner.end() && fo->second == f.entry ? b : 0})
+                if (r && r != f.entry && own(r) && g_blocks[r].supported)
+                    resume.push_back(r);
+        }
+        std::sort(resume.begin(), resume.end());
+        resume.erase(std::unique(resume.begin(), resume.end()), resume.end());
+        return resume;
+    };
+    // what the table will make enterable: the entries and resume points of every function that emits its blocks
+    auto enterable_set = [&] {
+        std::unordered_set<u64> e;
+        for (const Function& f : funcs) {
+            if (g_blocks[f.entry].supported && !skip_funcs.count(f.entry))
+                e.insert(f.entry);
+            if (emits_blocks(f))
+                for (u64 r : resumes_of(f))
+                    e.insert(r);
+        }
+        return e;
+    };
+    if (enter_all) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::unordered_set<u64> before = enterable_set();
+        // per block not yet enterable: the best owner so far (function index)
+        std::unordered_map<u64, u32> best;
+        size_t unique_blocks = 0;
+        {
+            std::unordered_set<u64> all;
+            for (const Function& f : funcs)
+                all.insert(f.blocks.begin(), f.blocks.end());
+            unique_blocks = all.size();
+        }
+        std::vector<u32> has_resume(funcs.size(), 2); // cached: 2 = unknown
+        auto rs = [&](u32 i) {
+            if (has_resume[i] == 2)
+                has_resume[i] = !resumes_of(funcs[i]).empty();
+            return has_resume[i] == 1;
+        };
+        auto better_c = [&](u32 a, u32 b) {
+            const Function &x = funcs[a], &y = funcs[b];
+            if (x.weight != y.weight)
+                return x.weight < y.weight;
+            if (rs(a) != rs(b))
+                return rs(a);
+            return x.blocks.size() < y.blocks.size();
+        };
+        for (u32 i = 0; i < funcs.size(); i++) {
+            if (!emits_blocks(funcs[i]))
+                continue;
+            for (u64 b : funcs[i].blocks) {
+                if (before.count(b) || !g_blocks[b].supported)
+                    continue;
+                auto [it, fresh] = best.try_emplace(b, i);
+                if (!fresh && better_c(i, it->second))
+                    it->second = i;
+            }
+        }
+        std::unordered_map<u32, size_t> per_owner;
+        size_t in_hot = 0;
+        for (auto [b, i] : best) {
+            force_owner[b] = funcs[i].entry;
+            per_owner[i]++;
+            if (funcs[i].weight > 0)
+                in_hot++;
+        }
+        std::printf("enter-all: %zu unique block starts, %zu enterable before, %zu become resume points in %zu "
+                    "functions (%zu of them in %zu profiled functions) [%.1f s]\n",
+                    unique_blocks, before.size(), best.size(), per_owner.size(), in_hot,
+                    size_t(std::count_if(per_owner.begin(), per_owner.end(),
+                                         [&](auto& p) { return funcs[p.first].weight > 0; })),
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
+    // Static check (not_enterable.txt, "<pc> <reason>"): known or possible indirect targets that Dispatch could not
+    // enter. A release build should list none.
+    {
+        const std::unordered_set<u64> enterable = enterable_set();
+        std::map<u64, std::string> bad;
+        for (const Function& f : funcs) {
+            for (u64 b : f.blocks) {
+                if (enterable.count(b))
+                    continue;
+                if (!g_blocks[b].supported)
+                    bad.try_emplace(b, "untranslatable block (exits to the JIT)");
+                else if (enter_all)
+                    bad.try_emplace(b, g_intrinsics.count(f.entry) ? "block of a C library routine run on the host"
+                                                                   : "block only in functions that emit no blocks");
+            }
+        }
+        for (u64 t : g_jt_targets)
+            if (!enterable.count(t))
+                bad.try_emplace(t, "jump table target");
+        for (u64 e : g_entries)
+            if (!enterable.count(e))
+                bad.try_emplace(e, g_blocks.count(e) && !g_blocks[e].supported ? "entry with an untranslatable first block"
+                                                                                : "entry not emitted");
+        for (u64 pc : g_missing)
+            if (InText(pc) && !enterable.count(pc))
+                bad.try_emplace(pc, "pc from recomp_missing");
+        if (FILE* nf = std::fopen((out / "not_enterable.txt").string().c_str(), "w")) {
+            for (auto& [pc, why] : bad)
+                std::fprintf(nf, "%llx %s\n", (unsigned long long)pc, why.c_str());
+            std::fclose(nf);
+        }
+        std::map<std::string, size_t> by;
+        for (auto& [pc, why] : bad)
+            by[why]++;
+        std::printf("not enterable: %zu (not_enterable.txt)\n", bad.size());
+        for (auto& [why, n] : by)
+            std::printf("  %zu %s\n", n, why.c_str());
     }
     for (u32 idx = 0; idx < funcs.size(); idx++) {
         const Function& f = funcs[idx];
@@ -1789,24 +2105,7 @@ int main(int argc, char** argv) {
                // instructions and spills (its write-backs and reloads around every call).
                "  s.icount++;\n  bool cbit = false;\n" << (nogm ? "" : "  u8* const gm = s.mem; volatile u32* const hp = s.halt;\n")
             << em.Declarations();
-        // Resume points: call-return blocks (the JIT can come back into this function after a callee it ran) and the
-        // blocks after SVCs (a thread halted inside an SVC continues there).
-        std::vector<u64> resume;
-        // A function with an unrecognised switch: every block is a resume point (the switch's targets are unknown,
-        // and the same code may also be reached from a function that split it off).
-        bool switchy = false;
-        for (u64 b : f.blocks)
-            switchy |= g_blocks[b].switch_like;
-        for (u64 b : f.blocks) {
-            // (loop heads are not resume points: without the JIT only a thread stop leaves at a back edge, and with
-            // it the JIT runs from there; the extra entry edges into loops would cost the optimizer)
-            for (const u64 r : {g_blocks[b].ret, g_blocks[b].svc_next, g_extra_resume.count(b) ? b : 0,
-                                g_jt_targets.count(b) ? b : 0, g_ext_targets.count(b) ? b : 0, switchy ? b : 0})
-                if (r && r != f.entry && blockset.count(r) && g_blocks[r].supported)
-                    resume.push_back(r);
-        }
-        std::sort(resume.begin(), resume.end());
-        resume.erase(std::unique(resume.begin(), resume.end()), resume.end());
+        const std::vector<u64> resume = resumes_of(f); // (see resumes_of)
         if (!resume.empty()) {
             cur << "  if (s.pc != 0x" << std::hex << f.entry << "ull) switch (s.pc) {\n";
             for (u64 r : resume) {
@@ -1823,6 +2122,8 @@ int main(int argc, char** argv) {
         }
         }
         const std::string text = fo.str();
+        const bool is_cold = split_cold && f.weight <= 0 && !hugeopt_funcs.count(f.entry);
+        (is_cold ? cold_bytes : hot_bytes) += text.size();
         if (!skip_funcs.count(f.entry) && !noopt_funcs.count(f.entry) && !g_intrinsics.count(f.entry) &&
             text.size() > kSplitMin && text.size() <= kSplitMax) {
             const std::string name = Emitter::fmt("recomp_%llx", cur_bucket) + Emitter::fmt("_%llx.cpp", f.entry);
@@ -1835,12 +2136,16 @@ int main(int argc, char** argv) {
             if (hugeopt_funcs.count(f.entry)) {
                 sf << "// mua3: optimise huge\n";
                 huge_marked++;
-            }
+            } else if (is_cold)
+                sf << kColdMark << "\n";
             sf << "#include \"core/cpu/recomp/recomp_rt.h\"\n#pragma warning(disable : 4102 4189 4100)\nnamespace recomp {\n";
             sf << "extern u64 " << ic_name(cur_bucket) << "[];\n";
             for (u64 c : fcalled)
                 sf << "void f_" << std::hex << c << std::dec << "(State& s);\n";
             sf << text << "}\n";
+        } else if (is_cold) {
+            cold << text;
+            cold_called.insert(fcalled.begin(), fcalled.end());
         } else {
             shard_out << text;
             called.insert(fcalled.begin(), fcalled.end());
@@ -1867,6 +2172,8 @@ int main(int argc, char** argv) {
     flush();
     std::printf("%zu big functions in files of their own (%zu..%zu bytes of C++), %zu of them to optimise\n", split_funcs,
                 kSplitMin, kSplitMax, huge_marked);
+    std::printf("C++: %.1f MB of profiled functions, %.1f MB of cold ones%s\n", hot_bytes / 1e6, cold_bytes / 1e6,
+                split_cold ? " (in recomp_<shard>_0.cpp files and marked big files)" : "");
     for (const auto& e : std::filesystem::directory_iterator(out)) {
         const std::string n = e.path().filename().string();
         if (n.rfind("recomp_", 0) == 0 && n.ends_with(".cpp") && n != "recomp_table.cpp" && !written.count(n))
@@ -1919,8 +2226,11 @@ int main(int argc, char** argv) {
     std::printf("%zu blocks failed to emit\n", g_emit_failures);
     std::printf("%zu C library routines run on the host\n", g_intrinsics.size());
     std::printf("%zu resume points\n", resumes.size());
-    std::printf("%zu jump tables resolved (%zu targets), %zu PLT stubs bound to their import, %zu register branches "
-                "unresolved\n", g_jump_tables, g_jump_targets, g_plt_bound, g_unresolved_br.size());
+    std::sort(g_unresolved_br.begin(), g_unresolved_br.end());
+    g_unresolved_br.erase(std::unique(g_unresolved_br.begin(), g_unresolved_br.end()), g_unresolved_br.end());
+    std::printf("%zu jump tables resolved (%zu targets, %zu read up to the next reference), %zu PLT stubs bound to "
+                "their import, %zu register branches unresolved\n",
+                g_jump_tables, g_jump_targets, g_jt_unbounded, g_plt_bound, g_unresolved_br.size());
     if (FILE* uf = std::fopen((out / "unresolved_br.txt").string().c_str(), "w")) {
         for (u64 a : g_unresolved_br)
             std::fprintf(uf, "%llx\n", (unsigned long long)a);
