@@ -264,10 +264,12 @@ bool InstallGame(const InstallOptions& opts, InstallProgress& prog, std::string&
         StoragePtr storage;
         std::shared_ptr<Nca> nca;
         std::string name;
+        size_t container = 0; // index into containers (the file it came from)
     };
     std::vector<NcaRef> ncas;
     std::vector<std::string> warnings;
-    for (auto& c : containers) {
+    for (size_t ci = 0; ci < containers.size(); ci++) {
+        auto& c = containers[ci];
         for (auto& e : c.entries) {
             if (!EndsWith(e.name, ".nca") || EndsWith(e.name, ".cnmt.nca"))
                 continue;
@@ -281,7 +283,7 @@ bool InstallGame(const InstallOptions& opts, InstallProgress& prog, std::string&
             }
             LOG_INFO("Install", "{}: type {} program {:016x}{}", e.name, int(nca->ContentType()), nca->ProgramId(),
                      nca->IsPatch() ? " (patch)" : "");
-            ncas.push_back({st, nca, e.name});
+            ncas.push_back({st, nca, e.name, ci});
         }
     }
 
@@ -308,6 +310,14 @@ bool InstallGame(const InstallOptions& opts, InstallProgress& prog, std::string&
         default: break;
         }
     }
+    // The update's control data carries the new version string ("4.0.1"). Some dumps give the update's control NCA
+    // the base program id (no 0x800), so prefer the control NCA from the same file as the update's program (#18).
+    if (update)
+        for (auto& r : ncas)
+            if (r.nca->ContentType() == NcaContentType::Control && r.container == update->container) {
+                control = &r;
+                break;
+            }
     if (!base && !update) {
         error = "No program NCA could be opened.";
         for (auto& w : warnings)
