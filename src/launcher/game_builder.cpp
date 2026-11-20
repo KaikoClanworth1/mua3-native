@@ -532,6 +532,9 @@ bool BuildGame(const Paths& p, int jobs, Progress& prog) {
             Q(p.sdk_dir / "recomp" / "skip.txt") + " --nogm " + Q(p.sdk_dir / "recomp" / "nogm.txt");
     if (fs::exists(p.sdk_dir / "recomp" / "hugeopt.txt"))
         args += " --hugeopt " + Q(p.sdk_dir / "recomp" / "hugeopt.txt");
+    // every block start enterable (no "not recompiled yet" stop where a register branch lands), and the functions no
+    // profile saw run in files of their own that compile more cheaply (kColdFlags)
+    args += " --enter-all 1 --cold-split 1";
     if (const int rc = Run(W(args), nullptr, log, BELOW_NORMAL_PRIORITY_CLASS, &prog.cancel); rc != 0)
         return fail(prog.cancel ? "Cancelled." : fmt::format("recomp.exe failed (code {}); see {}", rc, log.string()));
 
@@ -635,7 +638,14 @@ bool BuildGame(const Paths& p, int jobs, Progress& prog) {
                                      " /Fo" + Q(o) + " " + Q(src);
             int rc = -1;
             if (!clang.empty()) {
-                rc = Run(W(Q(clang) + " " + kClangFlags + " /I " + Q(p.sdk_dir / "include") + " /I " + Q(gen) + " /Fo" +
+                // cold-function files (recomp --cold-split marks them): no SLP vectorizer, ~40% of clang's time here
+                std::string first;
+                {
+                    std::ifstream in(src);
+                    std::getline(in, first);
+                }
+                const bool cold = first.rfind("// mua3: cold", 0) == 0;
+                rc = Run(W(Q(clang) + " " + kClangFlags + (cold ? " /clang:-fno-slp-vectorize" : "") + " /I " + Q(p.sdk_dir / "include") + " /I " + Q(gen) + " /Fo" +
                            Q(o) + " " + Q(src)),
                          &env, shard_log, BELOW_NORMAL_PRIORITY_CLASS, &prog.cancel);
                 if (rc != 0 && !prog.cancel)
