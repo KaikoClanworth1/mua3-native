@@ -95,14 +95,19 @@ private:
 // Polls the selected backend and feeds HID.
 class Input {
 public:
-    bool Init(core::InputBackend backend, int camera_speed = 100);
+    bool Init(core::InputBackend backend, int camera_speed = 100, int button_layout = 0);
     void Update(bool window_focused);
     void SetCameraSpeed(int percent) { camera_speed_ = percent < 10 ? 10 : percent > 200 ? 200 : percent; }
+    void SetButtonLayout(int layout) { button_layout_ = layout; } // core::Config::button_layout
+    // Stick deadzones in percent (core::Config::left_deadzone / right_deadzone).
+    void SetDeadzones(int left, int right) { left_dz_ = left; right_dz_ = right; }
     std::string DeviceName() const { return device_name_; }
 
 private:
     core::InputBackend backend_{};
     int camera_speed_ = 100;
+    int button_layout_ = 0;
+    int left_dz_ = 10, right_dz_ = 10;
     std::string device_name_ = "Keyboard";
     struct SDL_Gamepad* pad_ = nullptr;
 };

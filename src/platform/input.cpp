@@ -71,9 +71,10 @@ void ReadKeyboard(PadInput& p) {
 
 } // namespace
 
-bool Input::Init(core::InputBackend backend, int camera_speed) {
+bool Input::Init(core::InputBackend backend, int camera_speed, int button_layout) {
     backend_ = backend;
     camera_speed_ = camera_speed;
+    button_layout_ = button_layout;
     LOG_INFO("Input", "Input backend: {}", backend == core::InputBackend::XInput ? "XInput" : "SDL");
     return true;
 }
@@ -87,11 +88,15 @@ void Input::Update(bool focused) {
             if (XInputGetState(i, &st) != ERROR_SUCCESS)
                 continue;
             const auto& g = st.Gamepad;
+            // By letter (default): Xbox A/B/X/Y = the game's A/B/X/Y prompts. By position: the Switch layout (Xbox A
+            // is the bottom button = Switch B, and so on).
+            const bool pos = button_layout_ == 1;
             struct {
                 WORD x;
                 u64 b;
             } map[] = {
-                {XINPUT_GAMEPAD_A, A}, {XINPUT_GAMEPAD_B, B}, {XINPUT_GAMEPAD_X, Y}, {XINPUT_GAMEPAD_Y, X},
+                {XINPUT_GAMEPAD_A, pos ? B : A}, {XINPUT_GAMEPAD_B, pos ? A : B},
+                {XINPUT_GAMEPAD_X, pos ? Y : X}, {XINPUT_GAMEPAD_Y, pos ? X : Y},
                 {XINPUT_GAMEPAD_LEFT_SHOULDER, L}, {XINPUT_GAMEPAD_RIGHT_SHOULDER, R},
                 {XINPUT_GAMEPAD_START, Plus}, {XINPUT_GAMEPAD_BACK, Minus},
                 {XINPUT_GAMEPAD_LEFT_THUMB, LStick}, {XINPUT_GAMEPAD_RIGHT_THUMB, RStick},
@@ -103,8 +108,9 @@ void Input::Update(bool focused) {
                     p.buttons |= m.b;
             if (g.bLeftTrigger > 64) p.buttons |= ZL;
             if (g.bRightTrigger > 64) p.buttons |= ZR;
-            Stick(g.sThumbLX, g.sThumbLY, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE, 1.0, p.lx, p.ly);
-            Stick(g.sThumbRX, g.sThumbRY, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE, 1.0, p.rx, p.ry);
+            // (XInput's suggested deadzones are 24% / 27%: far too much on top of the game's own, #17)
+            Stick(g.sThumbLX, g.sThumbLY, left_dz_ * 32767 / 100, 1.0, p.lx, p.ly);
+            Stick(g.sThumbRX, g.sThumbRY, right_dz_ * 32767 / 100, 1.0, p.rx, p.ry);
             device_name_ = fmt::format("XInput controller {}", i + 1);
             break;
         }
@@ -125,13 +131,28 @@ void Input::Update(bool focused) {
             device_name_ = "Keyboard";
         }
         if (pad_) {
-            // SDL reports buttons by position; map positions to the Switch layout.
+            // SDL reports buttons by position. By position: the Switch layout. By letter (default): each face button's
+            // printed label (a Switch Pro pad ends up the same; PlayStation: cross = A, circle = B, square = X,
+            // triangle = Y; unknown labels count as an Xbox pad).
+            auto face = [&](SDL_GamepadButton s, u64 by_pos, u64 xbox) -> u64 {
+                if (button_layout_ == 1)
+                    return by_pos;
+                switch (SDL_GetGamepadButtonLabel(pad_, s)) {
+                case SDL_GAMEPAD_BUTTON_LABEL_A: case SDL_GAMEPAD_BUTTON_LABEL_CROSS: return A;
+                case SDL_GAMEPAD_BUTTON_LABEL_B: case SDL_GAMEPAD_BUTTON_LABEL_CIRCLE: return B;
+                case SDL_GAMEPAD_BUTTON_LABEL_X: case SDL_GAMEPAD_BUTTON_LABEL_SQUARE: return X;
+                case SDL_GAMEPAD_BUTTON_LABEL_Y: case SDL_GAMEPAD_BUTTON_LABEL_TRIANGLE: return Y;
+                default: return xbox;
+                }
+            };
             struct {
                 SDL_GamepadButton s;
                 u64 b;
             } map[] = {
-                {SDL_GAMEPAD_BUTTON_EAST, A}, {SDL_GAMEPAD_BUTTON_SOUTH, B}, {SDL_GAMEPAD_BUTTON_NORTH, X},
-                {SDL_GAMEPAD_BUTTON_WEST, Y}, {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, L},
+                {SDL_GAMEPAD_BUTTON_EAST, face(SDL_GAMEPAD_BUTTON_EAST, A, B)},
+                {SDL_GAMEPAD_BUTTON_SOUTH, face(SDL_GAMEPAD_BUTTON_SOUTH, B, A)},
+                {SDL_GAMEPAD_BUTTON_NORTH, face(SDL_GAMEPAD_BUTTON_NORTH, X, Y)},
+                {SDL_GAMEPAD_BUTTON_WEST, face(SDL_GAMEPAD_BUTTON_WEST, Y, X)}, {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, L},
                 {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, R}, {SDL_GAMEPAD_BUTTON_START, Plus},
                 {SDL_GAMEPAD_BUTTON_BACK, Minus}, {SDL_GAMEPAD_BUTTON_LEFT_STICK, LStick},
                 {SDL_GAMEPAD_BUTTON_RIGHT_STICK, RStick}, {SDL_GAMEPAD_BUTTON_DPAD_UP, Up},
@@ -143,9 +164,9 @@ void Input::Update(bool focused) {
                     p.buttons |= m.b;
             if (SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 8000) p.buttons |= ZL;
             if (SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 8000) p.buttons |= ZR;
-            Stick(SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_LEFTX), -SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_LEFTY), 7000,
+            Stick(SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_LEFTX), -SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_LEFTY), left_dz_ * 32767 / 100,
                   1.0, p.lx, p.ly);
-            Stick(SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_RIGHTX), -SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_RIGHTY), 7000,
+            Stick(SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_RIGHTX), -SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_RIGHTY), right_dz_ * 32767 / 100,
                   1.0, p.rx, p.ry);
         }
     }

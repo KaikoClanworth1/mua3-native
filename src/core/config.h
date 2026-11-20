@@ -36,6 +36,12 @@ struct Config {
     bool mute = false; // volume kept, output silent (the in-game MUTE row)
     InputBackend input = InputBackend::XInput;
     int camera_speed = 100; // right stick (camera) sensitivity in percent
+    // Face buttons (read live, #14): 0 = by the letter printed on the controller, so the game's A/B/X/Y prompts match an
+    // Xbox pad (PlayStation: cross = A, circle = B, square = X, triangle = Y); 1 = by position, like a Switch.
+    int button_layout = 0;
+    // Stick deadzones in percent of full tilt (read live, #17); the game adds its own small deadzone on top.
+    int left_deadzone = 10;
+    int right_deadzone = 10;
     bool docked = true;
     int language = 1; // 1 = American English
     int log_level = 2; // 0 trace .. 4 error
