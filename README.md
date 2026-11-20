@@ -1,121 +1,83 @@
 # MUA3 Native
 
+**Marvel Ultimate Alliance 3: The Black Order, running natively on Windows.**
+Higher resolutions, higher frame rates, mods, and no emulator.
+
 <a href="https://recomplauncher.com"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
+&nbsp;
+[![Latest release](https://img.shields.io/github/v/release/KaikoClanworth1/mua3-native?label=download&style=for-the-badge)](https://github.com/KaikoClanworth1/mua3-native/releases/latest)
 
-A native Windows port of *Marvel Ultimate Alliance 3: The Black Order* (Nintendo Switch), made by **static
-recompilation**: the game's AArch64 code is translated to C++ and compiled for x64 ahead of time, the Switch OS
-services it calls are implemented natively, and its NVN graphics calls are rendered with Direct3D 11. No emulator
-runs at play time.
+![Fighting Sandman as Star-Lord](docs/images/combat.jpg)
 
-**This repository contains no game code, data or keys.** You need your own copy of the game, dumped from your own
-Switch along with that console's keys. The recompiled game is built on your PC from your dump; it is never
-distributed here.
+<table><tr>
+<td><img src="docs/images/milano.jpg" alt="The Guardians on the Milano"></td>
+<td><img src="docs/images/options.jpg" alt="The PC graphics options"></td>
+</tr></table>
 
-## Status
+## What you get
 
-| Area | State |
-|---|---|
-| Installer: NSP/XCI base game, update (BKTR merge) and DLC, from the launcher | working |
-| Game code: statically recompiled (104,176 functions, 99.998% of the code), no JIT | working |
-| OS services: kernel, IPC, fs (RomFS over loose files, saves), hid, am, nvdrv, vi, audren, time, set, ... | working |
-| Rendering: NVN command stream replayed on D3D11, shaders translated to HLSL, cached | working, some effects missing |
-| Resolution: native 1080p, 1440p, 4K (internal resolution scales with the display) | working |
-| Frame rate: 30 (original), 60, or higher (experimental, patched timing) | working |
-| Audio (XAudio2 or SDL3), movies (Media Foundation), XInput / SDL3 gamepads, keyboard | working |
+- 🖥️ **Up to 4K**, sharp at your screen's real resolution
+- ⚡ **30, 60, 120 fps or more**
+- 🎮 Xbox, PlayStation and other controllers, or keyboard
+- 🧩 **Mods** made for the Switch version (retextures, data and UI mods)
+- ⚙️ All PC settings inside the game: **OPTIONS → GRAPHICS / PC SETTINGS**
 
-The story has been played through several chapters. Known issues: occasional missing or black UI/effect panels,
-the frame rate is limited by the render thread in large fights, a few shaders fail to translate.
+> **You need your own copy of the game.** This project contains no game code, data or keys. The game is built on
+> your PC from a dump of your own Switch.
 
-## Playing (release download)
+## How to play
 
-You need your Switch dump of the base game (`.nsp` / `.xci`), the 4.0.1 update (`.nsp`), any DLC, and your console's
-`prod.keys`. The game is compiled on your PC, so install Microsoft's free
-[Build Tools for Visual Studio 2026](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio)
-with "Desktop development with C++" first (tick "C++ Clang Compiler for Windows" too: a much faster build).
+**What you need:** your Switch dump of the base game (`.nsp` / `.xci`), the 4.0.1 update, any DLC, and your
+console's `prod.keys`.
 
-1. Download `MUA3Native-v…-Windows-x64.zip` from [Releases](https://github.com/KaikoClanworth1/mua3-native/releases)
-   and unzip it anywhere (about 25 GB free is needed for the game and the build).
-2. Run `MUA3Setup.exe`: it finds your game files and `prod.keys` (or browse / drop them on the window), asks where to
-   install, and **Build the game** installs the game data, translates and compiles your own `mua3.exe` and prepares
-   its shaders.
-3. **Play**. Every setting is in the game (title screen > SYSTEM > GRAPHICS).
+1. **Download** the latest `MUA3Native-…-Windows-x64.zip` from
+   [Releases](https://github.com/KaikoClanworth1/mua3-native/releases/latest) and unzip it (about 25 GB free needed).
+2. **Run `MUA3Setup.exe`.** Point it at your game files and keys, and it builds the game for you. If your PC is
+   missing Microsoft's free C++ build tools, it offers to install them.
+3. **Play!**
 
-Or install it with [RecompLauncher](https://recomplauncher.com): it reads `recomplauncher.json` from the release,
-asks for your game files and keys, runs the same setup without a window (`MUA3Setup.exe --prepare`) and shows the
-game's settings on its page.
+Or just install it from [RecompLauncher](https://recomplauncher.com), which does all of this for you.
 
-The release contains only this project's code (the setup, the recompiler and the port's libraries); the game is
-built from your copy on your PC.
-
-## Building from source
-
-Requirements: Windows 10/11 x64, Visual Studio 2026 with "Desktop development with C++", CMake 3.24+,
-Python 3, Git (with Git Bash), about 30 GB free for the build and 18 GB for the game data.
-
-```bash
-scripts/fetch-deps.sh                                   # dynarmic, SDL3, Dear ImGui, Boost headers into external/
-cmake -S . -B build -G "Visual Studio 18 2026" -A x64   # or "Visual Studio 17 2022"
-cmake --build build --config RelWithDebInfo --target MUA3Launcher nsodump recomp
-```
-
-1. **Install the game data.** Run `build\bin\RelWithDebInfo\MUA3Launcher.exe` → **Install**: choose your
-   `prod.keys`, add the base game, the 4.0.1 update and any DLC (`.nsp` / `.xci`), choose a folder, install.
-2. **Recompile the game code** from your installed copy (the long step: about an hour on 8 threads):
-   ```bash
-   build\bin\RelWithDebInfo\nsodump.exe game\exefs build\recomp_work\nso
-   python scripts\recomp_libbuild.py 8        # number of parallel compiler jobs
-   ```
-   This generates C++ from your NSOs into `build\recomp_full` and compiles `build\recomp_full\nxrecomp_full.lib`.
-3. **Build the game:** `cmake --build build --config RelWithDebInfo --target mua3`
-4. Copy `mua3.exe` next to the launcher (or run the launcher from the build folder) and press **Play**.
-
-Optional: `scripts\make_icon.ps1` makes the executables' icon from your installed game (rebuild afterwards).
-
-## Using it
-
-Settings live in `mua3.ini` and are edited in the launcher: presets (Recommended = the original 30 fps, Smooth = 60,
-High refresh), resolution, camera speed, language, audio. Keys: F11 fullscreen, F12 screenshot, F1 debug overlay.
-Keyboard: WASD move, L/K/I/J = A/B/X/Y, Q/E = L/R, 1/3 = ZL/ZR, Enter = +, Tab = −. Logs go to `mua3.log`.
+**Updating:** press **UPDATE NOW** in the launcher. Your saves, settings and mods are kept.
+After an update, the game rebuilds its shaders for your GPU in the background, so expect a few minutes of
+flicker or missing effects the first time.
 
 ## Mods
 
-Mods made for the Switch version (retextures, data and UI file mods, the "romfs" / LayeredFS kind) work: put each
-mod's folder into `mods\` next to `mua3.exe` and start the game. Emulator and Atmosphere layouts
-(`romfs\`, `010060700AC50000\romfs\`, `atmosphere\contents\010060700AC50000\romfs\`) are accepted as they are.
-`mods\order.txt` sets the load order (lower lines win) and turns mods off (`-` in front of a name);
-`mods\mods.log` lists what each mod replaced, added and conflicts. Code patches (exefs / IPS) and cheats cannot apply
-to the natively compiled game. Details: [docs/mods.md](docs/mods.md).
+Put each mod's folder into `mods\` next to `mua3.exe` and start the game. Emulator and Atmosphere layouts work as
+they are. Code patches and cheats can't apply to a native game. More in [docs/mods.md](docs/mods.md).
 
-## Layout
+## Found a bug?
 
-```
-src/
-  loader/    NCA / PFS0 / HFS0 / BKTR / RomFS / NSO, the installer
-  crypto/    AES (CNG), key files
-  core/      memory, kernel (SVCs), CPU runtime for the recompiled code, HLE services, NVN layer
-  gpu/       D3D11 renderer, shader translator (Maxwell -> HLSL / DXBC), texture and shader caches
-  platform/  SDL3 window, D3D11 swap chain, input, XAudio2 / SDL audio
-  launcher/  the ImGui launcher (installer, settings)
-  tools/     recomp (AArch64 -> C++), nsodump, nxextract (CLI installer), threadprof, shadertool, ...
-scripts/     fetch-deps.sh, recomp_libbuild.py, make_release.ps1 (the release package), bench.ps1, make_icon.ps1
-```
+Please [open an issue](https://github.com/KaikoClanworth1/mua3-native/issues/new) and **always attach**:
+
+1. 📄 **`mua3.log`** from the game's folder (next to `mua3.exe`)
+2. 📸 **Screenshots** of the problem (**F12** takes one in-game), and where in the game it happened
+3. 💻 Your **GPU** and **Windows version**
+
+Without the log we usually can't tell what went wrong.
+
+## For developers
+
+How the port works and how to build it from source: [docs/building.md](docs/building.md).
 
 ## Support the project
 
-If you enjoy the port and want to support its development:
-
-- [Patreon](https://www.patreon.com/c/KaikoClanworth)
-- [Ko-fi](https://ko-fi.com/kaikoclanworth)
-- [PayPal](https://www.paypal.com/donate/?hosted_button_id=MS4C2WC38N3W2)
+If you enjoy the port: [Patreon](https://www.patreon.com/c/KaikoClanworth) ·
+[Ko-fi](https://ko-fi.com/kaikoclanworth) ·
+[PayPal](https://www.paypal.com/donate/?hosted_button_id=MS4C2WC38N3W2)
 
 ## Legal
 
 *Marvel Ultimate Alliance 3: The Black Order* is © MARVEL, © Nintendo, developed by KOEI TECMO GAMES. This is an
-unofficial fan project, not affiliated with or endorsed by them. It contains no copyrighted game material; use it
-only with a game you own, dumped from your own console.
+unofficial fan project, not affiliated with or endorsed by them. It contains no game code, data or keys; use it only
+with a game you own, dumped from your own console. Screenshots are from the game running on this port.
 
-Third-party code: [dynarmic](https://github.com/azahar-emu/dynarmic) (0BSD; its A64 decoder and IR are used by the
-recompiler), [SDL3](https://github.com/libsdl-org/SDL) (zlib), [Dear ImGui](https://github.com/ocornut/imgui) (MIT),
+<details>
+<summary>Third-party code</summary>
+
+[dynarmic](https://github.com/azahar-emu/dynarmic) (0BSD; its A64 decoder and IR are used by the recompiler),
+[SDL3](https://github.com/libsdl-org/SDL) (zlib), [Dear ImGui](https://github.com/ocornut/imgui) (MIT),
 [Boost](https://www.boost.org) (BSL-1.0), AMD [FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) and
 [FSR 3.1](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) (MIT, `third_party/ffx_fsr1`, `third_party/ffx_fsr3`).
 Font: [Exo 2](https://github.com/googlefonts/Exo-2.0) by Natanael Gama and The Exo 2 Project Authors (SIL Open Font
@@ -124,3 +86,4 @@ License 1.1, `third_party/fonts/exo2/`), used by the launcher.
 NVIDIA DLSS: the optional DLSS upscaler (`mua3_dlss.dll`) uses NVIDIA's DLSS SDK, which is proprietary and not part of
 this repository: builds include it only where the SDK is placed in `third_party/dlss`. NVIDIA, DLSS and the NVIDIA
 logo are trademarks of NVIDIA Corporation. AMD FidelityFX and FSR are trademarks of Advanced Micro Devices, Inc.
+</details>
