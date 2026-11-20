@@ -291,6 +291,9 @@ bool Display::PumpEvents() {
         case SDL_EVENT_WINDOW_CLOSE_REQUESTED: return false;
         case SDL_EVENT_WINDOW_FOCUS_GAINED: focused_ = true; break;
         case SDL_EVENT_WINDOW_FOCUS_LOST: focused_ = false; break;
+        case SDL_EVENT_MOUSE_MOTION:
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        case SDL_EVENT_MOUSE_WHEEL: mouse_moved_ms_ = SDL_GetTicks(); break;
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
             SafeRelease(rtv_);
             swapchain_->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, SwapChainFlags()); // (the same flags)
@@ -313,6 +316,21 @@ bool Display::PumpEvents() {
             }
             break;
         default: break;
+        }
+    }
+    // The game is played with a controller or keyboard, so the mouse cursor hides once the mouse has been still for
+    // 2 s and comes back when it moves (#15). While hidden, ImGui must not set its own cursor, or it shows it again
+    // every frame.
+    const bool hide = SDL_GetTicks() - mouse_moved_ms_ > 2000;
+    if (hide != cursor_hidden_) {
+        cursor_hidden_ = hide;
+        ImGuiIO& io = ImGui::GetIO();
+        if (hide) {
+            io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+            SDL_HideCursor();
+        } else {
+            io.ConfigFlags &= ~ImGuiConfigFlags_NoMouseCursorChange;
+            SDL_ShowCursor();
         }
     }
     return true;

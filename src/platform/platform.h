@@ -83,6 +83,8 @@ private:
     const core::Config* live_cfg_ = nullptr; // the caller's config (outlives the display): vsync read per present
     void* frame_wait_ = nullptr;             // the swap chain's frame latency waitable object
     bool tearing_ = false, focused_ = true, fullscreen_ = false;
+    u64 mouse_moved_ms_ = 0; // last mouse movement/click: the cursor hides 2 s after it (#15)
+    bool cursor_hidden_ = false;
     std::chrono::steady_clock::time_point next_frame_{};
     std::mutex frame_mutex_;
     std::vector<u8> pending_frame_;
