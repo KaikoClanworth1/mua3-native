@@ -71,6 +71,11 @@ void ApplyGameSettings(const core::Config& n, core::Config& cfg, platform::Displ
     if (n.camera_speed != cfg.camera_speed)
         hle::camera_speed::Set(n.camera_speed);
     cfg.camera_speed = n.camera_speed;
+    input.SetButtonLayout(n.button_layout);
+    cfg.button_layout = n.button_layout;
+    input.SetDeadzones(n.left_deadzone, n.right_deadzone);
+    cfg.left_deadzone = n.left_deadzone;
+    cfg.right_deadzone = n.right_deadzone;
     LOG_INFO("Main", "settings from the game: {} {}x{}, fps limit {}, show fps {}", n.fullscreen ? "fullscreen" : "window",
              n.width, n.height, n.fps_limit, n.show_fps);
     if (keep_window)
@@ -778,7 +783,8 @@ int main(int argc, char** argv) {
         io.Fonts->AddFontDefault(&fc);
     }
     platform::Input input;
-    input.Init(cfg.input, cfg.camera_speed);
+    input.Init(cfg.input, cfg.camera_speed, cfg.button_layout);
+    input.SetDeadzones(cfg.left_deadzone, cfg.right_deadzone);
     platform::Audio().Init(cfg.audio, cfg.mute ? 0 : cfg.volume);
     hle::SetAudioOutput([](const s16* pcm, size_t frames) { platform::Audio().Push(pcm, frames); },
                         [] { return platform::Audio().Queued(); });
