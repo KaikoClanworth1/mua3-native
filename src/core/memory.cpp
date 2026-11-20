@@ -37,11 +37,22 @@ bool Memory::HandleWriteFault(uintptr_t host_addr) {
     const u64 page = (host_addr - b) >> 12;
     const u64 bit = 1ull << (page & 63);
     auto& tw = tracked_bits_[size_t(page >> 6)];
+    // Under the tracking lock. TrackWrites sets a page's bit first and makes the page read-only afterwards, so a
+    // handler running beside it could see "untracked and read-only" and give up (two threads faulting on one page
+    // while the renderer tracks it again), or make a page writable just before TrackWrites protects it and then clear
+    // its bit, leaving it read-only and untracked for good. Either way a plain guest write then crashed (the stage
+    // sweep's memcpy write faults on heap pages in ST090 and ST110). Nothing that holds this lock touches guest
+    // memory, so it can't fault here.
+    std::lock_guard lk(track_mutex_);
     if (!(tw.load() & bit)) {
         // Another thread may have just unprotected it; if the page is writable now, retry.
         MEMORY_BASIC_INFORMATION mbi{};
         VirtualQuery(base_ + (page << 12), &mbi, sizeof(mbi));
-        return mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_READWRITE);
+        if (mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_READWRITE))
+            return true;
+        LOG_ERROR("Memory", "write fault at guest {:#x}: page {} and not write-tracked", host_addr - b,
+                  mbi.State == MEM_COMMIT ? "read-only" : "not committed");
+        return false;
     }
     for (auto& d : dirty_bits_)
         d[size_t(page >> 6)].fetch_or(bit);
