@@ -121,6 +121,40 @@ Usage notes:
 - **Safety:** the sweep holds the test lock and checks its token before every action. It never touches `GameFiles` or
   the user's save. It does not start, and it stops, when D: has less than 10 GB free.
 
+## Slow PCs: `load_timeout`
+
+A fresh-boot row that would come out `no_stage` or `no_gameplay` is recorded as `load_timeout` instead when the boot
+itself was slow:
+
+- native code started more than 40 s after launch (about 13 s normally); or
+- the title screen did not show within 300 s. The title comes before anything of the checkpoint loads, so this can only
+  be the PC: a build on the same cores, or the user's game reading the same disk.
+
+The note says which, e.g. "slow boot: native entry at 84 s". `load_timeout` rows never count as dead. They run again on
+later sweeps, up to 3 tries, and the latest row of a key is the one that counts.
+
+`-Tag <text>` adds a label to every row's notes, e.g. which exe ran the rows.
+
+## Chaining checkpoints in one game (`-Chain`): parked
+
+`-Chain` was meant to save a boot per checkpoint. After a checkpoint, `chapter N S:P` in `mua3_cmd.txt` sets the debug
+save's next CONTINUE (src/app/debug_chapter.cpp, MUA3_DEBUG_STAGE only). The sweep then quits to the title through the
+pause menu (`-QuitSteps`) and chooses CONTINUE. It is parked (2026-11-20): no jump ever reached the title, and every
+chained row fell back to a fresh boot. What the `-ChainShots` screenshots showed:
+
+- The pause menu (PLUS) lists TEAM / CO-OP / SYSTEM. SYSTEM lists OPTIONS / TIPS / QUIT GAME.
+- Fixed button sequences do not survive the menu's timing:
+  - In one run a single DOWN went from TEAM straight to SYSTEM, so CO-OP was skipped, and the old "DOWN DOWN" wrapped
+    back to TEAM.
+  - In another run the first DOWN and A were dropped while the menu was still animating in, and a later DOWN stopped
+    on CO-OP, where A does nothing.
+  - UP from OPTIONS selected TIPS once instead of wrapping to QUIT GAME.
+  - Presses are dropped or doubled depending on frame timing and load.
+- The quit confirmation dialog was never reached, so its default button is still unknown.
+
+A starting point if chaining is wanted again: a debug-only command that returns to the title directly, instead of
+menu navigation. Until then the sweep uses fresh boots (about 9-12 checkpoints an hour on CPUs 8-15).
+
 ## Chapters that can't be started: 50-57, 80-83, 105, 106
 
 These chapter starts crash in every run. The cause is the game's own data, not the port, and it isn't missing DLC:
@@ -144,8 +178,9 @@ What each one does (guest addresses, main at 0x8004000):
 - **50-54, 57, 80-83:** f_85d2bf0 at 0x85d2c38 reads `[[mission + 0x20] + 0x14]`, and `mission + 0x20` is null
   because no stage was loaded.
 
-The sweep's dead-row rule does not skip them, because it only skips checkpoints that were always no_gameplay or
-no_stage, and these crash. Read their crash rows as expected.
+The sweep's dead-row rule does not catch them, because they crash rather than end as no_gameplay or no_stage. So the
+sweep lists them explicitly: they are skipped by default (run with `-All` or `-Keys`), and `-Plan` and the runner's
+summary show them as "unstartable (retail)", not as crashes.
 
 ## Automated, idle-gated runs: `build\autotest\autotest.ps1`
 

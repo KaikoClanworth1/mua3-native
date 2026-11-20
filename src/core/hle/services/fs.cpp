@@ -1,5 +1,6 @@
 // fsp-srv: RomFS (served from the extracted folder through a virtual RomFS image) and host-backed save data.
 #include <algorithm>
+#include <cstdlib>
 #include <fstream>
 #include <list>
 #include <unordered_map>
@@ -862,6 +863,10 @@ public:
                 r.SetError(kPathNotFound);
                 return;
             }
+            // debug start mode (the stage sweep's chained runs): when the game opens its save files
+            static const bool debug_stage = [] { const char* e = std::getenv("MUA3_DEBUG_STAGE"); return e && e[0] == '1'; }();
+            if (debug_stage)
+                LOG_INFO("fs", "host file open {} (mode {})", p.string(), r.ArgAt<u32>(0));
             r.PushInterface(Make<HostFile>(p, r.ArgAt<u32>(0)));
         });
         Reg(9, "OpenDirectory", [this](Request& r) {

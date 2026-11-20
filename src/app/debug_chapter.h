@@ -14,5 +14,9 @@ bool ParseCheckpoint(const std::string& s, int& section, int& point);
 // chapter start). `template_dir` (optional) seeds an empty debug_save. Returns false (nothing changed) when the mode
 // is off.
 bool Prepare(core::Config& cfg, int chapter, int section, int point, const fs::path& template_dir);
+// mua3_cmd.txt `chapter <N> [S:P]` (the stage sweep's chained mode): sets the running game's debug_save to chapter N at
+// checkpoint S:P again, for the next CONTINUE (after QUIT GAME to the title). Only after Prepare switched this run to
+// debug_save; never another save folder. Logs "debug jump: ..." (or why it refused).
+void Command(const std::string& line);
 
 } // namespace app::debug_chapter

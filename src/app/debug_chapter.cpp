@@ -13,14 +13,19 @@
 // section, u8 at +0x4d43d = its point. savedatainfo (the title screen's summary): u16 at +0x16 = the chapter.
 //
 // Only active with `[debug] stage_select=1` in mua3.ini or MUA3_DEBUG_STAGE=1 in the environment.
+//
+// Chained mode (the stage sweep): mua3_cmd.txt `chapter <N> [S:P]` sets the same fields again in the running game's
+// debug_save; QUIT GAME to the title and CONTINUE then start there without a new process.
 #include "app/debug_chapter.h"
 #include "core/hle/mods.h"
+#include "core/system.h"
 
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <sstream>
 
 namespace app::debug_chapter {
 namespace {
@@ -56,6 +61,37 @@ std::string DescribeCheckpoint(const core::Config& cfg, int chapter, int section
                                : fmt::format("(record {}: autosave point)", i);
     }
     return "(NOT a checkpoint listed in DataSavePoint.bin)";
+}
+
+// Sets the chapter / checkpoint fields of the save in `acct` (save00 + savedatainfo). Returns false (and logs why)
+// when the files are missing, not a layout this mode knows, or cannot be written; `was` describes the old fields.
+bool SetFields(const fs::path& acct, int chapter, int section, int point, std::string& was) {
+    auto save = common::ReadFile(acct / "save00");
+    auto info = common::ReadFile(acct / "savedatainfo");
+    if (save.empty()) {
+        was = "no save00";
+        return false;
+    }
+    if (save.size() != kSaveSize || std::memcmp(save.data(), kHeader, sizeof(kHeader)) != 0 || info.size() < 0x20) {
+        LOG_ERROR("Debug", "{} is not a save layout this mode knows ({} bytes); left unchanged", (acct / "save00").string(),
+                  save.size());
+        was = "unknown layout";
+        return false;
+    }
+    was = fmt::format("{} at {}:{}", Get16(save, kFields[0]), save[kSection], save[kPoint]);
+    for (size_t copy = 0; copy < 2; copy++) {
+        for (size_t f : kFields)
+            Put16(save, f + copy * kCopyStride, u16(chapter));
+        save[kSection + copy * kCopyStride] = u8(section);
+        save[kPoint + copy * kCopyStride] = u8(point);
+    }
+    Put16(info, kInfoChapter, u16(chapter));
+    if (!WriteFile(acct / "save00", save) || !WriteFile(acct / "savedatainfo", info)) {
+        LOG_ERROR("Debug", "cannot write {}", acct.string());
+        was = "write failed";
+        return false;
+    }
+    return true;
 }
 
 } // namespace
@@ -106,38 +142,48 @@ bool Prepare(core::Config& cfg, int chapter, int section, int point, const fs::p
             fs::copy_file(template_dir / name, acct / name, fs::copy_options::overwrite_existing, ec);
         LOG_INFO("Debug", "debug save copied from {}", template_dir.string());
     }
-    auto save = common::ReadFile(acct / "save00");
-    auto info = common::ReadFile(acct / "savedatainfo");
-    if (save.empty()) {
+    if (!fs::exists(acct / "save00")) {
         LOG_WARN("Debug", "--chapter {}: no save in {} yet. Start a NEW GAME once in this mode (it autosaves in "
                           "ST010), or pass --save-template <folder with save00 and savedatainfo>",
                  chapter, fs::absolute(acct, ec).string());
         return true;
     }
-    if (save.size() != kSaveSize || std::memcmp(save.data(), kHeader, sizeof(kHeader)) != 0 || info.size() < 0x20) {
-        LOG_ERROR("Debug", "--chapter {}: {} is not a save layout this mode knows ({} bytes); left unchanged", chapter,
-                  (acct / "save00").string(), save.size());
-        return true;
-    }
-    const u16 was = Get16(save, kFields[0]);
-    const int was_s = save[kSection], was_p = save[kPoint];
     section = std::max(section, 0), point = std::max(point, 0); // no --checkpoint: the chapter start (0:0)
-    for (size_t copy = 0; copy < 2; copy++) {
-        for (size_t f : kFields)
-            Put16(save, f + copy * kCopyStride, u16(chapter));
-        save[kSection + copy * kCopyStride] = u8(section);
-        save[kPoint + copy * kCopyStride] = u8(point);
-    }
-    Put16(info, kInfoChapter, u16(chapter));
-    if (!WriteFile(acct / "save00", save) || !WriteFile(acct / "savedatainfo", info)) {
-        LOG_ERROR("Debug", "--chapter {}: cannot write {}", chapter, acct.string());
+    std::string was;
+    if (!SetFields(acct, chapter, section, point, was))
         return true;
-    }
-    LOG_INFO("Debug", "--chapter {}: debug save set to chapter {} checkpoint {}:{} {} (was {} at {}:{}); choose "
-                      "CONTINUE on the title screen",
-             chapter, chapter, section, point, DescribeCheckpoint(cfg, chapter, section, point), was, was_s,
-             was_p);
+    LOG_INFO("Debug", "--chapter {}: debug save set to chapter {} checkpoint {}:{} {} (was {}); choose CONTINUE on the "
+                      "title screen",
+             chapter, chapter, section, point, DescribeCheckpoint(cfg, chapter, section, point), was);
     return true;
+}
+
+void Command(const std::string& line) {
+    const core::Config& cfg = core::Sys().Cfg();
+    std::istringstream ss(line);
+    std::string cmd, cp;
+    int chapter = -1, section = 0, point = 0;
+    ss >> cmd >> chapter >> cp;
+    if (!Enabled(cfg)) {
+        LOG_WARN("Debug", "debug jump refused: needs [debug] stage_select=1 or MUA3_DEBUG_STAGE=1");
+        return;
+    }
+    // only the debug save this run switched to (Prepare); never the configured (user's) save folder
+    if (cfg.save_dir != fs::path("debug_save") || cfg.user_save_dir.empty()) {
+        LOG_WARN("Debug", "debug jump refused: this run does not play from debug_save (start it with --chapter)");
+        return;
+    }
+    if (chapter < 0 || chapter > 999 || (!cp.empty() && !ParseCheckpoint(cp, section, point))) {
+        LOG_WARN("Debug", "debug jump refused: usage `chapter <N> [S:P]` ({})", line);
+        return;
+    }
+    std::string was;
+    if (!SetFields(cfg.save_dir / "account", chapter, section, point, was)) {
+        LOG_WARN("Debug", "debug jump refused: {} ({})", was, (cfg.save_dir / "account").string());
+        return;
+    }
+    LOG_INFO("Debug", "debug jump: debug save set to chapter {} checkpoint {}:{} {} (was {}); QUIT GAME and CONTINUE",
+             chapter, section, point, DescribeCheckpoint(cfg, chapter, section, point), was);
 }
 
 } // namespace app::debug_chapter

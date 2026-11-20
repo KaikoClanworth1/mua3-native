@@ -256,6 +256,8 @@ void PollCommandFile(platform::Input* input) {
                 g_renderer->RequestFrameShot(fs::u8path(arg));
             } else if (cmd == "shotui" && g_display) { // the window as shown, overlay included
                 g_display->capture_path = fs::u8path(arg);
+            } else if (cmd == "chapter") { // chapter <N> [S:P]: the debug save's next CONTINUE (MUA3_DEBUG_STAGE only)
+                app::debug_chapter::Command(line);
             } else if (cmd == "crash") { // test aid: an access violation (exercises the crash files and report)
                 LOG_WARN("Main", "crash requested by the test channel");
                 *static_cast<volatile int*>(nullptr) = 1;
