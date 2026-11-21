@@ -72,14 +72,14 @@ private:
     }
 
     std::string R(u32 i) {
-        if (i == RZ)
+        if (i >= RZ) // RZ, and the registers after RZ in a vector operand (RZ + 1, ...), all read as zero
             return "0u";
         regs_used_.insert(i);
         return fmt::format("r{}", i);
     }
-    std::string F(u32 i) { return i == RZ ? "0.0f" : fmt::format("asfloat({})", R(i)); }
+    std::string F(u32 i) { return i >= RZ ? "0.0f" : fmt::format("asfloat({})", R(i)); }
     void SetR(u32 i, const std::string& v) {
-        if (i == RZ)
+        if (i >= RZ) // writes to RZ (and past it) are discarded
             return;
         Line(fmt::format("{} = {};", R(i), v));
     }
@@ -456,6 +456,10 @@ void Translator::TexSample(u64 insn, u32 pc, Op op) {
         // lod_kind: 0 implicit, 1 zero, 2 explicit lod, 3 bias
         const std::string t = fmt::format("tex{}", slot);
         if (!dref.empty()) {
+            // Direct3D has no compare sampling on 3D textures: sample level 0 and compare by hand (less-equal).
+            if (res_.textures[slot].dim == TexDim::Tex3D)
+                return fmt::format("(({}) <= {}.SampleLevel({}, {}, 0.0f).x ? 1.0f : 0.0f).xxxx", dref, t, Sampler(slot),
+                                   coords);
             if (lod_kind == 0 && !vs && !opt_.force_lod0)
                 return fmt::format("{}.SampleCmp({}, {}, {}).xxxx", t, CmpSampler(slot), coords, dref);
             return fmt::format("{}.SampleCmpLevelZero({}, {}, {}).xxxx", t, CmpSampler(slot), coords, dref);
@@ -3012,6 +3016,28 @@ TranslateResult Translate(Stage stage, const u8* code, size_t size, const Transl
     if (size < kProgramStart + 16) {
         res.error = "program too small";
         return res;
+    }
+    // A cut-off program: the game wrote other programs over the end of this one (reused shader memory), so a copy of
+    // this program's header (word 0 low half and word 1) appears before the end marker, and decoding would run on into
+    // the next programs' headers and code. Not translated. (Vertex and pixel programs only: compute programs carry
+    // no program header.)
+    if (stage != Stage::Compute) {
+        u64 w0, w1;
+        std::memcpy(&w0, code, 8);
+        std::memcpy(&w1, code + 8, 8);
+        for (size_t off = kProgramStart; u32(w0) != 0 && off + 16 <= size; off += 8) {
+            u64 v0, v1;
+            std::memcpy(&v0, code + off, 8);
+            if (u32(v0) != u32(w0))
+                continue;
+            std::memcpy(&v1, code + off + 8, 8);
+            if (v1 == w1) {
+                res.error = fmt::format("cut-off program: another program header at +{:#x} of {:#x} bytes "
+                                        "(shader memory reused), not translated", off, size);
+                LOG_INFO("Shader", "{} (header {:016x})", res.error, w0);
+                return res;
+            }
+        }
     }
     Translator t(stage, code, size, opt, res);
     t.Run();
