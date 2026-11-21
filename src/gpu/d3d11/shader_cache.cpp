@@ -30,7 +30,8 @@ constexpr int kTranslatorVersion = 33; // 33: one iteration budget per invocatio
 // Failure markers carry this: older ones (before the direct backend took over what FXC fails on) are retried once.
 // 3: constant buffers 13+ read 0, BRX tables found through a clamp further back (only programs that failed change,
 // so no kTranslatorVersion bump: their failure markers are retried instead)
-constexpr u8 kFailGeneration = 3;
+// 4: 3D-texture depth compares and cut-off programs (translator 6672dd6): the same, failed programs retried once
+constexpr u8 kFailGeneration = 4;
 
 
 namespace {
