@@ -256,20 +256,40 @@ The title screen's SYSTEM submenu (SAVE, LOAD, OPTIONS, TIPS, GALLERY; title men
   renderer reads them at every present) and mua3.ini (also render scale and frame rate, which apply after a
   restart). The page shows the running config, except RENDER SCALE and FRAME RATE, which show the value saved in
   mua3.ini for the next start; their info line names the value running now.
-- **UPSCALER**: OFF / FSR ULTRA QUALITY / FSR QUALITY / FSR BALANCED / FSR PERFORMANCE = `upscaler` 0 or 1 and
-  `upscale_quality` 0-3 (FSR 1, live). **FSR SHARPNESS** (`sharpness`, 0-100% in steps of 10, 80% default; another
-  ini value is shown as is) is greyed while the upscaler is off (row grey main+0x7caf30 / ungrey 0x7cb230, flag
-  this+0x1ac + 4 * slot; A and LEFT/RIGHT do nothing on it). FSR and SSAA do not mix: picking FSR turns SSAA 2X into
-  FXAA, picking SSAA 2X turns FSR off (left / right, vfuncs +0x1b8 / +0x1c0, are wrapped: the row's new value is
+- **UPSCALER**: OFF, then ULTRA QUALITY / QUALITY / BALANCED / PERFORMANCE (`upscale_quality` 0-3) of FSR 1, FSR 3.1
+  and DLSS (`upscaler` 1, 3, 2; live). FSR 3.1 and DLSS are listed only where they run (`core::UpscalerAvailable`)
+  or when mua3.ini already asks for them: the row's guest choice array is packed when the page opens and ChoiceCount
+  returns 1 + 4 per upscaler shown. A value the row cannot show is left as it is. **FSR SHARPNESS** (`sharpness`,
+  0-100% in steps of 10, 80% default; another ini value is shown as is; FSR 1 and FSR 3.1's RCAS, DLSS ignores it) is
+  greyed while the upscaler is off or DLSS (row grey main+0x7caf30 / ungrey 0x7cb230, flag
+  this+0x1ac + 4 * slot; A and LEFT/RIGHT do nothing on it). Upscalers and SSAA do not mix: picking one turns SSAA 2X
+  into FXAA, picking SSAA 2X turns the upscaler off (left / right, vfuncs +0x1b8 / +0x1c0, are wrapped: the row's new value is
   read back, or taken as the arrow's wrapped step when the game stores it later; then the other row is set and drawn
   with ShowValue main+0x7c8970, a hook on which is not reached from the game's direct calls; A and Y run the same
   check). The cursor skips the greyed row.
-- **PC SETTINGS**: FPS LIMIT and SHOW FPS (live; here because a page holds 8 rows), MASTER VOLUME (0-100%, live, on top of the SOUND tab's volumes), MUTE (live, mua3.ini `mute`),
-  CAMERA SPEED (10-200%, 100% = original, live: `hle::camera_speed`; the camera update main+0x339d40 turns at
-  speed * (stick - deadzone)^2 with the speed floats in the camera parameters, so the update is wrapped and those floats
-  are scaled for its duration: speed% at every tilt; on top of the CAMERA tab's CONTROL SENSITIVITY), CONTROLLER TYPE (XInput / SDL) and AUDIO OUTPUT (XAudio2 / SDL / off), which apply after a
-  restart. No language row: the INTERFACE tab's LANGUAGE SELECTION is the game's own. Hidden test instances apply
-  volume changes to the ini only (they stay muted).
+- **PC SETTINGS**: FPS LIMIT and SHOW FPS (live; here because a page holds 8 rows), MASTER VOLUME (0-100%, live, on
+  top of the SOUND tab's volumes), MUTE (live, mua3.ini `mute`), AUDIO OUTPUT (XAudio2 / SDL / off, after a restart),
+  and two button rows that open their own page in the same slot: **CONTROLS** and **MODS**. No language row: the
+  INTERFACE tab's LANGUAGE SELECTION is the game's own. Hidden test instances apply volume changes to the ini only
+  (they stay muted).
+- **Sub pages** (CONTROLS, MODS): A on the row shows the page in tab 2's slot, tab 2's header named after it (GetString
+  hook) and tab 3's hidden; B goes back to PC SETTINGS with the cursor on the top row, as after a tab switch. L / R do
+  nothing on CONTROLS and turn the MODS pages. A page laid out again with the cursor elsewhere (MODS: picking up and
+  moving a mod) sets only the cursor's index (its vfunc +0x60, main+0x6bad00): the row highlight and info line stay
+  on row 0 (kCursorShow main+0x7cc0d0 called from a hook crashes in the row layout, main+0x7cd420; vfunc +0x1d8 does
+  not move them).
+- **CONTROLS**: CONTROLLER TYPE (XInput / SDL, after a restart), BUTTONS (`[input] button_layout`: XBOX LETTERS = 0,
+  the button the game shows; SWITCH POSITIONS = 1, the Switch's layout; live) and CAMERA SPEED (10-200%, 100% =
+  original, live: `hle::camera_speed`; the camera update main+0x339d40 turns at speed * (stick - deadzone)^2 with the
+  speed floats in the camera parameters, so the update is wrapped and those floats are scaled for its duration: speed%
+  at every tilt; on top of the CAMERA tab's CONTROL SENSITIVITY), LEFT / RIGHT STICK DEADZONE (`[input]
+  left_deadzone` / `right_deadzone`, 0-50% in steps of 2, 10% default, live through `input.SetDeadzones`). 3 rows
+  are free.
+- **MODS**: MODS ENABLED (`[mods] enabled`, the master switch), then one row per mod in load order (ON / OFF, its
+  replaced / added file counts and unsupported parts on the info line, "no game files found" for an empty romfs),
+  7 per page with L / R turning pages (the header shows the page number). Y picks a mod up, LEFT / RIGHT move it, Y or
+  A puts it down; the order and switches go to `mods\order.txt` (`hle::mods::SaveOrder`). The info line says "Applies
+  after a restart" once anything differs from the launch. No mods: "Put mods in the mods folder next to mua3.exe."
 
 - **From OPTIONS**: tab 2 (CONTROLS) gets a 4th row, GRAPHICS (the game's own string 0x36c4b2): its row table
   (GOT main+0x218bd40) is copied with one more entry and its row count raised to 4; its row type (main+0x1a634ec
