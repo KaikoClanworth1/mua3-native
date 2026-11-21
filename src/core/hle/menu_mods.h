@@ -17,6 +17,10 @@ namespace hle::menu {
 // MUA3_MENU_MODS=0.
 void Install(core::Memory& mem, kernel::Kernel& kernel, u64 main_base);
 
+// The title menu (NEW GAME, CONTINUE, ...; shown after the press-start screen) drew a frame in the last 0.5 s. Any
+// thread; false when the menu extensions are not installed.
+bool TitleMenuShowing();
+
 // RomFS reads: replaces the parts of game files that menu extensions draw anew (labels). `off` = offset in the file.
 void PatchRomfsRead(const fs::path& host, u64 off, u8* dst, size_t n);
 

@@ -40,6 +40,211 @@ const char* StageTag(shader::Stage st) {
 const char* StageTarget(shader::Stage st) {
     return st == shader::Stage::Vertex ? "vs_5_0" : st == shader::Stage::Compute ? "cs_5_0" : "ps_5_0";
 }
+
+// ---- out-of-process FXC: a compile server child per worker thread (`mua3 --compile-server`, see CompileServer).
+// Request: u32 magic, u32 target (0 vs, 1 ps, 2 cs), u32 size, HLSL. Reply: u32 status (0 bytecode, 1 errors),
+// u32 size, bytes.
+constexpr u32 kFxcMagic = 0x43584653; // 'SFXC'
+constexpr DWORD kFxcTimeoutMs = 120000;
+constexpr u32 kFxcJobsPerServer = 500; // a fresh process now and then (FXC's heap)
+
+struct FxcServer {
+    HANDLE proc = nullptr, in_w = nullptr, out_r = nullptr;
+    u32 jobs = 0;
+    bool failed = false; // could not start one: this thread uses the one-shot child
+    ~FxcServer() { Close(); }
+    void Close(bool kill = false) {
+        if (in_w)
+            CloseHandle(in_w); // (the server exits when its input closes)
+        if (out_r)
+            CloseHandle(out_r);
+        if (proc) {
+            if (kill || WaitForSingleObject(proc, 2000) == WAIT_TIMEOUT)
+                TerminateProcess(proc, 1);
+            CloseHandle(proc);
+        }
+        proc = in_w = out_r = nullptr;
+        jobs = 0;
+    }
+    bool Start() {
+        SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+        HANDLE in_r = nullptr, out_w = nullptr;
+        if (!CreatePipe(&in_r, &in_w, &sa, 1 << 16))
+            return false;
+        if (!CreatePipe(&out_r, &out_w, &sa, 1 << 16)) {
+            CloseHandle(in_r);
+            Close();
+            return false;
+        }
+        SetHandleInformation(in_w, HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(out_r, HANDLE_FLAG_INHERIT, 0);
+        // only these two handles go to the child (another worker may be creating its pipes at the same moment)
+        HANDLE inherit[2] = {in_r, out_w};
+        SIZE_T size = 0;
+        InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
+        std::vector<u8> attr_mem(size);
+        auto* attrs = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_mem.data());
+        bool ok = InitializeProcThreadAttributeList(attrs, 1, 0, &size) &&
+                  UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit, sizeof(inherit),
+                                            nullptr, nullptr);
+        if (ok) {
+            wchar_t exe[MAX_PATH];
+            GetModuleFileNameW(nullptr, exe, MAX_PATH);
+            std::wstring cmd = L"\"" + std::wstring(exe) + L"\" --compile-server";
+            STARTUPINFOEXW si{};
+            si.StartupInfo.cb = sizeof(si);
+            si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+            si.StartupInfo.hStdInput = in_r;
+            si.StartupInfo.hStdOutput = out_w;
+            si.StartupInfo.hStdError = out_w; // (never written: FXC reports through its error blob)
+            si.lpAttributeList = attrs;
+            PROCESS_INFORMATION pi{};
+            ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE,
+                                CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS | EXTENDED_STARTUPINFO_PRESENT, nullptr,
+                                nullptr, &si.StartupInfo, &pi);
+            if (ok) {
+                CloseHandle(pi.hThread);
+                proc = pi.hProcess;
+            }
+            DeleteProcThreadAttributeList(attrs);
+        }
+        CloseHandle(in_r);
+        CloseHandle(out_w);
+        if (!ok)
+            Close(true);
+        return ok;
+    }
+    bool Write(const void* p, size_t n) {
+        const u8* b = static_cast<const u8*>(p);
+        while (n) {
+            DWORD put = 0;
+            if (!WriteFile(in_w, b, DWORD(std::min<size_t>(n, 1 << 20)), &put, nullptr) || !put)
+                return false;
+            b += put, n -= put;
+        }
+        return true;
+    }
+    // false: the server died, or no reply by the deadline
+    bool Read(void* p, size_t n, std::chrono::steady_clock::time_point deadline) {
+        u8* b = static_cast<u8*>(p);
+        int idle = 0;
+        while (n) {
+            DWORD avail = 0;
+            if (!PeekNamedPipe(out_r, nullptr, 0, nullptr, &avail, nullptr))
+                return false;
+            if (!avail) {
+                if (std::chrono::steady_clock::now() > deadline)
+                    return false;
+                Sleep(idle++ < 50 ? 0 : 1);
+                continue;
+            }
+            DWORD got = 0;
+            if (!ReadFile(out_r, b, DWORD(std::min<size_t>(n, avail)), &got, nullptr) || !got)
+                return false;
+            b += got, n -= got;
+            idle = 0;
+        }
+        return true;
+    }
+};
+thread_local FxcServer t_fxc;
+
+// 1: compiled (blob), 0: FXC errors or a timeout (err), -1: no server (the caller runs the one-shot child)
+int FxcServerCompile(const std::string& source, const char* target, std::vector<u8>& blob, std::string& err) {
+    FxcServer& f = t_fxc;
+    if (f.failed)
+        return -1;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (f.proc && f.jobs >= kFxcJobsPerServer)
+            f.Close();
+        if (!f.proc && !f.Start()) {
+            f.failed = true;
+            LOG_WARN("Shader", "could not start a shader compile server ({}): one process per shader instead",
+                     GetLastError());
+            return -1;
+        }
+        f.jobs++;
+        const u32 hdr[3] = {kFxcMagic, u32(target[0] == 'v' ? 0 : target[0] == 'p' ? 1 : 2), u32(source.size())};
+        if (!f.Write(hdr, sizeof(hdr)) || !f.Write(source.data(), source.size())) {
+            f.Close(true); // died (crashed on the previous one?): a new server, once
+            continue;
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kFxcTimeoutMs);
+        u32 reply[2];
+        if (!f.Read(reply, sizeof(reply), deadline) || reply[1] > (256u << 20)) {
+            const bool timed_out = std::chrono::steady_clock::now() > deadline;
+            f.Close(true);
+            if (!timed_out)
+                continue;
+            err = "FXC timed out (2 min)";
+            return 0;
+        }
+        std::vector<u8> data(reply[1]);
+        if (!f.Read(data.data(), data.size(), deadline)) {
+            f.Close(true);
+            err = "FXC timed out (2 min)";
+            return 0;
+        }
+        if (reply[0] == 0) {
+            blob = std::move(data);
+            return 1;
+        }
+        err.assign(data.begin(), data.end());
+        if (err.empty())
+            err = "D3DCompile failed";
+        return 0;
+    }
+    err = "shader compile server stopped";
+    return 0;
+}
+} // namespace
+
+int CompileServer() {
+    HANDLE in = GetStdHandle(STD_INPUT_HANDLE), out = GetStdHandle(STD_OUTPUT_HANDLE);
+    auto read = [&](void* p, size_t n) {
+        u8* b = static_cast<u8*>(p);
+        while (n) {
+            DWORD got = 0;
+            if (!ReadFile(in, b, DWORD(std::min<size_t>(n, 1 << 20)), &got, nullptr) || !got)
+                return false;
+            b += got, n -= got;
+        }
+        return true;
+    };
+    auto write = [&](const void* p, size_t n) {
+        const u8* b = static_cast<const u8*>(p);
+        while (n) {
+            DWORD put = 0;
+            if (!WriteFile(out, b, DWORD(std::min<size_t>(n, 1 << 20)), &put, nullptr) || !put)
+                return false;
+            b += put, n -= put;
+        }
+        return true;
+    };
+    for (;;) {
+        u32 hdr[3];
+        if (!read(hdr, sizeof(hdr)) || hdr[0] != kFxcMagic || hdr[1] > 2)
+            return 0; // input closed: the game is done with this server
+        std::string src(hdr[2], '\0');
+        if (!read(src.data(), src.size()))
+            return 0;
+        const char* target = hdr[1] == 0 ? "vs_5_0" : hdr[1] == 1 ? "ps_5_0" : "cs_5_0";
+        ComPtr<ID3DBlob> code, errors;
+        const HRESULT hr = D3DCompile(src.data(), src.size(), nullptr, nullptr, nullptr, "main", target,
+                                      D3DCOMPILE_OPTIMIZATION_LEVEL1 | D3DCOMPILE_IEEE_STRICTNESS, 0, &code, &errors);
+        ID3DBlob* b = SUCCEEDED(hr) ? code.Get() : errors.Get();
+        const u32 reply[2] = {SUCCEEDED(hr) ? 0u : 1u, b ? u32(b->GetBufferSize()) : 0u};
+        if (!write(reply, sizeof(reply)) || (b && !write(b->GetBufferPointer(), b->GetBufferSize())))
+            return 0;
+    }
+}
+
+namespace {
+// The worker's compile server is closed once no loop shader is left queued (it is started again when one comes).
+void FxcServerIdle() {
+    if (t_fxc.proc)
+        t_fxc.Close();
+}
 } // namespace
 
 
@@ -52,16 +257,64 @@ ShaderCache::ShaderCache(ID3D11Device* dev, unsigned build_workers) : dev_(dev),
     OpenPack();
     if (!build_workers)
         StartDriverRewarm();
-    const unsigned n = build_workers ? build_workers : std::clamp(std::thread::hardware_concurrency() / 2, 2u, 6u);
+    // The last session's first uses (session.txt) become last_session.txt, which the prewarm compiles first: after an
+    // update that rebuilds the cache, what the player saw last (boot, title, the stage they continue on) is ready
+    // first. A short session (booted and quit: the title uses ~40 programs) leaves the earlier list in place.
+    if (!build_workers) {
+        std::error_code ec;
+        size_t lines = 0;
+        {
+            std::ifstream in(dump_dir_ / "session.txt");
+            for (std::string line; std::getline(in, line);)
+                lines++;
+        }
+        if (lines >= 300)
+            fs::rename(dump_dir_ / "session.txt", dump_dir_ / "last_session.txt", ec);
+        fs::remove(dump_dir_ / "session.txt", ec);
+    }
+    // Older translator versions' files can never be used again (each update that bumps the version left a full set:
+    // pack, bytecode and info files, failure markers): removed by a low-priority thread. Newer ones are kept (an
+    // older build run in the same folder would otherwise delete a newer one's cache).
+    std::thread([dir = cache_dir_] {
+        SetThreadDescription(GetCurrentThread(), L"ShaderCachePrune");
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+        std::error_code ec;
+        size_t files = 0;
+        u64 bytes = 0;
+        for (const auto& e : fs::directory_iterator(dir, ec)) {
+            const std::string name = e.path().filename().string();
+            // <hash>_v<N>.info, <hash>_<target>_v<N>.dxbc, <hash>_v<N>[_g<G>].fail, pack_v<N>.bin
+            const size_t v = name.rfind("_v");
+            if (v == std::string::npos || v + 2 >= name.size() || !std::isdigit(u8(name[v + 2])))
+                continue;
+            const int version = std::atoi(name.c_str() + v + 2);
+            const std::string ext = e.path().extension().string();
+            if (version >= kTranslatorVersion || (ext != ".info" && ext != ".dxbc" && ext != ".fail" && ext != ".bin"))
+                continue;
+            const u64 size = e.is_regular_file(ec) ? u64(e.file_size(ec)) : 0;
+            if (fs::remove(e.path(), ec))
+                files++, bytes += size;
+        }
+        if (files)
+            LOG_INFO("Shader", "removed {} files of older shader cache versions ({} MB)", files, bytes >> 20);
+    }).detach();
+    // In game: background workers for all but two of the CPUs this process may run on (its affinity mask), below
+    // normal priority so the game's own threads come first; when the in-process queue is empty they also take loop
+    // shaders (out of process: FXC can run for minutes on them, so the child can be killed). Two more at normal
+    // priority serve only the shaders the game is waiting on (one per queue), so a cold cache's backlog never delays
+    // the current frame. The setup's shader step has the machine to itself: that many of each kind.
+    DWORD_PTR mask = 0, sys = 0;
+    unsigned cpus = GetProcessAffinityMask(GetCurrentProcess(), &mask, &sys) ? unsigned(std::popcount(u64(mask))) : 0;
+    if (!cpus)
+        cpus = std::max(2u, std::thread::hardware_concurrency());
+    const unsigned n = build_workers ? build_workers : std::clamp(cpus > 2 ? cpus - 2 : 1u, 2u, 14u);
     for (unsigned i = 0; i < n; i++)
         workers_.emplace_back([this] { Worker(false); });
     workers_.emplace_back([this] { Worker(false, true); });
-    // Loop shaders compile out of process (FXC can run for minutes on them); two workers so one slow shader
-    // does not hold up the rest, and one more for the shaders the game is waiting on. The setup's shader step
-    // has the machine to itself: there they are most of its time, so one per CPU it may use.
-    for (unsigned i = 0; i < (build_workers ? build_workers : 2u); i++)
+    for (unsigned i = 0; i < build_workers; i++)
         std::thread([this] { Worker(true); }).detach();
     std::thread([this] { Worker(true, true); }).detach();
+    LOG_INFO("Shader", "{} compile workers ({} CPUs)", n, cpus);
 }
 
 ShaderCache::~ShaderCache() {
@@ -90,22 +343,50 @@ ShaderCache::~ShaderCache() {
 
 void ShaderCache::Worker(bool slow, bool urgent_only) {
     SetThreadDescription(GetCurrentThread(), slow ? L"ShaderCompiler (slow)" : L"ShaderCompiler");
-    auto& q = slow ? slow_queue_ : queue_;
+    // In game, the backlog workers yield to the game (the setup has the machine to itself).
+    if (!urgent_only && !setup_)
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    // An in-game backlog worker also takes the slow queue when its own is empty.
+    const bool steal = !slow && !urgent_only && !setup_;
     for (;;) {
         HostShader* s;
+        bool take_slow = slow;
         {
             std::unique_lock lk(mutex_);
             // urgent shaders are at the front: an urgent-only worker sleeps while only the backlog is left
-            cv_.wait(lk, [&] { return stop_ || (!q.empty() && (!urgent_only || !q.front()->prewarm)); });
+            auto& q = slow ? slow_queue_ : queue_;
+            cv_.wait(lk, [&] {
+                return stop_ || (!q.empty() && (!urgent_only || !q.front()->prewarm)) || (steal && !slow_queue_.empty());
+            });
             if (stop_)
                 return;
-            s = q.front();
-            q.pop_front();
+            // both queues in one order: the prewarm's (first-use) position, urgent ones (0) first
+            take_slow = slow || q.empty() ||
+                        (steal && !slow_queue_.empty() && slow_queue_.front()->seq < queue_.front()->seq);
+            auto& from = take_slow ? slow_queue_ : queue_;
+            s = from.front();
+            from.pop_front();
         }
         if (s->claimed.exchange(true))
             continue;
-        if (Build(*s, slow) && --pending == 0)
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool done = Build(*s, take_slow);
+        if (take_slow) {
+            const u64 ns = u64((std::chrono::steady_clock::now() - t0).count());
+            slow_ns += ns;
+            slow_built++;
+            for (u64 m = slow_max_ns; ns > m && !slow_max_ns.compare_exchange_weak(m, ns);)
+                ;
+        }
+        if (done && --pending == 0)
             prewarm_end_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+        if (take_slow) {
+            std::unique_lock lk(mutex_);
+            const bool idle = slow_queue_.empty();
+            lk.unlock();
+            if (idle)
+                FxcServerIdle();
+        }
     }
 }
 
@@ -430,6 +711,53 @@ void ShaderCache::OpenPack() {
     LOG_INFO("Shader", "packed cache: {} entries ({} MB), {} bytecodes, {} infos, {} failures, {} programs", entries,
              pack_size_ >> 20, pack_dxbc_.size(), pack_info_.size(), pack_fail_.size(),
              pack_prog_[0].size() + pack_prog_[1].size() + pack_prog_[2].size());
+    if (pack_prog_[0].empty() && pack_prog_[1].empty() && pack_prog_[2].empty())
+        CarryPrograms();
+}
+
+void ShaderCache::CarryPrograms() {
+    std::error_code ec;
+    int best = -1;
+    for (const auto& e : fs::directory_iterator(cache_dir_, ec)) {
+        const std::string name = e.path().filename().string(); // pack_v<N>.bin
+        if (!name.starts_with("pack_v") || !name.ends_with(".bin"))
+            continue;
+        const int v = std::atoi(name.c_str() + 6);
+        if (v < kTranslatorVersion && v > best)
+            best = v;
+    }
+    if (best < 0)
+        return;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::ifstream in(cache_dir_ / fmt::format("pack_v{}.bin", best), std::ios::binary);
+    std::vector<char> buf(1 << 20);
+    in.rdbuf()->pubsetbuf(buf.data(), std::streamsize(buf.size()));
+    u32 hdr[2] = {};
+    if (!in.read(reinterpret_cast<char*>(hdr), 8) || hdr[0] != 0x314B5053 || hdr[1] != u32(best))
+        return;
+    for (;;) {
+        u8 kind = 0;
+        u64 hash = 0;
+        u32 size = 0;
+        if (!in.read(reinterpret_cast<char*>(&kind), 1) || !in.read(reinterpret_cast<char*>(&hash), 8) ||
+            !in.read(reinterpret_cast<char*>(&size), 4))
+            break;
+        const bool prog = kind >= PackProgram && kind < PackProgram + 3;
+        if (!prog && kind != PackOpt) {
+            in.seekg(size, std::ios::cur);
+            continue;
+        }
+        std::vector<u8> data(size);
+        if (size && !in.read(reinterpret_cast<char*>(data.data()), size))
+            break; // (a partial entry at the end)
+        if (prog)
+            carried_prog_[hash] = {kind - PackProgram, std::move(data)};
+        else
+            carried_opt_[hash] = std::move(data);
+    }
+    LOG_INFO("Shader", "shader cache version {} -> {}: {} programs and {} launch options carried over from the old "
+             "pack in {:.1f} s", best, kTranslatorVersion, carried_prog_.size(), carried_opt_.size(),
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
 }
 
 bool ShaderCache::PackGet(PackKind kind, u64 hash, std::vector<u8>& out) const {
@@ -616,8 +944,22 @@ bool ShaderCache::Compile(HostShader& s, const std::string& hlsl, std::string& e
         }
         return true;
     };
+    // FXC in a child process we can kill: some loop shaders make it spin for many minutes. Each worker keeps one
+    // compile server child for as long as there are loop shaders queued, instead of starting mua3.exe (240 MB) for
+    // every one; the one-shot child is the fallback.
+    bool served = false;
     if (blob.empty() && out_of_process) {
-        // Run FXC in a child process we can kill: some loop shaders make it spin for many minutes.
+        if (const int r = FxcServerCompile(source, target, blob, err); r >= 0) {
+            served = true;
+            if (r > 0 && !cached.empty()) {
+                common::WriteFile(cached, blob);
+                PackPut(PackDxbc, s.hash, blob);
+            }
+            if (!err.empty() && !direct_fallback())
+                return false;
+        }
+    }
+    if (blob.empty() && out_of_process && !served) {
         const auto tmp = fs::temp_directory_path() / fmt::format("mua3_shader_{:016x}", s.hash);
         const fs::path in = tmp.string() + ".hlsl", out = tmp.string() + ".dxbc";
         common::WriteFile(in, std::span(reinterpret_cast<const u8*>(source.data()), source.size()));
@@ -1011,6 +1353,8 @@ HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size, c
     // count: it sets up all of them at boot)
     if (!anticipating_ && ordered_.insert(hash).second)
         AppendLine(dump_dir_ / "order.txt", fmt::format("{:016x}\n", hash));
+    if (!anticipating_ && !setup_ && session_seen_.insert(hash).second) // (this launch's first uses: the next prewarm)
+        AppendLine(dump_dir_ / "session.txt", fmt::format("{:016x}\n", hash));
     auto it = shaders_.find(hash);
     if (it != shaders_.end()) {
         HostShader* found = it->second.get();
@@ -1036,6 +1380,7 @@ HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size, c
             s.claimed = false;
             s.slow = false;
             s.prewarm = false;
+            s.seq = 0;
             s.persist = true; // (its options, with constant buffer 1, for the next launch's prewarm)
             {
                 std::lock_guard lk(ready_mutex_);
@@ -1058,6 +1403,7 @@ HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size, c
         if (found->prewarm && found->state == HostShader::Pending) { // still waiting in the prewarm backlog
             found->prewarm = false;
             std::lock_guard lk(mutex_);
+            found->seq = 0; // (read by the workers under mutex_)
             // already translated and handed to the slow (loop shader) queue, or still in the normal one
             (found->translated && found->info.uses_loop ? slow_queue_ : queue_).push_front(found);
             cv_.notify_all();
@@ -1086,6 +1432,7 @@ HostShader* ShaderCache::Queue(shader::Stage stage, u64 hash, const u8* code, si
                                const shader::TranslateOptions* opt, bool prewarm, bool persist) {
     auto s = std::make_unique<HostShader>();
     s->prewarm = prewarm;
+    s->seq = prewarm ? ++queued_ : 0;
     s->persist = persist;
     s->quiet = anticipating_ && !prewarm;
     s->stage = stage;
@@ -1282,6 +1629,7 @@ HostShader* ShaderCache::GetVariant(HostShader* base, const VariantKey& key_in) 
         if (!replaying_ && found->prewarm && found->state == HostShader::Pending) { // a draw needs it now
             found->prewarm = false;
             std::lock_guard lk(mutex_);
+            found->seq = 0; // (read by the workers under mutex_)
             queue_.push_front(found);
             cv_.notify_all();
         }
@@ -1292,6 +1640,7 @@ HostShader* ShaderCache::GetVariant(HostShader* base, const VariantKey& key_in) 
     s->hash = key;
     s->is_variant = true;
     s->prewarm = replaying_; // replayed from variants.txt: part of the backlog until a draw asks for it
+    s->seq = replaying_ ? ++queued_ : 0;
     s->base = base;
     s->key = {v.attr_uint, v.attr_sint, v.attr_scaled, v.attr_snorm10, v.tex_uint, v.tex_sint, v.velocity};
     s->record = !replaying_; // newly seen (not replayed from the manifest): remember it for the next prewarm
@@ -1459,19 +1808,27 @@ void ShaderCache::Prewarm() {
     prewarm_start_ = std::chrono::steady_clock::now();
     size_t n = 0;
     std::error_code ec;
-    // Programs in the order the game first asked for them (order.txt, appended by Get), then the rest: a cold
-    // cache compiles the boot and menu shaders first.
+    // The last session's programs in the order it first used them (last_session.txt), then those of all sessions
+    // in first-use order (order.txt, appended by Get), then the rest: a cold cache compiles the boot and title
+    // shaders and those of the stage the player was last on first.
     struct Prog {
         int stage; // StageIndex
         fs::path path; // empty: in the pack
     };
     std::unordered_map<u64, Prog> files;
+    std::unordered_set<u64> opt_files; // <hash>.<vs|ps|cs>.opt in the dump folder
     std::vector<u64> order;
     for (int st = 0; st < 3; st++)
         for (const auto& [h, e] : pack_prog_[st])
             files[h] = {st, {}};
+    for (const auto& [h, c] : carried_prog_)
+        files[h] = {c.first, {}};
     for (const auto& e : fs::directory_iterator(dump_dir_, ec)) { // dumps not yet in the pack (older launches)
         const std::string name = e.path().filename().string(); // <16 hex>.<vs|ps>.bin
+        if (name.size() == 23 && name.ends_with(".opt")) { // (listed: no attempt to open one that is not there)
+            opt_files.insert(std::strtoull(name.substr(0, 16).c_str(), nullptr, 16));
+            continue;
+        }
         if (name.size() != 23 || !name.ends_with(".bin"))
             continue;
         const std::string tag = name.substr(17, 2);
@@ -1482,8 +1839,14 @@ void ShaderCache::Prewarm() {
             files[h] = {tag == "vs" ? 0 : tag == "ps" ? 1 : 2, e.path()};
     }
     {
-        std::ifstream in(dump_dir_ / "order.txt");
         std::unordered_set<u64> seen;
+        {
+            std::ifstream last(dump_dir_ / "last_session.txt");
+            for (std::string line; std::getline(last, line);)
+                if (const u64 h = std::strtoull(line.c_str(), nullptr, 16); files.count(h) && seen.insert(h).second)
+                    order.push_back(h);
+        }
+        std::ifstream in(dump_dir_ / "order.txt");
         for (std::string line; std::getline(in, line);) {
             const u64 h = std::strtoull(line.c_str(), nullptr, 16);
             if (ordered_.insert(h).second)
@@ -1495,48 +1858,108 @@ void ShaderCache::Prewarm() {
             if (seen.insert(h).second)
                 order.push_back(h);
     }
+    // where queueing the prewarm spends its time (logged below)
+    u64 t_check = 0, t_read = 0, t_put = 0, t_opt = 0, t_queue = 0;
+    auto tick = [] { return u64(std::chrono::steady_clock::now().time_since_epoch().count()); };
+    // Programs in neither pack: read ahead by a few threads, in file name order. Thousands of small files on a hard
+    // disk cost ~14 ms each read one after another (55 s before the game could boot).
+    std::unordered_map<u64, std::vector<u8>> read_ahead;
+    {
+        const u64 r0 = tick();
+        std::vector<std::pair<fs::path, u64>> want;
+        for (const u64 hash : order) {
+            const Prog& prog = files[hash];
+            if (!prog.path.empty() && !pack_prog_[prog.stage].count(hash) && !carried_prog_.count(hash))
+                want.push_back({prog.path, hash});
+        }
+        std::sort(want.begin(), want.end());
+        std::vector<std::vector<u8>> data(want.size());
+        std::atomic<size_t> next{0};
+        auto reader = [&] {
+            for (size_t i; (i = next++) < want.size();)
+                data[i] = common::ReadFile(want[i].first);
+        };
+        std::vector<std::thread> readers;
+        for (int i = 0; i < (want.size() > 64 ? 8 : 0); i++)
+            readers.emplace_back(reader);
+        reader();
+        for (auto& t : readers)
+            t.join();
+        for (size_t i = 0; i < want.size(); i++)
+            read_ahead[want[i].second] = std::move(data[i]);
+        if (!want.empty())
+            LOG_INFO("Shader", "prewarm: {} program files read in {:.1f} s ({} from the last version's pack)",
+                     want.size(), (tick() - r0) / 1e9, carried_prog_.size());
+    }
     for (const u64 hash : order) {
         const Prog& prog = files[hash];
         const shader::Stage stage = prog.stage == 0   ? shader::Stage::Vertex
                                     : prog.stage == 1 ? shader::Stage::Fragment
                                                       : shader::Stage::Compute;
-        if (shaders_.find(hash) != shaders_.end() || HasFailed(hash))
+        u64 t0 = tick();
+        const bool skip = shaders_.find(hash) != shaders_.end() || HasFailed(hash);
+        t_check += tick() - t0;
+        if (skip)
             continue;
         std::vector<u8> code;
         if (!PackGet(PackKind(PackProgram + prog.stage), hash, code)) {
-            code = common::ReadFile(prog.path);
+            t0 = tick();
+            if (auto c = carried_prog_.find(hash); c != carried_prog_.end())
+                code = std::move(c->second.second);
+            else if (auto r = read_ahead.find(hash); r != read_ahead.end())
+                code = std::move(r->second);
+            else
+                code = common::ReadFile(prog.path);
+            t_read += tick() - t0;
             if (code.empty())
                 continue;
+            t0 = tick();
             PackPut(PackKind(PackProgram + prog.stage), hash, code); // folded in for the next launch
+            t_put += tick() - t0;
         }
+        t0 = tick();
         if (stage == shader::Stage::Compute) { // needs the launch options recorded next to it
             std::vector<u8> o;
             if (!PackGet(PackOpt, hash, o)) {
-                o = common::ReadFile(dump_dir_ / fmt::format("{:016x}.cs.opt", hash));
+                if (auto c = carried_opt_.find(hash); c != carried_opt_.end())
+                    o = std::move(c->second);
+                else if (opt_files.count(hash))
+                    o = common::ReadFile(dump_dir_ / fmt::format("{:016x}.cs.opt", hash));
                 if (o.size() >= 16)
                     PackPut(PackOpt, hash, o);
             }
-            if (o.size() < 16)
+            if (o.size() < 16) {
+                t_opt += tick() - t0;
                 continue;
+            }
             shader::TranslateOptions opt;
             u32 shape[4];
             std::memcpy(shape, o.data(), 16);
             opt.block[0] = shape[0], opt.block[1] = shape[1], opt.block[2] = shape[2], opt.shared_bytes = shape[3];
             opt.cbuf1 = o.size() > 16 ? o.data() + 16 : nullptr; // copied by Queue
             opt.cbuf1_size = u32(o.size() - 16);
+            t_opt += tick() - t0;
+            t0 = tick();
             Queue(shader::Stage::Compute, hash, code.data(), code.size(), &opt, true);
+            t_queue += tick() - t0;
         } else {
             // a vertex / pixel program with a BRX: its constant buffer 1, recorded at the draw that first used it
             std::vector<u8> o;
             if (!PackGet(PackOpt, hash, o)) {
-                o = common::ReadFile(dump_dir_ / fmt::format("{:016x}.{}.opt", hash, prog.stage == 0 ? "vs" : "ps"));
+                if (auto c = carried_opt_.find(hash); c != carried_opt_.end())
+                    o = std::move(c->second);
+                else if (opt_files.count(hash))
+                    o = common::ReadFile(dump_dir_ / fmt::format("{:016x}.{}.opt", hash, prog.stage == 0 ? "vs" : "ps"));
                 if (o.size() > 16)
                     PackPut(PackOpt, hash, o);
             }
             shader::TranslateOptions opt;
             opt.cbuf1 = o.size() > 16 ? o.data() + 16 : nullptr; // copied by Queue
             opt.cbuf1_size = o.size() > 16 ? u32(o.size() - 16) : 0;
+            t_opt += tick() - t0;
+            t0 = tick();
             Queue(stage, hash, code.data(), code.size(), opt.cbuf1 ? &opt : nullptr, true);
+            t_queue += tick() - t0;
         }
         n++;
     }
@@ -1559,8 +1982,12 @@ void ShaderCache::Prewarm() {
     }
     prewarm_reported_ = false;
     prewarm_total = u32(n + prewarm_variants_.size());
-    LOG_INFO("Shader", "prewarm: compiling {} programs and {} variants seen in earlier runs", n,
-             prewarm_variants_.size());
+    carried_prog_ = {};
+    carried_opt_ = {};
+    LOG_INFO("Shader", "prewarm: compiling {} programs and {} variants seen in earlier runs (queued in {:.1f} s: checks "
+             "{:.1f}, program files {:.1f}, pack {:.1f}, options {:.1f}, queue {:.1f})", n, prewarm_variants_.size(),
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - prewarm_start_).count(), t_check / 1e9,
+             t_read / 1e9, t_put / 1e9, t_opt / 1e9, t_queue / 1e9);
 }
 
 void ShaderCache::Tick() {
@@ -1812,6 +2239,57 @@ int BuildShadersAhead(const fs::path& game_dir) {
             SaveDriverVersion(dev.Get());
         }
     }
+    return 0;
+}
+
+int BenchShaders(unsigned build_workers) {
+    auto say = [](const std::string& s) {
+        std::fputs((s + "\n").c_str(), stdout);
+        std::fflush(stdout);
+    };
+    ComPtr<ID3D11Device> dev;
+    D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &fl, 1, D3D11_SDK_VERSION, &dev,
+                                 nullptr, nullptr))) {
+        say("could not create a Direct3D 11 device");
+        return 1;
+    }
+    DWORD_PTR mask = 0, sys = 0;
+    const unsigned cpus = GetProcessAffinityMask(GetCurrentProcess(), &mask, &sys) ? unsigned(std::popcount(u64(mask))) : 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    auto secs = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
+    // Never destroyed (detached out-of-process workers, as in BuildShadersAhead).
+    ShaderCache& cache = *new ShaderCache(dev.Get(), build_workers);
+    cache.Prewarm();
+    const u32 total = cache.prewarm_total;
+    say(fmt::format("bench: {} shaders, {} CPUs in the affinity mask, {} (prewarm queued after {:.2f} s)", total, cpus,
+                    build_workers ? fmt::format("{} workers of each kind (setup)", build_workers) : "in-game workers",
+                    secs()));
+    double at[11] = {};
+    int next = 1;
+    auto last = std::chrono::steady_clock::now();
+    while (!cache.PrewarmDone()) {
+        cache.Tick();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        const u32 left = cache.pending.load();
+        while (next <= 10 && total && u64(total - std::min(left, total)) * 10 >= u64(total) * next)
+            at[next++] = secs();
+        if (std::chrono::steady_clock::now() - last > std::chrono::seconds(5)) {
+            last = std::chrono::steady_clock::now();
+            say(fmt::format("  {:.0f} s: {} of {} left", secs(), left, total));
+        }
+    }
+    const double all = secs();
+    std::string marks;
+    for (int i = 1; i <= 10; i++)
+        marks += fmt::format(" {}%:{:.1f}", i * 10, at[i] ? at[i] : all);
+    say(fmt::format("bench done: {:.1f} s, {:.0f} shaders/s, {} failed; worker time: translation {:.1f} s, compilation "
+                    "{:.1f} s; out of process (loop shaders): {} in {:.1f} s, longest {:.1f} s",
+                    all, total / std::max(all, 1e-3), cache.failures.load(), cache.translate_ns / 1e9,
+                    cache.compile_ns / 1e9, cache.slow_built.load(), cache.slow_ns / 1e9, cache.slow_max_ns / 1e9));
+    say("bench progress:" + marks);
+    std::fflush(nullptr);
+    TerminateProcess(GetCurrentProcess(), 0); // (detached workers)
     return 0;
 }
 
