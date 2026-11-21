@@ -40,7 +40,8 @@ public:
     void ToggleFullscreen();
 
     std::function<void()> draw_overlay; // ImGui calls
-    // Supplies the latest rendered game frame (called with context_mutex held).
+    // Supplies the latest rendered game frame with a reference the display releases once it drew it (called on the UI
+    // thread without context_mutex: the GPU thread may replace the frame at any time).
     std::function<ID3D11ShaderResourceView*(u32& w, u32& h)> frame_source;
     std::recursive_mutex* context_mutex = nullptr;
     std::atomic<u64>* context_epoch = nullptr; // bumped whenever the UI used the shared context (state caches)
@@ -78,6 +79,9 @@ private:
     struct ID3D11RenderTargetView* rtv_ = nullptr;
     struct ID3D11Texture2D* frame_tex_ = nullptr;
     struct ID3D11ShaderResourceView* frame_srv_ = nullptr;
+    // The view the overlay's draw list samples this UI frame, referenced from BeginFrame until EndFrame drew it: the
+    // GPU thread may replace its own between the two (GitHub #12: a released view drawn, a crash in the driver).
+    struct ID3D11ShaderResourceView* shown_srv_ = nullptr;
     struct ID3D11BlendState* opaque_blend_ = nullptr; // the game frame is drawn without blending (its alpha is not coverage)
     u32 frame_w_ = 0, frame_h_ = 0;
     const core::Config* live_cfg_ = nullptr; // the caller's config (outlives the display): vsync read per present

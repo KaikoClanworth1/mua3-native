@@ -4228,15 +4228,19 @@ void D3D11Renderer::NoteTexture(ID3D11ShaderResourceView* srv, u64 addr, u32 w, 
         recent_.pop_back();
 }
 
+// (UI thread) A reference the caller releases: the present replaces these views (under frame_mutex_) when the frame's
+// size changes, e.g. as FSR 1 or the HUD split come up (GitHub #12: the overlay drew a released view, the driver's
+// worker thread crashed on it).
 ID3D11ShaderResourceView* D3D11Renderer::LatestFrame(u32& w, u32& h) {
-    if (upscaled_ && fsr_out_srv_) {
-        w = fsr_w_;
-        h = fsr_h_;
-        return fsr_out_srv_.Get();
-    }
-    w = frame_w_;
-    h = frame_h_;
-    return frame_srv_.Get();
+    std::lock_guard lk(frame_mutex_);
+    ID3D11ShaderResourceView* v;
+    if (upscaled_ && fsr_out_srv_)
+        v = fsr_out_srv_.Get(), w = fsr_w_, h = fsr_h_;
+    else
+        v = frame_srv_.Get(), w = frame_w_, h = frame_h_;
+    if (v)
+        v->AddRef();
+    return v;
 }
 
 void D3D11Renderer::InvalidateRegion(u64 gpu_va, u64 size) {

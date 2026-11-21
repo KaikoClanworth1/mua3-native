@@ -189,6 +189,7 @@ bool Display::RecoverDevice() {
     if (release_device)
         release_device();
     ImGui_ImplDX11_Shutdown();
+    SafeRelease(shown_srv_);
     SafeRelease(frame_srv_);
     SafeRelease(frame_tex_);
     frame_w_ = frame_h_ = 0;
@@ -253,6 +254,7 @@ void Display::Shutdown() {
         ImGui_ImplSDL3_Shutdown();
         ImGui::DestroyContext();
     }
+    SafeRelease(shown_srv_);
     SafeRelease(frame_srv_);
     SafeRelease(frame_tex_);
     SafeRelease(opaque_blend_);
@@ -384,13 +386,22 @@ void Display::BeginFrame() {
 }
 
 void Display::DrawFrameTexture() {
+    SafeRelease(shown_srv_);
     ID3D11ShaderResourceView* srv = frame_srv_;
     u32 fw = frame_w_, fh = frame_h_;
+    if (srv)
+        srv->AddRef();
     if (frame_source) {
         u32 w = 0, h = 0;
-        if (auto* s = frame_source(w, h); s && w && h)
-            srv = s, fw = w, fh = h;
+        if (auto* s = frame_source(w, h)) { // (referenced for us)
+            if (w && h) {
+                SafeRelease(srv);
+                srv = s, fw = w, fh = h;
+            } else
+                s->Release();
+        }
     }
+    shown_srv_ = srv; // (held until EndFrame drew it)
     if (!srv || !fw || !fh)
         return;
     const ImVec2 ds = ImGui::GetIO().DisplaySize;
@@ -466,6 +477,8 @@ void Display::EndFrame() {
     ctx_->OMSetRenderTargets(1, &rtv_, nullptr);
     ctx_->ClearRenderTargetView(rtv_, clear);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    // (the context references what is bound; the commands are recorded: the frame's view can go)
+    SafeRelease(shown_srv_);
     if (!capture_path.empty()) {
         SaveBackbuffer(capture_path);
         capture_path.clear();
