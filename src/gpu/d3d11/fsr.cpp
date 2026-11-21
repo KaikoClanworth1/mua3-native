@@ -32,10 +32,13 @@ AF4 FsrEasuRF(AF2 p) { return tex.GatherRed(lin, p); }
 AF4 FsrEasuGF(AF2 p) { return tex.GatherGreen(lin, p); }
 AF4 FsrEasuBF(AF2 p) { return tex.GatherBlue(lin, p); }
 #include "ffx_fsr1.h"
+// Alpha is carried along bilinearly: an upscaled layer the game blends by its alpha (the pause menu's team) keeps its
+// coverage (EASU itself only upscales colour).
 float4 ps_main(float4 pos : SV_Position) : SV_Target {
     AF3 c;
     FsrEasuF(c, AU2(pos.xy), con0, con1, con2, con3);
-    return float4(c, 1);
+    const float2 uv = pos.xy * asfloat(con0.xy) * asfloat(con1.xy); // (output pixel -> input pixel -> input UV)
+    return float4(c, tex.SampleLevel(lin, uv, 0).a);
 }
 #else
 cbuffer C : register(b0) { uint4 con; };
@@ -46,7 +49,7 @@ void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
 float4 ps_main(float4 pos : SV_Position) : SV_Target {
     AF1 r, g, b;
     FsrRcasF(r, g, b, AU2(pos.xy), con);
-    return float4(r, g, b, 1);
+    return float4(r, g, b, tex.Load(int3(pos.xy, 0)).a); // (alpha as EASU left it, unsharpened)
 }
 #endif
 )";
