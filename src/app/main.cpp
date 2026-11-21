@@ -25,6 +25,7 @@
 #include "core/hle/camera_speed.h"
 #include "core/hle/hid.h"
 #include "core/hle/menu_graphics.h"
+#include "core/hle/menu_mods.h"
 #include "gpu/d3d11/renderer_d3d11.h"
 #include "app/debug_chapter.h"
 #include "platform/bug_capture.h"
@@ -123,18 +124,33 @@ void DrawOverlay(const core::Config& cfg, platform::Input& input, bool& show) {
         ImGui::Text("%.1f FPS", g_stats.fps);
         ImGui::End();
     }
-    if (g_renderer && g_renderer->Shaders() && g_renderer->Shaders()->pending > 0) {
+    if (g_renderer && g_renderer->Shaders()) {
         // Like a PC game's first-launch shader compilation: everything the game ships is compiled up front.
-        // Before the game shows its first frame this is the whole screen; afterwards a corner box.
+        // Before the game shows its first frame this is the whole screen; afterwards a corner box. On the title menu
+        // (and the boot screens before it) with the launch's shaders still compiling, a note says what that means.
         auto* sc = g_renderer->Shaders();
         const u32 pending = sc->pending.load(), total = std::max(sc->prewarm_total.load(), pending);
+        const bool prewarming = !sc->PrewarmDone() && pending > 0;
+        // the title menu, or the boot and PRESS + screens before it (at most 5 minutes, in case the hook never fires)
+        static bool seen_title = false;
+        static auto first_frame = std::chrono::steady_clock::time_point{};
+        if (g_stats.presents > 0 && first_frame == std::chrono::steady_clock::time_point{})
+            first_frame = now;
+        const bool at_title = g_stats.presents > 0 && hle::menu::TitleMenuShowing();
+        seen_title |= at_title;
+        const bool title =
+            at_title || (g_stats.presents > 0 && !seen_title && now - first_frame < std::chrono::minutes(5));
+        static bool warned = false; // the title note was shown this launch
+        static auto ready_until = std::chrono::steady_clock::time_point{};
         const float frac = total ? float(total - pending) / float(total) : 0.0f;
         const ImVec2 ds = ImGui::GetIO().DisplaySize;
         const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
                                        ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav;
         char label[64];
         std::snprintf(label, sizeof(label), "%u / %u", total - pending, total);
-        if (g_stats.presents == 0) {
+        if (warned && !prewarming && title && ready_until == std::chrono::steady_clock::time_point{})
+            ready_until = now + std::chrono::seconds(4);
+        if (pending > 0 && g_stats.presents == 0) {
             ImGui::SetNextWindowPos(ImVec2(ds.x * 0.5f, ds.y * 0.5f), 0, ImVec2(0.5f, 0.5f));
             ImGui::SetNextWindowBgAlpha(0.9f);
             ImGui::Begin("##shaders", nullptr, flags);
@@ -142,12 +158,34 @@ void DrawOverlay(const core::Config& cfg, platform::Input& input, bool& show) {
             ImGui::ProgressBar(frac, UiVec(520, 24), label);
             ImGui::TextDisabled("Compiled once and kept; the game continues loading meanwhile.");
             ImGui::End();
-        } else {
+        } else if (prewarming && title) {
+            // (bottom centre: the title menu's items are on the left, its button guide along the bottom edge)
+            warned = true;
+            ImGui::SetNextWindowPos(ImVec2(ds.x * 0.5f, ds.y - 64 * g_ui), 0, ImVec2(0.5f, 1.0f));
+            ImGui::SetNextWindowBgAlpha(0.85f);
+            ImGui::Begin("##shaderwarn", nullptr, flags);
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Shaders are still being prepared (%u left)", pending);
+            ImGui::Text("The game may stutter or show missing textures until this finishes.");
+            ImGui::ProgressBar(frac, UiVec(560, 20), label);
+            ImGui::TextDisabled("You can wait here, or start playing now: it keeps going in the background.");
+            ImGui::End();
+        } else if (now < ready_until && title) {
+            ImGui::SetNextWindowPos(ImVec2(ds.x * 0.5f, ds.y - 64 * g_ui), 0, ImVec2(0.5f, 1.0f));
+            ImGui::SetNextWindowBgAlpha(0.85f);
+            ImGui::Begin("##shaderwarn", nullptr, flags);
+            ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "Shaders ready");
+            ImGui::End();
+        } else if (pending > 0) {
             ImGui::SetNextWindowPos(ImVec2(ds.x - 8 * g_ui, 8 * g_ui), 0, ImVec2(1, 0));
             ImGui::SetNextWindowBgAlpha(0.5f);
             ImGui::Begin("##shaders", nullptr, flags);
-            ImGui::Text("Compiling shaders");
+            if (prewarming)
+                ImGui::Text("Compiling shaders: %u left", pending);
+            else
+                ImGui::Text("Compiling shaders");
             ImGui::ProgressBar(frac, UiVec(220, 16), label);
+            if (prewarming && warned)
+                ImGui::TextDisabled("Stutter and missing textures until done");
             ImGui::End();
         }
     }
@@ -651,9 +689,16 @@ int main(int argc, char** argv) {
     // Child-process mode used by the shader cache for compiles that may not finish (see ShaderCache).
     if (argc == 5 && std::string(argv[1]) == "--compile-shader")
         return gpu::CompileShaderFile(argv[2], argv[3], argv[4]) ? 0 : 1;
+    if (argc == 2 && std::string(argv[1]) == "--compile-server")
+        return gpu::CompileServer();
     // The launcher's last build step: every shader translated and compiled before the first launch.
     if (argc == 3 && std::string(argv[1]) == "--build-shaders")
         return gpu::BuildShadersAhead(fs::u8path(argv[2]));
+    // Developer check: the launch prewarm of ./shader_dump, timed (`--bench-shaders [workers, 0 = in-game]`).
+    if ((argc == 2 || argc == 3) && std::string(argv[1]) == "--bench-shaders") {
+        common::SetLogFile("bench.log");
+        return gpu::BenchShaders(argc == 3 ? unsigned(std::atoi(argv[2])) : 0u);
+    }
     // Developer check of the motion-vector shader variants: `--test-motion <shader_dump dir> [programs, 0 = all]`.
     if ((argc == 3 || argc == 4) && std::string(argv[1]) == "--test-motion")
         return gpu::TestMotionVectors(fs::u8path(argv[2]), argc == 4 ? std::atoi(argv[3]) : 0);

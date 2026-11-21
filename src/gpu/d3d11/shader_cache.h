@@ -36,6 +36,7 @@ struct HostShader {
     std::atomic<bool> creating{false}; // a thread took the object's creation (cleared when it is released)
     u32 last_used = 0; // ShaderCache::frame when a draw last bound it (GPU thread)
     bool prewarm = false;             // queued by Prewarm (back of the queue) and not yet asked for by the game
+    u64 seq = 0;                      // place in the prewarm's order (0: the game asked for it); workers go by it
     // Looked up because the game set it up, no draw has asked for it yet: a failure is logged at debug level only
     // (MUA3 sets up programs it never draws, some untranslatable), and as an error once a draw asks for it.
     bool quiet = false;
@@ -111,7 +112,7 @@ public:
     // cache (see BuildShadersAhead). Returns how many.
     u32 WarmDriverCache();
     void Tick();
-    bool PrewarmDone() const { return prewarm_reported_; } // Tick() reported the prewarm complete
+    bool PrewarmDone() const { return prewarm_reported_; } // Tick() reported the prewarm complete (any thread)
     void RequestRescan() { rescan_ = true; } // any thread: Tick() re-reads the manifest
     std::atomic<bool> rescan_{false};
     size_t Count() const { return shaders_.size(); }
@@ -119,6 +120,8 @@ public:
     std::atomic<u32> pending{0};
     std::atomic<u32> prewarm_total{0}; // shaders Prewarm queued this launch (progress UI: pending of these)
     std::atomic<u64> translate_ns{0}, compile_ns{0}, create_ns{0}, cache_hits{0}, info_hits{0}; // where the time went
+    std::atomic<u64> slow_ns{0}, slow_max_ns{0}; // out-of-process FXC builds (loop shaders): worker time, longest one
+    std::atomic<u32> slow_built{0};
     // Waits up to `budget` for `s` to leave Pending. Shaders the game asks for go to the front of the queue and,
     // from the bytecode cache, are ready within milliseconds: a draw can wait for its shader instead of leaving a
     // hole in the frame. Returns true when it is no longer pending.
@@ -162,6 +165,12 @@ private:
     enum PackKind : u8 { PackDxbc = 1, PackInfo = 2, PackFail = 3, PackProgram = 4, PackOpt = 7 };
     static int StageIndex(shader::Stage s) { return s == shader::Stage::Vertex ? 0 : s == shader::Stage::Compute ? 2 : 1; }
     void OpenPack();
+    // A new translator version starts with an empty pack: the guest programs and their options (the same in every
+    // version) are read from the newest older pack, one sequential read instead of thousands of small files. Prewarm
+    // folds them into the new pack and drops these.
+    void CarryPrograms();
+    std::unordered_map<u64, std::pair<int, std::vector<u8>>> carried_prog_; // hash -> stage index, program
+    std::unordered_map<u64, std::vector<u8>> carried_opt_;
     bool PackGet(PackKind kind, u64 hash, std::vector<u8>& out) const;
     void PackPut(PackKind kind, u64 hash, std::span<const u8> data);
     bool HasBytecode(const HostShader& s) const;
@@ -185,6 +194,7 @@ private:
     std::mutex mutex_;
     std::condition_variable cv_;
     std::unordered_set<u64> ordered_; // programs already listed in order.txt (first-use order for Prewarm)
+    std::unordered_set<u64> session_seen_; // programs used this launch (session.txt; GPU thread)
     std::vector<u64> drawn_order_;     // order.txt as read by Prewarm (CreateObjectsAhead's list)
     struct PackEntry {
         size_t offset = 0;
@@ -204,6 +214,7 @@ private:
     std::deque<HostShader*> queue_;
     // FXC can take minutes on some loop shaders: they compile on their own worker so nothing else waits.
     std::deque<HostShader*> slow_queue_;
+    u64 queued_ = 0; // HostShader::seq of the last prewarm item (Queue)
     std::vector<std::thread> workers_;
     bool stop_ = false;
 
@@ -211,7 +222,7 @@ private:
                       bool prewarm, bool persist = false);
     std::vector<std::pair<u64, VariantKey>> prewarm_variants_; // waiting for their base shader
     std::chrono::steady_clock::time_point prewarm_start_;
-    bool prewarm_reported_ = true;
+    std::atomic<bool> prewarm_reported_{true};
     std::atomic<s64> prewarm_end_ns{0}; // when the last queued shader finished (the report waits for a Present)
     bool replaying_ = false; // Tick() is recreating manifest variants
 
@@ -241,12 +252,18 @@ private:
 // Compiles the HLSL file `in_path` for `target` (vs_5_0/ps_5_0) into DXBC at `out_path` (process entry point
 // for `mua3 --compile-shader`). Returns false on compile errors (written to `out_path`.err).
 bool CompileShaderFile(const char* in_path, const char* out_path, const char* target);
+// `mua3 --compile-server` (child process): compiles the HLSL requests the shader cache writes to its input, until the
+// input closes (protocol next to FxcServer in shader_cache.cpp).
+int CompileServer();
 
 // `mua3 --build-shaders <game dir>` (the launcher's last build step): translates and compiles every shader the game
 // can use before it is first played, into shader_cache/ (current directory). The vertex and pixel programs come
 // from the game's romfs/SHADER files, compute programs from the locations in known_programs (main module and
 // romfs), plus the integer variants known to be drawn. Returns 0 when everything that could be built is built.
 int BuildShadersAhead(const fs::path& game_dir);
+// `mua3 --bench-shaders [workers]` (developer check): the launch prewarm of ./shader_dump into ./shader_cache, timed
+// (run it in a folder whose shader_cache is empty for a cold cache). workers 0 = the in-game worker counts.
+int BenchShaders(unsigned build_workers);
 // `mua3 --test-motion <shader_dump dir> [n]` (developer check): translates up to n vertex/pixel programs of the dump
 // (all with n = 0), adds the motion-vector variant's edits and compiles them with the direct backend, and those
 // without loops also with FXC; prints the counts and writes each failing program's HLSL and error to

@@ -27,6 +27,8 @@
 #include "core/hle/menu_mods.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <bit>
 #include <cstring>
 #include <span>
@@ -459,8 +461,11 @@ void PlaceSpare(State& s, u64 layout, u32 sub4, u32 sub5, u32 spare) {
     // pane belongs to the main list, which fades out while the submenu shows
     W32(p + kPaneColor, R32(b + kPaneColor));
 }
+std::atomic<s64> g_title_seen_ns{0}; // the title menu's last frame (TitleMenuShowing)
 void TitleUpdate(State& s) {
     const u64 menu = s.x[0];
+    if (IsTitle(menu))
+        g_title_seen_ns = std::chrono::steady_clock::now().time_since_epoch().count();
     if (IsTitle(menu) && TitleBorrowed(menu) != ~0u) {
         const u64 anims = R64(menu + 0xa0), layout = anims ? R64(anims + 8) : 0;
         if (layout) {
@@ -561,6 +566,11 @@ void BuildTitleLabels(const QuitLabel* labels, size_t count, const char* texture
 }
 
 } // namespace
+
+bool TitleMenuShowing() {
+    const s64 seen = g_title_seen_ns;
+    return seen && std::chrono::steady_clock::now().time_since_epoch().count() - seen < 500'000'000;
+}
 
 void PatchRomfsRead(const fs::path& host, u64 off, u8* dst, size_t n) {
     if (g_overlays.empty())
