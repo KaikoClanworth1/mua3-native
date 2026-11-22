@@ -84,10 +84,21 @@ void TextureCache::Invalidate(u64 gpu_va, u64 size) {
         return;
     for (auto it = textures_.begin(); it != textures_.end();) {
         auto& t = *it->second;
-        if (t.gpu_va < gpu_va + size && gpu_va < t.gpu_va + t.size)
-            Erase(it);
-        else
+        if (!(t.gpu_va < gpu_va + size && gpu_va < t.gpu_va + t.size)) {
             ++it;
+            continue;
+        }
+        // (#8) a texture rewritten this way before is updatable: keep it and decode into it again on its next use,
+        // instead of a new D3D11 texture per rewrite (VIC writes each video frame; the AMD driver keeps the old ones)
+        if (t.updatable && !no_reuse_) {
+            t.dma_dirty = true;
+            ++it;
+            continue;
+        }
+        if (invalidated_keys_.size() >= 4096)
+            invalidated_keys_.clear();
+        invalidated_keys_.insert(t.key);
+        Erase(it);
     }
 }
 
@@ -102,6 +113,11 @@ void TextureCache::NextFrame() {
                             "asynchronous so far: {} queued, {} installed, {} dropped",
                  up_count_, up_bytes_ / 1048576.0, total / 1e6, up_ns_[0] / 1e6, up_ns_[1] / 1e6, async_queued_,
                  async_installed_, async_dropped_);
+    }
+    static u64 logged_dma = 0;
+    if (dma_reuploads_ != logged_dma && frame_ % 600 == 0) {
+        logged_dma = dma_reuploads_;
+        LOG_INFO("Texture", "rewritten by the GPU or DMA (video frames): {} decoded into the same texture so far", dma_reuploads_);
     }
     std::fill(std::begin(up_ns_), std::end(up_ns_), 0);
     up_count_ = up_bytes_ = 0;
@@ -265,6 +281,21 @@ ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::T
     }
     const u64 key = Hash64(tic.w.data(), 32) ^ (u64(use.dim) << 56) ^ (u64(use.array) << 60);
     auto it = textures_.find(key);
+    if (it != textures_.end() && it->second->dma_dirty) {
+        // (#8) rewritten by the GPU or DMA since the last decode (a video frame): decode into the same texture
+        CachedTexture& t = *it->second;
+        t.dma_dirty = false;
+        for (auto& [a, s] : t.cpu_ranges)
+            G().Mem().ConsumeDirty(a, s);
+        dma_reuploads_++;
+        reuploads++;
+        g_texture_stats.reuploads.fetch_add(1, std::memory_order_relaxed);
+        if (auto* srv = Upload(tic, use, key, &t))
+            return srv;
+        Erase(it);
+        auto* srv = Upload(tic, use, key, nullptr, true);
+        return srv ? srv : Fallback(use);
+    }
     if (it != textures_.end()) {
         // Re-decode if the CPU wrote to the guest copy since we uploaded it (e.g. glyph caches).
         bool dirty = false;
@@ -347,6 +378,11 @@ ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::T
     }
     // Only in load-sized bursts (a level's textures arrive at once: 238-470 in a frame entering ST010): a hero swap or
     // an enemy spawn uploads far fewer and stays synchronous, so gameplay never draws a placeholder.
+    // (#8) dropped by Invalidate before (guest memory rewritten under it): from now on updatable, decoded in place
+    if (!invalidated_keys_.empty() && invalidated_keys_.erase(key)) {
+        auto* srv = Upload(tic, use, key, nullptr, true);
+        return srv ? srv : Fallback(use);
+    }
     constexpr u64 kAsyncMinUploads = 96;
     if (budget_ns_ && use.dim == shader::TexDim::Tex2D && up_count_ >= kAsyncMinUploads &&
         up_ns_[0] + up_ns_[1] + up_ns_[2] + up_ns_[3] >= budget_ns_) {

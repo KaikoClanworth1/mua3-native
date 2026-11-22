@@ -2,6 +2,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -47,6 +48,7 @@ struct CachedTexture {
     ComPtr<ID3D11ShaderResourceView> srv;
     u64 last_use = 0;
     bool updatable = false; // DEFAULT usage: rewrites are decoded into it in place
+    bool dma_dirty = false; // (updatable) guest memory under it was rewritten by the GPU or DMA: decode again on use
     std::vector<u64> page_hash; // per backing 4 KiB page, as decoded (rewrites that change nothing are skipped)
 };
 
@@ -107,6 +109,11 @@ private:
     D3D11Renderer& r_;
     common::U64Map<std::unique_ptr<CachedTexture>> textures_;
     common::U64Map<int> pages_; // 64 KB GPU pages covered by cached textures -> texture count
+    // keys of textures dropped by Invalidate (VIC video frames: every frame): re-created updatable, so later frames
+    // decode into the same texture instead of creating one per frame (#8: AMD keeps the old ones, +1 GB/s of memory)
+    std::unordered_set<u64> invalidated_keys_;
+    u64 dma_reuploads_ = 0;
+    const bool no_reuse_ = std::getenv("MUA3_TEX_DMA_RECREATE") != nullptr; // (A/B: one new texture per rewrite, as before)
     void TrackPages(const CachedTexture& t, int delta);
     void Erase(common::U64Map<std::unique_ptr<CachedTexture>>::iterator& it);
     common::U64Map<ComPtr<ID3D11SamplerState>> samplers_;
