@@ -90,9 +90,16 @@ public:
     u64 throttle_wait_ns_ = 0, throttle_frames_ = 0;
     u32 CullListCount(u64 index_addr) override {
         auto it = cull_lists_.find(index_addr);
-        return it == cull_lists_.end() ? 0 : it->second;
+        return it == cull_lists_.end() ? 0 : it->second.count;
     }
-    std::unordered_map<u64, u32> cull_lists_; // culling list start -> indices written there (EmulateCullingGs)
+    struct CullList {
+        u32 count; // indices in the list
+        u32 frame; // frame_counter_ when it was last written
+    };
+    // culling list start -> its indices (EmulateCullingGs). Old entries go at the end of a frame (EvictCullLists): never
+    // mid-frame, where a frame's earlier lists would be lost before the draws that read them (a one-frame flash, #19).
+    std::unordered_map<u64, CullList> cull_lists_;
+    void EvictCullLists();
     struct CullSource {
         u64 addr;       // the culling draw's own indices (the list is those, as u32)
         u32 index_size; // bytes per source index
