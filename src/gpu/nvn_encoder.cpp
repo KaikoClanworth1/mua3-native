@@ -395,10 +395,20 @@ private:
                 g_indirect_unknown++;
                 SyncForRead(x[4], sizeof(a));
                 g_.ReadGpu(x[4], a, sizeof(a));
+                // The first 30 in full, then at most one line every 2 s with how many since the last line (player
+                // logs: a burst of these was #19's flashes).
                 static int logged = 0;
-                if (logged++ < 30)
-                    LOG_INFO("NVN", "indirect elements not from the host's culling list: args {:#x} count {} instances {} first {} base {} indices {:#x} type {} mode {}",
-                             x[4], a[0], a[1], a[2], a[3], x[3], x[2], x[1]);
+                static u64 since = 0;
+                static auto last_line = std::chrono::steady_clock::time_point{};
+                since++;
+                const auto now = std::chrono::steady_clock::now();
+                if (logged < 30 || now - last_line >= std::chrono::seconds(2)) {
+                    LOG_INFO("NVN", "indirect elements not from the host's culling list ({} since the last line): args {:#x} count {} instances {} first {} base {} indices {:#x} type {} mode {}",
+                             since, x[4], a[0], a[1], a[2], a[3], x[3], x[2], x[1]);
+                    logged++, since = 0;
+                    if (logged >= 30)
+                        last_line = now;
+                }
                 Draw(u32(x[1]), true, a[2], a[0], u32(x[2]), x[3], s32(a[3]), a[1], a[4]);
             }
         } else if (n == "DrawArraysIndirect") {

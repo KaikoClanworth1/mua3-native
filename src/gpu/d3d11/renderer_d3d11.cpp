@@ -2370,9 +2370,7 @@ void D3D11Renderer::EmulateCullingGs() {
         SyncGuest(counter_va, 4, 3);
         g.ReadGpu(counter_va, &counter, 4);
         const u64 list = list_va + u64(counter) * 4;
-        if (cull_lists_.size() > 65536)
-            cull_lists_.clear(), cull_src_.clear();
-        cull_lists_[list] = tris * 3;
+        cull_lists_[list] = {tris * 3, u32(frame_counter_)};
         cull_src_[list] = {m.index_addr + u64(dr.first) * isz, isz, tris * 3};
         counter += tris * 3;
         g.WriteGpu(counter_va, &counter, 4);
@@ -2411,9 +2409,7 @@ void D3D11Renderer::EmulateCullingGs() {
     const u8* cur = g.GpuPtr(list_va + u64(counter) * 4, bytes);
     if (!cur || std::memcmp(cur, src, bytes) != 0)
         g.WriteGpu(list_va + u64(counter) * 4, src, bytes);
-    if (cull_lists_.size() > 65536)
-        cull_lists_.clear(), cull_src_.clear();
-    cull_lists_[list_va + u64(counter) * 4] = tris * 3;
+    cull_lists_[list_va + u64(counter) * 4] = {tris * 3, u32(frame_counter_)};
     cull_src_.erase(list_va + u64(counter) * 4);
     counter += tris * 3;
     g.WriteGpu(counter_va, &counter, 4);
@@ -3733,9 +3729,26 @@ void D3D11Renderer::ReportHitch() {
     std::memcpy(g_hitch_prof, g_prof_ns, sizeof(g_prof_ns));
 }
 
+// Culling lists are keyed by where they start, which moves as the view changes, so the maps keep growing. Past 65,536
+// entries the ones not written in the last 8 frames go, between frames. (They used to be cleared outright the moment
+// the map got that big, mid-frame: the frame's lists recorded before that point were lost, and the draws reading them
+// fell back to list memory the host never wrote. Walking through ST010 did that every few seconds: #19's flashes.)
+void D3D11Renderer::EvictCullLists() {
+    if (cull_lists_.size() <= 65536)
+        return;
+    const u32 now = u32(frame_counter_);
+    for (auto it = cull_lists_.begin(); it != cull_lists_.end();)
+        if (now - it->second.frame > 8) {
+            cull_src_.erase(it->first);
+            it = cull_lists_.erase(it);
+        } else
+            ++it;
+}
+
 void D3D11Renderer::Present(const PresentInfo& p) {
     const u64 present_t0 = g_cpu_on ? ProfNow() : 0;
     std::lock_guard ctx_lock(ContextMutex());
+    EvictCullLists();
     frame_counter_++;
     if (!device_removed_.load(std::memory_order_relaxed) && dev_->GetDeviceRemovedReason() != S_OK)
         device_removed_ = true; // (the UI thread recreates the device: platform::Display::RecoverDevice)
