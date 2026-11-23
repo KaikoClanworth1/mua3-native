@@ -1,5 +1,6 @@
 #pragma once
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <map>
 #include <memory>
@@ -194,6 +195,8 @@ public:
     // Allocate a 0x200-byte TLS slot.
     u64 AllocTls();
     void DumpThreadState(Thread* t, bool error = true);
+    // A timed wait of 500 ms or more ran out, or a sleep that long returned (svc.cpp; rate-limited log).
+    void ReportLongWait(Thread* t, u32 svc, const u64 (&args)[4], std::chrono::steady_clock::duration waited);
     void DumpThreadRegs(u32 thread_id); // registers + backtrace of one guest thread (debug command)
     // Logs where every guest thread is (running threads are briefly interrupted).
     void DumpAllThreads(bool host_stacks = false);
