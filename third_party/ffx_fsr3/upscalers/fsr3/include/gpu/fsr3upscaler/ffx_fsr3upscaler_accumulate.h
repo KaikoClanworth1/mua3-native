@@ -140,8 +140,8 @@ void InitPassData(FfxInt32x2 iPxHrPos, FFX_PARAMETER_INOUT AccumulationPassCommo
 
 void Accumulate(FfxInt32x2 iPxHrPos)
 {
-    AccumulationPassCommonParams params;
-    AccumulationPassData data;
+    AccumulationPassCommonParams params = (AccumulationPassCommonParams)0; // mua3: zero-init for fxc (X3508)
+    AccumulationPassData data = (AccumulationPassData)0;
     InitPassData(iPxHrPos, params, data);
 
     if (params.bIsExistingSample && !params.bIsNewSample) {

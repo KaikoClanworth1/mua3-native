@@ -13,6 +13,7 @@
 #include "gpu/d3d11/fsr.h"
 #include "gpu/d3d11/upscale_inputs.h"
 #include "gpu/d3d11/dlss.h"
+#include "gpu/d3d11/fsr3.h"
 namespace gpu { class FrameCapture; }
 #include "gpu/d3d11/gpu_passes.h"
 #include "gpu/renderer.h"
@@ -393,6 +394,9 @@ private:
     // DLSS (upscaler=2): the scene is drawn with a sub-pixel jitter (Halton 2,3, as a D3D11 viewport offset on the
     // draws into the scene depth), DLSS accumulates it at the composite. Off: FSR 1 there instead.
     Dlss dlss_;
+    Fsr3 fsr3_; // (upscaler=3: the same inputs as DLSS)
+    bool fsr3_logged_ = false;
+    u64 fsr3_t_ = 0; // (the last FSR 3 frame: ProfNow)
     bool Temporal() const { return temporal_; }
     bool temporal_ = false;     // this frame's scene draws are jittered for DLSS
     bool temporal_reset_ = true; // DLSS has no usable history (first frame, new sizes, a cut)

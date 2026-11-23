@@ -90,6 +90,50 @@ file(WRITE ${CMAKE_BINARY_DIR}/generated/ffx_fsr1_embed.h
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${FFX_FSR1_DIR}/ffx_a.h ${FFX_FSR1_DIR}/ffx_fsr1.h)
 target_include_directories(platform PRIVATE ${CMAKE_BINARY_DIR}/generated)
 
+# AMD FidelityFX FSR 3.1 upscaler (MIT, third_party/ffx_fsr3): its compute passes compiled at build time by fxc
+# (cs_5_0: no wave operations, no 16-bit types) into byte-array headers for gpu/d3d11/fsr3.cpp.
+set(FFX_FSR3_DIR ${CMAKE_SOURCE_DIR}/third_party/ffx_fsr3)
+find_program(MUA3_FXC fxc HINTS
+             "${CMAKE_WINDOWS_KITS_10_DIR}/bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64"
+             "$ENV{WindowsSdkVerBinPath}/x64" "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64"
+             "C:/Program Files (x86)/Windows Kits/10/bin/10.0.22621.0/x64" "C:/Program Files (x86)/Windows Kits/10/bin/10.0.19041.0/x64")
+if(NOT MUA3_FXC)
+    message(FATAL_ERROR "fxc.exe (Windows SDK) not found: it compiles the FSR 3 shaders")
+endif()
+file(GLOB_RECURSE FFX_FSR3_HEADERS CONFIGURE_DEPENDS ${FFX_FSR3_DIR}/*.h)
+set(FFX_FSR3_GEN ${CMAKE_BINARY_DIR}/generated/fsr3)
+set(FFX_FSR3_BLOBS)
+# name | pass file | extra defines
+foreach(spec "prepare_inputs|prepare_inputs|" "luma_pyramid|luma_pyramid|" "shading_change_pyramid|shading_change_pyramid|"
+             "shading_change|shading_change|" "prepare_reactivity|prepare_reactivity|" "luma_instability|luma_instability|"
+             "accumulate|accumulate|/DFFX_FSR3UPSCALER_OPTION_APPLY_SHARPENING=0"
+             "accumulate_sharpen|accumulate|/DFFX_FSR3UPSCALER_OPTION_APPLY_SHARPENING=1" "rcas|rcas|")
+    string(REPLACE "|" ";" parts "${spec}")
+    list(GET parts 0 name)
+    list(GET parts 1 pass)
+    list(LENGTH parts n)
+    set(extra)
+    if(n GREATER 2)
+        list(GET parts 2 extra)
+    endif()
+    set(out ${FFX_FSR3_GEN}/fsr3_${name}.h)
+    add_custom_command(OUTPUT ${out}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${FFX_FSR3_GEN}
+        COMMAND ${MUA3_FXC} /nologo /T cs_5_0 /E CS /O3 /Qstrip_reflect /Qstrip_debug
+                /DFFX_GPU=1 /DFFX_HLSL=1 /DFFX_HALF=0 /DFFX_HLSL_SM=50 /DFFX_SPD_NO_WAVE_OPERATIONS=1
+                /DFFX_FSR3UPSCALER_OPTION_LOW_RESOLUTION_MOTION_VECTORS=1 /DFFX_FSR3UPSCALER_OPTION_INVERTED_DEPTH=0
+                /DFFX_FSR3UPSCALER_OPTION_JITTERED_MOTION_VECTORS=0 /DFFX_FSR3UPSCALER_OPTION_HDR_COLOR_INPUT=0
+                /DFFX_FSR3UPSCALER_OPTION_REPROJECT_USE_LANCZOS_TYPE=0 /DFFX_FSR3UPSCALER_OPTION_UPSAMPLE_USE_LANCZOS_TYPE=0
+                ${extra} /I ${FFX_FSR3_DIR}/upscalers/fsr3/include/gpu /I ${FFX_FSR3_DIR}/api/internal/gpu
+                /Vn kFsr3_${name} /Fh ${out}
+                ${FFX_FSR3_DIR}/upscalers/fsr3/internal/shaders/ffx_fsr3upscaler_${pass}_pass.hlsl
+        DEPENDS ${FFX_FSR3_DIR}/upscalers/fsr3/internal/shaders/ffx_fsr3upscaler_${pass}_pass.hlsl ${FFX_FSR3_HEADERS}
+        COMMENT "fxc: FSR 3 ${name}" VERBATIM)
+    list(APPEND FFX_FSR3_BLOBS ${out})
+endforeach()
+add_custom_target(fsr3_shaders DEPENDS ${FFX_FSR3_BLOBS})
+add_dependencies(platform fsr3_shaders)
+
 # NVIDIA DLSS Super Resolution: mua3_dlss.dll (src/dlss), which the game loads at run time (gpu/d3d11/dlss.cpp), so
 # the game and its libraries never link NVIDIA's code. NVIDIA's SDK is proprietary and never committed: the DLL is
 # built only when third_party/dlss (git-ignored) holds its headers (include/) and static-CRT import library

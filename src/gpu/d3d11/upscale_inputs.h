@@ -40,6 +40,10 @@ public:
     bool DrawDebug(ID3D11Device* dev, ID3D11DeviceContext* ctx, int mode, ID3D11ShaderResourceView* scene,
                    ID3D11ShaderResourceView* depth, ID3D11RenderTargetView* dst, u32 w, u32 h);
 
+    // From this frame's camera (after Resolve): device depth -> view distance, dist = [1] / (depth - [0]), and the
+    // tangents of the half field of view in x ([2]) and y ([3]), as FSR 3 takes them. False without a camera.
+    bool DepthToView(float out[4]) const;
+
     // At the end of a frame: this frame's matrix becomes the previous one.
     void EndFrame();
     void Reset() { *this = UpscaleInputs{}; }

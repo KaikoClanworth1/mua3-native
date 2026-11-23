@@ -17,6 +17,10 @@ public:
     bool Run(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* src, u32 in_w, u32 in_h,
              ID3D11RenderTargetView* mid, ID3D11ShaderResourceView* mid_srv, ID3D11RenderTargetView* dst, u32 out_w,
              u32 out_h, float sharpness_stops);
+    // Writes only alpha into `dst` (out_w x out_h): `src`'s, sampled bilinearly. For the temporal upscalers' output (FSR
+    // 3.1, DLSS), which does not keep the layer's alpha the game may blend by (the pause menu's team).
+    bool CopyAlpha(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* src, ID3D11RenderTargetView* dst,
+                   u32 out_w, u32 out_h);
 
 private:
     bool Init(ID3D11Device* dev);
@@ -24,9 +28,11 @@ private:
               ID3D11RenderTargetView* dst, u32 w, u32 h);
     bool tried_ = false, ok_ = false;
     Microsoft::WRL::ComPtr<ID3D11VertexShader> vs_;
-    Microsoft::WRL::ComPtr<ID3D11PixelShader> easu_, rcas_;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> easu_, rcas_, alpha_;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> sampler_;
-    Microsoft::WRL::ComPtr<ID3D11Buffer> easu_cb_, rcas_cb_;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> easu_cb_, rcas_cb_, alpha_cb_;
+    Microsoft::WRL::ComPtr<ID3D11BlendState> alpha_blend_;
+    u32 alpha_w_ = 0, alpha_h_ = 0;
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> raster_;
     Microsoft::WRL::ComPtr<ID3D11BlendState> blend_;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> depth_;

@@ -178,6 +178,32 @@ void UpscaleInputs::Resolve() {
     noted_ = true;
 }
 
+// clip = (x, y, z, 1) * M, M = V * P with V rigid: column 3 is the view axis (w = distance * s, s = its length),
+// columns 0 and 1 are it scaled by the projection's x and y scales, column 2 = A * column 3 + B * (0, 0, 0, 1).
+// Then depth = (A + B / w) * sz + tz, so distance = (B * sz / s) / (depth - (A * sz + tz)).
+bool UpscaleInputs::DepthToView(float out[4]) const {
+    if (!noted_)
+        return false;
+    auto col = [&](int c, int r) { return vp_[r * 4 + c]; };
+    auto len3 = [&](int c) { return std::sqrt(col(c, 0) * col(c, 0) + col(c, 1) * col(c, 1) + col(c, 2) * col(c, 2)); };
+    const float s = len3(3);
+    if (!(s > 1e-6f))
+        return false;
+    const float a = (col(2, 0) * col(3, 0) + col(2, 1) * col(3, 1) + col(2, 2) * col(3, 2)) / (s * s);
+    const float b = col(2, 3) - a * col(3, 3);
+    const float x_scale = len3(0) / s, y_scale = len3(1) / s;
+    if (!(std::abs(b) > 1e-12f) || !(x_scale > 1e-6f) || !(y_scale > 1e-6f))
+        return false;
+    out[0] = a * sz_ + tz_;
+    out[1] = b * sz_ / s;
+    // (positive distances in front: at a mid depth the sign of [1] / (0.5 - [0]) must be +)
+    if (out[1] / (0.5f - out[0]) < 0)
+        out[1] = -out[1];
+    out[2] = 1.0f / x_scale;
+    out[3] = 1.0f / y_scale;
+    return std::isfinite(out[0]) && std::isfinite(out[1]);
+}
+
 void UpscaleInputs::EndFrame() {
     if (noted_) {
         std::memcpy(prev_vp_, vp_, sizeof(prev_vp_));
