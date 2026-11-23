@@ -478,7 +478,10 @@ private:
             for (u32 k = 0; k < nsend; k++) {
                 auto mit = mix_offset_.find(sends[k].mix);
                 if (mit == mix_offset_.end()) {
+                    // The send's mix isn't in use in this update (the DSP mixes nothing into it either). The voice's
+                    // state still advances: UpdateVoice played and released its wave buffers before mixing.
                     stat_unrouted_++;
+                    LogUnrouted(p, channels, c, sends[k].mix, sit != splitters_.end());
                     continue;
                 }
                 stat_routed_++;
@@ -494,6 +497,40 @@ private:
             }
             vs.last[c] = src[size_t(count - 1) * channels + c];
         }
+    }
+
+    // A voice channel sent to a mix that isn't in use: once per voice/mix pair per 10 s, at most 16 lines per 10 s.
+    void LogUnrouted(const u8* p, u32 channels, u32 channel, u32 to_mix, bool by_splitter) {
+        static std::map<std::pair<u32, u32>, std::chrono::steady_clock::time_point> last;
+        static auto window = std::chrono::steady_clock::now();
+        static u32 lines = 0, left_out = 0;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - window > std::chrono::seconds(10)) {
+            if (left_out)
+                LOG_INFO("audren", "{} more unrouted voice channels in the last 10 s", left_out);
+            window = now;
+            lines = left_out = 0;
+        }
+        const u32 voice = common::Read<u32>(p);
+        auto [it, fresh] = last.try_emplace({voice, to_mix}, now);
+        if (!fresh && now - it->second < std::chrono::seconds(10))
+            return;
+        it->second = now;
+        if (lines >= 16) {
+            left_out++;
+            return;
+        }
+        lines++;
+        std::string in_use;
+        for (auto& [id, o] : mix_offset_)
+            in_use += fmt::format(" {}", id);
+        float vol;
+        std::memcpy(&vol, p + 0x20, 4);
+        LOG_INFO("audren", "unrouted: voice {} channel {} of {} (format {}, rate {}, vol {:.2f}, state {}) sends to mix {} through {} "
+                 "(voice mix {}, splitter {}), which isn't in use; mixes in use:{}",
+                 voice, channel, channels, p[0x0B], common::Read<u32>(p + 0x0C), vol, p[0x0A], s32(to_mix),
+                 by_splitter ? "its splitter" : "its channel resource", s32(common::Read<u32>(p + 0x58)),
+                 s32(common::Read<u32>(p + 0x5C)), in_use);
     }
 
     // Splitter data (between effects and mixes) when present: "SNDH" header {magic, info count, data count, pad},

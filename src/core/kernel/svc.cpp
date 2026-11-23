@@ -9,6 +9,7 @@
 
 #include "core/hle/service.h"
 #include "core/kernel/kernel.h"
+#include "core/system.h"
 
 namespace kernel {
 
@@ -102,6 +103,25 @@ void Kernel::SvcDispatch(Thread* t, u32 id) {
             stats.clear();
         }
     }
+
+    // Timed waits of 500 ms or more that run out, and sleeps that long: a game thread stalled on something nothing
+    // signals (#16: frames of about 2 s when the whole team fires their ultimates). Logged with the thread, what it
+    // waited on, the timeout, the time waited and the guest call stack; at most once per call site per 10 s, with a
+    // count of the ones left out.
+    const bool long_wait = ((id == 0x18 || id == 0x1C || id == 0x34) && s64(R(3)) >= 500'000'000) ||
+                           (id == 0x0B && s64(R(0)) >= 500'000'000);
+    struct LongWaitReport {
+        Kernel* k;
+        Thread* t;
+        u32 id;
+        u64 args[4];
+        std::chrono::steady_clock::time_point t0;
+        ~LongWaitReport() {
+            if (k)
+                k->ReportLongWait(t, id, args, std::chrono::steady_clock::now() - t0);
+        }
+    } long_wait_report{long_wait ? this : nullptr, t, id, {R(0), R(1), R(2), R(3)},
+                       long_wait ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};
 
     switch (id) {
     case 0x01: { // SetHeapSize
@@ -717,6 +737,61 @@ void Kernel::SvcDispatch(Thread* t, u32 id) {
         DumpThreadState(t);
         Ret(rc::NotImplemented);
         break;
+    }
+}
+
+void Kernel::ReportLongWait(Thread* t, u32 id, const u64 (&args)[4], std::chrono::steady_clock::duration waited) {
+    const bool sleep = id == 0x0B;
+    if (!sleep && u32(t->cpu->Reg(0)) != rc::TimedOut)
+        return; // signalled, cancelled or failed: not a stall
+    const u64 lr = t->cpu->Reg(30);
+    static std::mutex report_mutex;
+    static std::map<std::pair<u32, u64>, std::pair<std::chrono::steady_clock::time_point, u64>> last; // site -> {logged, left out}
+    {
+        std::lock_guard lk(report_mutex);
+        auto [it, fresh] = last.try_emplace({id, lr});
+        const auto now = std::chrono::steady_clock::now();
+        if (!fresh && now - it->second.first < std::chrono::seconds(10)) {
+            it->second.second++;
+            return;
+        }
+        const u64 left_out = it->second.second;
+        it->second = {now, 0};
+        auto& sys = core::Sys();
+        std::string what;
+        switch (id) {
+        case 0x0B: what = "SleepThread"; break;
+        case 0x18: {
+            what = "WaitSynchronization on";
+            const u32 count = std::min<u32>(u32(args[2]), 0x40);
+            for (u32 i = 0; i < count && mem_.IsValid(args[1] + i * 4, 4); i++) {
+                const Handle h = mem_.Read<u32>(args[1] + i * 4);
+                const KObjectPtr o = h == kCurrentThread ? t->shared_from_this() : handles_.Get(h);
+                std::string name = !o ? "closed" : !o->name.empty() ? o->name : fmt::format("type {}", int(o->Type()));
+                if (auto th = std::dynamic_pointer_cast<Thread>(o))
+                    name = fmt::format("thread {} ({})", th->id, th->name);
+                what += fmt::format(" {:#x} [{}]", h, name);
+            }
+            break;
+        }
+        case 0x1C:
+            what = fmt::format("WaitProcessWideKeyAtomic: condvar {:#x}, mutex {:#x}", args[1], args[0]);
+            break;
+        case 0x34:
+            what = fmt::format("WaitForAddress {:#x} (type {}, value {}; now {})", args[0], u32(args[1]), s32(args[2]),
+                               mem_.IsValid(args[0], 4) ? s32(mem_.Read<u32>(args[0])) : 0);
+            break;
+        }
+        std::string stack;
+        u64 fp = t->cpu->Reg(29);
+        for (int i = 0; i < 10 && fp && mem_.IsValid(fp, 16); i++) {
+            stack += " <- " + sys.Symbolize(mem_.Read<u64>(fp + 8));
+            fp = mem_.Read<u64>(fp);
+        }
+        LOG_WARN("Wait", "thread {} ({}): {} {} after {:.0f} ms ({} {:.0f} ms), lr {}{}{}", t->id, t->name, what,
+                 sleep ? "returned" : "timed out", std::chrono::duration<double, std::milli>(waited).count(),
+                 sleep ? "asked for" : "timeout", double(sleep ? args[0] : args[3]) / 1e6,
+                 sys.Symbolize(lr), stack, left_out ? fmt::format(" ({} more here since the last line)", left_out) : "");
     }
 }
 
