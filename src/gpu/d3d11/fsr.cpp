@@ -40,6 +40,12 @@ float4 ps_main(float4 pos : SV_Position) : SV_Target {
     const float2 uv = pos.xy * asfloat(con0.xy) * asfloat(con1.xy); // (output pixel -> input pixel -> input UV)
     return float4(c, tex.SampleLevel(lin, uv, 0).a);
 }
+#elif defined(COPY_ALPHA)
+// Only alpha is written (blend state): the source's, bilinear, into another upscaler's output.
+cbuffer C : register(b0) { float4 inv_out; };
+float4 ps_main(float4 pos : SV_Position) : SV_Target {
+    return float4(0, 0, 0, tex.SampleLevel(lin, pos.xy * inv_out.xy, 0).a);
+}
 #else
 cbuffer C : register(b0) { uint4 con; };
 #define FSR_RCAS_F 1
@@ -79,16 +85,20 @@ bool Fsr::Init(ID3D11Device* dev) {
     Microsoft::WRL::ComPtr<ID3DBlob> vs, easu, rcas, err;
     const UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
     const D3D_SHADER_MACRO easu_def[] = {{"EASU", "1"}, {nullptr, nullptr}};
+    const D3D_SHADER_MACRO alpha_def[] = {{"COPY_ALPHA", "1"}, {nullptr, nullptr}};
+    Microsoft::WRL::ComPtr<ID3DBlob> alpha;
     if (FAILED(D3DCompile(kSource, sizeof(kSource) - 1, "fsr1", nullptr, &inc, "vs_main", "vs_5_0", flags, 0, &vs, &err)) ||
         FAILED(D3DCompile(kSource, sizeof(kSource) - 1, "fsr1", easu_def, &inc, "ps_main", "ps_5_0", flags, 0, &easu, &err)) ||
-        FAILED(D3DCompile(kSource, sizeof(kSource) - 1, "fsr1", nullptr, &inc, "ps_main", "ps_5_0", flags, 0, &rcas, &err))) {
+        FAILED(D3DCompile(kSource, sizeof(kSource) - 1, "fsr1", nullptr, &inc, "ps_main", "ps_5_0", flags, 0, &rcas, &err)) ||
+        FAILED(D3DCompile(kSource, sizeof(kSource) - 1, "fsr1", alpha_def, &inc, "ps_main", "ps_5_0", flags, 0, &alpha, &err))) {
         LOG_ERROR("Renderer", "FSR shaders: {}", err ? std::string(static_cast<const char*>(err->GetBufferPointer()),
                                                                      err->GetBufferSize()) : "compile failed");
         return false;
     }
     if (FAILED(dev->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &vs_)) ||
         FAILED(dev->CreatePixelShader(easu->GetBufferPointer(), easu->GetBufferSize(), nullptr, &easu_)) ||
-        FAILED(dev->CreatePixelShader(rcas->GetBufferPointer(), rcas->GetBufferSize(), nullptr, &rcas_)))
+        FAILED(dev->CreatePixelShader(rcas->GetBufferPointer(), rcas->GetBufferSize(), nullptr, &rcas_)) ||
+        FAILED(dev->CreatePixelShader(alpha->GetBufferPointer(), alpha->GetBufferSize(), nullptr, &alpha_)))
         return false;
     D3D11_SAMPLER_DESC sd{};
     sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
@@ -107,7 +117,11 @@ bool Fsr::Init(ID3D11Device* dev) {
     D3D11_DEPTH_STENCIL_DESC dd{};
     if (FAILED(dev->CreateSamplerState(&sd, &sampler_)) || FAILED(dev->CreateBuffer(&bd, nullptr, &easu_cb_)) ||
         FAILED(dev->CreateBuffer(&bd, nullptr, &rcas_cb_)) || FAILED(dev->CreateRasterizerState(&rd, &raster_)) ||
-        FAILED(dev->CreateBlendState(&bl, &blend_)) || FAILED(dev->CreateDepthStencilState(&dd, &depth_)))
+        FAILED(dev->CreateBlendState(&bl, &blend_)) || FAILED(dev->CreateDepthStencilState(&dd, &depth_)) ||
+        FAILED(dev->CreateBuffer(&bd, nullptr, &alpha_cb_)))
+        return false;
+    bl.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALPHA;
+    if (FAILED(dev->CreateBlendState(&bl, &alpha_blend_)))
         return false;
     LOG_INFO("Renderer", "FSR 1 (EASU + RCAS) ready");
     return ok_ = true;
@@ -162,6 +176,31 @@ bool Fsr::Run(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11ShaderResourceV
     ctx->PSSetSamplers(0, 1, sampler_.GetAddressOf());
     Draw(ctx, easu_.Get(), easu_cb_.Get(), src, mid, out_w, out_h);
     Draw(ctx, rcas_.Get(), rcas_cb_.Get(), mid_srv, dst, out_w, out_h);
+    return true;
+}
+
+bool Fsr::CopyAlpha(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* src, ID3D11RenderTargetView* dst,
+                    u32 out_w, u32 out_h) {
+    if (!tried_)
+        Init(dev);
+    if (!ok_ || !src || !dst || !out_w || !out_h)
+        return false;
+    if (out_w != alpha_w_ || out_h != alpha_h_) {
+        const float c[16] = {1.0f / float(out_w), 1.0f / float(out_h)};
+        ctx->UpdateSubresource(alpha_cb_.Get(), 0, nullptr, c, 0, 0);
+        alpha_w_ = out_w, alpha_h_ = out_h;
+    }
+    ctx->RSSetState(raster_.Get());
+    ctx->OMSetBlendState(alpha_blend_.Get(), nullptr, 0xFFFFFFFF);
+    ctx->OMSetDepthStencilState(depth_.Get(), 0);
+    ctx->IASetInputLayout(nullptr);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx->VSSetShader(vs_.Get(), nullptr, 0);
+    ctx->GSSetShader(nullptr, nullptr, 0);
+    ctx->HSSetShader(nullptr, nullptr, 0);
+    ctx->DSSetShader(nullptr, nullptr, 0);
+    ctx->PSSetSamplers(0, 1, sampler_.GetAddressOf());
+    Draw(ctx, alpha_.Get(), alpha_cb_.Get(), src, dst, out_w, out_h);
     return true;
 }
 

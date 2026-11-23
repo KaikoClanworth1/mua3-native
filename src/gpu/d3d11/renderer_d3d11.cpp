@@ -619,7 +619,7 @@ D3D11Renderer::D3D11Renderer(ID3D11Device* dev, ID3D11DeviceContext* ctx) : dev_
     new_frame_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     shaders_ = std::make_unique<ShaderCache>(dev);
     // DLSS chosen and likely to run: also prewarm the velocity variants earlier DLSS sessions drew.
-    shaders_->prewarm_velocity = core::Sys().Cfg().upscaler == 2 && Dlss::Likely(dev);
+    shaders_->prewarm_velocity = (core::Sys().Cfg().upscaler == 2 && Dlss::Likely(dev)) || core::Sys().Cfg().upscaler == 3;
     shaders_->Prewarm();
     textures_ = std::make_unique<TextureCache>(dev, ctx, *this);
     gpu_passes_.Init(dev, ctx);
@@ -643,6 +643,7 @@ D3D11Renderer::D3D11Renderer(ID3D11Device* dev, ID3D11DeviceContext* ctx) : dev_
         }).detach();
     // For the menus: DLSS offered where mua3_dlss.dll is installed on an NVIDIA GPU (NGX's own answer corrects it).
     core::SetUpscalerAvailable(core::kUpscalerDlss, Dlss::Likely(dev_));
+    core::SetUpscalerAvailable(core::kUpscalerFsr3, fsr3_.Available(dev_));
     if (const char* d = std::getenv("MUA3_DEBUG_PS")) {
         debug_mode_ = std::atoi(d);
         const char* src = "float4 main() : SV_Target0 { return float4(1, 0, 1, 1); }";
@@ -708,6 +709,7 @@ void D3D11Renderer::ReleaseDevice() {
     fsr_ = Fsr{};
     upscale_in_.Reset();
     dlss_.Reset();
+    fsr3_.Reset();
     temporal_ = false;
     temporal_reset_ = true;
     vel_tex_.Reset(), vel_rtv_.Reset(), vel_srv_.Reset();
@@ -880,6 +882,32 @@ void D3D11Renderer::UpscaleComposite() {
         if (d && d->depth && d->srv && d->Scaled(d->width) == iw && d->Scaled(d->height) == ih &&
             upscale_in_.BuildMotion(dev_, ctx_, d->srv.Get(), iw, ih,
                                     vel_written_ && vel_w_ == iw && vel_h_ == ih ? vel_srv_.Get() : nullptr)) {
+            if (core::Sys().Cfg().upscaler == 3) {
+                Fsr3::Frame g;
+                g.color = src->srv.Get();
+                g.depth = d->srv.Get();
+                g.motion = upscale_in_.Motion();
+                g.output = comp_tex_[2].Get();
+                g.in_w = iw, g.in_h = ih, g.out_w = ow, g.out_h = oh;
+                g.jitter_x = jitter_x_, g.jitter_y = jitter_y_;
+                if (!upscale_in_.DepthToView(g.depth_to_view)) { // (no camera: a 60 degree view, 0.1 to 1000)
+                    g.depth_to_view[0] = 1000.0f / 999.9f, g.depth_to_view[1] = -100.0f / 999.9f;
+                    g.depth_to_view[2] = 0.5774f * float(iw) / float(ih), g.depth_to_view[3] = 0.5774f;
+                }
+                g.sharpness = float(std::clamp(core::Sys().Cfg().sharpness, 0, 100)) / 100.0f;
+                const u64 now = ProfNow();
+                g.frame_ms = fsr3_t_ ? float(double(now - fsr3_t_) / 1e6) : 16.7f;
+                fsr3_t_ = now;
+                g.reset = temporal_reset_;
+                ContextEpoch()++;
+                if (fsr3_.Evaluate(dev_, ctx_, g)) {
+                    fsr_.CopyAlpha(dev_, ctx_, src->srv.Get(), comp_rtv_[2].Get(), ow, oh); // (the layer's alpha)
+                    temporal_reset_ = false;
+                    comp_ready_ = true;
+                    comp_serial_ = src->write_serial;
+                    return;
+                }
+            }
             Dlss::Frame f;
             f.color = src->tex.Get();
             f.depth = d->tex.Get();
@@ -891,7 +919,8 @@ void D3D11Renderer::UpscaleComposite() {
             f.reset = temporal_reset_;
             f.quality = core::Sys().Cfg().upscale_quality;
             ContextEpoch()++;
-            if (dlss_.Evaluate(dev_, ctx_, f)) {
+            if (core::Sys().Cfg().upscaler == 2 && dlss_.Evaluate(dev_, ctx_, f)) {
+                fsr_.CopyAlpha(dev_, ctx_, src->srv.Get(), comp_rtv_[2].Get(), ow, oh); // (the layer's alpha)
                 temporal_reset_ = false;
                 comp_ready_ = true;
                 comp_serial_ = src->write_serial;
@@ -4106,16 +4135,22 @@ void D3D11Renderer::Present(const PresentInfo& p) {
         }
         // DLSS (upscaler=2) needs the HUD split (it runs at the composite); without it, or where it is unavailable,
         // FSR 1 upscales instead. Next frame's jitter: Halton (2, 3), 8 x the upscale area ratio phases.
+        // FSR 3 (upscaler=3) the same, with its own passes.
         const bool want_dlss = hud_scale_ && core::Sys().Cfg().upscaler == 2;
-        const bool temporal = want_dlss && dlss_.Available(dev_);
+        const bool want_fsr3 = hud_scale_ && core::Sys().Cfg().upscaler == 3;
+        const bool temporal = (want_dlss && dlss_.Available(dev_)) || (want_fsr3 && fsr3_.Available(dev_));
         if (want_dlss)
             core::SetUpscalerAvailable(core::kUpscalerDlss, temporal);
         if (want_dlss && !temporal && !dlss_logged_) {
             dlss_logged_ = true;
             LOG_INFO("Renderer", "DLSS: {}; FSR 1 upscales instead", dlss_.Status());
         }
+        if (want_fsr3 && !temporal && !fsr3_logged_) {
+            fsr3_logged_ = true;
+            LOG_INFO("Renderer", "FSR 3.1: {}; FSR 1 upscales instead", fsr3_.Status());
+        }
         if (temporal != temporal_) {
-            LOG_INFO("Renderer", "DLSS {}", temporal ? "on (jittered scene)" : "off");
+            LOG_INFO("Renderer", "{} {}", want_fsr3 ? "FSR 3.1" : "DLSS", temporal ? "on (jittered scene)" : "off");
             temporal_ = temporal;
             temporal_reset_ = true;
             jitter_index_ = 0;
