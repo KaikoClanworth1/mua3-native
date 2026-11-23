@@ -106,7 +106,7 @@ public:
     bool Init(core::InputBackend backend, int camera_speed = 100, int button_layout = 0);
     void Update(bool window_focused);
     void SetCameraSpeed(int percent) { camera_speed_ = percent < 10 ? 10 : percent > 200 ? 200 : percent; }
-    void SetButtonLayout(int layout) { button_layout_ = layout; } // core::Config::button_layout
+    void SetButtonLayout(int layout); // core::Config::button_layout
     // Stick deadzones in percent (core::Config::left_deadzone / right_deadzone).
     void SetDeadzones(int left, int right) { left_dz_ = left; right_dz_ = right; }
     std::string DeviceName() const { return device_name_; }
@@ -124,6 +124,7 @@ private:
     struct SDL_Gamepad* pad_ = nullptr;
     // The game button each face button (south, east, west, north) went down as, kept until it's released; 0 = up.
     u64 face_[4] = {};
+    bool pad_seen_ = false; // a pad was connected last poll (a pad that appears sets the prompts' device at once)
     void MapXInput(const ::_XINPUT_GAMEPAD& g, hle::hid::PadInput& p);
     u64 Face(int i, bool down, u64 by_layout, u64 by_pos, bool wheel);
 };

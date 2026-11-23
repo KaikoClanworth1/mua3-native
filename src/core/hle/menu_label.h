@@ -22,4 +22,11 @@ std::vector<u8> RenderLabel(const LabelStyle& style, const std::wstring& text, c
 // cannot draw it.
 std::vector<u8> RenderSystemLabel(const std::wstring& text, const wchar_t* face, bool cjk, bool selected, int w, int h);
 
+// White-on-black coverage (0-255, w x h) of `text` drawn with GDI at `px` pixels, its cell's top-left at (x, y).
+std::vector<u8> TextCoverage(const std::wstring& text, const wchar_t* face, int weight, bool italic, int px, int w, int h,
+                             int x, int y);
+
+// BC3 blocks (linear order) of straight-alpha RGBA (0-255 floats, w x h).
+std::vector<u8> EncodeBC3Rgba(const std::vector<float>& rgba, int w, int h);
+
 } // namespace hle::menu

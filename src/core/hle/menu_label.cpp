@@ -286,4 +286,11 @@ std::vector<u8> RenderSystemLabel(const std::wstring& text, const wchar_t* face,
     return EncodeBC3(rgba, w, h);
 }
 
+std::vector<u8> TextCoverage(const std::wstring& text, const wchar_t* face, int weight, bool italic, int px, int w, int h,
+                             int x, int y) {
+    return Render(text, face, weight, italic, px, w, h, x, y).a;
+}
+
+std::vector<u8> EncodeBC3Rgba(const std::vector<float>& rgba, int w, int h) { return EncodeBC3(rgba, w, h); }
+
 } // namespace hle::menu

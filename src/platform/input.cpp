@@ -3,10 +3,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
 
 #include <SDL3/SDL.h>
 
 #include "core/hle/hid.h"
+#include "core/hle/prompts.h"
 #include "platform/platform.h"
 
 #pragma comment(lib, "xinput.lib")
@@ -123,13 +125,20 @@ u64 Input::SimulateXInput(u32 buttons) {
     p.connected = true;
     MapXInput(g, p);
     SetPad(0, p);
+    hle::prompts::SetDevice(hle::prompts::Device::Xbox);
     return p.buttons;
+}
+
+void Input::SetButtonLayout(int layout) {
+    button_layout_ = layout;
+    hle::prompts::SetLayout(layout);
 }
 
 bool Input::Init(core::InputBackend backend, int camera_speed, int button_layout) {
     backend_ = backend;
     camera_speed_ = camera_speed;
     button_layout_ = button_layout;
+    hle::prompts::SetLayout(button_layout);
     LOG_INFO("Input", "Input backend: {}", backend == core::InputBackend::XInput ? "XInput" : "SDL");
     return true;
 }
@@ -138,6 +147,7 @@ void Input::Update(bool focused) {
     PadInput p;
     p.connected = true;
     bool pad = false;
+    std::optional<hle::prompts::Device> device; // the device the player used this poll
     if (backend_ == core::InputBackend::XInput) {
         for (DWORD i = 0; i < XUSER_MAX_COUNT; i++) {
             XINPUT_STATE st{};
@@ -145,6 +155,11 @@ void Input::Update(bool focused) {
                 continue;
             MapXInput(st.Gamepad, p);
             pad = true;
+            const auto& g = st.Gamepad;
+            const bool moved = std::abs(g.sThumbLX) > 12000 || std::abs(g.sThumbLY) > 12000 ||
+                               std::abs(g.sThumbRX) > 12000 || std::abs(g.sThumbRY) > 12000;
+            if (g.wButtons || g.bLeftTrigger > 64 || g.bRightTrigger > 64 || moved || !pad_seen_)
+                device = hle::prompts::Device::Xbox;
             device_name_ = fmt::format("XInput controller {}", i + 1);
             break;
         }
@@ -208,12 +223,39 @@ void Input::Update(bool focused) {
                   1.0, p.lx, p.ly);
             Stick(SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_RIGHTX), -SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_RIGHTY), right_dz_ * 32767 / 100,
                   1.0, p.rx, p.ry);
+            const bool moved = std::abs(p.lx) > 8000 || std::abs(p.ly) > 8000 || std::abs(p.rx) > 8000 || std::abs(p.ry) > 8000;
+            if (p.buttons || moved || !pad_seen_) {
+                switch (SDL_GetGamepadType(pad_)) {
+                case SDL_GAMEPAD_TYPE_PS3: case SDL_GAMEPAD_TYPE_PS4: case SDL_GAMEPAD_TYPE_PS5:
+                    device = hle::prompts::Device::PlayStation;
+                    break;
+                case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO: case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+                case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT: case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
+                    device = hle::prompts::Device::Switch;
+                    break;
+                default:
+                    device = hle::prompts::Device::Xbox;
+                }
+            }
         }
     }
     if (!pad)
         std::fill(std::begin(face_), std::end(face_), 0);
-    if (focused)
-        ReadKeyboard(p);
+    pad_seen_ = pad;
+    if (focused) {
+        const u64 before = p.buttons;
+        PadInput k;
+        ReadKeyboard(k);
+        if (k.buttons || k.lx || k.ly || k.rx || k.ry)
+            device = hle::prompts::Device::Keyboard;
+        p.buttons |= before | k.buttons;
+        if (k.lx) p.lx = k.lx;
+        if (k.ly) p.ly = k.ly;
+        if (k.rx) p.rx = k.rx;
+        if (k.ry) p.ry = k.ry;
+    }
+    if (device)
+        hle::prompts::SetDevice(*device);
     AddStickDirections(p);
     SetPad(0, p);
 }

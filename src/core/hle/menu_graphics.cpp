@@ -39,6 +39,7 @@
 #include "core/hle/mods.h"
 #include "core/kernel/kernel.h"
 #include "core/memory.h"
+#include "core/hle/prompts.h"
 #include "core/upscalers.h"
 
 namespace hle::menu::graphics {
@@ -1186,6 +1187,7 @@ void SetRenderScale(u32 scale3) { g_scale3 = scale3; }
 u32 LabelHash() { return kStrGraphics; }
 
 void Install(core::Memory& mem, kernel::Kernel& kernel, u64 main_base) {
+    prompts::Init(); // (button icons per input device: no game code involved)
     // the build these offsets come from: the first words of the functions, the row counts and tab 2's row types
     static constexpr std::pair<u64, u32> kExpect[] = {
         {kOptInit, 0xf81d0ff5},   {kOptStore, 0xa9be4ff4},  {kChoiceCount, 0xb9419808}, {kTabPrev, 0xa9bd57f6},
