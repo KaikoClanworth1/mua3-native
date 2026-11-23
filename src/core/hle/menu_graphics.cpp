@@ -649,9 +649,8 @@ void BuildKeyRows() {
         else if (g_key_note_action == int(a))
             info = g_key_note;
         else
-            info = u"A, then a key or mouse button: change it (ESC cancels, BACKSPACE clears).\r\nY: back to the default (" +
-                   kb::Text(kb::Default(a)) +
-                   u").";
+            info = u"A, then a key or mouse button: change it. Y: default (" + kb::Text(kb::Default(a)) + u").\r\n" +
+                   (kb::Note(a).empty() ? std::u16string(u"ESC cancels a change, BACKSPACE leaves no key.") : kb::Note(a));
         PutString(g_key_info[k], info, kInfoRoom);
     }
     g_pages[kPageKeys].rows.assign(g_key_rows.begin(), g_key_rows.begin() + 1 + shown);
