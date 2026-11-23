@@ -71,14 +71,16 @@ void ReadKeyboard(PadInput& p) {
 
 } // namespace
 
-// The skill wheel (R held) puts the skills on the face buttons by position, with no letters: with R held a face button
-// goes down as the Switch button in its position, whatever the layout (#14: by letter, Xbox X fired the skill shown
-// on the top circle). The choice holds until the button is released, so letting go of R mid-press changes nothing.
-u64 Input::Face(int i, bool down, u64 by_layout, u64 by_pos, bool skill_modifier) {
+// The wheels the game opens while a button is held show their choices on the face buttons by position, with no
+// letters: R the skills, ZR the team-up skills, ZL the emotes (L has none: it guards). While one of those is held a
+// face button goes down as the Switch button in its position, whatever the layout (#14: by letter, Xbox X fired the
+// top choice instead of the left one). The choice holds until the button is released, so letting go of the trigger
+// mid-press changes nothing.
+u64 Input::Face(int i, bool down, u64 by_layout, u64 by_pos, bool wheel) {
     if (!down)
         return face_[i] = 0;
     if (!face_[i])
-        face_[i] = skill_modifier ? by_pos : by_layout;
+        face_[i] = wheel ? by_pos : by_layout;
     return face_[i];
 }
 
@@ -87,11 +89,11 @@ void Input::MapXInput(const XINPUT_GAMEPAD& g, PadInput& p) {
     // By letter (default): Xbox A/B/X/Y = the game's A/B/X/Y prompts. By position: the Switch layout (Xbox A
     // is the bottom button = Switch B, and so on).
     const bool pos = button_layout_ == 1;
-    const bool skills = (g.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
+    const bool wheel = (g.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) || g.bRightTrigger > 64 || g.bLeftTrigger > 64;
     const WORD fx[4] = {XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y};
     const u64 letter[4] = {A, B, X, Y}, by_pos[4] = {B, A, Y, X};
     for (int f = 0; f < 4; f++)
-        p.buttons |= Face(f, (g.wButtons & fx[f]) != 0, pos ? by_pos[f] : letter[f], by_pos[f], skills);
+        p.buttons |= Face(f, (g.wButtons & fx[f]) != 0, pos ? by_pos[f] : letter[f], by_pos[f], wheel);
     struct {
         WORD x;
         u64 b;
@@ -112,9 +114,11 @@ void Input::MapXInput(const XINPUT_GAMEPAD& g, PadInput& p) {
     Stick(g.sThumbRX, g.sThumbRY, right_dz_ * 32767 / 100, 1.0, p.rx, p.ry);
 }
 
-u64 Input::SimulateXInput(u16 buttons) {
+u64 Input::SimulateXInput(u32 buttons) {
     XINPUT_GAMEPAD g{};
-    g.wButtons = buttons;
+    g.wButtons = WORD(buttons);
+    g.bLeftTrigger = buttons & kSimLeftTrigger ? 255 : 0;
+    g.bRightTrigger = buttons & kSimRightTrigger ? 255 : 0;
     PadInput p;
     p.connected = true;
     MapXInput(g, p);
@@ -175,12 +179,14 @@ void Input::Update(bool focused) {
                 default: return xbox;
                 }
             };
-            const bool skills = SDL_GetGamepadButton(pad_, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER);
+            const bool wheel = SDL_GetGamepadButton(pad_, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER) ||
+                               SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 8000 ||
+                               SDL_GetGamepadAxis(pad_, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 8000;
             const SDL_GamepadButton fs[4] = {SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST, SDL_GAMEPAD_BUTTON_WEST,
                                              SDL_GAMEPAD_BUTTON_NORTH};
             const u64 by_pos[4] = {B, A, Y, X}, xbox[4] = {A, B, X, Y};
             for (int f = 0; f < 4; f++)
-                p.buttons |= Face(f, SDL_GetGamepadButton(pad_, fs[f]), face(fs[f], by_pos[f], xbox[f]), by_pos[f], skills);
+                p.buttons |= Face(f, SDL_GetGamepadButton(pad_, fs[f]), face(fs[f], by_pos[f], xbox[f]), by_pos[f], wheel);
             pad = true;
             struct {
                 SDL_GamepadButton s;
