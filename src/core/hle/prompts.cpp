@@ -196,7 +196,7 @@ Blocks Button(const Layer& shape, const Layer& symbol, Rgb ink, Rgb outline = kO
     return c.Encode();
 }
 
-constexpr float kCx = 32, kCy = 24, kR = 22; // face buttons (the game's: 48 px across with the outline)
+constexpr float kCx = 32, kCy = 32, kR = 22; // face buttons (the game's: 48 px across with the outline, centred)
 
 Blocks Face(const std::wstring& letter, Rgb ink) {
     Layer shape, sym;
@@ -206,11 +206,12 @@ Blocks Face(const std::wstring& letter, Rgb ink) {
 }
 Blocks Shoulder(const std::wstring& text, Rgb ink, bool trigger) {
     Layer shape, sym;
-    if (trigger) // triggers: taller at the top, like a trigger seen from the front
-        RoundRect(shape, 8, 9, 56, 48, 9);
+    // where the game's L / ZL sit (outline included: x 6-58, y 13-53 and 12-52); triggers rounder
+    if (trigger)
+        RoundRect(shape, 8, 14, 56, 50, 9);
     else
-        RoundRect(shape, 6, 14, 58, 46, 7);
-    Text(sym, text, 19, 32, trigger ? 29.5f : 30);
+        RoundRect(shape, 8, 15, 56, 51, 7);
+    Text(sym, text, 19, 32, trigger ? 32 : 33);
     return Button(shape, sym, ink);
 }
 // Menu (three bars) and View (two overlapping windows), on a button or alone (the _JOY icons)
@@ -470,8 +471,8 @@ void Build() {
         {"btn_L_icon", Shoulder(L"LB", kInk, false)},     {"btn_L_icon_hold", Shoulder(L"LB", kHold, false)},
         {"btn_R_icon", Shoulder(L"RB", kInk, false)},     {"btn_ZL_icon", Shoulder(L"LT", kInk, true)},
         {"btn_ZR_icon", Shoulder(L"RT", kInk, true)},     {"btn_Plus_icon", OnButton(MenuSymbol(kCx, kCy, 1))},
-        {"btn_Minus_icon", OnButton(ViewSymbol(kCx, kCy, 1))}, {"btn_Plus_JOY_icon", Alone(MenuSymbol(32, 24, 1.1f))},
-        {"btn_Minus_JOY_icon", Alone(ViewSymbol(32, 24, 1.1f))}, {"btn_dir_all_ABXY_icon", Diamond()},
+        {"btn_Minus_icon", OnButton(ViewSymbol(kCx, kCy, 1))}, {"btn_Plus_JOY_icon", Alone(MenuSymbol(32, 32, 1.1f))},
+        {"btn_Minus_JOY_icon", Alone(ViewSymbol(32, 32, 1.1f))}, {"btn_dir_all_ABXY_icon", Diamond()},
     };
     std::lock_guard lk(g_mutex);
     for (Icon& ic : g_icons) {
