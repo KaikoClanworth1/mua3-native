@@ -250,6 +250,8 @@ u64 ParseButtons(const std::string& btns);
 
 // Test aid: external control channel. Each line of mua3_cmd.txt is executed then the file is deleted:
 //   press <BUTTON>[+BUTTON...] [hold_ms]     tap buttons on player 1
+//   xpad <XBOX>[+XBOX...][/...] [hold_ms]    the same through the Xbox pad mapping (A B X Y LB RB START BACK, D-pad);
+//                                            stages split by / are held hold_ms each
 //   stick <lx> <ly> [hold_ms]                tilt player 1's left stick (rstick: the right stick)
 //   shot <path.bmp>                          save the next presented game frame
 void PollCommandFile(platform::Input* input) {
@@ -267,7 +269,7 @@ void PollCommandFile(platform::Input* input) {
     f.close();
     std::error_code ec;
     fs::remove("mua3_cmd.txt", ec);
-    std::thread([lines] {
+    std::thread([lines, input] {
         for (auto& line : lines) {
             std::istringstream ss(line);
             std::string cmd, arg;
@@ -280,6 +282,25 @@ void PollCommandFile(platform::Input* input) {
                 hle::hid::SetPad(0, hle::hid::PadInput{true, ParseButtons(arg)});
                 std::this_thread::sleep_for(std::chrono::milliseconds(hold));
                 hle::hid::SetPad(0, hle::hid::PadInput{true});
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                g_script_active = false;
+            } else if (cmd == "xpad" && input) { // xpad <RB/RB+X/...> [hold_ms]: an Xbox pad's buttons, each stage held
+                static const std::pair<const char*, u16> names[] = {
+                    {"A", 0x1000}, {"B", 0x2000}, {"X", 0x4000}, {"Y", 0x8000}, {"LB", 0x100}, {"RB", 0x200},
+                    {"START", 0x10}, {"BACK", 0x20}, {"UP", 0x1}, {"DOWN", 0x2}, {"LEFT", 0x4}, {"RIGHT", 0x8}};
+                g_script_active = true;
+                std::istringstream stages(arg);
+                for (std::string stage; std::getline(stages, stage, '/');) {
+                    u16 xb = 0;
+                    std::istringstream parts(stage);
+                    for (std::string n; std::getline(parts, n, '+');)
+                        for (auto& [name, bit] : names)
+                            if (n == name)
+                                xb |= bit;
+                    LOG_INFO("Main", "xpad {}: game buttons {:#x}", stage, input->SimulateXInput(xb));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(hold));
+                }
+                input->SimulateXInput(0);
                 std::this_thread::sleep_for(std::chrono::milliseconds(250));
                 g_script_active = false;
             } else if (cmd == "stick" || cmd == "rstick") { // [r]stick <x> <y> [hold_ms]: tilt the left (right) stick

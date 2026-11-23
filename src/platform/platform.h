@@ -12,6 +12,10 @@ struct ID3D11ShaderResourceView;
 struct SDL_Window;
 struct ID3D11Device;
 struct ID3D11DeviceContext;
+struct _XINPUT_GAMEPAD;
+namespace hle::hid {
+struct PadInput;
+}
 
 namespace platform {
 
@@ -106,6 +110,8 @@ public:
     // Stick deadzones in percent (core::Config::left_deadzone / right_deadzone).
     void SetDeadzones(int left, int right) { left_dz_ = left; right_dz_ = right; }
     std::string DeviceName() const { return device_name_; }
+    // Test aid: an Xbox pad holding these XINPUT_GAMEPAD_* buttons, through the same mapping; returns the game's buttons.
+    u64 SimulateXInput(u16 buttons);
 
 private:
     core::InputBackend backend_{};
@@ -114,6 +120,10 @@ private:
     int left_dz_ = 10, right_dz_ = 10;
     std::string device_name_ = "Keyboard";
     struct SDL_Gamepad* pad_ = nullptr;
+    // The game button each face button (south, east, west, north) went down as, kept until it's released; 0 = up.
+    u64 face_[4] = {};
+    void MapXInput(const ::_XINPUT_GAMEPAD& g, hle::hid::PadInput& p);
+    u64 Face(int i, bool down, u64 by_layout, u64 by_pos, bool skill_modifier);
 };
 
 // Host audio output. The HLE audio renderer pushes interleaved stereo s16 48 kHz samples.
