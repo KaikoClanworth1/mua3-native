@@ -194,6 +194,22 @@ first repeat after 16/60 s, then every 4/60 s. Above 60 fps that ran fps/60 time
 from buttons already held (their counters, and their repeat bit unless freshly pressed). `MUA3_TRACE_REPEAT=1`
 logs each repeat with its time.
 
+## Button prompts (icons of the input device in use)
+
+Every on-screen button icon comes from one pack, RomFS `UI/screenlayout/80_button_icon/80_button_icon.ext.kslt`
+("TLSK3100": count at +8, params size at +0x10, entry offsets at 0x40 + params with stride 0x14, then the names;
+each entry a 64x64 BC3 texture, size at +0x1c, blocks at +0x48): `btn_A/B/X/Y_icon` (+ `_hold`), `btn_L/R/ZL/ZR_icon`,
+`btn_Plus/Minus(_JOY)_icon`, `btn_dir_*`, `stick_*`, ... Other layouts carry copies of some of them. In guest memory
+they are block-linear (block height log2 1, pitch 256).
+`hle::prompts` (prompts.cpp) reads the pack, draws our own Xbox-style icons in the same style (grey disc, black
+outline, soft shadow, coloured letter; LB / RB / LT / RT, menu and view symbols) for both BUTTONS layouts (by
+letter: the game's A is Xbox A; SWITCH POSITIONS: the game's A is Xbox B, and so on), and hooks the texture cache
+(`gpu::g_decoded_level_hook`, each decoded level of a 16-byte-block 2D texture): a level whose blocks hash to a
+known icon (any set) is remembered by address and replaced with the wanted set. When the device or layout changes
+(`prompts::SetDevice` from `platform::Input::Update`: XInput or SDL pad by type, keyboard; `SetLayout`) every
+remembered icon is written back into guest memory with the new set; the renderer's write tracking re-uploads it.
+Identical icons in two sets (Xbox A by letter = the game's B by position) are told apart by the address's known icon.
+
 ## The OPTIONS screen
 
 Screen 0x5f (opened by main+0x6da8d0 and the menu's vfunc +0x3d0), class vtable main+0x2121e40. Layouts

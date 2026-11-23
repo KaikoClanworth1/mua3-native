@@ -45,6 +45,14 @@ struct BlockLinearRect {
 void BlockLinearRects(u32 width, u32 height, u32 bpb, u32 block_height_log2, const std::pair<u64, u64>* ranges,
                       size_t count, std::vector<BlockLinearRect>& out);
 
+// Called by the texture cache for each decoded level of a 2D texture of 16-byte blocks (BC2/3/5/7...): `guest` is the
+// level's storage in guest memory (block-linear with `block_height_log2`, or `pitch` bytes per block row), `lin` the
+// decoded blocks (bw x bh, linear). The hook may rewrite both (hle::prompts: the button icons of the input device in
+// use). Set once before the game runs; null = none.
+using DecodedLevelHook = void (*)(u8* guest, u8* lin, u32 bw, u32 bh, bool block_linear, u32 block_height_log2,
+                                  u32 pitch);
+inline DecodedLevelHook g_decoded_level_hook = nullptr;
+
 // Decodes an ASTC 2D texture (bw x bh blocks) to RGBA8.
 void DecodeAstc(const u8* src, u8* dst, u32 width, u32 height, u32 bw, u32 bh);
 

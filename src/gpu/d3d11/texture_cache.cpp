@@ -771,6 +771,8 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
             else
                 for (u32 y = 0; y < l.bh * l.d; y++)
                     std::memcpy(lin + size_t(y) * row, src + size_t(y) * pitch(l), row);
+            if (g_decoded_level_hook && bpb == 16 && !astc && l.d == 1 && (type == 1 || type == 7))
+                g_decoded_level_hook(const_cast<u8*>(src), lin, l.bw, l.bh, block_linear, l.bhl, pitch(l));
             if (astc) {
                 u8* rgba = scratch(size_t(l.w) * l.h * 4);
                 DecodeAstc(lin, rgba, l.w, l.h, fi.block_w, fi.block_h);
