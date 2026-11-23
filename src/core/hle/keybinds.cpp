@@ -21,33 +21,37 @@ struct Info {
     int axis;    // 0 x, 1 y
     int sign;    // -1 / +1 (+y = up)
     Binding def; // the default
+    const char16_t* note = nullptr; // a second info line
 };
+// The names are the game's own (OPTIONS > CONTROLS > BUTTON SETTINGS, control style Type 1); Type 2 swaps A and L.
+constexpr const char16_t* kType2A = u"Control Style Type 2: GUARD/DODGE (A and L swap).";
+constexpr const char16_t* kType2L = u"Control Style Type 2: INTERACT (A and L swap).";
 // The defaults are the keys the port always had: WASD moves, L / K / I / J are A / B / X / Y, the numpad turns the camera.
 const Info kInfo[kActions] = {
     {"move_up", u"MOVE UP", 0, 0, 1, 1, {26}},
     {"move_down", u"MOVE DOWN", 0, 0, 1, -1, {22}},
     {"move_left", u"MOVE LEFT", 0, 0, 0, -1, {4}},
     {"move_right", u"MOVE RIGHT", 0, 0, 0, 1, {7}},
-    {"a", u"A BUTTON", hid::A, 0, 0, 0, {15}},
-    {"b", u"B BUTTON", hid::B, 0, 0, 0, {14}},
-    {"x", u"X BUTTON", hid::X, 0, 0, 0, {12}},
-    {"y", u"Y BUTTON", hid::Y, 0, 0, 0, {13}},
-    {"l", u"L BUTTON", hid::L, 0, 0, 0, {20}},
-    {"r", u"R BUTTON", hid::R, 0, 0, 0, {8}},
-    {"zl", u"ZL BUTTON", hid::ZL, 0, 0, 0, {30}},
-    {"zr", u"ZR BUTTON", hid::ZR, 0, 0, 0, {32}},
-    {"plus", u"+ BUTTON (MENU)", hid::Plus, 0, 0, 0, {40}},
-    {"minus", u"- BUTTON", hid::Minus, 0, 0, 0, {43}},
+    {"a", u"INTERACT (A)", hid::A, 0, 0, 0, {15}, kType2A},
+    {"b", u"JUMP (B)", hid::B, 0, 0, 0, {14}},
+    {"x", u"HEAVY ATTACK (X)", hid::X, 0, 0, 0, {12}},
+    {"y", u"LIGHT ATTACK (Y)", hid::Y, 0, 0, 0, {13}},
+    {"l", u"GUARD/DODGE (L)", hid::L, 0, 0, 0, {20}, kType2L},
+    {"r", u"ABILITY (R)", hid::R, 0, 0, 0, {8}, u"Held with a face button: an ability. L and R together: EX."},
+    {"zl", u"EMOTE (ZL)", hid::ZL, 0, 0, 0, {30}, u"Held with a face button: an emote."},
+    {"zr", u"SYNERGY LINK (ZR)", hid::ZR, 0, 0, 0, {32}, u"Held with a face button: a synergy link."},
+    {"plus", u"MENU (+)", hid::Plus, 0, 0, 0, {40}},
+    {"minus", u"MINUS (-)", hid::Minus, 0, 0, 0, {43}},
     {"camera_up", u"CAMERA UP", 0, 1, 1, 1, {96}},
     {"camera_down", u"CAMERA DOWN", 0, 1, 1, -1, {93}},
     {"camera_left", u"CAMERA LEFT", 0, 1, 0, -1, {92}},
     {"camera_right", u"CAMERA RIGHT", 0, 1, 0, 1, {94}},
-    {"left_stick", u"LEFT STICK PRESS", hid::LStick, 0, 0, 0, {9}},
-    {"right_stick", u"RIGHT STICK PRESS", hid::RStick, 0, 0, 0, {98}},
-    {"dpad_up", u"D-PAD UP", hid::Up, 0, 0, 0, {82}},
-    {"dpad_down", u"D-PAD DOWN", hid::Down, 0, 0, 0, {81}},
-    {"dpad_left", u"D-PAD LEFT", hid::Left, 0, 0, 0, {80}},
-    {"dpad_right", u"D-PAD RIGHT", hid::Right, 0, 0, 0, {79}},
+    {"left_stick", u"LEFT STICK PRESS (L3)", hid::LStick, 0, 0, 0, {9}},
+    {"right_stick", u"RIGHT STICK PRESS (R3)", hid::RStick, 0, 0, 0, {98}},
+    {"dpad_up", u"SWITCH HEROES (UP)", hid::Up, 0, 0, 0, {82}, u"The D-pad: also moves through the menus."},
+    {"dpad_down", u"SWITCH HEROES (DOWN)", hid::Down, 0, 0, 0, {81}, u"The D-pad: also moves through the menus."},
+    {"dpad_left", u"SWITCH HEROES (LEFT)", hid::Left, 0, 0, 0, {80}, u"The D-pad: also moves through the menus."},
+    {"dpad_right", u"SWITCH HEROES (RIGHT)", hid::Right, 0, 0, 0, {79}, u"The D-pad: also moves through the menus."},
 };
 
 struct KeyNameEntry {
@@ -195,6 +199,7 @@ void Store(core::Config& c) {
 
 const char* Id(Action a) { return kInfo[a].id; }
 std::u16string Label(Action a) { return kInfo[a].label; }
+std::u16string Note(Action a) { return kInfo[a].note ? kInfo[a].note : u""; }
 
 std::string KeyName(u16 key) {
     if (key >= 4 && key <= 29)

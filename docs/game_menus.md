@@ -307,7 +307,9 @@ The title screen's SYSTEM submenu (SAVE, LOAD, OPTIONS, TIPS, GALLERY; title men
   left_deadzone` / `right_deadzone`, 0-50% in steps of 2, 10% default, live through `input.SetDeadzones`) and KEY
   BINDINGS (OPEN). 2 rows are free.
 - **KEY BINDINGS** (from CONTROLS; B goes back to CONTROLS): RESET ALL, then 7 of the 24 actions a page (L / R: the
-  others; the header shows the page). An action's value is its key and mouse button (`hle::keybinds`). A on it shows
+  others; the header shows the page). The rows use the game's own action names (OPTIONS > CONTROLS > BUTTON
+  SETTINGS, control style Type 1) with the button after them, e.g. JUMP (B); Type 2 swaps A (GUARD/DODGE) and L
+  (INTERACT), which those two rows' info lines say. An action's value is its key and mouse button (`hle::keybinds`). A on it shows
   PRESS A KEY... and the next key or mouse button pressed is taken (`keybinds::Feed`, on the input thread; the game
   sees no input meanwhile and until everything is let go); ESC cancels, BACKSPACE clears it; another action with
   that key gets this one's old key (a swap). The input thread then taps A for 150 ms (`hid::PulseButtons`), so the

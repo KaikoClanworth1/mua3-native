@@ -47,7 +47,8 @@ void Load(const core::Config& c);
 void Store(core::Config& c);
 
 const char* Id(Action a);            // the ini name ("a", "move_up", ...)
-std::u16string Label(Action a);      // the menu's row name ("A BUTTON", "MOVE UP", ...)
+std::u16string Label(Action a);      // the menu's row name, the game's own action names ("JUMP (B)", "MOVE UP", ...)
+std::u16string Note(Action a);       // more about the action for the info line ("" for none)
 std::string KeyName(u16 key);        // "L", "ENTER", "NUM 8", ... ("" for none / unknown)
 std::string KeyIcon(u16 key);        // the short form a prompt icon shows ("ENT", "8", an arrow, ...), UTF-8
 std::string MouseName(u8 button);    // "MOUSE LEFT", ...
