@@ -1,5 +1,6 @@
 // hid: controllers via the HID shared memory block (6.x layout).
 #include <atomic>
+#include <chrono>
 #include <thread>
 
 #include "core/hle/hid.h"
@@ -44,6 +45,9 @@ void WriteLifo(u8* lifo, u64 ts, const void* state, size_t state_size) {
     hdr[3] = std::min<u64>(hdr[3] + 1, kLifoEntries - 1);
 }
 
+std::atomic<u64> g_pulse_buttons{0};
+std::atomic<s64> g_pulse_until{0}; // steady_clock ticks
+
 void UpdateOnce() {
     u8* base = Shm()->Data();
     const u64 ts = kernel::K().GetTicks();
@@ -52,6 +56,12 @@ void UpdateOnce() {
     {
         std::lock_guard lk(g_pad_mutex);
         std::copy(std::begin(g_pads), std::end(g_pads), pads);
+    }
+    if (const u64 pulse = g_pulse_buttons.load(std::memory_order_relaxed)) {
+        if (std::chrono::steady_clock::now().time_since_epoch().count() < g_pulse_until.load(std::memory_order_relaxed))
+            pads[0].buttons |= pulse, pads[0].connected = true;
+        else
+            g_pulse_buttons = 0;
     }
     // Player 1 also drives the handheld slot (index 8) so handheld-only code paths see input: its buttons only.
     // MUA3 builds player 1's input from No.1 and, when Handheld is connected, from Handheld too, and ADDS the two
@@ -103,6 +113,11 @@ void SetPad(int player, const PadInput& in) {
     g_pads[player] = in;
     if (player == 0)
         g_pads[0].connected = true;
+}
+
+void PulseButtons(u64 buttons, int ms) {
+    g_pulse_until = (std::chrono::steady_clock::now() + std::chrono::milliseconds(ms)).time_since_epoch().count();
+    g_pulse_buttons = buttons;
 }
 
 void StartUpdateThread() {

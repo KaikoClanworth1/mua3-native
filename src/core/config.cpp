@@ -29,7 +29,11 @@ bool Config::Load(const fs::path& ini) {
         if (line.empty() || line[0] == ';' || line[0] == '#')
             continue;
         const auto eq = line.find('=');
-        if (eq != std::string::npos) // keys are flat, except [mods] (mods.enabled)
+        if (eq == std::string::npos)
+            continue;
+        if (section == "keys") // [keys]: as they are (hle::keybinds reads them)
+            keys[Trim(line.substr(0, eq))] = Trim(line.substr(eq + 1));
+        else // keys are flat, except [mods] (mods.enabled)
             kv[(section == "mods" ? "mods." : "") + Trim(line.substr(0, eq))] = Trim(line.substr(eq + 1));
     }
     auto get_i = [&](const char* k, int& v) {
@@ -109,6 +113,11 @@ bool Config::Save(const fs::path& ini) const {
       << "\n[audio]\naudio_backend=" << int(audio) << "\nvolume=" << volume << "\nmute=" << mute << "\n[input]\ninput_backend="
       << int(input) << "\ncamera_speed=" << camera_speed << "\nbutton_layout=" << button_layout << "\nleft_deadzone=" << left_deadzone << "\nright_deadzone=" << right_deadzone << "\n[system]\ndocked=" << docked << "\nlanguage=" << language << "\nlog_level=" << log_level
       << "\n[mods]\nenabled=" << mods_enabled << "\n";
+    if (!keys.empty()) {
+        f << "[keys]\n";
+        for (const auto& [k, v] : keys)
+            f << k << "=" << v << "\n";
+    }
     if (bug_capture || stage_select) // (only written when on: release players never see the section)
         f << "[debug]\n" << (bug_capture ? "bug_capture=1\n" : "") << (stage_select ? "stage_select=1\n" : "");
     return bool(f);

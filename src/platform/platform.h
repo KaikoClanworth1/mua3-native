@@ -4,6 +4,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <vector>
 struct ID3D11ShaderResourceView;
 
 #include "common/common.h"
@@ -114,6 +115,9 @@ public:
     // the game's buttons.
     static constexpr u32 kSimLeftTrigger = 1u << 16, kSimRightTrigger = 1u << 17;
     u64 SimulateXInput(u32 buttons);
+    // Test aid: these keys (USB HID usages) and mouse buttons (bit n = button n + 1) held, through the bindings and the
+    // KEY BINDINGS capture; returns the game buttons.
+    u64 SimulateKeys(const std::vector<u16>& keys, u32 mouse);
 
 private:
     core::InputBackend backend_{};
@@ -124,9 +128,12 @@ private:
     struct SDL_Gamepad* pad_ = nullptr;
     // The game button each face button (south, east, west, north) went down as, kept until it's released; 0 = up.
     u64 face_[4] = {};
+    bool active_[4] = {}; // by hle::prompts::Device: in use last poll
+    std::chrono::steady_clock::time_point device_changed_{}; // the prompts' last device change
     bool pad_seen_ = false; // a pad was connected last poll (a pad that appears sets the prompts' device at once)
     void MapXInput(const ::_XINPUT_GAMEPAD& g, hle::hid::PadInput& p);
     u64 Face(int i, bool down, u64 by_layout, u64 by_pos, bool wheel);
+    bool KeyboardAndMouse(const bool* keys, u32 mouse, hle::hid::PadInput& p);
 };
 
 // Host audio output. The HLE audio renderer pushes interleaved stereo s16 48 kHz samples.

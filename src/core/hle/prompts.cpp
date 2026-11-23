@@ -22,6 +22,7 @@
 #include <windows.h>
 
 #include "common/common.h"
+#include "core/hle/keybinds.h"
 #include "core/hle/menu_label.h"
 #include "core/hle/mods.h"
 #include "gpu/formats.h"
@@ -103,7 +104,8 @@ Layer Dilate(const Layer& in, float r) {
 }
 
 // Text centred on (cx, cy) with capitals `cap` icon pixels high
-void Text(Layer& l, const std::wstring& text, float cap, float cx, float cy, const wchar_t* face = L"Segoe UI Black") {
+void Text(Layer& l, const std::wstring& text, float cap, float cx, float cy, const wchar_t* face = L"Segoe UI Black",
+          float max_w = 0) {
     const int probe = 200;
     auto probe_cov = menu::TextCoverage(L"H", face, FW_BLACK, false, probe, probe * 2, probe * 2, probe / 2, probe / 2);
     int y0 = probe * 2, y1 = -1;
@@ -113,16 +115,23 @@ void Text(Layer& l, const std::wstring& text, float cap, float cx, float cy, con
                 y0 = std::min(y0, y), y1 = std::max(y1, y);
     if (y1 < 0)
         return;
-    const int px = int(std::lround(probe * cap * S / float(y1 - y0 + 1)));
+    int px = int(std::lround(probe * cap * S / float(y1 - y0 + 1)));
     const int cw = W * 2;
-    auto cov = menu::TextCoverage(text, face, FW_BLACK, false, px, cw, cw, cw / 4, cw / 4);
-    int ix0 = cw, iy0 = cw, ix1 = -1, iy1 = -1;
-    for (int y = 0; y < cw; y++)
-        for (int x = 0; x < cw; x++)
-            if (cov[size_t(y) * cw + x] > 64)
-                ix0 = std::min(ix0, x), ix1 = std::max(ix1, x), iy0 = std::min(iy0, y), iy1 = std::max(iy1, y);
-    if (ix1 < 0)
-        return;
+    std::vector<u8> cov;
+    int ix0, iy0, ix1, iy1;
+    for (int pass = 0; pass < 2; pass++) { // (again smaller if wider than max_w)
+        cov = menu::TextCoverage(text, face, FW_BLACK, false, px, cw, cw, cw / 4, cw / 4);
+        ix0 = cw, iy0 = cw, ix1 = -1, iy1 = -1;
+        for (int y = 0; y < cw; y++)
+            for (int x = 0; x < cw; x++)
+                if (cov[size_t(y) * cw + x] > 64)
+                    ix0 = std::min(ix0, x), ix1 = std::max(ix1, x), iy0 = std::min(iy0, y), iy1 = std::max(iy1, y);
+        if (ix1 < 0)
+            return;
+        if (max_w <= 0 || ix1 - ix0 + 1 <= max_w * S)
+            break;
+        px = int(px * max_w * S / float(ix1 - ix0 + 1));
+    }
     const float mx = (ix0 + ix1 + 1) / 2.0f, my = (iy0 + iy1 + 1) / 2.0f;
     const int dx = int(std::lround(cx * S - mx)), dy = int(std::lround(cy * S - my));
     for (int y = 0; y < W; y++)
@@ -272,10 +281,104 @@ Blocks Diamond() {
     return c.Encode();
 }
 
+// A key: a keycap with the key's name (wide for long names)
+Blocks KeyCap(const std::wstring& name, Rgb ink) {
+    Layer shape, sym;
+    const size_t n = name.size();
+    if (n >= 4) {
+        RoundRect(shape, 5, 14, 59, 50, 7);
+        Text(sym, name, 12, 32, 32, L"Segoe UI Black", 46);
+    } else {
+        RoundRect(shape, 10, 10, 54, 54, 7);
+        Text(sym, name, n == 1 ? 22 : 15, 32, 32, L"Segoe UI Black", 36);
+    }
+    return Button(shape, sym, ink);
+}
+// A mouse with the button lit (1 left, 2 middle, 3 right); 4 and 5 are keycaps "M4" / "M5"
+Blocks MouseIcon(u8 button, Rgb ink) {
+    if (button >= 4)
+        return KeyCap(button == 4 ? L"M4" : L"M5", ink);
+    Layer body;
+    RoundRect(body, 18, 7, 46, 57, 14);
+    Layer inv;
+    for (size_t i = 0; i < inv.a.size(); i++)
+        inv.a[i] = 1 - body.a[i];
+    const Layer edge = Dilate(inv, 3.0f); // the body less 3 px
+    Layer area;
+    if (button == 2)
+        RoundRect(area, 29.5f, 12, 34.5f, 25, 2.5f);
+    else
+        RoundRect(area, button == 1 ? 0 : 33.5f, 0, button == 1 ? 30.5f : 64, 27, 0);
+    Layer sym;
+    for (size_t i = 0; i < sym.a.size(); i++)
+        sym.a[i] = std::max(0.0f, std::min(area.a[i], 1 - edge.a[i]));
+    return Button(body, sym, ink);
+}
+
+std::wstring Wide(const std::string& u8s) {
+    const int n = MultiByteToWideChar(CP_UTF8, 0, u8s.data(), int(u8s.size()), nullptr, 0);
+    std::wstring w(size_t(std::max(n, 0)), L'\0');
+    if (n > 0)
+        MultiByteToWideChar(CP_UTF8, 0, u8s.data(), int(u8s.size()), w.data(), n);
+    return w;
+}
+
+// The icon an action's binding makes (empty: none, the game's own stays)
+Blocks BindingIcon(keybinds::Action a, Rgb ink) {
+    const keybinds::Binding b = keybinds::Get(a);
+    if (b.key)
+        return KeyCap(Wide(keybinds::KeyIcon(b.key)), ink);
+    if (b.mouse)
+        return MouseIcon(b.mouse, ink);
+    return {};
+}
+// Several directions on one keycap ("WASD", the arrows) if each key is one character
+Blocks ClusterIcon(std::initializer_list<keybinds::Action> as) {
+    std::wstring t;
+    for (keybinds::Action a : as) {
+        const keybinds::Binding b = keybinds::Get(a);
+        const std::wstring k = b.key ? Wide(keybinds::KeyIcon(b.key)) : L"";
+        if (k.size() != 1)
+            return {};
+        t += k;
+    }
+    return KeyCap(t, kInk);
+}
+
+// The keyboard set: the keys bound to each icon's button
+std::map<std::string, Blocks> KeyboardIcons() {
+    using namespace keybinds;
+    std::map<std::string, Blocks> m;
+    const struct {
+        const char* name;
+        Action a;
+        bool hold;
+    } single[] = {
+        {"btn_A_icon", kA, false},      {"btn_A_icon_hold", kA, true}, {"btn_B_icon", kB, false},
+        {"btn_X_icon", kX, false},      {"btn_Y_icon", kY, false},     {"btn_Y_icon_hold", kY, true},
+        {"btn_L_icon", kL, false},      {"btn_L_icon_hold", kL, true}, {"btn_R_icon", keybinds::kR, false},
+        {"btn_ZL_icon", kZL, false},    {"btn_ZR_icon", kZR, false},   {"btn_Plus_icon", kPlus, false},
+        {"btn_Plus_JOY_icon", kPlus, false}, {"btn_Minus_icon", kMinus, false}, {"btn_Minus_JOY_icon", kMinus, false},
+        {"stick_btn_L_push_icon", kLStick, false}, {"stick_btn_R_push_icon", kRStick, false},
+        {"btn_Cross_UP_icon", kDUp, false}, {"btn_Cross_DOWN_icon", kDDown, false},
+        {"btn_Cross_L_icon", kDLeft, false}, {"btn_Cross_R_icon", kDRight, false},
+        {"btn_dir_UP_icon", kDUp, false}, {"btn_dir_DOWN_icon", kDDown, false},
+        {"btn_dir_L_icon", kDLeft, false}, {"btn_dir_L_icon_hold", kDLeft, true},
+        {"btn_dir_R_icon", kDRight, false}, {"btn_dir_R_icon_hold", kDRight, true},
+    };
+    for (const auto& e : single)
+        m[e.name] = BindingIcon(e.a, e.hold ? kHold : kInk);
+    m["btn_Cross_UPDOWN_icon"] = ClusterIcon({kDUp, kDDown});
+    m["btn_Cross_LR_icon"] = ClusterIcon({kDLeft, kDRight});
+    m["stick_btn_L_icon"] = ClusterIcon({kMoveUp, kMoveLeft, kMoveDown, kMoveRight});
+    m["stick_btn_R_icon"] = ClusterIcon({kCamUp, kCamLeft, kCamDown, kCamRight});
+    return m;
+}
+
 // ---- the sets
 
-enum Set { kSwitch, kXboxLetters, kXboxPositions, kSets };
-const char* const kSetNames[] = {"Switch", "Xbox (by letter)", "Xbox (Switch positions)"};
+enum Set { kSwitch, kXboxLetters, kXboxPositions, kKeyboard, kSets };
+const char* const kSetNames[] = {"Switch", "Xbox (by letter)", "Xbox (Switch positions)", "keyboard"};
 
 struct Icon {
     std::string name;
@@ -306,6 +409,8 @@ int WantedSet() {
     switch (g_device) {
     case Device::Xbox:
         return g_layout == 1 ? kXboxPositions : kXboxLetters;
+    case Device::Keyboard:
+        return kKeyboard;
     default:
         return kSwitch;
     }
@@ -483,7 +588,7 @@ void Build() {
             else if (auto c = common.find(ic.name); c != common.end())
                 ic.blocks[set] = c->second;
         }
-        for (int set = 1; set < kSets; set++)
+        for (int set = 1; set < kKeyboard; set++)
             if (!ic.blocks[set].empty()) {
                 ic.hash[set] = Hash(ic.blocks[set].data(), kBytes);
                 g_by_hash[ic.hash[set]].push_back({size_t(&ic - g_icons.data()), set});
@@ -492,7 +597,44 @@ void Build() {
     g_ready = true;
 }
 
+// The keyboard set drawn again from the bindings (off the game's threads), then put in: the icons showing the old
+// keyboard set are rewritten.
+std::atomic<u32> g_keys_wanted{0};
+void BuildKeyboard(u32 gen) {
+    std::map<std::string, Blocks> keys = KeyboardIcons();
+    std::lock_guard lk(g_mutex);
+    if (gen != g_keys_wanted.load())
+        return; // a newer one is on its way
+    for (auto& [h, cands] : g_by_hash)
+        std::erase_if(cands, [](const std::pair<size_t, int>& c) { return c.second == kKeyboard; });
+    for (Icon& ic : g_icons) {
+        auto it = keys.find(ic.name);
+        ic.blocks[kKeyboard] = it != keys.end() ? std::move(it->second) : Blocks{};
+        ic.hash[kKeyboard] = 0;
+        if (!ic.blocks[kKeyboard].empty()) {
+            ic.hash[kKeyboard] = Hash(ic.blocks[kKeyboard].data(), kBytes);
+            g_by_hash[ic.hash[kKeyboard]].push_back({size_t(&ic - g_icons.data()), int(kKeyboard)});
+        }
+    }
+    const int want = WantedSet();
+    size_t n = 0;
+    for (Location& l : g_locations)
+        if (l.set == kKeyboard) // (its old image is no longer known: written by what we know of the location)
+            Write(l, want), n++;
+    LOG_INFO("Prompts", "keyboard icons drawn ({} rewritten)", n);
+}
+
 } // namespace
+
+void KeysChanged() {
+    const u32 gen = ++g_keys_wanted;
+    if (!g_ready)
+        return; // (Init's thread draws them)
+    std::thread([gen] {
+        BuildKeyboard(gen);
+        Apply();
+    }).detach();
+}
 
 void Init() {
     std::vector<std::pair<std::string, Blocks>> pack;
@@ -516,7 +658,8 @@ void Init() {
     std::thread([n = g_icons.size()] {
         const auto t0 = std::chrono::steady_clock::now();
         Build();
-        LOG_INFO("Prompts", "{} button icons, Xbox sets drawn in {} ms", n,
+        BuildKeyboard(g_keys_wanted.load());
+        LOG_INFO("Prompts", "{} button icons, Xbox and keyboard sets drawn in {} ms", n,
                  std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
         Apply();
     }).detach();

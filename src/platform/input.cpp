@@ -8,6 +8,7 @@
 #include <SDL3/SDL.h>
 
 #include "core/hle/hid.h"
+#include "core/hle/keybinds.h"
 #include "core/hle/prompts.h"
 #include "platform/platform.h"
 
@@ -43,32 +44,6 @@ void AddStickDirections(PadInput& p) {
     if (p.rx > t) p.buttons |= RStickRight;
     if (p.ry > t) p.buttons |= RStickUp;
     if (p.ry < -t) p.buttons |= RStickDown;
-}
-
-// Keyboard: WASD = left stick, arrows = D-pad, numpad 8456 = right stick, L/K/I/J = A/B/X/Y,
-// Q/E = L/R, 1/3 = ZL/ZR, Enter = +, Tab = -.
-void ReadKeyboard(PadInput& p) {
-    const bool* k = SDL_GetKeyboardState(nullptr);
-    struct {
-        SDL_Scancode sc;
-        u64 b;
-    } map[] = {
-        {SDL_SCANCODE_L, A},     {SDL_SCANCODE_K, B},       {SDL_SCANCODE_I, X},          {SDL_SCANCODE_J, Y},
-        {SDL_SCANCODE_Q, L},     {SDL_SCANCODE_E, R},       {SDL_SCANCODE_1, ZL},         {SDL_SCANCODE_3, ZR},
-        {SDL_SCANCODE_RETURN, Plus}, {SDL_SCANCODE_TAB, Minus}, {SDL_SCANCODE_UP, Up},    {SDL_SCANCODE_DOWN, Down},
-        {SDL_SCANCODE_LEFT, Left}, {SDL_SCANCODE_RIGHT, Right}, {SDL_SCANCODE_F, LStick}, {SDL_SCANCODE_KP_0, RStick},
-    };
-    for (auto& m : map)
-        if (k[m.sc])
-            p.buttons |= m.b;
-    auto stick = [&](SDL_Scancode neg, SDL_Scancode pos, s32& v) {
-        if (k[neg]) v = -32767;
-        if (k[pos]) v = 32767;
-    };
-    stick(SDL_SCANCODE_A, SDL_SCANCODE_D, p.lx);
-    stick(SDL_SCANCODE_S, SDL_SCANCODE_W, p.ly);
-    stick(SDL_SCANCODE_KP_4, SDL_SCANCODE_KP_6, p.rx);
-    stick(SDL_SCANCODE_KP_5, SDL_SCANCODE_KP_8, p.ry);
 }
 
 } // namespace
@@ -147,7 +122,7 @@ void Input::Update(bool focused) {
     PadInput p;
     p.connected = true;
     bool pad = false;
-    std::optional<hle::prompts::Device> device; // the device the player used this poll
+    bool act[4] = {}; // by hle::prompts::Device: the player is using it this poll
     if (backend_ == core::InputBackend::XInput) {
         for (DWORD i = 0; i < XUSER_MAX_COUNT; i++) {
             XINPUT_STATE st{};
@@ -159,7 +134,7 @@ void Input::Update(bool focused) {
             const bool moved = std::abs(g.sThumbLX) > 12000 || std::abs(g.sThumbLY) > 12000 ||
                                std::abs(g.sThumbRX) > 12000 || std::abs(g.sThumbRY) > 12000;
             if (g.wButtons || g.bLeftTrigger > 64 || g.bRightTrigger > 64 || moved || !pad_seen_)
-                device = hle::prompts::Device::Xbox;
+                act[int(hle::prompts::Device::Xbox)] = true;
             device_name_ = fmt::format("XInput controller {}", i + 1);
             break;
         }
@@ -227,14 +202,14 @@ void Input::Update(bool focused) {
             if (p.buttons || moved || !pad_seen_) {
                 switch (SDL_GetGamepadType(pad_)) {
                 case SDL_GAMEPAD_TYPE_PS3: case SDL_GAMEPAD_TYPE_PS4: case SDL_GAMEPAD_TYPE_PS5:
-                    device = hle::prompts::Device::PlayStation;
+                    act[int(hle::prompts::Device::PlayStation)] = true;
                     break;
                 case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO: case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
                 case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT: case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
-                    device = hle::prompts::Device::Switch;
+                    act[int(hle::prompts::Device::Switch)] = true;
                     break;
                 default:
-                    device = hle::prompts::Device::Xbox;
+                    act[int(hle::prompts::Device::Xbox)] = true;
                 }
             }
         }
@@ -242,22 +217,62 @@ void Input::Update(bool focused) {
     if (!pad)
         std::fill(std::begin(face_), std::end(face_), 0);
     pad_seen_ = pad;
+    bool keys[hle::keybinds::kKeyCount] = {};
+    u32 mouse = 0;
     if (focused) {
-        const u64 before = p.buttons;
-        PadInput k;
-        ReadKeyboard(k);
-        if (k.buttons || k.lx || k.ly || k.rx || k.ry)
-            device = hle::prompts::Device::Keyboard;
-        p.buttons |= before | k.buttons;
-        if (k.lx) p.lx = k.lx;
-        if (k.ly) p.ly = k.ly;
-        if (k.rx) p.rx = k.rx;
-        if (k.ry) p.ry = k.ry;
+        int n = 0;
+        const bool* k = SDL_GetKeyboardState(&n);
+        std::copy(k, k + std::min<int>(n, hle::keybinds::kKeyCount), keys);
+        mouse = SDL_GetMouseState(nullptr, nullptr);
     }
-    if (device)
+    if (KeyboardAndMouse(keys, mouse, p))
+        act[int(hle::prompts::Device::Keyboard)] = true;
+    // The prompts follow a new touch only (a device's input appearing, not held or drifting), at most once a second,
+    // so a drifting stick or a held key cannot make them flicker between two devices.
+    std::optional<hle::prompts::Device> device;
+    for (int d = 0; d < 4; d++)
+        if (act[d] && !active_[d])
+            device = hle::prompts::Device(d);
+    std::copy(std::begin(act), std::end(act), active_);
+    const auto now = std::chrono::steady_clock::now();
+    if (device && *device != hle::prompts::CurrentDevice() && now - device_changed_ >= std::chrono::seconds(1)) {
         hle::prompts::SetDevice(*device);
+        device_changed_ = now;
+    }
     AddStickDirections(p);
     SetPad(0, p);
+}
+
+// The keyboard and mouse through the bindings (hle::keybinds), on top of the pad's input in `p`; while a binding is
+// being changed the game sees nothing. True if a key or mouse button the bindings use is down.
+bool Input::KeyboardAndMouse(const bool* keys, u32 mouse, PadInput& p) {
+    if (hle::keybinds::Feed(keys, mouse, p.buttons)) {
+        p = PadInput{};
+        p.connected = true;
+        return false;
+    }
+    PadInput k;
+    hle::keybinds::Map(keys, mouse, k);
+    p.buttons |= k.buttons;
+    if (k.lx) p.lx = k.lx;
+    if (k.ly) p.ly = k.ly;
+    if (k.rx) p.rx = k.rx;
+    if (k.ry) p.ry = k.ry;
+    return k.buttons || k.lx || k.ly || k.rx || k.ry;
+}
+
+u64 Input::SimulateKeys(const std::vector<u16>& keys, u32 mouse) {
+    bool k[hle::keybinds::kKeyCount] = {};
+    for (u16 c : keys)
+        if (c < hle::keybinds::kKeyCount)
+            k[c] = true;
+    PadInput p;
+    p.connected = true;
+    if (KeyboardAndMouse(k, mouse, p))
+        hle::prompts::SetDevice(hle::prompts::Device::Keyboard);
+    AddStickDirections(p);
+    SetPad(0, p);
+    return p.buttons;
 }
 
 } // namespace platform
