@@ -105,14 +105,13 @@ constexpr int kDeadStep = 2, kDeadMax = 50; // stick deadzones: 0-50% in steps o
 enum Aa { kAaOff, kAaFxaa, kAaSsaa2 }; // anti_aliasing: 2-4 = SSAA 2X-4X
 // UPSCALER row: OFF, then 4 qualities (upscale_quality 0-3) of each upscaler= value shown, in this order. FSR 3.1 and
 // DLSS are shown where they run, or when mua3.ini already asks for them; a value the row cannot show is left as it is.
-constexpr int kUpscalerFsr3 = 3; // core::kUpscalerFsr3 (render chat)
-constexpr int kUpscalerKinds[] = {core::kUpscalerFsr1, kUpscalerFsr3, core::kUpscalerDlss};
+constexpr int kUpscalerKinds[] = {core::kUpscalerFsr1, core::kUpscalerFsr3, core::kUpscalerDlss};
 constexpr u32 kQualities = 4;
 std::vector<int> g_kinds{core::kUpscalerFsr1}; // the upscalers the row shows (ShowUpscalers, when the page opens)
 // upscaler= of a row value (0 = off)
 int UpscalerOf(u8 v) { return v >= 1 && v <= kQualities * g_kinds.size() ? g_kinds[(v - 1) / kQualities] : 0; }
 // FSR SHARPNESS applies to the FSR upscalers
-bool Sharpened(int upscaler) { return upscaler == core::kUpscalerFsr1 || upscaler == kUpscalerFsr3; }
+bool Sharpened(int upscaler) { return upscaler == core::kUpscalerFsr1 || upscaler == core::kUpscalerFsr3; }
 static_assert(kGraphicsRows <= kMaxRows && kPcRows <= kMaxRows && kControlsRows <= kMaxRows);
 constexpr int kCameraSpeeds[] = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200};
 const char16_t* const kControllerNames[] = {u"XBOX (XINPUT)", u"ANY CONTROLLER (SDL)"};
