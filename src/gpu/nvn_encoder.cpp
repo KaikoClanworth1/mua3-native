@@ -450,8 +450,9 @@ private:
     // Texture <-> buffer copies, one DMA launch per slice / layer: linear rows of whole blocks on the buffer side.
     void CopyTexture(const ReplayCommand& c, bool upload) {
         const u64 buffer = upload ? c.x[1] : c.x[4], tex = upload ? c.x[2] : c.x[1];
-        hle::nvn::TextureInfo t;
-        if (!hle::nvn::QueryTexture(tex, t)) {
+        hle::nvn::TextureInfo t; // (as recorded, #24: see SetRenderTargets)
+        const bool snapped = c.extra.size() >= hle::nvn::kTextureSnapshotWords;
+        if (!(snapped && hle::nvn::UnpackTexture(c.extra.data(), t)) && !hle::nvn::QueryTexture(tex, t)) {
             Unhandled("copy: texture not in the model");
             return;
         }
@@ -568,10 +569,34 @@ private:
 
     void SetRenderTargets(const ReplayCommand& c) {
         const u32 count = std::min<u32>(u32(c.x[1]), 8);
+        // the textures as recorded (#24), when the recorder took them: the colors' pointers, then their descriptions
+        // and the depth's
+        constexpr u32 W = hle::nvn::kTextureSnapshotWords;
+        const bool snap = c.extra.size() == count + (count + 1) * W;
+        auto query = [&](u32 slot, u64 tex, hle::nvn::TextureInfo& t) {
+            if (!tex)
+                return false;
+            if (!snap)
+                return hle::nvn::QueryTexture(tex, t);
+            if (!hle::nvn::UnpackTexture(&c.extra[count + slot * W], t))
+                return hle::nvn::QueryTexture(tex, t); // (not described when recorded)
+            if (rt_changed_logs_ < 20) { // (diagnostic: how often the live object moved on since)
+                hle::nvn::TextureInfo now;
+                const bool live = hle::nvn::QueryTexture(tex, now);
+                if (!live || now.gpu != t.gpu || now.width != t.width || now.height != t.height || now.format != t.format) {
+                    rt_changed_logs_++;
+                    LOG_INFO("NVN", "render target {:#x} changed since recorded: {}x{} format {:#x} at {:#x} -> {}", tex,
+                             t.width, t.height, t.format, t.gpu,
+                             live ? fmt::format("{}x{} format {:#x} at {:#x}", now.width, now.height, now.format, now.gpu)
+                                  : std::string("finalized"));
+                }
+            }
+            return true;
+        };
         for (u32 i = 0; i < 8; i++) {
             hle::nvn::TextureInfo t;
             auto& rt = s_.color[i];
-            if (i >= count || i >= c.extra.size() || !c.extra[i] || !hle::nvn::QueryTexture(c.extra[i], t)) {
+            if (i >= count || i >= c.extra.size() || !query(i, c.extra[i], t)) {
                 rt.format = 0;
                 continue;
             }
@@ -586,7 +611,7 @@ private:
         }
         s_.rt_count = count;
         hle::nvn::TextureInfo d;
-        if (c.x[4] && hle::nvn::QueryTexture(c.x[4], d)) {
+        if (query(count, c.x[4], d)) {
             auto f = kNvnZetaFormat.find(d.format);
             if (f == kNvnZetaFormat.end())
                 Unhandled(fmt::format("depth format {:#x}", d.format));
@@ -780,6 +805,7 @@ private:
     float viewport_[16][4]{};
     float depth_range_[16][2]{};
     std::set<std::string> unhandled_;
+    u32 rt_changed_logs_ = 0; // (SetRenderTargets' diagnostic)
 };
 
 } // namespace
