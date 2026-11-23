@@ -71,6 +71,57 @@ void ReadKeyboard(PadInput& p) {
 
 } // namespace
 
+// The skill wheel (R held) puts the skills on the face buttons by position, with no letters: with R held a face button
+// goes down as the Switch button in its position, whatever the layout (#14: by letter, Xbox X fired the skill shown
+// on the top circle). The choice holds until the button is released, so letting go of R mid-press changes nothing.
+u64 Input::Face(int i, bool down, u64 by_layout, u64 by_pos, bool skill_modifier) {
+    if (!down)
+        return face_[i] = 0;
+    if (!face_[i])
+        face_[i] = skill_modifier ? by_pos : by_layout;
+    return face_[i];
+}
+
+// An Xbox pad's state as the game's buttons and sticks.
+void Input::MapXInput(const XINPUT_GAMEPAD& g, PadInput& p) {
+    // By letter (default): Xbox A/B/X/Y = the game's A/B/X/Y prompts. By position: the Switch layout (Xbox A
+    // is the bottom button = Switch B, and so on).
+    const bool pos = button_layout_ == 1;
+    const bool skills = (g.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
+    const WORD fx[4] = {XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y};
+    const u64 letter[4] = {A, B, X, Y}, by_pos[4] = {B, A, Y, X};
+    for (int f = 0; f < 4; f++)
+        p.buttons |= Face(f, (g.wButtons & fx[f]) != 0, pos ? by_pos[f] : letter[f], by_pos[f], skills);
+    struct {
+        WORD x;
+        u64 b;
+    } map[] = {
+        {XINPUT_GAMEPAD_LEFT_SHOULDER, L}, {XINPUT_GAMEPAD_RIGHT_SHOULDER, R},
+        {XINPUT_GAMEPAD_START, Plus}, {XINPUT_GAMEPAD_BACK, Minus},
+        {XINPUT_GAMEPAD_LEFT_THUMB, LStick}, {XINPUT_GAMEPAD_RIGHT_THUMB, RStick},
+        {XINPUT_GAMEPAD_DPAD_UP, Up}, {XINPUT_GAMEPAD_DPAD_DOWN, Down},
+        {XINPUT_GAMEPAD_DPAD_LEFT, Left}, {XINPUT_GAMEPAD_DPAD_RIGHT, Right},
+    };
+    for (auto& m : map)
+        if (g.wButtons & m.x)
+            p.buttons |= m.b;
+    if (g.bLeftTrigger > 64) p.buttons |= ZL;
+    if (g.bRightTrigger > 64) p.buttons |= ZR;
+    // (XInput's suggested deadzones are 24% / 27%: far too much on top of the game's own, #17)
+    Stick(g.sThumbLX, g.sThumbLY, left_dz_ * 32767 / 100, 1.0, p.lx, p.ly);
+    Stick(g.sThumbRX, g.sThumbRY, right_dz_ * 32767 / 100, 1.0, p.rx, p.ry);
+}
+
+u64 Input::SimulateXInput(u16 buttons) {
+    XINPUT_GAMEPAD g{};
+    g.wButtons = buttons;
+    PadInput p;
+    p.connected = true;
+    MapXInput(g, p);
+    SetPad(0, p);
+    return p.buttons;
+}
+
 bool Input::Init(core::InputBackend backend, int camera_speed, int button_layout) {
     backend_ = backend;
     camera_speed_ = camera_speed;
@@ -82,35 +133,14 @@ bool Input::Init(core::InputBackend backend, int camera_speed, int button_layout
 void Input::Update(bool focused) {
     PadInput p;
     p.connected = true;
+    bool pad = false;
     if (backend_ == core::InputBackend::XInput) {
         for (DWORD i = 0; i < XUSER_MAX_COUNT; i++) {
             XINPUT_STATE st{};
             if (XInputGetState(i, &st) != ERROR_SUCCESS)
                 continue;
-            const auto& g = st.Gamepad;
-            // By letter (default): Xbox A/B/X/Y = the game's A/B/X/Y prompts. By position: the Switch layout (Xbox A
-            // is the bottom button = Switch B, and so on).
-            const bool pos = button_layout_ == 1;
-            struct {
-                WORD x;
-                u64 b;
-            } map[] = {
-                {XINPUT_GAMEPAD_A, pos ? B : A}, {XINPUT_GAMEPAD_B, pos ? A : B},
-                {XINPUT_GAMEPAD_X, pos ? Y : X}, {XINPUT_GAMEPAD_Y, pos ? X : Y},
-                {XINPUT_GAMEPAD_LEFT_SHOULDER, L}, {XINPUT_GAMEPAD_RIGHT_SHOULDER, R},
-                {XINPUT_GAMEPAD_START, Plus}, {XINPUT_GAMEPAD_BACK, Minus},
-                {XINPUT_GAMEPAD_LEFT_THUMB, LStick}, {XINPUT_GAMEPAD_RIGHT_THUMB, RStick},
-                {XINPUT_GAMEPAD_DPAD_UP, Up}, {XINPUT_GAMEPAD_DPAD_DOWN, Down},
-                {XINPUT_GAMEPAD_DPAD_LEFT, Left}, {XINPUT_GAMEPAD_DPAD_RIGHT, Right},
-            };
-            for (auto& m : map)
-                if (g.wButtons & m.x)
-                    p.buttons |= m.b;
-            if (g.bLeftTrigger > 64) p.buttons |= ZL;
-            if (g.bRightTrigger > 64) p.buttons |= ZR;
-            // (XInput's suggested deadzones are 24% / 27%: far too much on top of the game's own, #17)
-            Stick(g.sThumbLX, g.sThumbLY, left_dz_ * 32767 / 100, 1.0, p.lx, p.ly);
-            Stick(g.sThumbRX, g.sThumbRY, right_dz_ * 32767 / 100, 1.0, p.rx, p.ry);
+            MapXInput(st.Gamepad, p);
+            pad = true;
             device_name_ = fmt::format("XInput controller {}", i + 1);
             break;
         }
@@ -145,14 +175,18 @@ void Input::Update(bool focused) {
                 default: return xbox;
                 }
             };
+            const bool skills = SDL_GetGamepadButton(pad_, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER);
+            const SDL_GamepadButton fs[4] = {SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST, SDL_GAMEPAD_BUTTON_WEST,
+                                             SDL_GAMEPAD_BUTTON_NORTH};
+            const u64 by_pos[4] = {B, A, Y, X}, xbox[4] = {A, B, X, Y};
+            for (int f = 0; f < 4; f++)
+                p.buttons |= Face(f, SDL_GetGamepadButton(pad_, fs[f]), face(fs[f], by_pos[f], xbox[f]), by_pos[f], skills);
+            pad = true;
             struct {
                 SDL_GamepadButton s;
                 u64 b;
             } map[] = {
-                {SDL_GAMEPAD_BUTTON_EAST, face(SDL_GAMEPAD_BUTTON_EAST, A, B)},
-                {SDL_GAMEPAD_BUTTON_SOUTH, face(SDL_GAMEPAD_BUTTON_SOUTH, B, A)},
-                {SDL_GAMEPAD_BUTTON_NORTH, face(SDL_GAMEPAD_BUTTON_NORTH, X, Y)},
-                {SDL_GAMEPAD_BUTTON_WEST, face(SDL_GAMEPAD_BUTTON_WEST, Y, X)}, {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, L},
+                {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, L},
                 {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, R}, {SDL_GAMEPAD_BUTTON_START, Plus},
                 {SDL_GAMEPAD_BUTTON_BACK, Minus}, {SDL_GAMEPAD_BUTTON_LEFT_STICK, LStick},
                 {SDL_GAMEPAD_BUTTON_RIGHT_STICK, RStick}, {SDL_GAMEPAD_BUTTON_DPAD_UP, Up},
@@ -170,6 +204,8 @@ void Input::Update(bool focused) {
                   1.0, p.rx, p.ry);
         }
     }
+    if (!pad)
+        std::fill(std::begin(face_), std::end(face_), 0);
     if (focused)
         ReadKeyboard(p);
     AddStickDirections(p);
