@@ -105,6 +105,28 @@ $size = (Get-ChildItem $out -Recurse -File | Measure-Object Length -Sum).Sum
 if ($Zip) {
     $zipPath = "$out.zip"
     Remove-Item $zipPath -ErrorAction SilentlyContinue
-    Compress-Archive -Path $out -DestinationPath $zipPath -CompressionLevel Optimal
-    "zip $zipPath ($([math]::Round((Get-Item $zipPath).Length / 1MB)) MB)"
+    # Not Compress-Archive: in PowerShell 5 it names entries with '\', which other unzip tools take as part of
+    # the file name. Entries here use '/', under the package's one top folder.
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $root = (Get-Item $out).FullName.TrimEnd('\')
+    $top = Split-Path $root -Leaf
+    $zs = [System.IO.File]::Open($zipPath, [System.IO.FileMode]::CreateNew)
+    try {
+        $za = New-Object System.IO.Compression.ZipArchive($zs, [System.IO.Compression.ZipArchiveMode]::Create)
+        try {
+            foreach ($f in Get-ChildItem $root -Recurse -File) {
+                $rel = $f.FullName.Substring($root.Length + 1).Replace('\', '/')
+                [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($za, $f.FullName, "$top/$rel",
+                    [System.IO.Compression.CompressionLevel]::Optimal)
+            }
+        } finally { $za.Dispose() }
+    } finally { $zs.Dispose() }
+    $za = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+    try {
+        $bad = @($za.Entries | Where-Object { $_.FullName.Contains('\') -or -not $_.FullName.StartsWith("$top/") })
+        $count = $za.Entries.Count
+    } finally { $za.Dispose() }
+    if ($bad.Count) { throw "zip entries with '\' or outside $top/: $($bad[0].FullName)" }
+    if ($count -ne (Get-ChildItem $root -Recurse -File).Count) { throw "zip holds $count entries, the package $((Get-ChildItem $root -Recurse -File).Count) files" }
+    "zip $zipPath ($([math]::Round((Get-Item $zipPath).Length / 1MB)) MB, $count entries, '/' names)"
 }
