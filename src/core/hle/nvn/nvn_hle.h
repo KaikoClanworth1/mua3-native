@@ -202,6 +202,17 @@ struct TextureInfo {
     recomp::u32 width = 0, height = 0, depth = 0, levels = 0, format = 0, target = 0;
 };
 bool QueryTexture(recomp::u64 texture, TextureInfo& out);
+// A texture as described when a command naming it was recorded (render targets, copies), in 4 words: the driver
+// bakes these into its command memory at record time, and by the time the GPU thread encodes the command the game
+// may have finalized the texture or initialized another one in the same object (#24). gpu 0 = not known then.
+constexpr recomp::u32 kTextureSnapshotWords = 4;
+inline bool UnpackTexture(const recomp::u64* w, TextureInfo& out) {
+    if (!w[0])
+        return false;
+    out = {w[0], recomp::u32(w[1]), recomp::u32(w[1] >> 32), recomp::u32(w[2]), recomp::u32(w[2] >> 32),
+           recomp::u32(w[3]), recomp::u32(w[3] >> 32)};
+    return true;
+}
 // Last recorded call of `setter` (e.g. "nvnBlendStateSetBlendFunc") on a state object; false if never set.
 bool QueryState(recomp::u64 object, std::string_view setter, recomp::u64 x[8], recomp::u32 v[4]);
 // Shader code GPU address of a single-stage program (the SPH is at +0x30), or 0.

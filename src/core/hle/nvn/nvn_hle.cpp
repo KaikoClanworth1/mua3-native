@@ -282,6 +282,19 @@ void EnsureTexture(State& s, u64 tex) {
     LOG_INFO("NVN", "texture {:#x} described at bind: {}x{} format {:#x} pool {:#x}+{:#x}", tex, d.width, d.height,
              d.format, d.pool, d.offset);
 }
+// The texture as it is now, in kTextureSnapshotWords words (UnpackTexture), for a command being recorded.
+void SnapTexture(State& s, u64 tex, u64* w) {
+    EnsureTexture(s, tex);
+    TextureInfo t;
+    if (!tex || !QueryTexture(tex, t)) {
+        w[0] = w[1] = w[2] = w[3] = 0;
+        return;
+    }
+    w[0] = t.gpu;
+    w[1] = t.width | u64(t.height) << 32;
+    w[2] = t.depth | u64(t.levels) << 32;
+    w[3] = t.format | u64(t.target) << 32;
+}
 void TextureInitialize(State& s) {
     BumpTexGen(s.x[0]); // (before the global counter: the registration fast path reads them in the other order)
     g_texture_generation.fetch_add(1, std::memory_order_release);
@@ -647,6 +660,7 @@ struct GenericSlot {
     bool tex_bind = false; // BindTexture: consecutive calls share one command (ForEachTextureBind)
     // texture copies: argument indices of their NVNtextureView* and NVNcopyRegion* pairs (-1 = none)
     int copy_view[2] = {-1, -1}, copy_region[2] = {-1, -1};
+    int copy_tex[2] = {-1, -1}; // ... and of their NVNtexture* (snapshotted into `extra`)
 };
 constexpr int kGenericSlots = 320;
 std::array<GenericSlot, kGenericSlots> g_generic;
@@ -843,12 +857,28 @@ void Generic(State& s) {
     if (g.rts) { // SetRenderTargets(cb, n, NVNtexture** colors, views, depth, depthView): the arrays are temporaries
         for (u64 i = 0; i < u32(s.x[1]) && i < 8; i++)
             c.extra.push_back(recomp::Rd<u64>(s, s.x[2] + i * 8));
-        if (g_sink.load()) {
-            for (u64 t : c.extra)
-                EnsureTexture(s, t);
-            EnsureTexture(s, s.x[4]);
+        if (g_sink.load()) { // ... followed by the colors' and the depth's descriptions now (SnapTexture)
+            const size_t n = c.extra.size();
+            u64 tex[9], w[kTextureSnapshotWords];
+            for (size_t i = 0; i < n; i++)
+                tex[i] = c.extra[i];
+            tex[n] = s.x[4];
+            c.extra.reserve(n + (n + 1) * kTextureSnapshotWords);
+            for (size_t i = 0; i <= n; i++) {
+                SnapTexture(s, tex[i], w);
+                for (u64 v : w)
+                    c.extra.push_back(v);
+            }
         }
     }
+    if (g_sink.load())
+        for (int k = 0; k < 2; k++)
+            if (g.copy_tex[k] >= 0) {
+                u64 w[kTextureSnapshotWords];
+                SnapTexture(s, s.x[g.copy_tex[k]], w);
+                for (u64 v : w)
+                    c.extra.push_back(v);
+            }
     if (g.shaders) { // nvnProgramSetShaders(program, count, const NVNshaderData*): {code address, control pointer}
         for (u64 i = 0; i < u32(s.x[1]) && i < 8; i++) {
             c.extra.push_back(recomp::Rd<u64>(s, s.x[2] + i * 16));
@@ -1891,12 +1921,20 @@ bool DecodeCommand(State& s, int fn, int mode) {
     if (g.rts) {
         for (u64 i = 0; i < u32(s.x[1]) && i < 8; i++)
             mem[nm++] = recomp::Rd<u64>(s, s.x[2] + i * 8);
-        if (mode == 1 && replay) {
-            for (u32 i = 0; i < nm; i++)
-                EnsureTexture(s, mem[i]);
-            EnsureTexture(s, s.x[4]);
+        if (replay) { // the textures as they are now (SnapTexture; the direct path's layout)
+            const u32 n = nm;
+            for (u32 i = 0; i < n; i++, nm += kTextureSnapshotWords)
+                SnapTexture(s, mem[i], mem + nm);
+            SnapTexture(s, s.x[4], mem + nm);
+            nm += kTextureSnapshotWords;
         }
     }
+    if (replay)
+        for (int k = 0; k < 2; k++)
+            if (g.copy_tex[k] >= 0) {
+                SnapTexture(s, s.x[g.copy_tex[k]], mem + nm);
+                nm += kTextureSnapshotWords;
+            }
     if (g.shaders) {
         const u32 at = nm;
         for (u64 i = 0; i < u32(s.x[1]) && i < 8; i++) {
@@ -2094,9 +2132,19 @@ void DecodeRecordCommand(Recording& rec, DecodeCtx& d, int I, bool replay, const
         if (live && (++d.heads & 1023) == 0)
             g_bt_heads.fetch_add(1024, std::memory_order_relaxed);
     }
-    if (g.rts)
-        for (u64 i = 0; i < u32(x[1]) && i < 8; i++)
+    if (g.rts) {
+        u32 n = 0;
+        for (u64 i = 0; i < u32(x[1]) && i < 8; i++, n++)
             c.extra.push_back(mem[m++]);
+        if (replay)
+            for (u32 i = 0; i < (n + 1) * kTextureSnapshotWords; i++)
+                c.extra.push_back(mem[m++]);
+    }
+    if (replay)
+        for (int k = 0; k < 2; k++)
+            if (g.copy_tex[k] >= 0)
+                for (u32 i = 0; i < kTextureSnapshotWords; i++)
+                    c.extra.push_back(mem[m++]);
     if (g.shaders)
         for (u64 i = 0; i < u32(x[1]) && i < 8; i++) {
             c.extra.push_back(mem[m++]);
@@ -2400,11 +2448,12 @@ recomp::Fn Find(std::string_view name, recomp::Fn driver, u64 pc) {
         g.rts = name == "nvnCommandBufferSetRenderTargets";
         g.tex_bind = kind == Kind::Command && name == "nvnCommandBufferBindTexture";
         if (name == "nvnCommandBufferCopyBufferToTexture") // (cb, src, dst, dstView, dstRegion, flags)
-            g.copy_view[0] = 3, g.copy_region[0] = 4;
+            g.copy_view[0] = 3, g.copy_region[0] = 4, g.copy_tex[0] = 2;
         else if (name == "nvnCommandBufferCopyTextureToBuffer") // (cb, src, srcView, srcRegion, dst, flags)
-            g.copy_view[0] = 2, g.copy_region[0] = 3;
+            g.copy_view[0] = 2, g.copy_region[0] = 3, g.copy_tex[0] = 1;
         else if (name == "nvnCommandBufferCopyTextureToTexture") // (cb, src, srcView, srcRegion, dst, dstView, dstRegion, flags)
-            g.copy_view[0] = 2, g.copy_region[0] = 3, g.copy_view[1] = 5, g.copy_region[1] = 6;
+            g.copy_view[0] = 2, g.copy_region[0] = 3, g.copy_view[1] = 5, g.copy_region[1] = 6, g.copy_tex[0] = 1,
+            g.copy_tex[1] = 4;
         if (kind == Kind::Command) {
             // exactly what the host encoder implements; the driver records the rest into its command memory, which
             // is never submitted (the queue, fences and present are host functions)
