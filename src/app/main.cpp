@@ -24,6 +24,7 @@
 #include "core/hle/audio_output.h"
 #include "core/hle/camera_speed.h"
 #include "core/hle/hid.h"
+#include "core/hle/keybinds.h"
 #include "core/hle/menu_graphics.h"
 #include "core/hle/menu_mods.h"
 #include "gpu/d3d11/renderer_d3d11.h"
@@ -252,6 +253,8 @@ u64 ParseButtons(const std::string& btns);
 //   press <BUTTON>[+BUTTON...] [hold_ms]     tap buttons on player 1
 //   xpad <XBOX>[+XBOX...][/...] [hold_ms]    the same through the Xbox pad mapping (A B X Y LB RB LT RT START BACK, D-pad);
 //                                            stages split by / are held hold_ms each
+//   key <KEY>[+KEY...][/...] [hold_ms]       keys and mouse buttons through the KEY BINDINGS (names as in mua3.ini's
+//                                            [keys], _ for spaces: L, NUM_8, MOUSE_LEFT; NONE = nothing held)
 //   stick <lx> <ly> [hold_ms]                tilt player 1's left stick (rstick: the right stick)
 //   shot <path.bmp>                          save the next presented game frame
 void PollCommandFile(platform::Input* input) {
@@ -302,6 +305,26 @@ void PollCommandFile(platform::Input* input) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(hold));
                 }
                 input->SimulateXInput(0);
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                g_script_active = false;
+            } else if (cmd == "key" && input) { // key <L/MOUSE_LEFT+ESC/...> [hold_ms]: keys, each stage held
+                g_script_active = true;
+                std::istringstream stages(arg);
+                for (std::string stage; std::getline(stages, stage, '/');) {
+                    std::vector<u16> keys;
+                    u32 mouse = 0;
+                    std::istringstream parts(stage);
+                    for (std::string n; std::getline(parts, n, '+');) {
+                        std::replace(n.begin(), n.end(), '_', ' ');
+                        if (const u8 m = hle::keybinds::MouseFromName(n))
+                            mouse |= 1u << (m - 1);
+                        else if (const u16 k = hle::keybinds::KeyFromName(n))
+                            keys.push_back(k);
+                    }
+                    LOG_INFO("Main", "key {}: game buttons {:#x}", stage, input->SimulateKeys(keys, mouse));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(hold));
+                }
+                input->SimulateKeys({}, 0);
                 std::this_thread::sleep_for(std::chrono::milliseconds(250));
                 g_script_active = false;
             } else if (cmd == "stick" || cmd == "rstick") { // [r]stick <x> <y> [hold_ms]: tilt the left (right) stick

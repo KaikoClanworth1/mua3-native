@@ -209,6 +209,9 @@ known icon (any set) is remembered by address and replaced with the wanted set. 
 (`prompts::SetDevice` from `platform::Input::Update`: XInput or SDL pad by type, keyboard; `SetLayout`) every
 remembered icon is written back into guest memory with the new set; the renderer's write tracking re-uploads it.
 Identical icons in two sets (Xbox A by letter = the game's B by position) are told apart by the address's known icon.
+While the keyboard is in use the icons are keycaps with the bound key (a mouse for an action bound to a mouse button
+only; one keycap with all four keys for the sticks, e.g. WASD), drawn again whenever a binding changes
+(`prompts::KeysChanged`).
 
 ## The OPTIONS screen
 
@@ -301,8 +304,17 @@ The title screen's SYSTEM submenu (SAVE, LOAD, OPTIONS, TIPS, GALLERY; title men
   original, live: `hle::camera_speed`; the camera update main+0x339d40 turns at speed * (stick - deadzone)^2 with the
   speed floats in the camera parameters, so the update is wrapped and those floats are scaled for its duration: speed%
   at every tilt; on top of the CAMERA tab's CONTROL SENSITIVITY), LEFT / RIGHT STICK DEADZONE (`[input]
-  left_deadzone` / `right_deadzone`, 0-50% in steps of 2, 10% default, live through `input.SetDeadzones`). 3 rows
-  are free.
+  left_deadzone` / `right_deadzone`, 0-50% in steps of 2, 10% default, live through `input.SetDeadzones`) and KEY
+  BINDINGS (OPEN). 2 rows are free.
+- **KEY BINDINGS** (from CONTROLS; B goes back to CONTROLS): RESET ALL, then 7 of the 24 actions a page (L / R: the
+  others; the header shows the page). An action's value is its key and mouse button (`hle::keybinds`). A on it shows
+  PRESS A KEY... and the next key or mouse button pressed is taken (`keybinds::Feed`, on the input thread; the game
+  sees no input meanwhile and until everything is let go); ESC cancels, BACKSPACE clears it; another action with
+  that key gets this one's old key (a swap). The input thread then taps A for 150 ms (`hid::PulseButtons`), so the
+  game calls the page's A handler again and it shows the result (`keybinds::TakeDone`). Y puts the action's default
+  back. The rows are arrow rows with one choice: the game redraws an arrow row's value in place (kShowValue), a
+  button row's only when the page is laid out. The info line is redrawn only when the cursor moves. Saved to
+  mua3.ini's `[keys]` (only bindings that differ from the defaults: `action=KEY[, MOUSE BUTTON]`), used at once.
 - **MODS**: MODS ENABLED (`[mods] enabled`, the master switch), then one row per mod in load order (ON / OFF, its
   replaced / added file counts and unsupported parts on the info line, "no game files found" for an empty romfs),
   7 per page with L / R turning pages (the header shows the page number). Y picks a mod up, LEFT / RIGHT move it, Y or

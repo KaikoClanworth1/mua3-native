@@ -1,4 +1,7 @@
 #pragma once
+#include <map>
+#include <string>
+
 #include "common/common.h"
 
 namespace core {
@@ -48,6 +51,8 @@ struct Config {
     bool bug_capture = false; // [debug] F4 writes a bug capture folder (platform/bug_capture.cpp)
     bool stage_select = false; // [debug] allows --chapter / --stage (app/debug_chapter.cpp)
     bool mods_enabled = true;  // [mods] enabled: master switch for the mods folder (core/hle/mods.h, docs/mods.md)
+    // [keys]: keyboard / mouse bindings that differ from the defaults, action -> "KEY[, MOUSE BUTTON]" (hle::keybinds)
+    std::map<std::string, std::string> keys;
     // Not stored: set while --chapter plays from its own save folder; Save() writes this as save_dir instead.
     fs::path user_save_dir;
 

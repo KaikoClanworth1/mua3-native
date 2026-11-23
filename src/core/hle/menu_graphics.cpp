@@ -35,6 +35,7 @@
 #include <tuple>
 #include <vector>
 
+#include "core/hle/keybinds.h"
 #include "core/hle/menu_guest.h"
 #include "core/hle/mods.h"
 #include "core/kernel/kernel.h"
@@ -101,7 +102,7 @@ enum GraphicsRows {
 };
 enum PcRows { kRowLimit, kRowShowFps, kRowVolume, kRowMute, kRowAudio, kRowControls, kRowMods, kPcRows };
 // CONTROLS (opened from PC SETTINGS' CONTROLS row); room for more rows (stick deadzones, #17)
-enum ControlsRows { kRowController, kRowButtons, kRowCamera, kRowLeftDead, kRowRightDead, kControlsRows };
+enum ControlsRows { kRowController, kRowButtons, kRowCamera, kRowLeftDead, kRowRightDead, kRowKeys, kControlsRows };
 constexpr int kDeadStep = 2, kDeadMax = 50; // stick deadzones: 0-50% in steps of 2 (another ini value: its own text)
 enum Aa { kAaOff, kAaFxaa, kAaSsaa2 }; // anti_aliasing: 2-4 = SSAA 2X-4X
 // UPSCALER row: OFF, then 4 qualities (upscale_quality 0-3) of each upscaler= value shown, in this order. FSR 3.1 and
@@ -142,9 +143,10 @@ struct Page {
     void (*to)(const core::Config&, u8* v) = nullptr;
     void (*from)(core::Config&, bool running, const u8* v) = nullptr;
 };
-Page g_pages[4];
+Page g_pages[5];
 constexpr int kPageMods = 2;     // MODS, opened from PC SETTINGS' MODS row
 constexpr int kPageControls = 3; // CONTROLS, opened from PC SETTINGS' CONTROLS row
+constexpr int kPageKeys = 4;     // KEY BINDINGS, opened from CONTROLS' KEY BINDINGS row
 int g_cur = 0; // the page shown
 bool SubPage() { return g_cur >= kPageMods; } // a page opened from a PC SETTINGS row: one header, B goes back
 Page& Cur() { return g_pages[g_cur]; }
@@ -167,6 +169,7 @@ cpu::FunctionOverride g_hooks[kHookCount];
 bool OnPage(u64 opt);
 void UpdateGrey(State& s, u64 opt, int upscaler = -1, bool force = false);
 void ModsPage(State& s, u64 opt, int dir);
+void KeysPage(State& s, u64 opt, int dir);
 void Exclude(State& s, u64 opt, u32 row, u8 value);
 
 u64 R64(u64 a) { return g_mem->Read<u64>(a); }
@@ -217,6 +220,15 @@ bool g_launch_mods_enabled = true;
 u32 g_mods_title = 0, g_master_info = 0, g_no_mods = 0, g_mod_label[kModRows]{}, g_mod_info[kModRows]{};
 std::vector<RowInfo> g_mod_rows; // all 8; the page shows the first ones
 
+// KEY BINDINGS: RESET ALL, then 7 actions a page (L / R: the others). A on an action takes the next key or mouse
+// button pressed (hle::keybinds' capture), Y puts the action's default back.
+constexpr u32 kKeyRows = kMaxRows - 1;
+u32 g_key_first = 0;                 // the first action shown
+u32 g_keys_title = 0, g_keys_info = 0, g_key_label[kKeyRows]{}, g_key_info[kKeyRows]{}, g_key_value[kKeyRows]{};
+std::vector<RowInfo> g_key_rows;     // all 8
+int g_key_note_action = -1;          // the action whose info line tells of a swap
+std::u16string g_key_note;
+
 // A page's row table, choice arrays and value bytes in guest memory.
 void Finish(Page& page) {
     for (RowInfo& r : page.rows) {
@@ -256,6 +268,8 @@ void ToMods(const core::Config& c, u8* v);
 void FromMods(core::Config& c, bool running, const u8* v);
 void ToControls(const core::Config& c, u8* v);
 void FromControls(core::Config& c, bool running, const u8* v);
+void ToKeys(const core::Config&, u8*) {} // (button rows only: the bindings live in hle::keybinds)
+void FromKeys(core::Config&, bool, const u8*) {}
 
 void BuildPages() {
     g_block = g_mem->FindFree(core::layout::kKernelMapBase, 0x1000000000ull, kBlockSize);
@@ -337,7 +351,8 @@ void BuildPages() {
     add(Text(u"AUDIO OUTPUT"), g_audio_info, kArrows,
         {Text(kAudioNames[0]), Text(kAudioNames[1]), Text(kAudioNames[2])});
     const u32 open = Text(u"OPEN");
-    add(Text(u"CONTROLS"), Text(u"Controller type, button layout, camera speed and stick deadzones."), kButton, {open});
+    add(Text(u"CONTROLS"), Text(u"Controller type, button layout, camera speed, stick deadzones and key bindings."),
+        kButton, {open});
     add(Text(u"MODS"), Text(u"Turn mods on or off and set their load order. Mods apply after a restart."), kButton,
         {open});
     Finish(*page);
@@ -370,7 +385,27 @@ void BuildPages() {
         dead.push_back(g_custom_dead[k]);
         add(Text(k == 0 ? u"LEFT STICK DEADZONE" : u"RIGHT STICK DEADZONE"), dead_info, kArrows, dead);
     }
+    add(Text(u"KEY BINDINGS"), Text(u"Which keys and mouse buttons play the game. Saved and used at once."), kButton,
+        {open});
     Finish(*page);
+    // KEY BINDINGS
+    page = &g_pages[kPageKeys];
+    g_keys_title = Text(u"KEY BINDINGS", 24);
+    page->title = g_keys_title;
+    page->to = ToKeys;
+    page->from = FromKeys;
+    g_keys_info = Text(u"", kInfoRoom);
+    add(Text(u"RESET ALL"), g_keys_info, kButton, {Text(u"RESET")});
+    for (u32 k = 0; k < kKeyRows; k++) {
+        g_key_label[k] = Text(u"", kLabelRoom);
+        g_key_info[k] = Text(u"", kInfoRoom);
+        g_key_value[k] = Text(u"", kLabelRoom);
+        // (an arrow row with one choice: the game redraws an arrow row's value text in place, a button row's only
+        // at layout)
+        add(g_key_label[k], g_key_info[k], kArrows, {g_key_value[k]});
+    }
+    Finish(*page);
+    g_key_rows = page->rows;
     // MODS
     page = &g_pages[kPageMods];
     g_mods_title = Text(u"MODS", 16);
@@ -591,6 +626,41 @@ void SyncMods(const u8* v) {
     }
     if (changed && !mods::SaveOrder(g_mods))
         LOG_WARN("Menu", "could not save mods\\order.txt");
+}
+
+// The KEY BINDINGS page's rows and texts for the actions shown (g_mutex held).
+void BuildKeyRows() {
+    namespace kb = keybinds;
+    const u32 pages = (kb::kActions + kKeyRows - 1) / kKeyRows;
+    const u32 shown = std::min<u32>(kKeyRows, kb::kActions - g_key_first);
+    PutString(g_keys_title, U16(fmt::format("KEY BINDINGS {} / {}", g_key_first / kKeyRows + 1, pages)), 24);
+    PutString(g_keys_info,
+              U16(fmt::format("Puts every key and mouse button back to the defaults.\r\nL / R: more ({} in all).",
+                              int(kb::kActions))),
+              kInfoRoom);
+    const int capturing = kb::Capturing();
+    for (u32 k = 0; k < shown; k++) {
+        const auto a = kb::Action(g_key_first + k);
+        PutString(g_key_label[k], kb::Label(a), kLabelRoom);
+        PutString(g_key_value[k], capturing == int(a) ? u"PRESS A KEY..." : kb::Text(kb::Get(a)), kLabelRoom);
+        std::u16string info;
+        if (capturing == int(a))
+            info = u"Press a key or mouse button for " + kb::Label(a) + u".\r\nESC: cancel. BACKSPACE: no key.";
+        else if (g_key_note_action == int(a))
+            info = g_key_note;
+        else
+            info = u"A, then a key or mouse button: change it (ESC cancels, BACKSPACE clears).\r\nY: back to the default (" +
+                   kb::Text(kb::Default(a)) +
+                   u").";
+        PutString(g_key_info[k], info, kInfoRoom);
+    }
+    g_pages[kPageKeys].rows.assign(g_key_rows.begin(), g_key_rows.begin() + 1 + shown);
+}
+
+// The bindings changed: into mua3.ini and the keyboard prompts.
+void SaveKeys() {
+    core::Sys().UpdateConfig([](core::Config& c, bool) { keybinds::Store(c); });
+    prompts::KeysChanged();
 }
 
 void ToPage(Page& page, const core::Config& c) {
@@ -853,6 +923,8 @@ void SwitchPage(State& s, Hook h) {
         return GuestReturn(s, 0);
     if (g_cur == kPageMods)
         return ModsPage(s, opt, h == kHTabPrev ? -1 : 1);
+    if (g_cur == kPageKeys)
+        return KeysPage(s, opt, h == kHTabPrev ? -1 : 1);
     if (SubPage()) // one page
         return GuestReturn(s, 0);
     int from = 0, to = 0;
@@ -926,6 +998,11 @@ void EnterSub(State& s, u64 opt, int sub) {
             g_mod_first = 0;
             BuildModsRows();
         }
+        if (sub == kPageKeys) {
+            g_key_first = 0;
+            g_key_note_action = -1;
+            BuildKeyRows();
+        }
     }
     GuestCall(s, g_main + kPlayAnim, {opt + kObjAnims, 0, 0});
     GuestCall(s, g_main + kPlayAnim, {opt + kObjAnims, g_mem->Read<u8>(g_main + kTabAnims + kPageTabs[0]), 0});
@@ -936,11 +1013,26 @@ void EnterSub(State& s, u64 opt, int sub) {
     if (sub == kPageMods)
         LOG_INFO("Menu", "MODS page shown ({} mods)", g_mods.size());
     else
-        LOG_INFO("Menu", "CONTROLS page shown");
+        LOG_INFO("Menu", "{} page shown", sub == kPageKeys ? "KEY BINDINGS" : "CONTROLS");
 }
-// B on MODS or CONTROLS: back to PC SETTINGS.
+// B on MODS or CONTROLS: back to PC SETTINGS; on KEY BINDINGS: back to CONTROLS.
 void LeaveSub(State& s, u64 opt) {
     const int sub = g_cur;
+    if (sub == kPageKeys) {
+        if (keybinds::Capturing() >= 0)
+            return;
+        {
+            std::lock_guard lk(g_mutex);
+            g_cur = kPageControls;
+        }
+        GuestCall(s, g_main + kPlayAnim, {opt + kObjAnims, 0, 0});
+        GuestCall(s, g_main + kPlayAnim, {opt + kObjAnims, g_mem->Read<u8>(g_main + kTabAnims + kPageTabs[0]), 0});
+        GuestCall(s, g_main + kTabNames, {opt});
+        Layout(s, opt, -1);
+        PlaySound(s, kSoundBack);
+        LOG_INFO("Menu", "KEY BINDINGS page closed, back to CONTROLS");
+        return;
+    }
     {
         std::lock_guard lk(g_mutex);
         Apply();
@@ -1011,6 +1103,71 @@ void MoveMod(State& s, u64 opt, int dir) {
     PlaySound(s, kSoundTab);
 }
 
+// The KEY BINDINGS rows' texts again (the value texts redrawn in place, the cursor stays).
+void RefreshKeys(State& s, u64 opt) {
+    size_t n = 0;
+    {
+        std::lock_guard lk(g_mutex);
+        BuildKeyRows();
+        n = Cur().rows.size();
+    }
+    for (u32 r = 0; r < n; r++)
+        GuestCall(s, g_main + kShowValue, {opt, r});
+}
+// A on KEY BINDINGS: RESET ALL, or the action takes the next key; the tap of A that ends a capture (keybinds::Feed)
+// shows its result.
+void KeysDecide(State& s, u64 opt, u32 row) {
+    namespace kb = keybinds;
+    kb::Outcome o;
+    if (kb::TakeDone(o)) {
+        g_key_note_action = -1;
+        if (!o.cancelled) {
+            if (o.swapped >= 0) {
+                g_key_note_action = o.action;
+                g_key_note = u"Swapped: " + kb::Label(kb::Action(o.swapped)) + u" now uses " +
+                             kb::Text(kb::Get(kb::Action(o.swapped))) + u".\r\nY: back to the default (" +
+                             kb::Text(kb::Default(kb::Action(o.action))) + u").";
+            }
+            SaveKeys();
+            const kb::Binding b = kb::Get(kb::Action(o.action));
+            LOG_INFO("Menu", "{} bound to key '{}', mouse '{}'{}", kb::Id(kb::Action(o.action)), kb::KeyName(b.key),
+                     kb::MouseName(b.mouse), o.swapped >= 0 ? fmt::format(" (swapped with {})", kb::Id(kb::Action(o.swapped))) : "");
+        }
+        RefreshKeys(s, opt);
+        PlaySound(s, o.cancelled ? kSoundBack : kSoundTab);
+        return;
+    }
+    if (kb::Capturing() >= 0 || R32(opt + kObjState) != kStateIdle)
+        return;
+    g_key_note_action = -1;
+    if (row == 0) {
+        kb::ResetAll();
+        SaveKeys();
+        LOG_INFO("Menu", "key bindings reset");
+    } else if (row < Cur().rows.size()) {
+        kb::StartCapture(kb::Action(g_key_first + row - 1));
+        LOG_INFO("Menu", "binding {}: waiting for a key", kb::Id(kb::Action(g_key_first + row - 1)));
+    }
+    RefreshKeys(s, opt);
+    PlaySound(s, kSoundTab);
+}
+// L / R on KEY BINDINGS: the previous / next 7 actions.
+void KeysPage(State& s, u64 opt, int dir) {
+    if (keybinds::Capturing() >= 0)
+        return GuestReturn(s, 0);
+    {
+        std::lock_guard lk(g_mutex);
+        const u32 pages = (keybinds::kActions + kKeyRows - 1) / kKeyRows;
+        g_key_first = (g_key_first / kKeyRows + pages + dir) % pages * kKeyRows;
+        g_key_note_action = -1;
+        BuildKeyRows();
+    }
+    GuestCall(s, g_main + kTabNames, {opt});
+    Layout(s, opt, -1);
+    PlaySound(s, kSoundTab);
+    GuestReturn(s, 0);
+}
+
 // A on the GRAPHICS row: our pages, in place. A on our pages: the row's next value, wrapping round (like right).
 void Decide(State& s) {
     const u64 opt = s.x[0];
@@ -1021,9 +1178,17 @@ void Decide(State& s) {
         return GuestReturn(s, 0);
     }
     const u32 row = CursorRow(s, opt);
+    if (g_cur == kPageKeys) {
+        KeysDecide(s, opt, row);
+        return GuestReturn(s, 0);
+    }
     if (R32(opt + kObjState) == kStateIdle) {
         if (g_cur == 1 && (row == kRowMods || row == kRowControls)) {
             EnterSub(s, opt, row == kRowMods ? kPageMods : kPageControls);
+            return GuestReturn(s, 0);
+        }
+        if (g_cur == kPageControls && row == kRowKeys) {
+            EnterSub(s, opt, kPageKeys);
             return GuestReturn(s, 0);
         }
         if (g_cur == kPageMods && g_moving >= 0 && row >= 1 && int(g_mod_first + row - 1) == g_moving) {
@@ -1141,6 +1306,17 @@ void Default(State& s) {
         return RunOriginal(s, g_hooks[kHDefault]);
     }
     const u32 row = CursorRow(s, opt);
+    if (g_cur == kPageKeys) {
+        if (row >= 1 && row < Cur().rows.size() && keybinds::Capturing() < 0 && R32(opt + kObjState) == kStateIdle) {
+            const auto a = keybinds::Action(g_key_first + row - 1);
+            keybinds::Set(a, keybinds::Default(a));
+            g_key_note_action = -1;
+            SaveKeys();
+            RefreshKeys(s, opt);
+            PlaySound(s, kSoundTab);
+        }
+        return GuestReturn(s, 0);
+    }
     if (g_cur == kPageMods && row >= 1 && row < Cur().rows.size() && !g_mods.empty()) {
         if (R32(opt + kObjState) == kStateIdle)
             PickUp(s, opt, row);
@@ -1187,6 +1363,7 @@ void SetRenderScale(u32 scale3) { g_scale3 = scale3; }
 u32 LabelHash() { return kStrGraphics; }
 
 void Install(core::Memory& mem, kernel::Kernel& kernel, u64 main_base) {
+    keybinds::Load(core::Sys().CfgSnapshot());
     prompts::Init(); // (button icons per input device: no game code involved)
     // the build these offsets come from: the first words of the functions, the row counts and tab 2's row types
     static constexpr std::pair<u64, u32> kExpect[] = {

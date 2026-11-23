@@ -20,6 +20,9 @@ struct PadInput {
 
 // Called by the platform layer (any thread); written into HID shared memory by the HID update thread.
 void SetPad(int player, const PadInput& in);
+// Player 1 also presses `buttons` for the next `ms` milliseconds, whatever SetPad says (the KEY BINDINGS page's way to
+// tell the menu a key was taken: one A press).
+void PulseButtons(u64 buttons, int ms);
 void StartUpdateThread();
 
 } // namespace hle::hid

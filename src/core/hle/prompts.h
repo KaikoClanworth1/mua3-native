@@ -15,6 +15,8 @@ void Init();
 // The device whose buttons the prompts show, and core::Config::button_layout (0 by letter, 1 Switch positions). Live.
 void SetDevice(Device d);
 void SetLayout(int layout);
+// The key bindings changed (hle::keybinds): the keyboard icons are drawn again.
+void KeysChanged();
 Device CurrentDevice();
 const char* DeviceName(Device d);
 
