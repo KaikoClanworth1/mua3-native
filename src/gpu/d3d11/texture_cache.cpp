@@ -290,6 +290,11 @@ ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::T
         dma_reuploads_++;
         reuploads++;
         g_texture_stats.reuploads.fetch_add(1, std::memory_order_relaxed);
+        // all of it through the staging ring (UpdateRects, as for CPU rewrites), else decoded again by Upload
+        static const std::vector<std::pair<u64, u64>> none;
+        static const bool update_sub = std::getenv("MUA3_TEX_UPDATESUB") != nullptr;
+        if (t.updatable && UpdateRects(tic, use, t, none, !update_sub, true))
+            return t.srv.Get();
         if (auto* srv = Upload(tic, use, key, &t))
             return srv;
         Erase(it);
@@ -513,8 +518,13 @@ bool TextureCache::UpdateRects(const TicEntry& tic, const shader::TextureUse& us
     for (auto& [o, n] : changed)
         bytes += n;
     if (bytes * 2 > total) { // most of it: one whole upload
-        if (!staging)
+        // (#8) through the reused staging ring, not UpdateSubresource: the AMD driver keeps a copy per whole-texture
+        // UpdateSubresource while the GPU is behind (video planes every frame: memory +800 MB/s on an RX 6800).
+        // MUA3_TEX_UPDATESUB=1: UpdateSubresource as before (A/B).
+        static const bool update_sub = std::getenv("MUA3_TEX_UPDATESUB") != nullptr;
+        if (!staging && update_sub)
             return decline("over half of it changed");
+        staging = true;
         whole = true;
     }
     const u8* guest = G().GpuPtr(tic.Address(), size_t(total));
@@ -621,7 +631,7 @@ ID3D11Texture2D* TextureCache::MapStaging(ID3D11Texture2D* dst, D3D11_MAPPED_SUB
         }
         ring.tex.push_back(s);
         ring.next = n + 1;
-        LOG_INFO("Texture", "MUA3_TEX_STAGING: staging texture {} of {} for {}x{} format {}", n + 1, kStagingRing,
+        LOG_INFO("Texture", "staging texture {} of {} for {}x{} format {} (rewritten textures go through it)", n + 1, kStagingRing,
                  d.Width, d.Height, int(d.Format));
         return s.Get();
     }
