@@ -110,8 +110,10 @@ public:
     // Stick deadzones in percent (core::Config::left_deadzone / right_deadzone).
     void SetDeadzones(int left, int right) { left_dz_ = left; right_dz_ = right; }
     std::string DeviceName() const { return device_name_; }
-    // Test aid: an Xbox pad holding these XINPUT_GAMEPAD_* buttons, through the same mapping; returns the game's buttons.
-    u64 SimulateXInput(u16 buttons);
+    // Test aid: an Xbox pad holding these XINPUT_GAMEPAD_* buttons (and kSim*Trigger), through the same mapping; returns
+    // the game's buttons.
+    static constexpr u32 kSimLeftTrigger = 1u << 16, kSimRightTrigger = 1u << 17;
+    u64 SimulateXInput(u32 buttons);
 
 private:
     core::InputBackend backend_{};
@@ -123,7 +125,7 @@ private:
     // The game button each face button (south, east, west, north) went down as, kept until it's released; 0 = up.
     u64 face_[4] = {};
     void MapXInput(const ::_XINPUT_GAMEPAD& g, hle::hid::PadInput& p);
-    u64 Face(int i, bool down, u64 by_layout, u64 by_pos, bool skill_modifier);
+    u64 Face(int i, bool down, u64 by_layout, u64 by_pos, bool wheel);
 };
 
 // Host audio output. The HLE audio renderer pushes interleaved stereo s16 48 kHz samples.

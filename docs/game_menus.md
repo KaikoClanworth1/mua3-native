@@ -279,8 +279,9 @@ The title screen's SYSTEM submenu (SAVE, LOAD, OPTIONS, TIPS, GALLERY; title men
   on row 0 (kCursorShow main+0x7cc0d0 called from a hook crashes in the row layout, main+0x7cd420; vfunc +0x1d8 does
   not move them).
 - **CONTROLS**: CONTROLLER TYPE (XInput / SDL, after a restart), BUTTONS (`[input] button_layout`: XBOX LETTERS = 0,
-  the button the game shows; SWITCH POSITIONS = 1, the Switch's layout; live; with R held, the skill wheel, the face
-  buttons go by position in both, since the wheel shows its skills by position without letters) and CAMERA SPEED (10-200%, 100% =
+  the button the game shows; SWITCH POSITIONS = 1, the Switch's layout; live; with R, ZR or ZL held (the skill,
+  team-up and emote wheels) the face buttons go by position in both, since those wheels show their choices by
+  position without letters) and CAMERA SPEED (10-200%, 100% =
   original, live: `hle::camera_speed`; the camera update main+0x339d40 turns at speed * (stick - deadzone)^2 with the
   speed floats in the camera parameters, so the update is wrapped and those floats are scaled for its duration: speed%
   at every tilt; on top of the CAMERA tab's CONTROL SENSITIVITY), LEFT / RIGHT STICK DEADZONE (`[input]
