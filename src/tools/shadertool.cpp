@@ -1253,6 +1253,11 @@ int main(int argc, char** argv) {
             return 0;
         }
         run(fxc->GetBufferPointer(), fxc->GetBufferSize(), a);
+        if (std::getenv("MUA3_REPLAY_DUMP")) // both builds' windows, for comparisons a word diff cannot make (atomic order)
+            for (auto& w : wins) {
+                common::WriteFile(fs::u8path(fmt::format("{}.fxc.w{}.bin", argv[2], w.slot)), std::span(a[w.slot].data(), a[w.slot].size()));
+                common::WriteFile(fs::u8path(fmt::format("{}.dxbc.w{}.bin", argv[2], w.slot)), std::span(b[w.slot].data(), b[w.slot].size()));
+            }
         int total = 0;
         for (auto& w : wins) {
             u32 n = 0, chg = 0;
@@ -1397,6 +1402,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         common::WriteFile(fs::u8path(argv[3]), blob);
+        common::WriteFile(fs::u8path(std::string(argv[3]) + ".hlsl"), std::span((const u8*)src.data(), src.size()));
         fmt::print("compiled in {:.1f} ms, {} bytes\n", ms, blob.size());
         if (argc < 5 || std::string(argv[4]) != "--quiet") {
             ID3DBlob* text = nullptr;
