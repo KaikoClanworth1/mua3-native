@@ -209,7 +209,10 @@ known icon (any set) is remembered by address and replaced with the wanted set. 
 (`prompts::SetDevice` from `platform::Input::Update`: XInput or SDL pad by type, keyboard; `SetLayout`) every
 remembered icon is written back into guest memory with the new set; the renderer's write tracking re-uploads it.
 Identical icons in two sets (Xbox A by letter = the game's B by position) are told apart by the address's known icon.
-While the keyboard is in use the icons are keycaps with the bound key (a mouse for an action bound to a mouse button
+The pad and keyboard art comes from `hle::prompt_art` (original icons, scripts/prompt_art/gen.py); prompts.cpp's own
+drawings are the fallback where it has none. PlayStation pads (SDL types PS3/4/5) get their own set (by letter:
+the game's A is cross; Switch positions: circle). `MUA3_PROMPTS_DEVICE=ps|xbox|keyboard` (test aid) picks the
+device at start. While the keyboard is in use the icons are keycaps with the bound key (a mouse for an action bound to a mouse button
 only; one keycap with all four keys for the sticks, e.g. WASD), drawn again whenever a binding changes
 (`prompts::KeysChanged`).
 

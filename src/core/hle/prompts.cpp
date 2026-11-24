@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -24,6 +25,7 @@
 #include "common/common.h"
 #include "core/hle/keybinds.h"
 #include "core/hle/menu_label.h"
+#include "core/hle/prompt_art.h"
 #include "core/hle/mods.h"
 #include "gpu/formats.h"
 
@@ -323,17 +325,37 @@ std::wstring Wide(const std::string& u8s) {
     return w;
 }
 
-// The icon an action's binding makes (empty: none, the game's own stays)
-Blocks BindingIcon(keybinds::Action a, Rgb ink) {
+// An icon of prompt_art (64 x 64 RGBA8) as BC3 blocks (empty: none)
+Blocks FromArt(const prompt_art::Rgba& art) {
+    if (art.size() != size_t(kIcon) * kIcon * 4)
+        return {};
+    return menu::EncodeBC3Rgba(std::vector<float>(art.begin(), art.end()), kIcon, kIcon);
+}
+
+// The icon an action's binding makes (empty: none, the game's own stays): prompt_art's keycap or mouse, else ours
+Blocks BindingIcon(keybinds::Action a, bool hold) {
     const keybinds::Binding b = keybinds::Get(a);
-    if (b.key)
-        return KeyCap(Wide(keybinds::KeyIcon(b.key)), ink);
-    if (b.mouse)
-        return MouseIcon(b.mouse, ink);
+    const Rgb ink = hold ? kHold : kInk;
+    if (b.key) {
+        Blocks art = FromArt(prompt_art::Key(b.key, hold));
+        return !art.empty() ? art : KeyCap(Wide(keybinds::KeyIcon(b.key)), ink);
+    }
+    if (b.mouse) {
+        Blocks art = FromArt(prompt_art::Mouse(b.mouse, hold));
+        return !art.empty() ? art : MouseIcon(b.mouse, ink);
+    }
     return {};
 }
-// Several directions on one keycap ("WASD", the arrows) if each key is one character
+// Several directions on one icon ("WASD", the arrows) if each key is one character: four as prompt_art's inverted T
 Blocks ClusterIcon(std::initializer_list<keybinds::Action> as) {
+    if (as.size() == 4) {
+        u16 k[4];
+        int i = 0;
+        for (keybinds::Action a : as)
+            k[i++] = keybinds::Get(a).key;
+        if (Blocks art = FromArt(prompt_art::Cluster(k[0], k[1], k[2], k[3])); !art.empty())
+            return art;
+    }
     std::wstring t;
     for (keybinds::Action a : as) {
         const keybinds::Binding b = keybinds::Get(a);
@@ -367,7 +389,7 @@ std::map<std::string, Blocks> KeyboardIcons() {
         {"btn_dir_R_icon", kDRight, false}, {"btn_dir_R_icon_hold", kDRight, true},
     };
     for (const auto& e : single)
-        m[e.name] = BindingIcon(e.a, e.hold ? kHold : kInk);
+        m[e.name] = BindingIcon(e.a, e.hold);
     m["btn_Cross_UPDOWN_icon"] = ClusterIcon({kDUp, kDDown});
     m["btn_Cross_LR_icon"] = ClusterIcon({kDLeft, kDRight});
     m["stick_btn_L_icon"] = ClusterIcon({kMoveUp, kMoveLeft, kMoveDown, kMoveRight});
@@ -377,8 +399,9 @@ std::map<std::string, Blocks> KeyboardIcons() {
 
 // ---- the sets
 
-enum Set { kSwitch, kXboxLetters, kXboxPositions, kKeyboard, kSets };
-const char* const kSetNames[] = {"Switch", "Xbox (by letter)", "Xbox (Switch positions)", "keyboard"};
+enum Set { kSwitch, kXboxLetters, kXboxPositions, kKeyboard, kPsLetters, kPsPositions, kSets };
+const char* const kSetNames[] = {"Switch",   "Xbox (by letter)",        "Xbox (Switch positions)",
+                                 "keyboard", "PlayStation (by letter)", "PlayStation (Switch positions)"};
 
 struct Icon {
     std::string name;
@@ -411,6 +434,8 @@ int WantedSet() {
         return g_layout == 1 ? kXboxPositions : kXboxLetters;
     case Device::Keyboard:
         return kKeyboard;
+    case Device::PlayStation:
+        return g_layout == 1 ? kPsPositions : kPsLetters;
     default:
         return kSwitch;
     }
@@ -579,17 +604,34 @@ void Build() {
         {"btn_Minus_icon", OnButton(ViewSymbol(kCx, kCy, 1))}, {"btn_Plus_JOY_icon", Alone(MenuSymbol(32, 32, 1.1f))},
         {"btn_Minus_JOY_icon", Alone(ViewSymbol(32, 32, 1.1f))}, {"btn_dir_all_ABXY_icon", Diamond()},
     };
+    // prompt_art's Xbox and PlayStation icons first (ours above stay the Xbox fallback)
+    std::vector<std::string> names;
+    {
+        std::lock_guard lk(g_mutex);
+        for (const Icon& ic : g_icons)
+            names.push_back(ic.name);
+    }
+    std::map<std::string, Blocks> art[kSets];
+    for (const std::string& n : names)
+        for (int lay = 0; lay < 2; lay++) {
+            art[lay ? kXboxPositions : kXboxLetters][n] = FromArt(prompt_art::PadIcon(prompt_art::Pad::Xbox, n, lay));
+            art[lay ? kPsPositions : kPsLetters][n] = FromArt(prompt_art::PadIcon(prompt_art::Pad::PlayStation, n, lay));
+        }
     std::lock_guard lk(g_mutex);
     for (Icon& ic : g_icons) {
         for (int lay = 0; lay < 2; lay++) {
             const int set = lay ? kXboxPositions : kXboxLetters;
-            if (auto it = xbox[lay].find(ic.name); it != xbox[lay].end())
+            if (Blocks& a = art[set][ic.name]; !a.empty())
+                ic.blocks[set] = std::move(a);
+            else if (auto it = xbox[lay].find(ic.name); it != xbox[lay].end())
                 ic.blocks[set] = it->second;
             else if (auto c = common.find(ic.name); c != common.end())
                 ic.blocks[set] = c->second;
+            const int ps = lay ? kPsPositions : kPsLetters;
+            ic.blocks[ps] = std::move(art[ps][ic.name]);
         }
-        for (int set = 1; set < kKeyboard; set++)
-            if (!ic.blocks[set].empty()) {
+        for (int set = 1; set < kSets; set++)
+            if (set != kKeyboard && !ic.blocks[set].empty()) {
                 ic.hash[set] = Hash(ic.blocks[set].data(), kBytes);
                 g_by_hash[ic.hash[set]].push_back({size_t(&ic - g_icons.data()), set});
             }
@@ -659,8 +701,15 @@ void Init() {
         const auto t0 = std::chrono::steady_clock::now();
         Build();
         BuildKeyboard(g_keys_wanted.load());
-        LOG_INFO("Prompts", "{} button icons, Xbox and keyboard sets drawn in {} ms", n,
+        LOG_INFO("Prompts", "{} button icons, pad and keyboard sets drawn in {} ms", n,
                  std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
+        // test aid: MUA3_PROMPTS_DEVICE=ps / xbox / keyboard shows that device's icons from the start
+        if (const char* d = std::getenv("MUA3_PROMPTS_DEVICE")) {
+            const std::string v = d;
+            std::lock_guard lk(g_mutex);
+            g_device = v == "ps" ? Device::PlayStation : v == "xbox" ? Device::Xbox : v == "keyboard" ? Device::Keyboard
+                                                                                                      : g_device;
+        }
         Apply();
     }).detach();
 }
