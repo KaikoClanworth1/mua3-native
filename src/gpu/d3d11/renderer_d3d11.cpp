@@ -2093,7 +2093,9 @@ void D3D11Renderer::Dispatch(const ComputeLaunch& l) {
                 continue;
             TicEntry tic;
             g.ReadGpu(tic_base + u64(handle_of(t) & 0xFFFFF) * 32, tic.w.data(), 32);
-            if (FindSurfaceByGpu(tic.Address()))
+            // (#8) only where TextureCache::Get serves the render target itself (plain 2D): a texel buffer at an old
+            // surface's address still gets its integer view, so it keeps its integer variant
+            if (t.dim == shader::TexDim::Tex2D && !t.array && FindSurfaceByGpu(tic.Address()))
                 continue;
             switch (DxgiIntKind(TicFormat(tic.Format(), tic.RType(), tic.Srgb()).dxgi)) {
             case 1: vk.tex_uint |= 1u << t.slot; break;
@@ -2598,8 +2600,8 @@ void D3D11Renderer::Draw() {
             if (t.slot >= 32)
                 continue;
             const TicEntry& tic = stage_textures[st][t.slot].tic;
-            if (FindSurfaceByGpu(tic.Address()))
-                continue; // render targets are float/unorm surfaces
+            if (t.dim == shader::TexDim::Tex2D && !t.array && FindSurfaceByGpu(tic.Address()))
+                continue; // render targets are float/unorm surfaces (served only to plain 2D uses: TextureCache::Get)
             switch (DxgiIntKind(TicFormat(tic.Format(), tic.RType(), tic.Srgb()).dxgi)) {
             case 1: key.tex_uint |= 1u << t.slot; break;
             case 2: key.tex_sint |= 1u << t.slot; break;
