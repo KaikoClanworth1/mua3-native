@@ -81,6 +81,10 @@ bool Config::Load(const fs::path& ini) {
     left_deadzone = std::clamp(left_deadzone, 0, 50);
     get_i("right_deadzone", right_deadzone);
     right_deadzone = std::clamp(right_deadzone, 0, 50);
+    get_i("mouse_camera", mouse_camera);
+    mouse_camera = std::clamp(mouse_camera, 0, 2);
+    get_i("mouse_sensitivity", mouse_sensitivity);
+    mouse_sensitivity = std::clamp(mouse_sensitivity, 10, 500);
     camera_speed = std::clamp(camera_speed, 10, 200);
     audio = AudioBackend(std::clamp(a, 0, 2));
     input = InputBackend(std::clamp(in, 0, 1));
@@ -111,7 +115,7 @@ bool Config::Save(const fs::path& ini) const {
       << "\nfps_limit=" << fps_limit << "\nfps_target=" << fps_target << "\nswap_interval=" << swap_interval << "\nanti_aliasing=" << anti_aliasing
       << "\nupscaler=" << upscaler << "\nupscale_quality=" << upscale_quality << "\nsharpness=" << sharpness << "\nshow_fps=" << show_fps << "\nshow_debug_overlay=" << show_debug_overlay
       << "\n[audio]\naudio_backend=" << int(audio) << "\nvolume=" << volume << "\nmute=" << mute << "\n[input]\ninput_backend="
-      << int(input) << "\ncamera_speed=" << camera_speed << "\nbutton_layout=" << button_layout << "\nleft_deadzone=" << left_deadzone << "\nright_deadzone=" << right_deadzone << "\n[system]\ndocked=" << docked << "\nlanguage=" << language << "\nlog_level=" << log_level
+      << int(input) << "\ncamera_speed=" << camera_speed << "\nbutton_layout=" << button_layout << "\nleft_deadzone=" << left_deadzone << "\nright_deadzone=" << right_deadzone << "\nmouse_camera=" << mouse_camera << "\nmouse_sensitivity=" << mouse_sensitivity << "\n[system]\ndocked=" << docked << "\nlanguage=" << language << "\nlog_level=" << log_level
       << "\n[mods]\nenabled=" << mods_enabled << "\n";
     if (!keys.empty()) {
         f << "[keys]\n";

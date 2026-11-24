@@ -3,10 +3,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <optional>
+#include <string>
 
 #include <SDL3/SDL.h>
 
+#include "core/hle/camera_speed.h"
 #include "core/hle/hid.h"
 #include "core/hle/keybinds.h"
 #include "core/hle/prompts.h"
@@ -259,6 +262,40 @@ bool Input::KeyboardAndMouse(const bool* keys, u32 mouse, PadInput& p) {
     if (k.rx) p.rx = k.rx;
     if (k.ry) p.ry = k.ry;
     return k.buttons || k.lx || k.ly || k.rx || k.ry;
+}
+
+void Input::SetMouseCamera(int mode, int sensitivity) {
+    mouse_camera_ = mode != 0;
+    hle::camera_speed::SetMouse(mode != 0, sensitivity, mode == 2);
+}
+
+// MOUSE CAMERA: the mouse is captured (relative mode, no cursor) only while the player camera runs and the window has
+// the focus; its motion goes to the camera's yaw and pitch (hle::camera_speed). Menus, pause, cut-scenes, another
+// window and KEY BINDINGS' capture release it. MUA3_MOUSE_CAMERA_TEST=1 (test aid): the window counts as focused and
+// SDL is not asked (hidden test instances; the `mouse` command feeds counts).
+void Input::MouseCamera(SDL_Window* window, bool focused) {
+    static const bool test = std::getenv("MUA3_MOUSE_CAMERA_TEST") != nullptr;
+    const char* why = !mouse_camera_                          ? "MOUSE CAMERA off"
+                      : !(focused || test)                    ? "window not focused"
+                      : hle::keybinds::Capturing() >= 0       ? "binding a key"
+                      : !hle::camera_speed::CameraActive()    ? "camera not running: menu, pause or cut-scene"
+                                                              : nullptr;
+    const bool want = why == nullptr;
+    if (want != mouse_captured_) {
+        mouse_captured_ = want;
+        if (!test && window) {
+            SDL_SetWindowRelativeMouseMode(window, want);
+            float x, y;
+            SDL_GetRelativeMouseState(&x, &y); // (motion from before the change is dropped)
+        }
+        LOG_INFO("Input", "mouse camera: {}", want ? std::string("captured") : fmt::format("released ({})", why));
+    }
+    if (mouse_captured_ && !test) {
+        float dx = 0, dy = 0;
+        SDL_GetRelativeMouseState(&dx, &dy);
+        if (dx != 0 || dy != 0)
+            hle::camera_speed::AddMouse(dx, dy);
+    }
 }
 
 u64 Input::SimulateKeys(const std::vector<u16>& keys, u32 mouse) {

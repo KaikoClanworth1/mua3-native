@@ -102,7 +102,10 @@ enum GraphicsRows {
 };
 enum PcRows { kRowLimit, kRowShowFps, kRowVolume, kRowMute, kRowAudio, kRowControls, kRowMods, kPcRows };
 // CONTROLS (opened from PC SETTINGS' CONTROLS row); room for more rows (stick deadzones, #17)
-enum ControlsRows { kRowController, kRowButtons, kRowCamera, kRowLeftDead, kRowRightDead, kRowKeys, kControlsRows };
+enum ControlsRows {
+    kRowController, kRowButtons, kRowCamera, kRowLeftDead, kRowRightDead, kRowKeys, kRowMouseCam, kRowMouseSens,
+    kControlsRows
+};
 constexpr int kDeadStep = 2, kDeadMax = 50; // stick deadzones: 0-50% in steps of 2 (another ini value: its own text)
 enum Aa { kAaOff, kAaFxaa, kAaSsaa2 }; // anti_aliasing: 2-4 = SSAA 2X-4X
 // UPSCALER row: OFF, then 4 qualities (upscale_quality 0-3) of each upscaler= value shown, in this order. FSR 3.1 and
@@ -115,6 +118,7 @@ int UpscalerOf(u8 v) { return v >= 1 && v <= kQualities * g_kinds.size() ? g_kin
 // FSR SHARPNESS applies to the FSR upscalers
 bool Sharpened(int upscaler) { return upscaler == core::kUpscalerFsr1 || upscaler == core::kUpscalerFsr3; }
 static_assert(kGraphicsRows <= kMaxRows && kPcRows <= kMaxRows && kControlsRows <= kMaxRows);
+constexpr int kMouseSens[] = {25, 50, 75, 100, 125, 150, 175, 200, 250, 300, 400, 500};
 constexpr int kCameraSpeeds[] = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200};
 const char16_t* const kControllerNames[] = {u"XBOX (XINPUT)", u"ANY CONTROLLER (SDL)"};
 const char16_t* const kButtonLayoutNames[] = {u"XBOX LETTERS", u"SWITCH POSITIONS"}; // button_layout 0 / 1
@@ -197,6 +201,7 @@ u32 Text(const std::u16string& t, size_t room = 0) {
 std::u16string U16(const std::string& s) { return std::u16string(s.begin(), s.end()); }
 
 u32 g_custom_dead[2]{}; // LEFT / RIGHT STICK DEADZONE: a value off the steps
+u32 g_custom_mouse_sens = 0; // MOUSE SENSITIVITY off the steps
 u32 g_custom_res = 0, g_custom_limit = 0, g_custom_volume = 0, g_custom_camera = 0,
     g_custom_sharpness = 0, g_sharpness_off = 0; // rewritable value texts; the greyed FSR SHARPNESS text
 // the restart rows' info lines (they name the value running now)
@@ -351,7 +356,7 @@ void BuildPages() {
     add(Text(u"AUDIO OUTPUT"), g_audio_info, kArrows,
         {Text(kAudioNames[0]), Text(kAudioNames[1]), Text(kAudioNames[2])});
     const u32 open = Text(u"OPEN");
-    add(Text(u"CONTROLS"), Text(u"Controller type, button layout, camera speed, stick deadzones and key bindings."),
+    add(Text(u"CONTROLS"), Text(u"Controller, buttons, camera speed, deadzones, key bindings and the mouse camera."),
         kButton, {open});
     add(Text(u"MODS"), Text(u"Turn mods on or off and set their load order. Mods apply after a restart."), kButton,
         {open});
@@ -387,6 +392,16 @@ void BuildPages() {
     }
     add(Text(u"KEY BINDINGS"), Text(u"Which keys and mouse buttons play the game. Saved and used at once."), kButton,
         {open});
+    add(Text(u"MOUSE CAMERA"),
+        Text(u"The mouse turns the camera while you play (the cursor hides).\r\n"
+             u"Menus, pause and other windows free the mouse."),
+        kArrows, {kStrOn, Text(u"ON (INVERT Y)"), kStrOff});
+    std::vector<u32> sens;
+    for (int v : kMouseSens)
+        sens.push_back(Text(U16(v == 100 ? "100% (DEFAULT)" : fmt::format("{}%", v))));
+    g_custom_mouse_sens = Text(u"", 8);
+    sens.push_back(g_custom_mouse_sens);
+    add(Text(u"MOUSE SENSITIVITY"), Text(u"How far the camera turns for a mouse movement."), kArrows, sens);
     Finish(*page);
     // KEY BINDINGS
     page = &g_pages[kPageKeys];
@@ -468,6 +483,9 @@ void ToPc(const core::Config& c, u8* v) {
     v[kRowAudio] = u8(std::clamp(int(c.audio), 0, 2));
 }
 void ToControls(const core::Config& c, u8* v) {
+    v[kRowMouseCam] = u8(c.mouse_camera == 0 ? 2 : c.mouse_camera == 2 ? 1 : 0);
+    PutString(g_custom_mouse_sens, U16(fmt::format("{}%", c.mouse_sensitivity)), 8);
+    v[kRowMouseSens] = u8(IndexOf(kMouseSens, c.mouse_sensitivity, int(std::size(kMouseSens))));
     v[kRowController] = u8(std::clamp(int(c.input), 0, 1));
     v[kRowButtons] = u8(std::clamp(c.button_layout, 0, 1));
     PutString(g_custom_camera, U16(fmt::format("{}%", c.camera_speed)), 8);
@@ -514,6 +532,9 @@ void FromPc(core::Config& c, bool running, const u8* v) {
 }
 void FromControls(core::Config& c, bool running, const u8* v) {
     c.button_layout = std::min<int>(v[kRowButtons], 1); // live
+    c.mouse_camera = v[kRowMouseCam] == 2 ? 0 : v[kRowMouseCam] == 1 ? 2 : 1; // live
+    if (v[kRowMouseSens] < std::size(kMouseSens))
+        c.mouse_sensitivity = kMouseSens[v[kRowMouseSens]];
     if (v[kRowCamera] < std::size(kCameraSpeeds))
         c.camera_speed = kCameraSpeeds[v[kRowCamera]];
     if (v[kRowLeftDead] <= kDeadMax / kDeadStep) // live, like the camera speed
