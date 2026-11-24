@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <map>
 #include <mutex>
@@ -185,6 +186,7 @@ void Kernel::SvcDispatch(Thread* t, u32 id) {
         if (core == -2)
             core = 0;
         auto nt = CreateThread(R(1), R(2), R(3), s32(R(4)), core, fmt::format("thread@{:x}", R(1)));
+        LogThreadPlacement(nt.get(), fmt::format("create (asked core {}, by thread {})", s32(R(5)), t->id).c_str());
         W(1, nt->handle);
         Ret(0);
         break;
@@ -226,7 +228,10 @@ void Kernel::SvcDispatch(Thread* t, u32 id) {
             Ret(rc::InvalidHandle);
             break;
         }
-        th->priority = s32(R(1));
+        if (th->priority != s32(R(1))) {
+            th->priority = s32(R(1));
+            LogThreadPlacement(th.get(), "priority");
+        }
         Ret(0);
         break;
     }
@@ -247,15 +252,30 @@ void Kernel::SvcDispatch(Thread* t, u32 id) {
             Ret(rc::InvalidHandle);
             break;
         }
+        // core: a core, -1 "don't care" (any core of the mask), -2 the process default (0), -3 no change. As in the
+        // Horizon kernel, a thread whose core is not in its new mask moves to the mask's highest core. MUA3 creates
+        // most threads on the default core and then sets only a one-core mask with -1: they ran with core 0 here, so
+        // svcGetCurrentProcessorNumber told threads on different cores that they share core 0.
+        // MUA3_OLD_CORE_MASK=1 keeps the old behaviour (core only from a core >= 0), for A/B runs on one exe.
+        static const bool old_rule = std::getenv("MUA3_OLD_CORE_MASK") != nullptr;
         s32 core = s32(R(1));
+        const s32 old_core = th->core;
+        const u64 old_affinity = th->affinity;
         if (core >= 0)
             th->core = core;
+        else if (core == -2 && !old_rule)
+            th->core = 0;
         if (R(2))
             th->affinity = R(2);
+        if (const u64 mask = th->affinity & 0xF; !old_rule && mask && !(mask >> th->core & 1))
+            th->core = 63 - std::countl_zero(mask);
+        if (th->core != old_core || th->affinity != old_affinity)
+            LogThreadPlacement(th.get(), fmt::format("core mask (asked core {}, mask {:#x})", core, R(2)).c_str());
         Ret(0);
         break;
     }
     case 0x10: // GetCurrentProcessorNumber
+        t->processor_number_calls.fetch_add(1, std::memory_order_relaxed);
         W(0, u32(t->core));
         break;
     case 0x11: { // SignalEvent
