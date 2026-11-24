@@ -10,6 +10,10 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+# Every child without a console window of its own: started from a parent with no console (a background task, the
+# Bash tool) a cmd or powershell child would open a visible window and take focus from the owner's games.
+NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW
+
 P = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the repository
 # Work dir with nso/ (nsodump output), optional prof*.txt / missing*.txt (coverage from game runs), noopt.txt/skip.txt
 S = os.environ.get('MUA3_RECOMP_WORK') or os.path.join(P, 'build', 'recomp_work')
@@ -31,7 +35,7 @@ def find_vcvars():
     if os.path.exists(vswhere):
         out = subprocess.run([vswhere, '-latest', '-products', '*', '-requires',
                               'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', '-property', 'installationPath'],
-                             capture_output=True, text=True).stdout.strip()
+                             capture_output=True, text=True, creationflags=NO_WINDOW).stdout.strip()
         if out:
             return os.path.join(out, 'VC', 'Auxiliary', 'Build', 'vcvars64.bat')
     sys.exit('Visual Studio with C++ not found: set MUA3_VCVARS to vcvars64.bat')
@@ -230,7 +234,7 @@ def generate():
            '--cold-split', os.environ.get('MUA3_RECOMP_COLD_SPLIT', '1')]
     os.makedirs(GEN, exist_ok=True)
     with open(os.path.join(GEN, 'generate.log'), 'w') as out:  # the generator's counts (data scans, enter-all, ...)
-        subprocess.run(cmd, stdout=out, check=True)
+        subprocess.run(cmd, stdout=out, check=True, creationflags=NO_WINDOW)
 
 
 def is_cold(src):
@@ -257,7 +261,7 @@ def run_pinned(bat, mask):
     # Not through cmd's start /affinity: quoting the bat path for it from Python went wrong (a "cannot find '\'"
     # dialog per compile) and start /wait loses the exit code. The cmd starts suspended, gets its priority and CPUs,
     # then runs; everything it starts inherits both.
-    p = subprocess.Popen(['cmd', '/c', bat], creationflags=0x4 | 0x4000)  # CREATE_SUSPENDED, BELOW_NORMAL_PRIORITY
+    p = subprocess.Popen(['cmd', '/c', bat], creationflags=0x4 | 0x4000 | NO_WINDOW)  # suspended, below normal
     k32 = ctypes.windll.kernel32
     k32.SetProcessAffinityMask(ctypes.c_void_p(int(p._handle)), ctypes.c_size_t(int(mask, 16)))
     ctypes.windll.ntdll.NtResumeProcess(ctypes.c_void_p(int(p._handle)))
@@ -288,7 +292,8 @@ def kill_compiler(obj):
                     "Get-CimInstance Win32_Process -Filter \"Name='clang-cl.exe' or Name='cl.exe'\" | "
                     f"Where-Object {{ $_.CommandLine -like '*{q}*' }} | "
                     "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"],
-                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   creationflags=NO_WINDOW)
 
 
 def cl_compile(src, obj, huge=None, msvc=False, mask='FF00', tier=0):
@@ -393,7 +398,7 @@ for attempt in range(10):
         bat = os.path.join(S, 'lib.bat')
         open(bat, 'w').write(f'@call "{VC}" >nul 2>&1\nlib /nologo /OUT:"{os.path.join(GEN, "nxrecomp_full.lib")}" @"{rsp}"\n'
                              f'exit /b %ERRORLEVEL%\n')
-        rc = subprocess.run(['cmd', '/c', bat]).returncode
+        rc = subprocess.run(['cmd', '/c', bat], creationflags=NO_WINDOW).returncode
         log('LIB', 'OK' if rc == 0 else f'failed {rc}')
         sys.exit(rc)
     with ThreadPoolExecutor(JOBS) as ex:
