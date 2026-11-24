@@ -1,9 +1,14 @@
 #include "gpu/gpu.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <set>
+#include <string>
 
 #include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
 
 #include "core/memory.h"
 #include "gpu/renderer.h"
@@ -90,13 +95,122 @@ u64 AddressSpace::Translate(u64 gpu_va) const {
 }
 
 // ---------------------------------------------------------------- Gpu
-Gpu::Gpu(core::Memory& mem) : mem_(mem) { thread_ = std::thread([this] { ThreadMain(); }); }
+Gpu::Gpu(core::Memory& mem) : mem_(mem) {
+    thread_ = std::thread([this] { ThreadMain(); });
+    watchdog_ = std::thread([this] { WatchdogMain(); });
+}
 
 Gpu::~Gpu() {
     running_ = false;
     queue_cv_.notify_all();
     if (thread_.joinable())
         thread_.join();
+    if (watchdog_.joinable())
+        watchdog_.join();
+}
+
+void Gpu::WatchdogMain() {
+    SetThreadDescription(GetCurrentThread(), L"GPU watchdog");
+    // A stall: no job finished for 5 s while one runs or some wait in the queue (a thread stuck in a job, or one that
+    // stopped taking them). Idle with an empty queue is not a stall.
+    u64 last_done = ~0ull;
+    u64 since = NowNs(); // when a job last finished, or the thread was last idle with nothing queued
+    double next_report = 0, last_cpu = 0, last_s = 0;
+    // the thread's CPU time beside its stack: climbing with a stack that does not move is a spin, flat is a wait
+    auto cpu_s = [&] {
+        FILETIME c, e, k, u;
+        if (!GetThreadTimes(static_cast<HANDLE>(thread_.native_handle()), &c, &e, &k, &u))
+            return 0.0;
+        auto v = [](const FILETIME& f) { return double((u64(f.dwHighDateTime) << 32) | f.dwLowDateTime) / 1e7; };
+        return v(k) + v(u);
+    };
+    while (running_) {
+        Sleep(500);
+        const u64 start = job_start_ns_.load(std::memory_order_relaxed);
+        const u64 done = jobs_done_.load(std::memory_order_relaxed);
+        size_t queued;
+        {
+            std::lock_guard lk(queue_mutex_);
+            queued = queue_.size();
+        }
+        if (done != last_done || (!start && !queued)) {
+            last_done = done, since = NowNs(), next_report = 0;
+            last_cpu = cpu_s(), last_s = 0;
+            continue;
+        }
+        const double s = double(NowNs() - since) / 1e9;
+        if (s < 5) { // (the baseline for the first report: the last poll before it)
+            last_cpu = cpu_s(), last_s = s;
+            continue;
+        }
+        if (s < next_report)
+            continue;
+        next_report = s < 10 ? 10 : s * 2; // at 5 s, 10 s, 20 s, 40 s ...
+        // The thread's host stack: raw return addresses while it is suspended (it may hold the heap or loader lock),
+        // named after it runs again.
+        HANDLE th = static_cast<HANDLE>(thread_.native_handle());
+        DWORD64 pcs[24];
+        int n = 0;
+        if (SuspendThread(th) != DWORD(-1)) {
+            CONTEXT ctx{};
+            ctx.ContextFlags = CONTEXT_FULL;
+            if (GetThreadContext(th, &ctx))
+                for (; n < 24 && ctx.Rip; n++) {
+                    pcs[n] = ctx.Rip;
+                    DWORD64 image = 0;
+                    RUNTIME_FUNCTION* fn = RtlLookupFunctionEntry(ctx.Rip, &image, nullptr);
+                    if (!fn) { // leaf function: the return address is on top of the stack
+                        ctx.Rip = *reinterpret_cast<DWORD64*>(ctx.Rsp);
+                        ctx.Rsp += 8;
+                        continue;
+                    }
+                    void* handler_data = nullptr;
+                    DWORD64 frame = 0;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, fn, &ctx, &handler_data, &frame, nullptr);
+                }
+            ResumeThread(th);
+        }
+        static const bool sym = [] {
+            SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+            char exe[MAX_PATH]{}; // the pdb sits next to the exe
+            GetModuleFileNameA(nullptr, exe, MAX_PATH);
+            std::string dir(exe);
+            dir = dir.substr(0, dir.find_last_of("\\/"));
+            SymInitialize(GetCurrentProcess(), dir.c_str(), TRUE); // (fails harmlessly if already done elsewhere)
+            return true;
+        }();
+        (void)sym;
+        std::string stack;
+        for (int i = 0; i < n; i++) {
+            alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256]{};
+            auto* si = reinterpret_cast<SYMBOL_INFO*>(buf);
+            si->SizeOfStruct = sizeof(SYMBOL_INFO);
+            si->MaxNameLen = 255;
+            DWORD64 disp = 0;
+            HMODULE mod = nullptr;
+            char name[MAX_PATH] = "?";
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCSTR>(pcs[i]), &mod))
+                GetModuleFileNameA(mod, name, MAX_PATH);
+            const char* base = std::max(std::strrchr(name, '\\'), std::strrchr(name, '/'));
+            base = base ? base + 1 : name;
+            if (SymFromAddr(GetCurrentProcess(), pcs[i], &disp, si))
+                stack += fmt::format("\n    {}!{}+{:#x}", base, si->Name, disp);
+            else
+                stack += fmt::format("\n    {}+{:#x}", base, mod ? pcs[i] - u64(mod) : pcs[i]);
+        }
+        const int kind = job_kind_.load(std::memory_order_relaxed);
+        const double cpu = cpu_s();
+        const double used = s > last_s ? (cpu - last_cpu) / (s - last_s) * 100 : 0;
+        last_cpu = cpu, last_s = s;
+        const std::string what = start ? fmt::format("in one {} job", kind == Job::Present ? "present"
+                                                                      : kind == Job::Host  ? "command"
+                                                                                           : "?")
+                                       : std::string("between jobs, not taking the next one");
+        LOG_WARN("GPU", "GPU thread waiting {:.0f} s {} ({} queued, {} jobs done), {:.0f} % of a CPU since the last check ({}); "
+                        "host stack:{}",
+                 s, what, queued, done, used, used > 50 ? "spinning" : "waiting", stack);
+    }
 }
 
 void Gpu::SetRenderer(Renderer* r) {
@@ -267,6 +381,15 @@ void Gpu::ThreadMain() {
             queue_.pop_front();
             busy_ = true;
         }
+        job_kind_.store(int(job.kind), std::memory_order_relaxed);
+        job_start_ns_.store(NowNs(), std::memory_order_relaxed);
+        struct JobDone {
+            Gpu* g;
+            ~JobDone() {
+                g->job_start_ns_.store(0, std::memory_order_relaxed);
+                g->jobs_done_.fetch_add(1, std::memory_order_relaxed);
+            }
+        } job_done{this};
         switch (job.kind) {
         case Job::Host: {
             const u64 t0 = NowNs();

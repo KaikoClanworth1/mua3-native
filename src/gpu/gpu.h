@@ -126,6 +126,8 @@ private:
         PresentInfo present;
     };
     void ThreadMain();
+    // Logs "GPU thread waiting N s on ..." with the thread's host stack when one job runs 5 s or more (a hang report)
+    void WatchdogMain();
 
     core::Memory& mem_;
     AddressSpace as_;
@@ -143,7 +145,10 @@ private:
     std::deque<Job> queue_;
     bool busy_ = false;
     std::atomic<bool> running_{true};
-    std::thread thread_;
+    std::atomic<u64> job_start_ns_{0}; // when the running job started (0: idle)
+    std::atomic<int> job_kind_{-1};
+    std::atomic<u64> jobs_done_{0};
+    std::thread thread_, watchdog_;
 };
 
 Gpu& G();
