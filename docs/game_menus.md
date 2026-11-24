@@ -314,7 +314,8 @@ The title screen's SYSTEM submenu (SAVE, LOAD, OPTIONS, TIPS, GALLERY; title men
   mouse counts gathered since its last run added before it runs: the yaw (camera +0x220, copies +0x270 / +0x2c0)
   turns right for a move right, the pitch (+0x228, copies +0x278 / +0x2c8 / +0x318) moves within the game's own
   limits (+0x1f0 / +0x1f4; where both are 0 the game allows no pitch and the mouse moves none either).
-  `platform::Input::MouseCamera` captures the mouse (SDL relative mode) only while that update has run in the last
+  `platform::Input::MouseCamera` captures the mouse (SDL relative mode) only while the keyboard is the device in use
+  (a pad player keeps a free cursor), that update has run in the last
   150 ms, the window has the focus and KEY BINDINGS is not taking a key; menus, pause and cut-scenes release it. Log
   lines: "mouse camera: captured / released (why)" and once a second the counts, radians and radians per count.
 - **KEY BINDINGS** (from CONTROLS; B goes back to CONTROLS): RESET ALL, then 7 of the 24 actions a page (L / R: the
