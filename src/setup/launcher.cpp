@@ -205,6 +205,9 @@ struct State {
     // a newer version of the port (checked once when the launcher opens)
     updater::Updater update;
     bool update_started = false; // the player asked for it (its failures show)
+    // the SETTINGS rows last drawn (for test logs)
+    int settings_rows = 0;
+    const char* settings_labels[4]{};
 } g;
 
 // RecompLauncher installs (setup --prepare in the install folder) are updated by RecompLauncher.
@@ -764,6 +767,7 @@ void PlaySection(ImDrawList* dl, const Layout& L, bool activate) {
         dl->AddText(ImVec2(x0, y), col::dim,
                     g.game ? "The launcher waits here until the game closes."
                     : exe  ? "The game is built and installed."
+                    : g.host->installed.dev ? "mua3.exe is missing from this developer folder."
                            : "mua3.exe is missing: SETTINGS > SYSTEM > UPDATE OR REPAIR builds it again.");
     }
     y += U(30);
@@ -1423,13 +1427,22 @@ Action SettingsSection(ImDrawList* dl, const Layout& L) {
         const char* sub;
         Action action;
     };
-    const Entry entries[] = {
+    const Entry all[] = {
         {"UPDATE OR REPAIR", "Add an update or DLC, change the language, or build the game again.", Action::UpdateRepair},
         {"REPORT A PROBLEM", "Makes a zip with the logs and crash files to send.", Action::Report},
         {"RUN DIAGNOSTICS", "A 6-minute test run with a report to attach to a bug report.", Action::None},
         {"UNINSTALL", "Remove the game from this PC. You can keep your saves.", Action::Uninstall},
     };
-    constexpr int kEntries = int(sizeof(entries) / sizeof(entries[0]));
+    // a developer's folder (dev=1 in setup.ini) is never rebuilt or removed from here
+    Entry entries[4];
+    int kEntries = 0;
+    for (const Entry& e : all)
+        if (!g.host->installed.dev || (e.action != Action::UpdateRepair && e.action != Action::Uninstall))
+            entries[kEntries++] = e;
+    g.settings_sel = std::min(g.settings_sel, kEntries - 1);
+    g.settings_rows = kEntries;
+    for (int i = 0; i < kEntries; i++)
+        g.settings_labels[i] = entries[i].label;
     for (int i = 0; i < kEntries; i++) {
         const ImVec2 a(L.x0, y), b(L.x1, y + U(62));
         ImGui::SetCursorScreenPos(a);
@@ -1514,7 +1527,10 @@ void Open(Host& host) {
     g.mods_on = g.cfg.mods_enabled;
     ScanMods();
     ProbeGame();
-    g.update.Check(host.version);
+    if (host.installed.dev) // (no UPDATE NOW: an update rebuilds the folder)
+        LOG_INFO("Launcher", "{}: developer folder (dev=1), no update check", g.dir.string());
+    else
+        g.update.Check(host.version);
 }
 
 Action Frame(Host& host) {
@@ -1639,6 +1655,20 @@ void Shutdown() {
 void Select(int section, bool focus) {
     g.sel = std::clamp(section, 0, kSections - 1);
     g.in_section = focus;
+}
+
+bool TestPlay() { return !g.game && Launch(); }
+
+void TestToggleMods() {
+    g.mods_on = !g.mods_on;
+    SaveMods(g.mods_on ? "Mods are on." : "Mods are off: the game starts without them.");
+}
+
+std::string SettingsRows() {
+    std::string s;
+    for (int i = 0; i < g.settings_rows; i++)
+        s += (i ? ", " : "") + std::string(g.settings_labels[i]);
+    return s;
 }
 
 void OpenDiagnostics(const fs::path& sample_log) {

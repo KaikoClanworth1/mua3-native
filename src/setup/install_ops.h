@@ -85,6 +85,9 @@ struct Installed {
     std::vector<fs::path> files; // the game files used
     int language = 1;
     bool desktop = false, start_menu = false;
+    // dev=1, written by hand: a developer's game folder (junctions to shared data, real saves). Its launcher has no
+    // update, repair or uninstall, and wins over the Apps entry when the launcher runs from there.
+    bool dev = false;
 };
 std::optional<Installed> FindInstalled(); // from the Apps entry
 bool SaveInstalled(const Installed& in);   // setup.ini

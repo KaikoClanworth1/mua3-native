@@ -2205,6 +2205,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         LocalFree(argv);
     }
     if (want_prepare) {
+        if (auto here = setup::LoadInstalled(setup::SetupDir()); here && here->dev) {
+            Out("error This is a developer folder (dev=1 in setup.ini): nothing is built here.");
+            return 4;
+        }
         w.install_dir = setup::SetupDir();
         return RunPrepare(w, args);
     }
@@ -2212,9 +2216,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     if (!update_dir.empty()) // (--update: the install the launcher belongs to, whatever the Apps entry says)
         if (auto there = setup::LoadInstalled(update_dir))
             w.installed = there;
-    if (!w.installed) // run from an install folder whose Apps entry is gone
-        if (auto here = setup::LoadInstalled(setup::SetupDir()))
-            w.installed = here;
+    if (auto here = setup::LoadInstalled(setup::SetupDir()); here && (!w.installed || here->dev))
+        w.installed = here; // run from an install folder whose Apps entry is gone, or from a developer's folder (dev=1)
+    if (w.installed && w.installed->dev) { // a developer's folder: no update, repair or uninstall of it, ever
+        if (want_update || want_uninstall)
+            LOG_WARN("Setup", "{} is a developer folder (dev=1 in setup.ini): no update or uninstall there",
+                     w.installed->dir.string());
+        want_update = want_uninstall = false;
+    }
     if (want_report) {
         w.page = Page::Report;
         if (w.installed)
@@ -2237,6 +2246,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         as_launcher = !want_uninstall && !want_report && !want_update && w.installed && fs::exists(w.installed->dir / "mua3.exe", e2) &&
                       (_wcsicmp(fs::path(self).filename().c_str(), fs::u8path(setup::kLauncherExe).c_str()) == 0 ||
                        fs::equivalent(setup::SetupDir(), w.installed->dir, e2));
+        if (!want_report && w.installed && w.installed->dev) // (never the Installed page there: it updates and uninstalls)
+            as_launcher = true;
         if (const char* pg = std::getenv("MUA3_SETUP_PAGE"); pg && std::string(pg).rfind("launcher", 0) == 0 && w.installed)
             as_launcher = true;
     }
@@ -2297,6 +2308,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 
     bool quit = false;
     display.draw_overlay = [&] {
+        // a developer's folder (dev=1) never shows the pages that update, repair or uninstall it
+        if (w.installed && w.installed->dev && (w.page == Page::Installed || w.page == Page::Files || w.page == Page::Build)) {
+            LOG_WARN("Setup", "dev=1: page {} refused, back to the launcher", int(w.page));
+            EnterLauncher(w);
+        }
         if (!w.icon_loaded && !w.icon_busy && !w.icon_jpeg.empty()) {
             w.icon_loaded = true;
             if (w.icon.srv)
@@ -2515,6 +2531,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 case 110: launcher::Select(3, false); break;
                 case 120: shot("l5_exit.bmp"); break;
                 case 124: quit = true; break;
+                // MUA3_SETUP_DEVTEST=1: a mods switch saved to mua3.ini, the SETTINGS rows logged, PLAY pressed
+                case 50: if (std::getenv("MUA3_SETUP_DEVTEST")) launcher::TestToggleMods(); break;
+                case 90: if (std::getenv("MUA3_SETUP_DEVTEST")) LOG_INFO("Setup", "devtest: settings rows: {}", launcher::SettingsRows()); break;
+                case 122: if (std::getenv("MUA3_SETUP_DEVTEST")) LOG_INFO("Setup", "devtest: play {}", launcher::TestPlay() ? "started" : "failed"); break;
                 default: break;
                 }
             }

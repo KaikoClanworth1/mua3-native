@@ -48,5 +48,10 @@ void Select(int section, bool focus);
 void OpenDiagnostics(const fs::path& sample_log);
 // Installs `path` as a mod and waits for it (developer test); returns the status line.
 std::string InstallNow(const fs::path& path);
+// Developer tests: PLAY as if pressed (true when the game started); the MODS master switch flipped and saved.
+bool TestPlay();
+void TestToggleMods();
+// The SETTINGS rows shown, top to bottom (dev=1 hides UPDATE OR REPAIR and UNINSTALL), for test logs.
+std::string SettingsRows();
 
 } // namespace launcher
