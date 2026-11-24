@@ -2213,6 +2213,16 @@ void D3D11Renderer::Dispatch(const ComputeLaunch& l) {
         drv.image[k][2] = w | (hgt << 16);
         drv.image[k][3] = dep | (mode << 16) | (bh << 24) | (bd << 28);
     }
+    // (#8) Two windows served by one buffer (adjacent guest ranges that ComputeBuffer merged) would bind the same UAV
+    // in two slots, which D3D11 does not allow (the debug layer's "UAV at slot 0 overlaps with slot 1"; AMD may drop
+    // one or hang). Both describe the same range, and GmemWindow takes the first window that contains an address, so
+    // the later slot was never used: unbind it and give it no range.
+    for (u32 i = 1; i < shader::kGmemWindows; i++)
+        for (u32 j = 0; j < i && uavs[i]; j++)
+            if (win[j] == win[i]) {
+                uavs[i] = nullptr;
+                drv.gmem[i][2] = 0;
+            }
     // Debug: MUA3_CAPTURE=<program offset hex> saves one dispatch's inputs for `shadertool --replay`.
     static const u32 capture_off = [] {
         const char* e = std::getenv("MUA3_CAPTURE");
