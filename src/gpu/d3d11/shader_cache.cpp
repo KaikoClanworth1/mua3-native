@@ -1678,7 +1678,11 @@ void ShaderCache::BuildVariantSource(HostShader& s) {
         std::lock_guard lk(hlsl_mutex_);
         // Its bytecode is cached: Compile loads that, so only the base's resource layout is needed (re-translating
         // a base that was itself loaded from the cache costs tens of milliseconds the draw would wait for).
-        if (!overridden && HasBytecode(s)) {
+        // Not for compute: the direct backend compiles the HLSL below and never loads cached bytecode, so a compute
+        // variant with a leftover cache entry was built from its base's float4 declarations (FLOAT views over UINT
+        // texel buffers, #8).
+        const bool loads_cache = s.stage != shader::Stage::Compute || std::getenv("MUA3_FXC_COMPUTE");
+        if (!overridden && loads_cache && HasBytecode(s)) {
             s.info = base->info;
             return;
         }
