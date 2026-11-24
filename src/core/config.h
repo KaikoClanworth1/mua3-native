@@ -45,6 +45,10 @@ struct Config {
     // Stick deadzones in percent of full tilt (read live, #17); the game adds its own small deadzone on top.
     int left_deadzone = 10;
     int right_deadzone = 10;
+    // The mouse turns the camera while playing (read live): 0 off, 1 on, 2 on with Y inverted; mouse_sensitivity in
+    // percent (100 = 0.0025 radians per mouse count).
+    int mouse_camera = 1;
+    int mouse_sensitivity = 100;
     bool docked = true;
     int language = 1; // 1 = American English
     int log_level = 2; // 0 trace .. 4 error

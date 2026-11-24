@@ -307,8 +307,16 @@ The title screen's SYSTEM submenu (SAVE, LOAD, OPTIONS, TIPS, GALLERY; title men
   original, live: `hle::camera_speed`; the camera update main+0x339d40 turns at speed * (stick - deadzone)^2 with the
   speed floats in the camera parameters, so the update is wrapped and those floats are scaled for its duration: speed%
   at every tilt; on top of the CAMERA tab's CONTROL SENSITIVITY), LEFT / RIGHT STICK DEADZONE (`[input]
-  left_deadzone` / `right_deadzone`, 0-50% in steps of 2, 10% default, live through `input.SetDeadzones`) and KEY
-  BINDINGS (OPEN). 2 rows are free.
+  left_deadzone` / `right_deadzone`, 0-50% in steps of 2, 10% default, live through `input.SetDeadzones`), KEY
+  BINDINGS (OPEN), MOUSE CAMERA (ON / ON (INVERT Y) / OFF, `[input] mouse_camera` 1 / 2 / 0, live) and MOUSE
+  SENSITIVITY (`mouse_sensitivity`, 25-500%, 100% = 0.0025 radians per mouse count, live). The page is full (8 rows).
+- **Mouse camera** (`hle::camera_speed`, camera_speed.cpp): the player camera's update (main+0x339d40) gets the
+  mouse counts gathered since its last run added before it runs: the yaw (camera +0x220, copies +0x270 / +0x2c0)
+  turns right for a move right, the pitch (+0x228, copies +0x278 / +0x2c8 / +0x318) moves within the game's own
+  limits (+0x1f0 / +0x1f4; where both are 0 the game allows no pitch and the mouse moves none either).
+  `platform::Input::MouseCamera` captures the mouse (SDL relative mode) only while that update has run in the last
+  150 ms, the window has the focus and KEY BINDINGS is not taking a key; menus, pause and cut-scenes release it. Log
+  lines: "mouse camera: captured / released (why)" and once a second the counts, radians and radians per count.
 - **KEY BINDINGS** (from CONTROLS; B goes back to CONTROLS): RESET ALL, then 7 of the 24 actions a page (L / R: the
   others; the header shows the page). The rows use the game's own action names (OPTIONS > CONTROLS > BUTTON
   SETTINGS, control style Type 1) with the button after them, e.g. JUMP (B); Type 2 swaps A (GUARD/DODGE) and L

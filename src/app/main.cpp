@@ -78,6 +78,9 @@ void ApplyGameSettings(const core::Config& n, core::Config& cfg, platform::Displ
     input.SetDeadzones(n.left_deadzone, n.right_deadzone);
     cfg.left_deadzone = n.left_deadzone;
     cfg.right_deadzone = n.right_deadzone;
+    input.SetMouseCamera(n.mouse_camera, n.mouse_sensitivity);
+    cfg.mouse_camera = n.mouse_camera;
+    cfg.mouse_sensitivity = n.mouse_sensitivity;
     LOG_INFO("Main", "settings from the game: {} {}x{}, fps limit {}, show fps {}", n.fullscreen ? "fullscreen" : "window",
              n.width, n.height, n.fps_limit, n.show_fps);
     if (keep_window)
@@ -255,6 +258,7 @@ u64 ParseButtons(const std::string& btns);
 //                                            stages split by / are held hold_ms each
 //   key <KEY>[+KEY...][/...] [hold_ms]       keys and mouse buttons through the KEY BINDINGS (names as in mua3.ini's
 //                                            [keys], _ for spaces: L, NUM_8, MOUSE_LEFT; NONE = nothing held)
+//   mouse <dx> <dy> [times]                  mouse counts to the MOUSE CAMERA, every 16 ms (default once)
 //   stick <lx> <ly> [hold_ms]                tilt player 1's left stick (rstick: the right stick)
 //   shot <path.bmp>                          save the next presented game frame
 void PollCommandFile(platform::Input* input) {
@@ -327,6 +331,15 @@ void PollCommandFile(platform::Input* input) {
                 input->SimulateKeys({}, 0);
                 std::this_thread::sleep_for(std::chrono::milliseconds(250));
                 g_script_active = false;
+            } else if (cmd == "mouse") { // mouse <dx> <dy> [times]: counts to the mouse camera
+                float dx = 0, dy = 0;
+                int times = 1;
+                std::string c;
+                std::istringstream(line) >> c >> dx >> dy >> times;
+                for (int k = 0; k < std::max(times, 1); k++) {
+                    hle::camera_speed::AddMouse(dx, dy);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(16));
+                }
             } else if (cmd == "stick" || cmd == "rstick") { // [r]stick <x> <y> [hold_ms]: tilt the left (right) stick
                 int lx = 0, ly = 0, ms = 1000;
                 std::string c;
@@ -874,6 +887,7 @@ int main(int argc, char** argv) {
     }
     platform::Input input;
     input.Init(cfg.input, cfg.camera_speed, cfg.button_layout);
+    input.SetMouseCamera(cfg.mouse_camera, cfg.mouse_sensitivity);
     input.SetDeadzones(cfg.left_deadzone, cfg.right_deadzone);
     platform::Audio().Init(cfg.audio, cfg.mute ? 0 : cfg.volume);
     hle::SetAudioOutput([](const s16* pcm, size_t frames) { platform::Audio().Push(pcm, frames); },
@@ -966,6 +980,7 @@ int main(int argc, char** argv) {
         }
         if (autopress_after == 0 && !g_script_active && !test_instance) // the test aids drive player 1 themselves
             input.Update(display.Focused());
+        input.MouseCamera(display.Window(), display.Focused());
         PollCommandFile(&input);
         platform::bugcap::Poll(renderer, display);
         display.BeginFrame();

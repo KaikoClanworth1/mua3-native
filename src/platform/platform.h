@@ -118,6 +118,10 @@ public:
     // Test aid: these keys (USB HID usages) and mouse buttons (bit n = button n + 1) held, through the bindings and the
     // KEY BINDINGS capture; returns the game buttons.
     u64 SimulateKeys(const std::vector<u16>& keys, u32 mouse);
+    // MOUSE CAMERA (core::Config::mouse_camera: 0 off, 1 on, 2 on with Y inverted; mouse_sensitivity in percent), live.
+    void SetMouseCamera(int mode, int sensitivity);
+    // Once a frame: captures or releases the mouse for the camera and passes its motion on.
+    void MouseCamera(SDL_Window* window, bool focused);
 
 private:
     core::InputBackend backend_{};
@@ -128,6 +132,7 @@ private:
     struct SDL_Gamepad* pad_ = nullptr;
     // The game button each face button (south, east, west, north) went down as, kept until it's released; 0 = up.
     u64 face_[4] = {};
+    bool mouse_camera_ = true, mouse_captured_ = false;
     bool active_[4] = {}; // by hle::prompts::Device: in use last poll
     std::chrono::steady_clock::time_point device_changed_{}; // the prompts' last device change
     bool pad_seen_ = false; // a pad was connected last poll (a pad that appears sets the prompts' device at once)
