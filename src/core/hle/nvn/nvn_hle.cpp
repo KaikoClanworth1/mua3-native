@@ -1436,6 +1436,7 @@ struct HostQueue {
     std::mutex mutex;
     std::condition_variable cv;
     u64 submitted = 0, completed = 0;
+    std::chrono::steady_clock::time_point completed_at{}; // when `completed` last moved (#16's timeout log)
     std::unordered_map<u64, u64> syncs;                   // NVNsync -> fence sequence
     std::unordered_map<u64, std::vector<u64>> builders;   // NVNwindowBuilder -> textures
     struct Window {
@@ -1476,6 +1477,7 @@ void FenceDone(u64 seq) {
         {
             std::lock_guard lk(hq.mutex);
             hq.completed = std::max(hq.completed, seq);
+            hq.completed_at = std::chrono::steady_clock::now();
         }
         hq.cv.notify_all();
     });
@@ -1484,6 +1486,26 @@ void FenceDone(u64 seq) {
 void QueueFenceSync(State& s) {
     HostFence(s.x[1]);
     Return(s, 0);
+}
+// A sync wait that timed out (#16: ~2 s frames with the GPU idle): who waited, for which fence, how far the GPU thread
+// got and how long ago it last completed one (long ago = the fence job was never queued, or the GPU thread is stuck).
+void LogSyncTimeout(u64 caller, u64 sync, u64 seq, u64 completed, u64 submitted, u64 timeout,
+                    std::chrono::steady_clock::time_point completed_at) {
+    static std::mutex m;
+    static std::unordered_map<u64, std::pair<std::chrono::steady_clock::time_point, u64>> last; // caller -> (line, since)
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard lk(m);
+    auto& [t, since] = last[caller];
+    since++;
+    if (t != std::chrono::steady_clock::time_point{} && now - t < std::chrono::seconds(10))
+        return;
+    const double ago = completed_at == std::chrono::steady_clock::time_point{}
+                           ? -1.0
+                           : std::chrono::duration<double, std::milli>(now - completed_at).count();
+    LOG_WARN("NVN", "sync wait timed out ({} from this caller since the last line): caller {:#x} sync {:#x} fence {} "
+                    "completed {} submitted {}, timeout {:.1f} ms, last fence completed {:.1f} ms ago",
+             since, caller, sync, seq, completed, submitted, timeout / 1e6, ago);
+    t = now, since = 0;
 }
 // NVNsyncWaitResult nvnSyncWait(const NVNsync*, uint64_t timeoutNs): 0 already signaled, 1 satisfied, 2 timeout
 void SyncWait(State& s) {
@@ -1500,6 +1522,10 @@ void SyncWait(State& s) {
         q.cv.wait(lk, done), ok = true;
     else
         ok = q.cv.wait_for(lk, std::chrono::nanoseconds(timeout), done);
+    // (#16) a timed-out wait of 50 ms or more (short polls are normal): the fence never completed within the game's
+    // own timeout. At most one line per caller every 10 s.
+    if (!ok && timeout >= 50'000'000)
+        LogSyncTimeout(s.x[30], s.x[0], seq, q.completed, q.submitted, timeout, q.completed_at);
     lk.unlock();
     if (timeout)
         TimelineEvent(ok ? "syncwait-done" : "syncwait-timeout", seq);
