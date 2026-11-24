@@ -507,6 +507,8 @@ bool SaveInstalled(const Installed& in) {
     f << "build_dir=" << U8(in.build_dir) << "\nsource_dir=" << U8(in.source_dir)
       << "\nkeys=" << U8(in.keys) << "\nlanguage=" << in.language << "\ndesktop=" << in.desktop
       << "\nstart_menu=" << in.start_menu << "\n";
+    if (in.dev)
+        f << "dev=1\n";
     for (auto& p : in.files)
         f << "file=" << U8(p) << "\n";
     return bool(f);
@@ -519,6 +521,8 @@ std::optional<Installed> LoadInstalled(const fs::path& dir) {
     Installed in;
     in.dir = dir;
     for (std::string line; std::getline(f, line);) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) // (a file written by hand: CRLF)
+            line.pop_back();
         const auto eq = line.find('=');
         if (line.empty() || line[0] == '#' || eq == std::string::npos)
             continue;
@@ -529,6 +533,7 @@ std::optional<Installed> LoadInstalled(const fs::path& dir) {
         else if (k == "language") in.language = std::atoi(v.c_str());
         else if (k == "desktop") in.desktop = v == "1";
         else if (k == "start_menu") in.start_menu = v == "1";
+        else if (k == "dev") in.dev = v == "1";
         else if (k == "file") in.files.push_back(fs::u8path(v));
     }
     return in;
