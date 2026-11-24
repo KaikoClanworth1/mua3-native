@@ -269,14 +269,17 @@ void Input::SetMouseCamera(int mode, int sensitivity) {
     hle::camera_speed::SetMouse(mode != 0, sensitivity, mode == 2);
 }
 
-// MOUSE CAMERA: the mouse is captured (relative mode, no cursor) only while the player camera runs and the window has
-// the focus; its motion goes to the camera's yaw and pitch (hle::camera_speed). Menus, pause, cut-scenes, another
-// window and KEY BINDINGS' capture release it. MUA3_MOUSE_CAMERA_TEST=1 (test aid): the window counts as focused and
-// SDL is not asked (hidden test instances; the `mouse` command feeds counts).
+// MOUSE CAMERA: the mouse is captured (relative mode, no cursor) only while the keyboard and mouse are the device in
+// use (a pad player keeps a free cursor), the player camera runs and the window has the focus; its motion goes to the
+// camera's yaw and pitch (hle::camera_speed). Menus, pause, cut-scenes, another window, a pad and KEY BINDINGS'
+// capture release it. MUA3_MOUSE_CAMERA_TEST=1 (test aid): the window counts as focused and SDL is not asked (hidden
+// test instances; the `mouse` command feeds counts).
 void Input::MouseCamera(SDL_Window* window, bool focused) {
     static const bool test = std::getenv("MUA3_MOUSE_CAMERA_TEST") != nullptr;
     const char* why = !mouse_camera_                          ? "MOUSE CAMERA off"
                       : !(focused || test)                    ? "window not focused"
+                      : hle::prompts::CurrentDevice() != hle::prompts::Device::Keyboard
+                                                              ? "a pad is in use"
                       : hle::keybinds::Capturing() >= 0       ? "binding a key"
                       : !hle::camera_speed::CameraActive()    ? "camera not running: menu, pause or cut-scene"
                                                               : nullptr;
