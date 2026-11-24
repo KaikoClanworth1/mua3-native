@@ -2953,9 +2953,20 @@ void D3D11Renderer::Draw() {
         rd.DepthClipEnable = TRUE;
         // Polygon offset (shadow casters).
         if (m.polygon_offset) {
-            rd.DepthBias = INT(std::lround(m.depth_bias));
-            rd.SlopeScaledDepthBias = m.slope_scale_depth_bias;
-            rd.DepthBiasClamp = m.depth_bias_clamp;
+            // Rounded: ultimates animate the offset (the constant part between about 12,000 and 32,000 units in the
+            // Elektra fight), and each new exact value made a new rasterizer state (about one a second, toward
+            // D3D11's 4,096 limit; #16). The constant part keeps 5 significant bits (within 1.6 %), slope and clamp 8.
+            auto q = [](float v, float steps) {
+                if (!std::isfinite(v) || v == 0.0f)
+                    return v;
+                int e;
+                const float f = std::frexp(v, &e); // v = f * 2^e, 0.5 <= |f| < 1
+                return std::ldexp(std::round(f * steps) / steps, e);
+            };
+            const long bias = std::lround(m.depth_bias);
+            rd.DepthBias = INT(std::labs(bias) > 32 ? std::lround(q(float(bias), 32.0f)) : bias);
+            rd.SlopeScaledDepthBias = q(m.slope_scale_depth_bias, 256.0f);
+            rd.DepthBiasClamp = q(m.depth_bias_clamp, 256.0f);
         }
         // Debug: MUA3_ZBIAS_PS=<ps hash>:<depth bias units> biases one pixel shader's depth.
         static const std::pair<u64, int> zbias = [] {
@@ -2972,6 +2983,13 @@ void D3D11Renderer::Draw() {
         rd.ScissorEnable = TRUE;
         g_seen.raster_obj = dc.Cached(dc.raster, rd, [&](const D3D11_RASTERIZER_DESC* d, ID3D11RasterizerState** o) {
             dev_->CreateRasterizerState(d, o);
+            static int logged = 0; // (which fields keep making new states, if any still do)
+            if (dc.raster.size() > 64 && logged < 12) {
+                logged++;
+                LOG_INFO("Renderer", "rasterizer state {}: cull {} ccw {} bias {} slope {} clamp {}", dc.raster.size(),
+                         int(d->CullMode), d->FrontCounterClockwise, d->DepthBias, d->SlopeScaledDepthBias,
+                         d->DepthBiasClamp);
+            }
         });
     }
     ID3D11RasterizerState* const rs = g_seen.raster_obj;
