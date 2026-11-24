@@ -128,6 +128,9 @@ public:
     u64 arbiter_addr = 0;
     std::atomic<u32> current_svc{0}; // SVC being serviced (0 = running guest code)
     std::string current_ipc;          // service/command being called (debug)
+    // MUA3_CORE_EXCLUSIVE: the core whose run token this thread holds (-1 none).
+    s32 held_core = -1;
+    std::atomic<u64> processor_number_calls{0}; // svcGetCurrentProcessorNumber (thread stats line)
 };
 using ThreadPtr = std::shared_ptr<Thread>;
 
@@ -231,6 +234,27 @@ public:
     std::vector<Thread*> cv_waiters;
     std::vector<Thread*> arb_waiters;
     std::vector<Thread*> lock_waiters;
+
+    // MUA3_CORE_EXCLUSIVE=1 (experiment, #19): guest threads with the same core never run at the same time, as on
+    // Horizon. A thread holds its core's run token while it runs guest code and gives it up while it blocks, sleeps,
+    // yields or is in an HLE hook or IPC call (kernel.cpp).
+    static bool CoreExclusive();
+    void AcquireCore(Thread* t);
+    void ReleaseCore(Thread* t);
+    // Logs a guest thread's core, affinity and priority (at start and when they change).
+    void LogThreadPlacement(Thread* t, const char* why);
+    void StartThreadStats();
+
+private:
+    struct CoreToken {
+        std::mutex m;
+        std::condition_variable cv;
+        Thread* owner = nullptr;
+        std::vector<Thread*> waiting;
+        u64 handoffs = 0, contended = 0;
+        s64 wait_ns = 0;
+    };
+    CoreToken core_tokens_[4];
 };
 
 Kernel& K(); // global instance

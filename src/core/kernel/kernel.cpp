@@ -1,6 +1,7 @@
 #include "core/kernel/kernel.h"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <memory>
@@ -123,6 +124,7 @@ ThreadPtr Kernel::CreateThread(u64 entry, u64 arg, u64 stack_top, s32 prio, s32 
 
 void Kernel::StartThread(const ThreadPtr& t) {
     t->state = Thread::State::Running;
+    StartThreadStats();
     // Recompiled guest code recurses on the host stack, with frames larger than the guest's: a 32 MB reservation
     // (committed only as it is used) keeps deep guest call chains native instead of hitting the stack floor.
     struct Start {
@@ -174,7 +176,11 @@ void Kernel::ThreadMain(ThreadPtr t) {
         SetThreadPriority(GetCurrentThread(), MapPriority(t->priority));
     }
     LOG_DEBUG("Kernel", "Thread {} ({}) started at {:#x}", t->id, t->name, t->entry);
+    if (t->id == 1) // the others are logged at their CreateThread
+        LogThreadPlacement(t.get(), "start");
+    AcquireCore(t.get());
     t->cpu->Run();
+    ReleaseCore(t.get());
     // Exited via svcExitThread (or the CPU was halted for process exit).
     LOG_DEBUG("Kernel", "Thread {} ({}) exited at {}", t->id, t->name, core::Sys().Symbolize(t->cpu->PC()));
     {
@@ -195,6 +201,145 @@ void Kernel::ThreadMain(ThreadPtr t) {
     if (t->host_handle)
         CloseHandle((HANDLE)t->host_handle);
     t->host_handle = nullptr;
+}
+
+bool Kernel::CoreExclusive() {
+    static const bool on = [] {
+        const char* e = std::getenv("MUA3_CORE_EXCLUSIVE");
+        const bool v = e && std::atoi(e) != 0;
+        if (v)
+            LOG_INFO("Kernel", "MUA3_CORE_EXCLUSIVE: guest threads of one core run one at a time");
+        return v;
+    }();
+    return on;
+}
+
+// The run token of a thread's core: handed to the waiting thread with the best priority (lowest number) when its
+// holder gives it up. A thread that never gives it up (spinning on another thread of its core without a system
+// call) would stop its core's other threads; a wait over 2 s is logged with the holder.
+void Kernel::AcquireCore(Thread* t) {
+    if (!CoreExclusive() || t->held_core >= 0)
+        return;
+    // The core the thread is bound to. MUA3 creates most threads on the process default core and then sets only an
+    // affinity mask (SetThreadCoreMask with ideal core -1), so the mask decides; a thread allowed on several cores
+    // moves between them on Horizon and takes no token here.
+    const u64 mask = t->affinity & 0xF;
+    if (!mask || (mask & (mask - 1)))
+        return;
+    const s32 core = std::countr_zero(mask);
+    CoreToken& k = core_tokens_[core];
+    std::unique_lock lk(k.m);
+    if (!k.owner && k.waiting.empty()) {
+        k.owner = t;
+        t->held_core = core;
+        return;
+    }
+    k.contended++;
+    const auto t0 = std::chrono::steady_clock::now();
+    k.waiting.push_back(t);
+    bool warned = false;
+    while (k.owner != t) {
+        if (!k.owner) { // free with waiters: the best of them takes it
+            Thread* best = nullptr;
+            for (Thread* w : k.waiting)
+                if (!best || w->priority < best->priority)
+                    best = w;
+            k.owner = best;
+            if (best != t) {
+                k.cv.notify_all();
+                continue;
+            }
+            break;
+        }
+        k.cv.wait_for(lk, std::chrono::milliseconds(500));
+        if (!warned && k.owner != t && std::chrono::steady_clock::now() - t0 > std::chrono::seconds(2)) {
+            warned = true;
+            Thread* o = k.owner;
+            LOG_WARN("Kernel", "core {}: thread {} ({}, prio {}) has waited 2 s for the core; held by {} ({}, prio {}, in svc {:#x})",
+                     core, t->id, t->name, t->priority, o ? o->id : 0, o ? o->name : "nobody", o ? o->priority : 0,
+                     o ? o->current_svc.load() : 0);
+        }
+    }
+    k.waiting.erase(std::find(k.waiting.begin(), k.waiting.end(), t));
+    t->held_core = core;
+    k.wait_ns += (std::chrono::steady_clock::now() - t0).count();
+}
+
+void Kernel::ReleaseCore(Thread* t) {
+    if (t->held_core < 0)
+        return;
+    CoreToken& k = core_tokens_[t->held_core];
+    t->held_core = -1;
+    std::lock_guard lk(k.m);
+    Thread* best = nullptr;
+    for (Thread* w : k.waiting)
+        if (!best || w->priority < best->priority)
+            best = w;
+    k.owner = best;
+    if (best) {
+        k.handoffs++;
+        k.cv.notify_all();
+    }
+}
+
+void Kernel::LogThreadPlacement(Thread* t, const char* why) {
+    static std::atomic<int> lines{0};
+    if (lines++ >= 4000)
+        return;
+    LOG_INFO("Threads", "{}: thread {} ({}) entry {} core {} affinity {:#x} priority {}", why, t->id, t->name,
+             core::Sys().Symbolize(t->entry), t->core, t->affinity, t->priority);
+}
+
+// Every 10 s: the guest threads with the most host CPU time, with their core and priority, and (MUA3_CORE_EXCLUSIVE)
+// how often each core's token changed hands and how long threads waited for it.
+void Kernel::StartThreadStats() {
+    static std::once_flag once;
+    std::call_once(once, [this] {
+        std::thread([this] {
+            std::unordered_map<u64, u64> last; // thread id -> CPU time (100 ns units)
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(10));
+                struct Row {
+                    u64 cpu;
+                    std::string text;
+                };
+                std::vector<Row> rows;
+                {
+                    std::lock_guard lk(threads_mutex_);
+                    for (auto& t : threads_) {
+                        if (!t->host_handle)
+                            continue;
+                        FILETIME c, e, k, u;
+                        if (!GetThreadTimes((HANDLE)t->host_handle, &c, &e, &k, &u))
+                            continue;
+                        const u64 now = (u64(k.dwHighDateTime) << 32 | k.dwLowDateTime) + (u64(u.dwHighDateTime) << 32 | u.dwLowDateTime);
+                        const u64 d = now - last[t->id];
+                        last[t->id] = now;
+                        rows.push_back({d, fmt::format(" {} (core {} mask {:#x} prio {}): {:.0f}%, {} core-number calls", t->id, t->core,
+                                                       t->affinity, t->priority, double(d) / 1e6, // 100 ns units: % of one CPU
+                                                       t->processor_number_calls.exchange(0))});
+                    }
+                }
+                std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.cpu > b.cpu; });
+                std::string top;
+                for (size_t i = 0; i < rows.size() && i < 10; i++)
+                    top += rows[i].text;
+                LOG_INFO("Threads", "busiest guest threads (CPU, last 10 s):{}", top);
+                if (CoreExclusive()) {
+                    std::string s;
+                    for (int c = 0; c < 4; c++) {
+                        CoreToken& k = core_tokens_[c];
+                        std::lock_guard lk(k.m);
+                        s += fmt::format(" [core {}: {} hand-offs, {} waits, {:.0f} ms waited]", c, k.handoffs, k.contended,
+                                         double(k.wait_ns) / 1e6);
+                        k.handoffs = k.contended = 0;
+                        k.wait_ns = 0;
+                    }
+                    LOG_INFO("Threads", "core tokens (last 10 s):{}", s);
+                }
+            }
+        }).detach();
+    });
 }
 
 void Kernel::ExitCurrentThread() {
@@ -297,10 +442,13 @@ void Kernel::HandleSvc(Thread* t, u32 imm) {
                      t->name, what, double(ns) / 1e6, a[0], a[1], a[2], a[3], t->cpu->Reg(0),
                      core::Sys().Symbolize(lr));
     };
+    // MUA3_CORE_EXCLUSIVE: give the core up for the call (it may block on another thread of this core).
+    ReleaseCore(t);
     if (imm >= 0x1000) {
         const u32 idx = imm - 0x1000;
         if (idx < hooks.size()) {
             hooks[idx].second(t);
+            AcquireCore(t);
             if (stall_ns)
                 report("hook " + hooks[idx].first);
             return;
@@ -309,6 +457,7 @@ void Kernel::HandleSvc(Thread* t, u32 imm) {
     t->current_svc = imm;
     SvcDispatch(t, imm);
     t->current_svc = 0;
+    AcquireCore(t);
     if (stall_ns)
         report(fmt::format("svc {:#x}", imm));
 }
