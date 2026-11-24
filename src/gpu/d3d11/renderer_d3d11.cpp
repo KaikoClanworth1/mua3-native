@@ -3966,6 +3966,27 @@ void D3D11Renderer::Present(const PresentInfo& p) {
                  p.cpu_addr, p.width, p.height, s ? fmt::format("{:#x}", s->gpu_va) : "none", draws_ok, draws_skipped,
                  skip_reason_[0], skip_reason_[1], skip_reason_[2], skip_reason_[3], skip_reason_[4], skip_reason_[5],
                  clears, surfaces_.size(), shaders_->Count(), shaders_->failures.load());
+        // (#16) D3D11 crawls near 4,096 live state objects of one kind: how many each cache holds, once a count first
+        // passes 512, 1024, 2048 or 3072 (at most one line a minute; quiet in normal play)
+        if (g_dc) {
+            static size_t logged_level = 0;
+            static auto last_line = std::chrono::steady_clock::time_point{};
+            const size_t counts[5] = {textures_->SamplerCount(), g_dc->layouts.size(), g_dc->blend.size(),
+                                      g_dc->depth.size(), g_dc->raster.size()};
+            const size_t top = *std::max_element(std::begin(counts), std::end(counts));
+            size_t level = 0;
+            for (size_t l : {512u, 1024u, 2048u, 3072u})
+                if (top >= l)
+                    level = l;
+            const auto now = std::chrono::steady_clock::now();
+            if (level > logged_level &&
+                (last_line == std::chrono::steady_clock::time_point{} || now - last_line >= std::chrono::minutes(1))) {
+                LOG_INFO("Renderer", "state objects past {}: samplers {}, input layouts {}, blend {}, depth {}, rasterizer {}",
+                         level, counts[0], counts[1], counts[2], counts[3], counts[4]);
+                logged_level = level;
+                last_line = now;
+            }
+        }
         // video memory in use by this process (the VRAM budget work)
         if (frame_counter_ % 300 == 1) {
             Microsoft::WRL::ComPtr<IDXGIDevice> dd;

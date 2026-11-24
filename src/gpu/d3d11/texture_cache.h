@@ -59,6 +59,7 @@ public:
     // Returns an SRV for the TIC entry (or null). `swizzle_out` receives the packed component swizzle.
     ID3D11ShaderResourceView* Get(const TicEntry& tic, const shader::TextureUse& use, u32& swizzle_out);
     ID3D11SamplerState* GetSampler(const u32* tsc, bool compare);
+    size_t SamplerCount() const { return samplers_.size(); }
     void Invalidate(u64 gpu_va, u64 size);
     void NextFrame();
     u64 reuploads = 0, uploads = 0, unchanged_rewrites = 0, tracked_bytes = 0;
