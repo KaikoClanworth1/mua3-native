@@ -4418,6 +4418,7 @@ void D3D11Renderer::InvalidateRegion(u64 gpu_va, u64 size) {
     if (gpu_va < code_hi_ && code_lo_ < gpu_va + size) {
         shader_by_addr_.clear();
         compute_by_key_.clear();
+        code_generation_++; // (the encoder's per-program caches: constant buffer 1, compute launch info)
         code_lo_ = ~0ull;
         code_hi_ = 0;
     }

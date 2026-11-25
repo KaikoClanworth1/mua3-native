@@ -194,6 +194,12 @@ private:
     common::U64Map<bool> gs_emits_; // geometry program address -> has OUT instructions
     common::U64Map<HostShader*> shader_by_addr_; // code address ^ stage -> shader
     u64 code_lo_ = ~0ull, code_hi_ = 0;                   // range of code those addresses cover
+    u64 code_generation_ = 1;                             // CodeGeneration(): bumped when that code is rewritten
+
+public:
+    u64 CodeGeneration() const override { return code_generation_; }
+
+private:
     void EmulateCullingGs();
     // Guest global memory used by compute (NVN storage buffers, image storage): raw UAV buffers that stay resident
     // on the host GPU, so chained kernels and texel-buffer reads use results without a round trip through guest

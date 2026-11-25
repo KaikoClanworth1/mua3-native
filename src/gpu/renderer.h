@@ -16,6 +16,8 @@ public:
     virtual void Present(const PresentInfo& p) = 0;
     // Guest-visible memory was written by the GPU (I2M, DMA, 2D); drop cached copies overlapping it.
     virtual void InvalidateRegion(u64 gpu_va, u64 size) {}
+    // Bumped whenever shader code the renderer has seen was rewritten: caches keyed by a program's address go stale.
+    virtual u64 CodeGeneration() const { return 0; }
     // 2D engine surface copy (Fermi 0x902D); returns false if unsupported.
     virtual bool Blit2D(const u32* regs) { return false; }
     virtual void Dispatch(const ComputeLaunch& l) {}
