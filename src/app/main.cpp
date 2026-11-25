@@ -744,6 +744,24 @@ int main(int argc, char** argv) {
     // Stack overflows need stack left for the filter to run.
     ULONG guarantee = 64 * 1024;
     SetThreadStackGuarantee(&guarantee);
+    // The game's files (mua3.ini, mua3.log, logs\, reports\, save\, game\ ...) are relative to its folder, and a
+    // launcher may start it from another working folder (#8: the new log landed there and the game folder kept a
+    // stale mua3.log). An installed exe (its folder holds mua3.ini or game\) therefore works from its own folder.
+    // Test instances (bin\mua3.exe with nothing beside it) keep their working folder, and MUA3_KEEP_CWD=1 keeps any.
+    fs::path start_cwd;
+    bool moved_to_exe = false;
+    {
+        wchar_t self[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, self, MAX_PATH);
+        std::error_code ec;
+        const fs::path dir = fs::path(self).parent_path();
+        start_cwd = fs::current_path(ec);
+        if (!std::getenv("MUA3_KEEP_CWD") && !fs::equivalent(dir, start_cwd, ec) &&
+            (fs::exists(dir / "mua3.ini", ec) || fs::is_directory(dir / "game", ec))) {
+            fs::current_path(dir, ec);
+            moved_to_exe = !ec;
+        }
+    }
     // Child-process mode used by the shader cache for compiles that may not finish (see ShaderCache).
     if (argc == 5 && std::string(argv[1]) == "--compile-shader")
         return gpu::CompileShaderFile(argv[2], argv[3], argv[4]) ? 0 : 1;
@@ -806,6 +824,8 @@ int main(int argc, char** argv) {
     common::RotateLog("mua3", 5); // the previous run's log goes to logs/
     common::SetLogFile("mua3.log");
     LOG_INFO("Main", "MUA3 Native {}", common::Version());
+    if (moved_to_exe)
+        LOG_INFO("Main", "started from {}: working in the game's folder {}", start_cwd.string(), fs::current_path().string());
     if (!bad_checkpoint.empty())
         LOG_WARN("Debug", "--checkpoint {}: takes <section>:<point> (DataSavePoint.bin numbering), e.g. 1:0",
                  bad_checkpoint);
