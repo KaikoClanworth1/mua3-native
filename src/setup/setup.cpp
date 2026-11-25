@@ -1240,6 +1240,7 @@ void BuildThread(Wizard& w, std::vector<fs::path> files, fs::path keys) {
     in.language = w.language;
     in.desktop = w.want_desktop;
     in.start_menu = w.want_start_menu;
+    in.version = common::Version(); // (the launcher and the next setup compare with it: issue #8)
     const fs::path self = setup::SetupDir() / "MUA3Setup.exe";
     {
         // The install always gets "MUA3 Launcher.exe", also when setup runs from the install folder itself
@@ -1787,9 +1788,36 @@ void InstalledPage(Wizard& w, bool& quit) {
         ImGui::PopID();
         return pressed;
     };
-    if (exe && card("play", "Play", "Open the launcher: play, mods and settings.", true))
+    // The installed game built by an older version than this setup (issue #8: Play here ran the old game under a
+    // launcher showing the new version): Update comes first and is the highlighted card.
+    static fs::path older_dir;
+    static bool older = false;
+    static std::string game_version;
+    if (older_dir != in.dir) {
+        older_dir = in.dir;
+        game_version = setup::GameVersion(in);
+        older = setup::GameOlder(in, common::Version());
+        LOG_INFO("Setup", "installed game built by {}; this setup {}{}", game_version.empty() ? "an unknown version" : game_version,
+                 common::Version(), older ? ": older, Update first" : "");
+    }
+    const bool old_game = exe && older;
+    if (old_game) {
+        const std::string line = (game_version.empty() ? std::string("The installed game was built by an older version")
+                                                       : "The installed game was built by " + game_version) +
+                                 ". This setup is " + common::Version() + ": update to build the game with it.";
+        {
+            FontScope f(g_regular, kSmall);
+            ImGui::PushStyleColor(ImGuiCol_Text, V(col::amber));
+            ImGui::TextWrapped("%s", line.c_str());
+            ImGui::PopStyleColor();
+        }
+        ImGui::Dummy(S(1, 6));
+        if (card("update", "Update or repair", "Build the game again with this version (your saves and settings stay).", true))
+            StartRepair(w);
+    }
+    if (exe && card("play", "Play", old_game ? "Play the installed (older) game as it is." : "Open the launcher: play, mods and settings.", !old_game))
         EnterLauncher(w);
-    if (card("update", "Update or repair", "Add an update or DLC, change the language, or build the game again.", false))
+    if (!old_game && card("update", "Update or repair", "Add an update or DLC, change the language, or build the game again.", false))
         StartRepair(w);
     if (exe && card("mods", "Mods", "Turn mods on or off and set their load order.", false))
         OpenModsPage(w);
@@ -2203,6 +2231,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 want_report = true, i++;
         }
         LocalFree(argv);
+    }
+    if (args.size() == 3 && args[0] == L"--test-replace") { // developer test: builder::ReplaceExe <built> <out>
+        std::string why;
+        const bool ok = builder::ReplaceExe(fs::path(args[1]), fs::path(args[2]), why);
+        Out(ok ? "replaced" : "error " + why);
+        return ok ? 0 : 4;
     }
     if (want_prepare) {
         if (auto here = setup::LoadInstalled(setup::SetupDir()); here && here->dev) {

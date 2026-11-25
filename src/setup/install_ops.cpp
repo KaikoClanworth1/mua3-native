@@ -14,6 +14,7 @@
 #include "common/crash.h"
 #include "crypto/crypto.h"
 #include "loader/formats.h"
+#include "setup/updater.h"
 
 #pragma comment(lib, "windowscodecs.lib")
 
@@ -509,6 +510,8 @@ bool SaveInstalled(const Installed& in) {
       << "\nstart_menu=" << in.start_menu << "\n";
     if (in.dev)
         f << "dev=1\n";
+    if (!in.version.empty())
+        f << "version=" << in.version << "\n";
     for (auto& p : in.files)
         f << "file=" << U8(p) << "\n";
     return bool(f);
@@ -534,9 +537,32 @@ std::optional<Installed> LoadInstalled(const fs::path& dir) {
         else if (k == "desktop") in.desktop = v == "1";
         else if (k == "start_menu") in.start_menu = v == "1";
         else if (k == "dev") in.dev = v == "1";
+        else if (k == "version") in.version = v;
         else if (k == "file") in.files.push_back(fs::u8path(v));
     }
     return in;
+}
+
+std::string GameVersion(const Installed& in) {
+    if (!in.version.empty())
+        return in.version;
+    std::ifstream f(in.dir / "mua3.log");
+    std::string line;
+    for (int i = 0; i < 3 && std::getline(f, line); i++) // "[   0.0004] [INFO ] [Main:3908] MUA3 Native v0.4.1"
+        if (const auto at = line.find("MUA3 Native "); at != std::string::npos) {
+            std::string v = line.substr(at + 12);
+            while (!v.empty() && (v.back() == '\r' || v.back() == ' '))
+                v.pop_back();
+            return v;
+        }
+    return {};
+}
+
+bool GameOlder(const Installed& in, const std::string& running) {
+    if (in.dev || !updater::Newer(running, "0")) // (a developer folder, or a "dev" build with no version number)
+        return false;
+    const std::string game = GameVersion(in);
+    return game.empty() || updater::Newer(running, game);
 }
 
 std::optional<Installed> FindInstalled() {
@@ -614,7 +640,7 @@ std::vector<std::string> Uninstall(const Installed& in, bool keep_saves) {
     remove_all(LocalDataDir() / "icon.jpg"); // the game's icon, cached for setup's window
     // What setup and the game wrote in the install folder. Anything else the player put there stays.
     if (!in.dir.empty() && (fs::exists(in.dir / "mua3.exe", ec) || fs::exists(in.dir / kSetupIni, ec))) {
-        for (const char* p : {"mua3.exe", "mua3.ini", "mua3.ico", "mua3.log", "mua3.pdb", "setup.ini", "game",
+        for (const char* p : {"mua3.exe", "mua3.exe.new", "mua3.ini", "mua3.ico", "mua3.log", "mua3.pdb", "setup.ini", "game",
                               "shader_cache", "shader_dump", "logs", "crash", "romfs_index.bin", "launcher.log", ".mod_install"})
             remove_all(in.dir / p);
         for (auto it = fs::directory_iterator(in.dir, ec); !ec && it != fs::directory_iterator(); it.increment(ec)) {

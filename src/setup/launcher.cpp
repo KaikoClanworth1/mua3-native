@@ -205,6 +205,9 @@ struct State {
     // a newer version of the port (checked once when the launcher opens)
     updater::Updater update;
     bool update_started = false; // the player asked for it (its failures show)
+    // the version that built the installed mua3.exe, and whether it is older than this launcher (issue #8)
+    std::string game_built;
+    bool game_older = false;
     // the SETTINGS rows last drawn (for test logs)
     int settings_rows = 0;
     const char* settings_labels[4]{};
@@ -753,7 +756,7 @@ void InfoRow(ImDrawList* dl, float x0, float x1, float& y, const char* label, co
 void PlaySection(ImDrawList* dl, const Layout& L, bool activate) {
     const bool exe = fs::exists(g.dir / "mua3.exe");
     const float banner = UpdateBannerHeight();
-    const ImVec2 a(L.x1 - U(520), L.y0 + U(56)), b(L.x1, L.y0 + U(56) + U(g.ended.empty() ? 384 : 458) + banner);
+    const ImVec2 a(L.x1 - U(520), L.y0 + U(56)), b(L.x1, L.y0 + U(56) + U(g.ended.empty() ? 426 : 500) + banner);
     Card(dl, a, b);
     const float x0 = a.x + U(34), x1 = b.x - U(34);
     float y = a.y + U(28);
@@ -764,8 +767,9 @@ void PlaySection(ImDrawList* dl, const Layout& L, bool activate) {
     y += U(40);
     {
         Font f(g_body, 14);
-        dl->AddText(ImVec2(x0, y), col::dim,
+        dl->AddText(ImVec2(x0, y), exe && g.game_older && !g.game ? col::amber : col::dim,
                     g.game ? "The launcher waits here until the game closes."
+                    : exe && g.game_older ? "Built by an older version: SETTINGS > UPDATE OR REPAIR."
                     : exe  ? "The game is built and installed."
                     : g.host->installed.dev ? "mua3.exe is missing from this developer folder."
                            : "mua3.exe is missing: SETTINGS > SYSTEM > UPDATE OR REPAIR builds it again.");
@@ -780,6 +784,11 @@ void PlaySection(ImDrawList* dl, const Layout& L, bool activate) {
     int on = 0;
     for (auto& r : g.mods)
         on += r.mod.enabled;
+    if (exe)
+        InfoRow(dl, x0, x1, y, "BUILT BY",
+                (g.game_built.empty() ? std::string("an older version") : "MUA3 Native " + g.game_built) +
+                    (g.game_older ? "  ·  older" : ""),
+                g.game_older ? col::amber : col::text);
     InfoRow(dl, x0, x1, y, "GAME VERSION", version, version.find("supported") != std::string::npos ? col::green : col::text);
     InfoRow(dl, x0, x1, y, "DLC", dlc, col::text);
     InfoRow(dl, x0, x1, y, "MODS", !g.mods_on ? "Off" : g.mods.empty() ? "None" : fmt::format("{} of {} on", on, g.mods.size()),
@@ -1527,6 +1536,10 @@ void Open(Host& host) {
     g.mods_on = g.cfg.mods_enabled;
     ScanMods();
     ProbeGame();
+    g.game_built = setup::GameVersion(host.installed);
+    g.game_older = fs::exists(g.dir / "mua3.exe") && setup::GameOlder(host.installed, host.version);
+    LOG_INFO("Launcher", "game built by {}{}", g.game_built.empty() ? "an unknown version" : g.game_built,
+             g.game_older ? fmt::format(", older than this launcher ({})", host.version) : std::string());
     if (host.installed.dev) // (no UPDATE NOW: an update rebuilds the folder)
         LOG_INFO("Launcher", "{}: developer folder (dev=1), no update check", g.dir.string());
     else

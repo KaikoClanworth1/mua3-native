@@ -6,6 +6,7 @@
 #include <functional>
 #include <fstream>
 #include <optional>
+#include <system_error>
 #include <thread>
 
 #include <windows.h>
@@ -432,6 +433,31 @@ bool GameBuilt(const Paths& p) {
     return fs::exists(p.out_exe) && MTime(p.out_exe) >= MTime(p.sdk_dir / "lib" / "nxcore.lib");
 }
 
+bool ReplaceExe(const fs::path& built, const fs::path& out, std::string& error) {
+    // The new exe replaces the old one in one step, or not at all (issue #8: a failed remove used to leave the old
+    // game in place without a word). It is copied next to it first (the build folder can be on another drive), then
+    // swapped in; a virus scanner may hold either for a moment.
+    std::error_code ec;
+    const fs::path fresh = out.parent_path() / (out.filename().wstring() + L".new");
+    fs::copy_file(built, fresh, fs::copy_options::overwrite_existing, ec);
+    if (ec) {
+        error = fmt::format("Could not copy the new game into {}: {}", out.parent_path().string(), ec.message());
+        return false;
+    }
+    DWORD err = 0;
+    for (int attempt = 0; attempt < 10; attempt++) {
+        if (MoveFileExW(fresh.c_str(), out.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            return true;
+        err = GetLastError();
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    fs::remove(fresh, ec);
+    error = fmt::format("The old {} could not be replaced ({}): close the game and anything else using it, then build "
+                        "again. The installed game was left as it was.",
+                        out.string(), std::system_category().message(int(err)));
+    return false;
+}
+
 bool BuildGame(const Paths& p, int jobs, Progress& prog) {
     prog.running = true;
     prog.finished = false;
@@ -736,10 +762,8 @@ bool BuildGame(const Paths& p, int jobs, Progress& prog) {
     }
     if (const int rc = Run(W(Q(link) + " @" + Q(rsp)), &env, log, BELOW_NORMAL_PRIORITY_CLASS, &prog.cancel); rc != 0)
         return fail(fmt::format("Linking failed (code {}); see {}", rc, log.string()));
-    fs::remove(p.out_exe, ec);
-    fs::rename(p.work_dir / "mua3.exe", p.out_exe, ec);
-    if (ec)
-        return fail("Could not write " + p.out_exe.string() + " (is the game running?)");
+    if (std::string why; !ReplaceExe(p.work_dir / "mua3.exe", p.out_exe, why))
+        return fail(why);
     // 6. the game's shaders, translated and compiled now so none is built while playing (shader_cache/, made from
     // the player's own install like the game itself). Not fatal: the game builds whatever is missing as it runs.
     stage("Preparing the game's shaders (up to half an hour on a hard disk)");

@@ -66,6 +66,10 @@ struct Progress {
 
 // Runs every step (blocking; the launcher calls it on a worker thread). `jobs` compilers run at once.
 bool BuildGame(const Paths& paths, int jobs, Progress& progress);
+
+// Puts the freshly linked `built` in place of `out` in one step (copied next to it as <name>.new, then swapped in),
+// or leaves `out` as it was and says why (`error`). Retries for about 5 s.
+bool ReplaceExe(const fs::path& built, const fs::path& out, std::string& error);
 // Compiler jobs that fit this PC: cores - 1, at most one per 2.5 GB of RAM.
 int DefaultJobs();
 // True when a built mua3.exe is newer than everything it was built from.
