@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <thread>
 #include <fstream>
 #include <mutex>
@@ -77,6 +78,48 @@ static void StartLogWriter() {
     (void)started;
 }
 
+// Test-harness log mirror (MUA3_TEST_STATE=<name>, off by default): every log line is also appended to a named
+// shared-memory block "Local\<name>", so test scripts read the game's state without waiting on err.log (which a busy
+// hard disk delays by minutes). Layout: u64 magic "MUA3LOG1", u64 data capacity, u64 bytes written (published after
+// the bytes, release), u64 1 once full (then nothing more is appended: readers fall back to err.log); data at +64.
+// Read once at the first log line; when the variable is unset this costs one branch per line.
+namespace {
+struct LogMirror {
+    u8* base = nullptr;
+    u64 cap = 0;
+    LogMirror() {
+        char name[128]{};
+        if (!GetEnvironmentVariableA("MUA3_TEST_STATE", name, sizeof(name)) || !name[0])
+            return;
+        constexpr u64 kSize = 64ull << 20;
+        const std::string full = std::string("Local\\") + name;
+        HANDLE h = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, DWORD(kSize), full.c_str());
+        if (!h)
+            return;
+        base = static_cast<u8*>(MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, kSize));
+        if (!base)
+            return; // (the handle stays open for the process's life: the block lives as long as the game)
+        cap = kSize - 64;
+        std::memcpy(base, "MUA3LOG1", 8);
+        std::memcpy(base + 8, &cap, 8);
+    }
+    void Append(const std::string& line) { // (under g_queue_mutex: one writer at a time)
+        auto* pos = reinterpret_cast<std::atomic<u64>*>(base + 16);
+        const u64 p = pos->load(std::memory_order_relaxed);
+        if (p + line.size() > cap) {
+            reinterpret_cast<std::atomic<u64>*>(base + 24)->store(1, std::memory_order_release);
+            return;
+        }
+        std::memcpy(base + 64 + p, line.data(), line.size());
+        pos->store(p + line.size(), std::memory_order_release);
+    }
+};
+LogMirror& Mirror() {
+    static LogMirror m;
+    return m;
+}
+} // namespace
+
 void LogRaw(LogLevel level, const char* category, std::string_view message) {
     static const char* names[] = {"TRACE", "DEBUG", "INFO ", "WARN ", "ERROR", "FATAL"};
     const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count();
@@ -85,6 +128,8 @@ void LogRaw(LogLevel level, const char* category, std::string_view message) {
     StartLogWriter();
     {
         std::lock_guard lk(g_queue_mutex);
+        if (LogMirror& m = Mirror(); m.base)
+            m.Append(line);
         if (g_queue.size() + line.size() <= kMaxQueued)
             g_queue += line;
         else
