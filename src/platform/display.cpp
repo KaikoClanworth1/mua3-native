@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <ctime>
+#include <thread>
 #include <cstdlib>
 #include <d3d11.h>
 #include <dxgi1_5.h>
@@ -444,24 +445,40 @@ void Display::SaveBackbuffer(const fs::path& path) {
         ctx_->CopyResource(st, bb);
         D3D11_MAPPED_SUBRESOURCE m;
         if (SUCCEEDED(ctx_->Map(st, 0, D3D11_MAP_READ, 0, &m))) {
-            const u32 w = td.Width, h = td.Height, row = (w * 3 + 3) & ~3u;
-            std::vector<u8> file(54 + size_t(row) * h, 0);
-            auto put32 = [&](size_t o, u32 v) { std::memcpy(&file[o], &v, 4); };
-            file[0] = 'B', file[1] = 'M';
-            put32(2, u32(file.size())), put32(10, 54), put32(14, 40), put32(18, w), put32(22, h);
-            file[26] = 1, file[28] = 24;
-            const bool bgra = td.Format == DXGI_FORMAT_B8G8R8A8_UNORM || td.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-            for (u32 y = 0; y < h; y++) {
-                const u8* src = static_cast<const u8*>(m.pData) + size_t(y) * m.RowPitch;
-                u8* dst = &file[54 + size_t(h - 1 - y) * row];
-                for (u32 x = 0; x < w; x++) {
-                    dst[x * 3 + 0] = src[x * 4 + (bgra ? 0 : 2)];
-                    dst[x * 3 + 1] = src[x * 4 + 1];
-                    dst[x * 3 + 2] = src[x * 4 + (bgra ? 2 : 0)];
-                }
-            }
+            // Only the copy happens here, under the caller's context lock: the BMP is encoded and written on a thread
+            // of its own. Writing a 4K BMP (33 MB) under the lock stalled the GPU thread for seconds whenever the
+            // disk was slow (#8: 5-41 s stalls in the runner's shot-taking runs).
+            const u32 w = td.Width, h = td.Height;
+            std::vector<u8> pixels(size_t(w) * 4 * h);
+            for (u32 y = 0; y < h; y++)
+                std::memcpy(&pixels[size_t(y) * w * 4], static_cast<const u8*>(m.pData) + size_t(y) * m.RowPitch, size_t(w) * 4);
             ctx_->Unmap(st, 0);
-            common::WriteFile(path, file);
+            const bool bgra = td.Format == DXGI_FORMAT_B8G8R8A8_UNORM || td.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+            std::thread([path, w, h, bgra, pixels = std::move(pixels)] {
+                const u32 row = (w * 3 + 3) & ~3u;
+                std::vector<u8> file(54 + size_t(row) * h, 0);
+                auto put32 = [&](size_t o, u32 v) { std::memcpy(&file[o], &v, 4); };
+                file[0] = 'B', file[1] = 'M';
+                put32(2, u32(file.size())), put32(10, 54), put32(14, 40), put32(18, w), put32(22, h);
+                file[26] = 1, file[28] = 24;
+                for (u32 y = 0; y < h; y++) {
+                    const u8* src = &pixels[size_t(y) * w * 4];
+                    u8* dst = &file[54 + size_t(h - 1 - y) * row];
+                    for (u32 x = 0; x < w; x++) {
+                        dst[x * 3 + 0] = src[x * 4 + (bgra ? 0 : 2)];
+                        dst[x * 3 + 1] = src[x * 4 + 1];
+                        dst[x * 3 + 2] = src[x * 4 + (bgra ? 2 : 0)];
+                    }
+                }
+                // written beside the target and renamed, so a reader waiting for the file never sees half of it
+                fs::path tmp = path;
+                tmp += ".part";
+                common::WriteFile(tmp, file);
+                std::error_code ec;
+                fs::rename(tmp, path, ec);
+                if (ec)
+                    fs::remove(tmp, ec);
+            }).detach();
         }
         st->Release();
     }
