@@ -75,6 +75,16 @@ private:
     static bool TearingSupported();
     u32 SwapChainFlags() const;
     void SaveBackbuffer(const fs::path& path);
+    void CollectShots();
+    void DropShots();
+    struct PendingShot {
+        struct ID3D11Texture2D* staging;
+        fs::path path;
+        u32 w, h;
+        bool bgra;
+        u32 frames;
+    };
+    std::vector<PendingShot> pending_shots_; // copies the GPU has not finished yet (SaveBackbuffer -> CollectShots)
     void DrawFrameTexture();
 
     SDL_Window* window_ = nullptr;

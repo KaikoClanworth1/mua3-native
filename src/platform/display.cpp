@@ -187,6 +187,7 @@ bool Display::RecoverDevice() {
     std::unique_lock<std::recursive_mutex> lk;
     if (context_mutex)
         lk = std::unique_lock(*context_mutex);
+    DropShots();
     if (release_device)
         release_device();
     ImGui_ImplDX11_Shutdown();
@@ -250,6 +251,7 @@ void Display::CreateBackbuffer() {
 }
 
 void Display::Shutdown() {
+    DropShots();
     if (ImGui::GetCurrentContext()) {
         ImGui_ImplDX11_Shutdown();
         ImGui_ImplSDL3_Shutdown();
@@ -429,7 +431,10 @@ void Display::DrawFrameTexture() {
     dl->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
 }
 
-// Writes the current backbuffer to a 24-bit BMP (automation: screenshots of hidden windows).
+// Writes the current backbuffer to a 24-bit BMP (automation: screenshots of hidden windows). Only the GPU copy into a
+// staging texture happens now; CollectShots maps it once the GPU is done (D3D11_MAP_FLAG_DO_NOT_WAIT, a later frame),
+// so a shot never holds the context lock while the GPU is behind, and a thread of its own encodes and writes the
+// file (#8: a 33 MB 4K write, and then the map's wait, under the lock stalled the GPU thread for seconds).
 void Display::SaveBackbuffer(const fs::path& path) {
     ID3D11Texture2D* bb = nullptr;
     if (FAILED(swapchain_->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb)))
@@ -443,18 +448,31 @@ void Display::SaveBackbuffer(const fs::path& path) {
     ID3D11Texture2D* st = nullptr;
     if (SUCCEEDED(device_->CreateTexture2D(&td, nullptr, &st))) {
         ctx_->CopyResource(st, bb);
+        pending_shots_.push_back({st, path, td.Width, td.Height,
+                                  td.Format == DXGI_FORMAT_B8G8R8A8_UNORM || td.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, 0});
+    }
+    bb->Release();
+}
+
+// The shots whose GPU copy has finished: their pixels go to a writer thread (encoded there, written to <name>.part,
+// then renamed). Called under the context lock each frame; never waits (a shot is dropped after 600 frames).
+void Display::CollectShots() {
+    for (size_t i = 0; i < pending_shots_.size();) {
+        PendingShot& ps = pending_shots_[i];
         D3D11_MAPPED_SUBRESOURCE m;
-        if (SUCCEEDED(ctx_->Map(st, 0, D3D11_MAP_READ, 0, &m))) {
-            // Only the copy happens here, under the caller's context lock: the BMP is encoded and written on a thread
-            // of its own. Writing a 4K BMP (33 MB) under the lock stalled the GPU thread for seconds whenever the
-            // disk was slow (#8: 5-41 s stalls in the runner's shot-taking runs).
-            const u32 w = td.Width, h = td.Height;
+        const HRESULT hr = ctx_->Map(ps.staging, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+        if (hr == DXGI_ERROR_WAS_STILL_DRAWING && ++ps.frames < 600) {
+            i++;
+            continue;
+        }
+        if (SUCCEEDED(hr)) {
+            const u32 w = ps.w, h = ps.h;
+            const bool bgra = ps.bgra;
             std::vector<u8> pixels(size_t(w) * 4 * h);
             for (u32 y = 0; y < h; y++)
                 std::memcpy(&pixels[size_t(y) * w * 4], static_cast<const u8*>(m.pData) + size_t(y) * m.RowPitch, size_t(w) * 4);
-            ctx_->Unmap(st, 0);
-            const bool bgra = td.Format == DXGI_FORMAT_B8G8R8A8_UNORM || td.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-            std::thread([path, w, h, bgra, pixels = std::move(pixels)] {
+            ctx_->Unmap(ps.staging, 0);
+            std::thread([path = ps.path, w, h, bgra, pixels = std::move(pixels)] {
                 const u32 row = (w * 3 + 3) & ~3u;
                 std::vector<u8> file(54 + size_t(row) * h, 0);
                 auto put32 = [&](size_t o, u32 v) { std::memcpy(&file[o], &v, 4); };
@@ -470,7 +488,6 @@ void Display::SaveBackbuffer(const fs::path& path) {
                         dst[x * 3 + 2] = src[x * 4 + (bgra ? 2 : 0)];
                     }
                 }
-                // written beside the target and renamed, so a reader waiting for the file never sees half of it
                 fs::path tmp = path;
                 tmp += ".part";
                 common::WriteFile(tmp, file);
@@ -479,16 +496,25 @@ void Display::SaveBackbuffer(const fs::path& path) {
                 if (ec)
                     fs::remove(tmp, ec);
             }).detach();
+        } else {
+            LOG_WARN("Display", "screenshot {} dropped ({:#x})", ps.path.string(), u32(hr));
         }
-        st->Release();
+        ps.staging->Release();
+        pending_shots_.erase(pending_shots_.begin() + i);
     }
-    bb->Release();
+}
+
+void Display::DropShots() {
+    for (PendingShot& ps : pending_shots_)
+        ps.staging->Release();
+    pending_shots_.clear();
 }
 
 void Display::EndFrame() {
     std::unique_lock<std::recursive_mutex> lk;
     if (context_mutex)
         lk = std::unique_lock(*context_mutex);
+    CollectShots();
     ImGui::Render();
     const float clear[4] = {0, 0, 0, 1};
     ctx_->OMSetRenderTargets(1, &rtv_, nullptr);
