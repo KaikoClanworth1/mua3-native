@@ -5,9 +5,11 @@
 #include <cstring>
 #include <set>
 #include <string>
+#include <vector>
 
 #include <windows.h>
 #include <dbghelp.h>
+#include <tlhelp32.h>
 #pragma comment(lib, "dbghelp.lib")
 
 #include "core/memory.h"
@@ -109,6 +111,114 @@ Gpu::~Gpu() {
         watchdog_.join();
 }
 
+// ---------------------------------------------------------------- watchdog stacks
+// A thread's host stack: raw return addresses while it is suspended (it may hold the heap or loader lock, so nothing
+// here allocates or names), named by StackText after it runs again.
+static int WalkStack(HANDLE th, DWORD64 (&pcs)[24]) {
+    int n = 0;
+    if (SuspendThread(th) == DWORD(-1))
+        return 0;
+    CONTEXT ctx{};
+    ctx.ContextFlags = CONTEXT_FULL;
+    if (GetThreadContext(th, &ctx))
+        for (; n < 24 && ctx.Rip; n++) {
+            pcs[n] = ctx.Rip;
+            DWORD64 image = 0;
+            RUNTIME_FUNCTION* fn = RtlLookupFunctionEntry(ctx.Rip, &image, nullptr);
+            if (!fn) { // leaf function: the return address is on top of the stack
+                ctx.Rip = *reinterpret_cast<DWORD64*>(ctx.Rsp);
+                ctx.Rsp += 8;
+                continue;
+            }
+            void* handler_data = nullptr;
+            DWORD64 frame = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, fn, &ctx, &handler_data, &frame, nullptr);
+        }
+    ResumeThread(th);
+    return n;
+}
+
+static std::string StackText(const DWORD64* pcs, int n, const char* sep) {
+    static const bool sym = [] {
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+        char exe[MAX_PATH]{}; // the pdb sits next to the exe
+        GetModuleFileNameA(nullptr, exe, MAX_PATH);
+        std::string dir(exe);
+        dir = dir.substr(0, dir.find_last_of("\\/"));
+        SymInitialize(GetCurrentProcess(), dir.c_str(), TRUE); // (fails harmlessly if already done elsewhere)
+        return true;
+    }();
+    (void)sym;
+    std::string stack;
+    for (int i = 0; i < n; i++) {
+        alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256]{};
+        auto* si = reinterpret_cast<SYMBOL_INFO*>(buf);
+        si->SizeOfStruct = sizeof(SYMBOL_INFO);
+        si->MaxNameLen = 255;
+        DWORD64 disp = 0;
+        HMODULE mod = nullptr;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCSTR>(pcs[i]), &mod))
+            GetModuleFileNameA(mod, name, MAX_PATH);
+        const char* base = std::max(std::strrchr(name, '\\'), std::strrchr(name, '/'));
+        base = base ? base + 1 : name;
+        stack += sep;
+        if (SymFromAddr(GetCurrentProcess(), pcs[i], &disp, si))
+            stack += fmt::format("{}!{}+{:#x}", base, si->Name, disp);
+        else
+            stack += fmt::format("{}+{:#x}", base, mod ? pcs[i] - u64(mod) : pcs[i]);
+    }
+    return stack;
+}
+
+// Every other thread's stack (at a stall's first report: whoever holds the lock the GPU thread waits on shows up
+// here). Each thread is suspended alone, walked and resumed before the next; the raw addresses are named afterwards
+// by AllThreadText (naming loads the pdb the first time, which takes seconds; the walk itself is quick).
+struct ThreadStack {
+    DWORD id;
+    std::string name;
+    DWORD64 pcs[24];
+    int n;
+};
+static std::vector<ThreadStack> WalkAllThreads(DWORD skip_a, DWORD skip_b) {
+    std::vector<ThreadStack> ts;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return ts;
+    THREADENTRY32 te{};
+    te.dwSize = sizeof(te);
+    const DWORD pid = GetCurrentProcessId();
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == skip_a || te.th32ThreadID == skip_b)
+            continue;
+        HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE,
+                               te.th32ThreadID);
+        if (!th)
+            continue;
+        ThreadStack t{te.th32ThreadID, {}, {}, 0};
+        PWSTR d = nullptr;
+        if (SUCCEEDED(GetThreadDescription(th, &d)) && d) {
+            for (const wchar_t* c = d; *c; c++)
+                t.name += *c < 128 ? char(*c) : '?';
+            LocalFree(d);
+        }
+        t.n = WalkStack(th, t.pcs);
+        CloseHandle(th);
+        ts.push_back(std::move(t));
+    }
+    CloseHandle(snap);
+    return ts;
+}
+static std::string AllThreadText(const std::vector<ThreadStack>& ts) {
+    if (ts.empty())
+        return "\n    (no thread snapshot)";
+    std::string out;
+    for (const ThreadStack& t : ts)
+        out += fmt::format("\n  thread {} '{}':{}", t.id, t.name, StackText(t.pcs, t.n, " < "));
+    return out;
+}
+
 void Gpu::WatchdogMain() {
     SetThreadDescription(GetCurrentThread(), L"GPU watchdog");
     // A stall: no job finished for 5 s while one runs or some wait in the queue (a thread stuck in a job, or one that
@@ -116,6 +226,7 @@ void Gpu::WatchdogMain() {
     u64 last_done = ~0ull;
     u64 since = NowNs(); // when a job last finished, or the thread was last idle with nothing queued
     double next_report = 0, last_cpu = 0, last_s = 0;
+    bool all_dumped = false; // this stall's every-thread dump was written
     // the thread's CPU time beside its stack: climbing with a stack that does not move is a spin, flat is a wait
     auto cpu_s = [&] {
         FILETIME c, e, k, u;
@@ -134,7 +245,7 @@ void Gpu::WatchdogMain() {
             queued = queue_.size();
         }
         if (done != last_done || (!start && !queued)) {
-            last_done = done, since = NowNs(), next_report = 0;
+            last_done = done, since = NowNs(), next_report = 0, all_dumped = false;
             last_cpu = cpu_s(), last_s = 0;
             continue;
         }
@@ -146,63 +257,22 @@ void Gpu::WatchdogMain() {
         if (s < next_report)
             continue;
         next_report = s < 10 ? 10 : s * 2; // at 5 s, 10 s, 20 s, 40 s ...
-        // The thread's host stack: raw return addresses while it is suspended (it may hold the heap or loader lock),
-        // named after it runs again.
         HANDLE th = static_cast<HANDLE>(thread_.native_handle());
         DWORD64 pcs[24];
-        int n = 0;
-        if (SuspendThread(th) != DWORD(-1)) {
-            CONTEXT ctx{};
-            ctx.ContextFlags = CONTEXT_FULL;
-            if (GetThreadContext(th, &ctx))
-                for (; n < 24 && ctx.Rip; n++) {
-                    pcs[n] = ctx.Rip;
-                    DWORD64 image = 0;
-                    RUNTIME_FUNCTION* fn = RtlLookupFunctionEntry(ctx.Rip, &image, nullptr);
-                    if (!fn) { // leaf function: the return address is on top of the stack
-                        ctx.Rip = *reinterpret_cast<DWORD64*>(ctx.Rsp);
-                        ctx.Rsp += 8;
-                        continue;
-                    }
-                    void* handler_data = nullptr;
-                    DWORD64 frame = 0;
-                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, fn, &ctx, &handler_data, &frame, nullptr);
-                }
-            ResumeThread(th);
-        }
-        static const bool sym = [] {
-            SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
-            char exe[MAX_PATH]{}; // the pdb sits next to the exe
-            GetModuleFileNameA(nullptr, exe, MAX_PATH);
-            std::string dir(exe);
-            dir = dir.substr(0, dir.find_last_of("\\/"));
-            SymInitialize(GetCurrentProcess(), dir.c_str(), TRUE); // (fails harmlessly if already done elsewhere)
-            return true;
-        }();
-        (void)sym;
-        std::string stack;
-        for (int i = 0; i < n; i++) {
-            alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256]{};
-            auto* si = reinterpret_cast<SYMBOL_INFO*>(buf);
-            si->SizeOfStruct = sizeof(SYMBOL_INFO);
-            si->MaxNameLen = 255;
-            DWORD64 disp = 0;
-            HMODULE mod = nullptr;
-            char name[MAX_PATH] = "?";
-            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                   reinterpret_cast<LPCSTR>(pcs[i]), &mod))
-                GetModuleFileNameA(mod, name, MAX_PATH);
-            const char* base = std::max(std::strrchr(name, '\\'), std::strrchr(name, '/'));
-            base = base ? base + 1 : name;
-            if (SymFromAddr(GetCurrentProcess(), pcs[i], &disp, si))
-                stack += fmt::format("\n    {}!{}+{:#x}", base, si->Name, disp);
-            else
-                stack += fmt::format("\n    {}+{:#x}", base, mod ? pcs[i] - u64(mod) : pcs[i]);
-        }
+        const int n = WalkStack(th, pcs);
+        // At the first report of a stall, every other thread too (once per stall): the GPU thread is usually blocked
+        // on a lock (the D3D11 context mutex) and its holder is somewhere else. Walked now, named below.
+        const bool all = !all_dumped;
+        all_dumped = true;
+        std::vector<ThreadStack> others;
+        if (all)
+            others = WalkAllThreads(GetThreadId(th), GetCurrentThreadId());
+        // its CPU use up to now, before naming the stack (the first naming loads the pdb, seconds)
+        const double cpu = cpu_s(), now_s = double(NowNs() - since) / 1e9;
+        const double used = now_s > last_s ? (cpu - last_cpu) / (now_s - last_s) * 100 : 0;
+        last_cpu = cpu, last_s = now_s;
+        const std::string stack = StackText(pcs, n, "\n    ");
         const int kind = job_kind_.load(std::memory_order_relaxed);
-        const double cpu = cpu_s();
-        const double used = s > last_s ? (cpu - last_cpu) / (s - last_s) * 100 : 0;
-        last_cpu = cpu, last_s = s;
         const std::string what = start ? fmt::format("in one {} job", kind == Job::Present ? "present"
                                                                       : kind == Job::Host  ? "command"
                                                                                            : "?")
@@ -210,6 +280,9 @@ void Gpu::WatchdogMain() {
         LOG_WARN("GPU", "GPU thread waiting {:.0f} s {} ({} queued, {} jobs done), {:.0f} % of a CPU since the last check ({}); "
                         "host stack:{}",
                  s, what, queued, done, used, used > 50 ? "spinning" : "waiting", stack);
+        if (all)
+            LOG_WARN("GPU", "GPU thread waiting {:.0f} s: every other thread's host stack (innermost first):{}", s,
+                     AllThreadText(others));
     }
 }
 
