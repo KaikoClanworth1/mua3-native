@@ -91,6 +91,18 @@ void TextureCache::Invalidate(u64 gpu_va, u64 size) {
         // (#8) a texture rewritten this way before is updatable: keep it and decode into it again on its next use,
         // instead of a new D3D11 texture per rewrite (VIC writes each video frame; the AMD driver keeps the old ones)
         if (t.updatable && !no_reuse_) {
+            if (const u64 movie = MovieWatch()) { // (#22) per movie, its first 3 rewritten video textures (luma, chroma)
+                static u64 movie_seen = 0;
+                static std::vector<u64> seen;
+                if (movie_seen != movie)
+                    movie_seen = movie, seen.clear();
+                if (seen.size() < 3 && std::find(seen.begin(), seen.end(), t.gpu_va) == seen.end()) {
+                    seen.push_back(t.gpu_va);
+                    LOG_INFO("Texture", "movie texture rewritten: texture {:#x}+{:#x} (cpu {:#x}) by a write to {:#x}+{:#x} "
+                                        "(cpu {:#x}, movie plane {})", t.gpu_va, t.size, G().As().Translate(t.gpu_va), gpu_va,
+                             size, G().As().Translate(gpu_va), MoviePlaneAt(G().As().Translate(gpu_va)));
+                }
+            }
             t.dma_dirty = true;
             ++it;
             continue;
@@ -238,6 +250,20 @@ ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::T
             return v;
     }
     r_.SyncGuest(addr, 1, 1);
+    // (#22) once per movie and plane: how the game's shader gets it (only while a movie's planes are still unreported)
+    if (const u64 movie = MovieWatch()) {
+        static u64 done[3] = {};
+        const int plane = MoviePlaneAt(G().As().Translate(addr));
+        if (plane && done[plane] != movie) {
+            done[plane] = movie;
+            const Surface* s = r_.FindSurfaceByGpu(addr);
+            const bool by_surface = s && s->srv && use.dim == shader::TexDim::Tex2D && !use.array;
+            LOG_INFO("Texture", "movie {} plane {:#x}: texture {}x{} format {:#x} swizzle {:#x}, {}", plane == 1 ? "luma" : "chroma",
+                     addr, tic.Width(), tic.Height(), tic.Format(), tic.Swizzle(),
+                     by_surface ? fmt::format("served by a render target {}x{} format {:#x}", s->width, s->height, s->format)
+                                : std::string("from the texture cache"));
+        }
+    }
     if (use.dim == shader::TexDim::Tex3D) {
         static int n = 0;
         if (n++ < 4)
