@@ -780,6 +780,8 @@ int main(int argc, char** argv) {
         return gpu::TestMotionVectors(fs::u8path(argv[2]), argc == 4 ? std::atoi(argv[3]) : 0);
     core::Config cfg;
     cfg.Load("mua3.ini");
+    if (!cfg.fxc_cs.empty() && !std::getenv("MUA3_FXC_CS")) // [debug] fxc_cs: read by the shader cache (an env var wins)
+        _putenv_s("MUA3_FXC_CS", cfg.fxc_cs.c_str());
     int watch_seconds = 0;
     bool headless = false;
     int autopress_after = 0; // test aid: tap A every 3 s after N seconds (headless)

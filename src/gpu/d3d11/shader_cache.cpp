@@ -246,6 +246,32 @@ void FxcServerIdle() {
     if (t_fxc.proc)
         t_fxc.Close();
 }
+
+// Compute shaders built by FXC instead of the direct DXBC backend: all of them (MUA3_FXC_COMPUTE), or those whose hash
+// is listed in MUA3_FXC_CS (hex, separated by commas or spaces; a base program's hash also covers its variants). main.cpp
+// sets MUA3_FXC_CS from mua3.ini [debug] fxc_cs. Tells a graphics driver's handling of our own bytecode apart from a
+// translation fault on a player's GPU (#23).
+bool ComputeViaFxc(const HostShader& s) {
+    static const bool all = std::getenv("MUA3_FXC_COMPUTE") != nullptr;
+    static const std::unordered_set<u64> listed = [] {
+        std::unordered_set<u64> set;
+        if (const char* e = std::getenv("MUA3_FXC_CS"))
+            for (const char* p = e; *p;) {
+                char* end = nullptr;
+                const u64 h = std::strtoull(p, &end, 16);
+                if (end == p) {
+                    p++;
+                    continue;
+                }
+                set.insert(h);
+                p = end;
+            }
+        if (!set.empty())
+            LOG_INFO("Shader", "{} compute shader(s) built by FXC instead of the direct backend (fxc_cs)", set.size());
+        return set;
+    }();
+    return all || listed.count(s.hash) || (s.base && listed.count(s.base->hash));
+}
 } // namespace
 
 
@@ -438,7 +464,7 @@ bool ShaderCache::Build(HostShader& s, bool slow) {
     }
     const char* target = StageTarget(s.stage);
     // Compute shaders go through the direct DXBC backend (milliseconds): no slow FXC queue for them.
-    const bool direct = s.stage == shader::Stage::Compute && !std::getenv("MUA3_FXC_COMPUTE");
+    const bool direct = s.stage == shader::Stage::Compute && !ComputeViaFxc(s);
     // Vertex and pixel shaders: FXC, and the direct backend for what FXC fails on (Compile). MUA3_DIRECT_VSPS=1 uses
     // the direct backend first (milliseconds instead of up to minutes per loop shader), but its bytecode costs the
     // driver ~2.5x FXC's to compile at first draw, so it is not the default.
@@ -860,7 +886,7 @@ fs::path ShaderCache::CachePath(const HostShader& s, const char* target) const {
 
 bool ShaderCache::Compile(HostShader& s, const std::string& hlsl, std::string& err, bool out_of_process) {
     const char* target = StageTarget(s.stage);
-    if (s.stage == shader::Stage::Compute && !std::getenv("MUA3_FXC_COMPUTE") && !s.direct_dxbc) {
+    if (s.stage == shader::Stage::Compute && !ComputeViaFxc(s) && !s.direct_dxbc) {
         std::vector<u8> blob;
         std::string derr;
         std::string src = hlsl;
@@ -1681,7 +1707,7 @@ void ShaderCache::BuildVariantSource(HostShader& s) {
         // Not for compute: the direct backend compiles the HLSL below and never loads cached bytecode, so a compute
         // variant with a leftover cache entry was built from its base's float4 declarations (FLOAT views over UINT
         // texel buffers, #8).
-        const bool loads_cache = s.stage != shader::Stage::Compute || std::getenv("MUA3_FXC_COMPUTE");
+        const bool loads_cache = s.stage != shader::Stage::Compute || ComputeViaFxc(s);
         if (!overridden && loads_cache && HasBytecode(s)) {
             s.info = base->info;
             return;

@@ -2433,9 +2433,20 @@ bool Translator::Seq(u32 first, u32 last, u32 end_target, LoopCtx ctx, u32 skip_
                 // otherwise multiply their caps (a solver that never converges on another GPU's float maths ran
                 // 4096^3 iterations, a multi-second dispatch and a driver reset, GitHub #8). Once the budget is
                 // spent, every enclosing loop also leaves at its next header.
-                SLine("loop_total_ += 1u;");
-                SLine(fmt::format("if (li_ >= 4096u || loop_total_ > {}u) {{ loop_capped = true; break; }}",
-                                  stage_ == Stage::Compute ? 65536 : 32768));
+                // A compute loop holding a group barrier is capped on its own counter only: the shared budget differs
+                // between threads (their inner loops run different counts), so a break on it is divergent flow
+                // around a barrier. That is undefined on the GPU (each driver compiles it its own way; FXC refuses it,
+                // X3663) although the cap never fires in practice (light-list sort 8d1754b934e53aa0, #23).
+                bool barrier = false;
+                for (u32 j = i; stage_ == Stage::Compute && j <= latch && !barrier; j++)
+                    barrier = sblocks_[j].body.find("GroupMemoryBarrierWithGroupSync") != std::string::npos;
+                if (barrier) {
+                    SLine("if (li_ >= 4096u) { loop_capped = true; break; } // (barrier loop: uniform cap)");
+                } else {
+                    SLine("loop_total_ += 1u;");
+                    SLine(fmt::format("if (li_ >= 4096u || loop_total_ > {}u) {{ loop_capped = true; break; }}",
+                                      stage_ == Stage::Compute ? 65536 : 32768));
+                }
                 if (!Seq(i, loop_end, loop_end, LoopCtx{i, loop_end}, i))
                     return false;
                 SLine("break;");
