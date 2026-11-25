@@ -88,7 +88,14 @@ struct Installed {
     // dev=1, written by hand: a developer's game folder (junctions to shared data, real saves). Its launcher has no
     // update, repair or uninstall, and wins over the Apps entry when the launcher runs from there.
     bool dev = false;
+    std::string version; // the setup version that built mua3.exe (empty: built by a setup older than v0.4.3)
 };
+// The version that built the installed mua3.exe: setup.ini's version, else the first line of the game's last
+// mua3.log ("MUA3 Native v0.4.1"), else empty (unknown).
+std::string GameVersion(const Installed& in);
+// True when the installed mua3.exe was built by an older version than `running` (this setup or launcher), or by an
+// unknown one (installs made before v0.4.3 record none). False for a developer folder (dev=1) or a "dev" build.
+bool GameOlder(const Installed& in, const std::string& running);
 std::optional<Installed> FindInstalled(); // from the Apps entry
 bool SaveInstalled(const Installed& in);   // setup.ini
 std::optional<Installed> LoadInstalled(const fs::path& dir);
