@@ -1760,36 +1760,9 @@ void InstalledPage(Wizard& w, bool& quit) {
         ImGui::TextUnformatted("Marvel Ultimate Alliance 3 is installed");
     }
     Dim("In " + Short(in.dir, 70), false);
-    ImGui::EndGroup();
-    ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + 2 * r + S(28)));
-    const bool exe = fs::exists(in.dir / "mua3.exe");
-    auto card = [&](const char* id, const char* title, const char* sub, bool primary) {
-        ImGui::PushID(id);
-        const ImVec2 a = ImGui::GetCursorScreenPos();
-        const float wd = ImGui::GetContentRegionAvail().x;
-        const float h = S(72);
-        const bool pressed = ImGui::InvisibleButton("card", ImVec2(wd, h));
-        const bool hov = ImGui::IsItemHovered();
-        dl->AddRectFilled(a, ImVec2(a.x + wd, a.y + h), primary ? Alpha(col::accent, hov ? 90 : 60) : IM_COL32(255, 255, 255, hov ? 20 : 10), S(10));
-        dl->AddRect(a, ImVec2(a.x + wd, a.y + h), primary ? Alpha(col::accent_hi, 140) : col::panel_border, S(10));
-        {
-            FontScope f(g_semibold, 17);
-            dl->AddText(ImVec2(a.x + S(22), a.y + S(14)), col::text, title);
-        }
-        {
-            FontScope f(g_regular, kSmall);
-            dl->AddText(ImVec2(a.x + S(22), a.y + S(40)), primary ? IM_COL32(210, 220, 255, 255) : col::dim, sub);
-        }
-        {
-            FontScope f(g_semibold, 20);
-            dl->AddText(ImVec2(a.x + wd - S(36), a.y + h * 0.5f - S(12)), hov ? col::text : col::dim, ">");
-        }
-        ImGui::Dummy(S(1, 4));
-        ImGui::PopID();
-        return pressed;
-    };
     // The installed game built by an older version than this setup (issue #8: Play here ran the old game under a
-    // launcher showing the new version): Update comes first and is the highlighted card.
+    // launcher showing the new version): a line under the folder, and Update comes first and is highlighted.
+    const bool exe = fs::exists(in.dir / "mua3.exe");
     static fs::path older_dir;
     static bool older = false;
     static std::string game_version;
@@ -1802,16 +1775,42 @@ void InstalledPage(Wizard& w, bool& quit) {
     }
     const bool old_game = exe && older;
     if (old_game) {
-        const std::string line = (game_version.empty() ? std::string("The installed game was built by an older version")
-                                                       : "The installed game was built by " + game_version) +
-                                 ". This setup is " + common::Version() + ": update to build the game with it.";
+        FontScope f(g_regular, kSmall);
+        ImGui::PushStyleColor(ImGuiCol_Text, V(col::amber));
+        ImGui::TextUnformatted(((game_version.empty() ? std::string("The game was built by an older version")
+                                                      : "The game was built by " + game_version) +
+                                ". This setup is " + common::Version() + ": update to build it again.")
+                                   .c_str());
+        ImGui::PopStyleColor();
+    }
+    ImGui::EndGroup();
+    ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + 2 * r + S(28)));
+    auto card = [&](const char* id, const char* title, const char* sub, bool primary) {
+        ImGui::PushID(id);
+        const ImVec2 a = ImGui::GetCursorScreenPos();
+        const float wd = ImGui::GetContentRegionAvail().x;
+        const float h = S(62); // (four cards and the window's bottom margin: about 40 units clear at 960 x 620)
+        const bool pressed = ImGui::InvisibleButton("card", ImVec2(wd, h));
+        const bool hov = ImGui::IsItemHovered();
+        dl->AddRectFilled(a, ImVec2(a.x + wd, a.y + h), primary ? Alpha(col::accent, hov ? 90 : 60) : IM_COL32(255, 255, 255, hov ? 20 : 10), S(10));
+        dl->AddRect(a, ImVec2(a.x + wd, a.y + h), primary ? Alpha(col::accent_hi, 140) : col::panel_border, S(10));
+        {
+            FontScope f(g_semibold, 17);
+            dl->AddText(ImVec2(a.x + S(22), a.y + S(10)), col::text, title);
+        }
         {
             FontScope f(g_regular, kSmall);
-            ImGui::PushStyleColor(ImGuiCol_Text, V(col::amber));
-            ImGui::TextWrapped("%s", line.c_str());
-            ImGui::PopStyleColor();
+            dl->AddText(ImVec2(a.x + S(22), a.y + S(35)), primary ? IM_COL32(210, 220, 255, 255) : col::dim, sub);
         }
-        ImGui::Dummy(S(1, 6));
+        {
+            FontScope f(g_semibold, 20);
+            dl->AddText(ImVec2(a.x + wd - S(36), a.y + h * 0.5f - S(12)), hov ? col::text : col::dim, ">");
+        }
+        ImGui::Dummy(S(1, 4));
+        ImGui::PopID();
+        return pressed;
+    };
+    if (old_game) {
         if (card("update", "Update or repair", "Build the game again with this version (your saves and settings stay).", true))
             StartRepair(w);
     }
