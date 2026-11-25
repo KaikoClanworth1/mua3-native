@@ -154,4 +154,14 @@ private:
 Gpu& G();
 void Init(core::Memory& mem);
 
+// The movie playing now (#22): CPU addresses of the VIC output planes (luma, chroma; 0 = none; the video engine's
+// own addresses are another address space), set at each movie's first frame, so the texture cache can say once per
+// movie and plane how the game's shader gets that plane.
+void NoteMoviePlanes(u64 luma_cpu, u64 luma_size, u64 chroma_cpu, u64 chroma_size);
+// The current movie's number for 10 s after it starts (its planes are watched then), else 0: callers keep the
+// number they last reported per plane.
+u64 MovieWatch();
+// 1 luma, 2 chroma, 0 neither: the plane a CPU address lies in.
+int MoviePlaneAt(u64 cpu);
+
 } // namespace gpu

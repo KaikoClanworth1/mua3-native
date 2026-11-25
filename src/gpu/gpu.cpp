@@ -19,6 +19,38 @@ namespace gpu {
 
 static Gpu* g_gpu = nullptr;
 Gpu& G() { return *g_gpu; }
+
+static std::atomic<u64> g_movie_plane[2][2]{}; // [luma, chroma][cpu, size]
+static std::atomic<u64> g_movie_serial{0};
+static std::atomic<s64> g_movie_until{0}; // steady_clock ticks
+void NoteMoviePlanes(u64 luma_cpu, u64 luma_size, u64 chroma_cpu, u64 chroma_size) {
+    g_movie_plane[0][0] = luma_cpu, g_movie_plane[0][1] = luma_size;
+    g_movie_plane[1][0] = chroma_cpu, g_movie_plane[1][1] = chroma_size;
+    g_movie_until.store((std::chrono::steady_clock::now() + std::chrono::seconds(10)).time_since_epoch().count(),
+                        std::memory_order_relaxed);
+    g_movie_serial.fetch_add(1, std::memory_order_release);
+}
+u64 MovieWatch() {
+    const u64 serial = g_movie_serial.load(std::memory_order_acquire);
+    const s64 until = g_movie_until.load(std::memory_order_relaxed);
+    if (!serial || !until) // (the common case: one load, no clock read)
+        return 0;
+    if (std::chrono::steady_clock::now().time_since_epoch().count() > until) {
+        g_movie_until.store(0, std::memory_order_relaxed);
+        return 0;
+    }
+    return serial;
+}
+int MoviePlaneAt(u64 cpu) {
+    if (!cpu)
+        return 0;
+    for (int p = 0; p < 2; p++) {
+        const u64 base = g_movie_plane[p][0].load(std::memory_order_relaxed);
+        if (base && cpu >= base && cpu < base + g_movie_plane[p][1].load(std::memory_order_relaxed))
+            return p + 1;
+    }
+    return 0;
+}
 void Init(core::Memory& mem) { g_gpu = new Gpu(mem); }
 
 // ---------------------------------------------------------------- AddressSpace
@@ -515,6 +547,20 @@ void Gpu::RunDma(const u32* r, u32 launch) {
     const u32 lines = multi ? std::max<u32>(r[0x107], 1) : 1;
     if (!len)
         return;
+    if (const u64 movie = MovieWatch(); movie && !dst_pitch) { // (#22) per movie, its first 4 copies into textures
+        static u64 movie_seen = 0;
+        static int count = 0;
+        if (movie_seen != movie)
+            movie_seen = movie, count = 0;
+        if (count < 4) {
+            count++;
+            const u64 src_cpu = As().Translate(src);
+            LOG_INFO("GPU", "movie DMA {}: src {:#x} ({}, cpu {:#x}, movie plane {}) -> dst {:#x} block-linear, {} bytes x {} "
+                            "lines, pitch in {}, remap {} ({:#x}), dst surface {:#x} {:#x} {:#x}",
+                     count, src, src_pitch ? "pitch" : "block-linear", src_cpu, MoviePlaneAt(src_cpu), dst, len, lines,
+                     pitch_in, remap, r[0x1C2], r[0x1C3], r[0x1C4], r[0x1C5]);
+        }
+    }
 
     u32 bpp = 1; // bytes per element (DMA works in bytes unless remapping)
     if (remap) {

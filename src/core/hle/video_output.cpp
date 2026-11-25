@@ -12,6 +12,7 @@
 #include "core/memory.h"
 #include "core/system.h"
 #include "gpu/formats.h"
+#include "gpu/gpu.h"
 
 namespace video {
 
@@ -163,9 +164,14 @@ void VicExecute(const VicState& s, const std::function<u64(u64)>& translate) {
     }
     if (!NextFrame(m) && m.frame.empty())
         return;
-    if (m.frames <= 1)
-        LOG_INFO("Video", "VIC output {}x{} format {:#x} block-linear {} (height log2 {}) <- {}x{} frames", sw, sh, fmt, bl_kind, bh,
-                 m.width, m.height);
+    if (m.frames <= 1) {
+        const u64 pitch = (u64(sw) + 255) & ~255ull; // (0x44: Y plane then a half-height UV plane, as written below)
+        gpu::NoteMoviePlanes(luma, fmt == 0x44 ? pitch * sh : u64(sw) * sh * 4, s.chroma ? translate(s.chroma) : 0,
+                             pitch * ((sh + 1) / 2));
+        LOG_INFO("Video", "VIC output {}x{} format {:#x} block-linear {} (height log2 {}) <- {}x{} frames; luma gpu {:#x} "
+                          "chroma gpu {:#x} (cpu {:#x} / {:#x})", sw, sh, fmt, bl_kind, bh, m.width, m.height, s.luma, s.chroma,
+                 luma, s.chroma ? translate(s.chroma) : 0);
+    }
 
     // Scale (nearest) the decoded BGRX frame to the output surface and convert to its format.
     std::vector<u8> out;
