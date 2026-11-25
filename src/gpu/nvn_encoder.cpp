@@ -21,6 +21,7 @@
 #include "gpu/gpu.h"
 #include "gpu/draw_state.h"
 #include "gpu/renderer.h"
+#include "gpu/shader/harvest.h"
 #include "gpu/shader/translator.h"
 
 namespace gpu {
@@ -750,20 +751,44 @@ private:
         }
     }
 
+    // Per-program caches keyed by address go stale when the game loads other programs there (#22: after a quit and
+    // a reload, the YUV movie shader got another program's constant buffer 1, 0x100 bytes too far, read zeros and
+    // drew grey): dropped whenever the renderer saw shader code rewritten.
+    void CheckCodeGeneration() {
+        const u64 gen = g_.GetRenderer() ? g_.GetRenderer()->CodeGeneration() : 0;
+        if (gen != code_generation_) {
+            code_generation_ = gen;
+            constants_.clear();
+            compute_.clear();
+        }
+    }
+    // The first 128 bytes of a program (its header and the start of its code), to tell programs at one address apart.
+    u64 ProgramHead(u64 sph) {
+        u8 head[128]{};
+        g_.ReadGpuPartial(sph, head, sizeof(head));
+        return Hash64(head, sizeof(head));
+    }
+
     // A program's constant buffer 1 (compiler constants, BRX tables) follows its code.
     u64 ProgramConstants(u64 sph) {
+        CheckCodeGeneration();
+        const u64 head = ProgramHead(sph);
         auto it = constants_.find(sph);
-        if (it != constants_.end())
-            return it->second;
+        if (it != constants_.end() && it->second.head == head)
+            return it->second.c1;
         static thread_local std::vector<u8> buf;
         buf.assign(0x40000, 0);
         const size_t got = g_.ReadGpuPartial(sph, buf.data(), buf.size());
         const u64 c1 = common::AlignUp(sph + shader::ProgramSize(buf.data(), got), 0x100);
-        constants_[sph] = c1;
+        constants_[sph] = {c1, head};
         return c1;
     }
 
-    std::unordered_map<u64, u64> constants_;
+    struct ProgramConst {
+        u64 c1, head;
+    };
+    std::unordered_map<u64, ProgramConst> constants_;
+    u64 code_generation_ = 0;
     // From a compute program's NVN control section (offsets learned against the driver's launches).
     struct ComputeInfo {
         u32 block[3] = {1, 1, 1};
@@ -772,6 +797,7 @@ private:
     };
     std::unordered_map<u64, ComputeInfo> compute_;
     const ComputeInfo& Compute(u64 code, u64 control) {
+        CheckCodeGeneration();
         auto it = compute_.find(code);
         if (it != compute_.end())
             return it->second;
