@@ -55,6 +55,9 @@ struct Config {
     bool bug_capture = false; // [debug] F4 writes a bug capture folder (platform/bug_capture.cpp)
     bool stage_select = false; // [debug] allows --chapter / --stage (app/debug_chapter.cpp)
     std::string fxc_cs;        // [debug] compute shader hashes built by FXC, not the direct backend (gpu/d3d11/shader_cache.cpp)
+    // [debug] rewritten (video) textures through UpdateSubresource instead of the staging ring, as MUA3_TEX_UPDATESUB=1
+    // (#22: a player's test of the grey movie without the ring)
+    bool tex_updatesub = false;
     bool mods_enabled = true;  // [mods] enabled: master switch for the mods folder (core/hle/mods.h, docs/mods.md)
     // [keys]: keyboard / mouse bindings that differ from the defaults, action -> "KEY[, MOUSE BUTTON]" (hle::keybinds)
     std::map<std::string, std::string> keys;

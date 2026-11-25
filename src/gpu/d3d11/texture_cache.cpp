@@ -6,6 +6,7 @@
 #include <set>
 
 #include "core/memory.h"
+#include "core/system.h"
 #include "gpu/d3d11/renderer_d3d11.h"
 #include "gpu/d3d11/shader_cache.h"
 #include "gpu/d3d11/texture_stats.h"
@@ -13,6 +14,18 @@
 #include "gpu/gpu.h"
 
 namespace gpu {
+
+// Rewritten textures through UpdateSubresource, not the staging ring: MUA3_TEX_UPDATESUB=1 or [debug] tex_updatesub=1
+// (#22: lets a player try the grey movie without the ring).
+static bool UpdateSubForRewrites() {
+    static const bool on = [] {
+        const bool v = std::getenv("MUA3_TEX_UPDATESUB") != nullptr || core::Sys().Cfg().tex_updatesub;
+        if (v)
+            LOG_INFO("Texture", "rewritten textures go through UpdateSubresource, not the staging ring (tex_updatesub)");
+        return v;
+    }();
+    return on;
+}
 
 TextureCache::TextureCache(ID3D11Device* dev, ID3D11DeviceContext* ctx, D3D11Renderer& r)
     : dev_(dev), ctx_(ctx), r_(r) {
@@ -318,11 +331,34 @@ ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::T
         g_texture_stats.reuploads.fetch_add(1, std::memory_order_relaxed);
         // all of it through the staging ring (UpdateRects, as for CPU rewrites), else decoded again by Upload
         static const std::vector<std::pair<u64, u64>> none;
-        static const bool update_sub = std::getenv("MUA3_TEX_UPDATESUB") != nullptr;
-        if (t.updatable && UpdateRects(tic, use, t, none, !update_sub, true))
+        static const bool update_sub = UpdateSubForRewrites();
+        // (#22) per movie, how each of its first 3 video textures is re-decoded: format, size and path
+        auto note = [&](const char* path) {
+            const u64 movie = MovieWatch();
+            if (!movie)
+                return;
+            static u64 movie_seen = 0;
+            static std::vector<u64> seen;
+            if (movie_seen != movie)
+                movie_seen = movie, seen.clear();
+            if (seen.size() >= 3 || std::find(seen.begin(), seen.end(), t.gpu_va) != seen.end())
+                return;
+            seen.push_back(t.gpu_va);
+            D3D11_TEXTURE2D_DESC d{};
+            if (ID3D11Texture2D* t2 = nullptr; t.res && SUCCEEDED(t.res->QueryInterface(&t2)))
+                t2->GetDesc(&d), t2->Release();
+            LOG_INFO("Texture", "movie texture {:#x}: TIC {}x{} format {:#x} swizzle {:#x}, D3D11 {}x{} DXGI {}, re-decoded {}",
+                     t.gpu_va, tic.Width(), tic.Height(), tic.Format(), tic.Swizzle(), d.Width, d.Height, int(d.Format), path);
+        };
+        if (t.updatable && UpdateRects(tic, use, t, none, !update_sub, true)) {
+            note(update_sub ? "with UpdateSubresource (rectangles)" : "through the staging ring");
             return t.srv.Get();
-        if (auto* srv = Upload(tic, use, key, &t))
+        }
+        if (auto* srv = Upload(tic, use, key, &t)) {
+            note("with UpdateSubresource (whole, same texture)");
             return srv;
+        }
+        note("into a new texture");
         Erase(it);
         auto* srv = Upload(tic, use, key, nullptr, true);
         return srv ? srv : Fallback(use);
@@ -549,7 +585,7 @@ bool TextureCache::UpdateRects(const TicEntry& tic, const shader::TextureUse& us
         // (#8) through the reused staging ring, not UpdateSubresource: the AMD driver keeps a copy per whole-texture
         // UpdateSubresource while the GPU is behind (video planes every frame: memory +800 MB/s on an RX 6800).
         // MUA3_TEX_UPDATESUB=1: UpdateSubresource as before (A/B).
-        static const bool update_sub = std::getenv("MUA3_TEX_UPDATESUB") != nullptr;
+        static const bool update_sub = UpdateSubForRewrites();
         if (!staging && update_sub)
             return decline("over half of it changed");
         staging = true;
