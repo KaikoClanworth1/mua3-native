@@ -400,6 +400,9 @@ private:
     // draws into the scene depth), DLSS accumulates it at the composite. Off: FSR 1 there instead.
     Dlss dlss_;
     Fsr3 fsr3_; // (upscaler=3: the same inputs as DLSS)
+    ComPtr<ID3D11Buffer> up_ring_; // UploadToBuffer's ring
+    u32 up_off_ = 0;
+    void UploadToBuffer(ID3D11Buffer* dst, const D3D11_BOX& box, const void* src, UploadSite site);
     bool fsr3_logged_ = false;
     u64 fsr3_t_ = 0; // (the last FSR 3 frame: ProfNow)
     bool Temporal() const { return temporal_; }

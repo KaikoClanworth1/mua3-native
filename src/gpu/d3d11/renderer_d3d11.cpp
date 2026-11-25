@@ -655,6 +655,7 @@ D3D11Renderer::D3D11Renderer(ID3D11Device* dev, ID3D11DeviceContext* ctx) : dev_
 
 void D3D11Renderer::ReleaseDevice() {
     std::lock_guard ctx_lock(ContextMutex());
+    up_ring_.Reset();
     LOG_INFO("Renderer", "device lost: releasing {} surfaces, {} compute buffers, {} index / {} vertex buffers",
              surfaces_.size(), gbufs_.size(), index_cache_.size(), vertex_cache_.size());
     if (FrameCapture* c = capture_.exchange(nullptr)) // (an F4 capture in progress is dropped)
@@ -764,6 +765,49 @@ u32 D3D11Renderer::TextureScale(u64 gpu_va, bool tex2d) {
 }
 
 static std::atomic<u64> g_upload_bytes[kUpSites]{};
+// (#8) Buffer uploads through a dynamic ring (Map NO_OVERWRITE, DISCARD on wrap) and CopySubresourceRegion instead of
+// UpdateSubresource, whose data the AMD driver copies per call while the GPU is behind (a player's RX 6800 grew to
+// 65 GB of host memory). MUA3_UPLOAD_RING=0: UpdateSubresource as before (A/B).
+void D3D11Renderer::UploadToBuffer(ID3D11Buffer* dst, const D3D11_BOX& box, const void* src, UploadSite site) {
+    u32 n = box.right - box.left, dst_off = box.left;
+    CountUpload(site, n);
+    static const bool off = [] {
+        const char* e = std::getenv("MUA3_UPLOAD_RING");
+        return e && e[0] == '0';
+    }();
+    constexpr u32 kRing = 32u << 20;
+    if (!off && !up_ring_) {
+        D3D11_BUFFER_DESC d{kRing, D3D11_USAGE_DYNAMIC, D3D11_BIND_VERTEX_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0};
+        if (FAILED(dev_->CreateBuffer(&d, nullptr, &up_ring_)))
+            up_ring_.Reset();
+        up_off_ = kRing; // (the first map discards)
+    }
+    const u8* p = static_cast<const u8*>(src);
+    while (n) {
+        if (off || !up_ring_) {
+            const D3D11_BOX b{dst_off, 0, 0, dst_off + n, 1, 1};
+            ctx_->UpdateSubresource(dst, 0, &b, p, n, n);
+            return;
+        }
+        const u32 chunk = std::min(n, kRing / 2);
+        u32 at = u32(common::AlignUp(up_off_, 16));
+        D3D11_MAP mode = D3D11_MAP_WRITE_NO_OVERWRITE;
+        if (u64(at) + chunk > kRing)
+            at = 0, mode = D3D11_MAP_WRITE_DISCARD;
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (FAILED(ctx_->Map(up_ring_.Get(), 0, mode, 0, &m))) {
+            up_ring_.Reset(); // (falls back to UpdateSubresource for good)
+            continue;
+        }
+        std::memcpy(static_cast<u8*>(m.pData) + at, p, chunk);
+        ctx_->Unmap(up_ring_.Get(), 0);
+        const D3D11_BOX b{at, 0, 0, at + chunk, 1, 1};
+        ctx_->CopySubresourceRegion(dst, 0, dst_off, 0, 0, up_ring_.Get(), 0, &b);
+        up_off_ = at + chunk;
+        p += chunk, dst_off += chunk, n -= chunk;
+    }
+}
+
 void CountUpload(UploadSite site, u64 bytes) { g_upload_bytes[site].fetch_add(bytes, std::memory_order_relaxed); }
 // Once a minute, when anything went through UpdateSubresource: how much, by call site.
 static void LogUploads() {
@@ -779,8 +823,9 @@ static void LogUploads() {
     if (!total)
         return;
     auto mb = [&](u64 v) { return double(v) / (1 << 20); };
-    LOG_INFO("Renderer", "UpdateSubresource, last {:.0f} s: {:.1f} MB/s (compute sync {:.0f} MB, compute merge {:.0f}, "
+    LOG_INFO("Renderer", "uploads (buffers through {}, textures through UpdateSubresource), last {:.0f} s: {:.1f} MB/s (compute sync {:.0f} MB, compute merge {:.0f}, "
                          "geometry {:.0f}, whole buffers {:.0f}, texture parts {:.0f}, whole textures {:.0f}, texture reuse {:.0f})",
+             std::getenv("MUA3_UPLOAD_RING") && std::getenv("MUA3_UPLOAD_RING")[0] == '0' ? "UpdateSubresource" : "the upload ring",
              secs, mb(total) / secs, mb(b[kUpComputeSync]), mb(b[kUpComputeMerge]), mb(b[kUpGeometry]), mb(b[kUpBufferWhole]),
              mb(b[kUpTexturePartial]), mb(b[kUpTextureWhole]), mb(b[kUpTextureReuse]));
 }
@@ -1213,8 +1258,7 @@ void D3D11Renderer::Reupload(GpuBuf& b, bool all, u32 from) {
         n = std::min(n, b.size - off);
         g.ReadGpuPartial(b.addr + off, b.snapshot.data() + off, n);
         const D3D11_BOX box{off, 0, 0, off + n, 1, 1};
-        CountUpload(kUpComputeSync, n);
-        ctx_->UpdateSubresource(b.buf.Get(), 0, &box, b.snapshot.data() + off, n, n);
+        UploadToBuffer(b.buf.Get(), box, b.snapshot.data() + off, kUpComputeSync);
         if (b.prev && off + n <= b.prev_capacity) // (prev follows guest memory)
             ctx_->UpdateSubresource(b.prev.Get(), 0, &box, b.snapshot.data() + off, n, n);
         else
@@ -1333,8 +1377,7 @@ D3D11Renderer::GpuBuf* D3D11Renderer::ComputeBuffer(u64 addr, u32 size) {
                     if (!n)
                         continue;
                     const D3D11_BOX box{o, 0, 0, o + n, 1, 1};
-                    CountUpload(kUpComputeMerge, n);
-                    ctx_->UpdateSubresource(nb->buf.Get(), 0, &box, nb->snapshot.data() + o, n, n);
+                    UploadToBuffer(nb->buf.Get(), box, nb->snapshot.data() + o, kUpComputeMerge);
                 }
                 if (nb->gpu_dirty) {
                     gpu_dirty_any_ = true;
@@ -1951,8 +1994,7 @@ bool D3D11Renderer::RefreshGeometry(GeomBuf& b, D3D11_BIND_FLAG bind, bool& fill
             tmp.resize(n);
             g.ReadGpu(b.addr + off, tmp.data(), n);
             const D3D11_BOX box{off, 0, 0, off + n, 1, 1};
-            CountUpload(kUpGeometry, n);
-            ctx_->UpdateSubresource(b.buf.Get(), 0, &box, tmp.data(), n, n);
+            UploadToBuffer(b.buf.Get(), box, tmp.data(), kUpGeometry);
         }
     }
     for (auto& r : b.cpu_ranges)
@@ -1996,8 +2038,7 @@ D3D11Renderer::GeomBuf* D3D11Renderer::CachedIndices(u64 addr, u32 count, u32 in
         b.min_v = lo == ~0u ? 0 : lo;
         b.max_v = lo == ~0u ? 0 : hi;
         const D3D11_BOX box{0, 0, 0, b.size, 1, 1};
-        CountUpload(kUpBufferWhole, b.size);
-        ctx_->UpdateSubresource(b.buf.Get(), 0, &box, data.data(), b.size, b.size);
+        UploadToBuffer(b.buf.Get(), box, data.data(), kUpBufferWhole);
     }
     return &b;
 }
@@ -2018,8 +2059,7 @@ D3D11Renderer::GeomBuf* D3D11Renderer::CachedVertices(u64 addr, u32 size) {
         std::vector<u8> data(b.size, 0);
         G().ReadGpuPartial(addr, data.data(), std::min(size, b.size));
         const D3D11_BOX box{0, 0, 0, b.size, 1, 1};
-        CountUpload(kUpBufferWhole, b.size);
-        ctx_->UpdateSubresource(b.buf.Get(), 0, &box, data.data(), b.size, b.size);
+        UploadToBuffer(b.buf.Get(), box, data.data(), kUpBufferWhole);
     }
     return &b;
 }
