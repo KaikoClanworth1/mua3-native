@@ -763,6 +763,28 @@ u32 D3D11Renderer::TextureScale(u64 gpu_va, bool tex2d) {
     return s && s->srv ? s->scale3 : 0;
 }
 
+static std::atomic<u64> g_upload_bytes[kUpSites]{};
+void CountUpload(UploadSite site, u64 bytes) { g_upload_bytes[site].fetch_add(bytes, std::memory_order_relaxed); }
+// Once a minute, when anything went through UpdateSubresource: how much, by call site.
+static void LogUploads() {
+    static auto last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(60))
+        return;
+    const double secs = std::chrono::duration<double>(now - last).count();
+    last = now;
+    u64 b[kUpSites], total = 0;
+    for (int i = 0; i < kUpSites; i++)
+        total += (b[i] = g_upload_bytes[i].exchange(0, std::memory_order_relaxed));
+    if (!total)
+        return;
+    auto mb = [&](u64 v) { return double(v) / (1 << 20); };
+    LOG_INFO("Renderer", "UpdateSubresource, last {:.0f} s: {:.1f} MB/s (compute sync {:.0f} MB, compute merge {:.0f}, "
+                         "geometry {:.0f}, whole buffers {:.0f}, texture parts {:.0f}, whole textures {:.0f}, texture reuse {:.0f})",
+             secs, mb(total) / secs, mb(b[kUpComputeSync]), mb(b[kUpComputeMerge]), mb(b[kUpGeometry]), mb(b[kUpBufferWhole]),
+             mb(b[kUpTexturePartial]), mb(b[kUpTextureWhole]), mb(b[kUpTextureReuse]));
+}
+
 Surface* D3D11Renderer::FindSurfaceByGpu(u64 gpu_va) {
     auto it = surfaces_.find(gpu_va);
     return it == surfaces_.end() ? nullptr : it->second.get();
@@ -806,7 +828,9 @@ void D3D11Renderer::SetResolutionScale3(u32 s) {
     applied_quality_ = core::Sys().Cfg().upscale_quality;
     res_scale_ = ScaleFor(applied_aa_);
     if (const u32 fs = FsrScale())
-        LOG_INFO("Renderer", "FSR 1: rendering at {:.3g}x of the guest frame, upscaled to {} px high", fs / 3.0, output_h_);
+        LOG_INFO("Renderer", "{}: rendering at {:.3g}x of the guest frame, upscaled to {} px high",
+                 applied_upscaler_ == 3 ? "FSR 3.1 (FSR 1 where it can't run)" : applied_upscaler_ == 2 ? "DLSS (FSR 1 where it can't run)" : "FSR 1",
+                 fs / 3.0, output_h_);
 }
 
 u32 D3D11Renderer::FsrScale() const {
@@ -1189,6 +1213,7 @@ void D3D11Renderer::Reupload(GpuBuf& b, bool all, u32 from) {
         n = std::min(n, b.size - off);
         g.ReadGpuPartial(b.addr + off, b.snapshot.data() + off, n);
         const D3D11_BOX box{off, 0, 0, off + n, 1, 1};
+        CountUpload(kUpComputeSync, n);
         ctx_->UpdateSubresource(b.buf.Get(), 0, &box, b.snapshot.data() + off, n, n);
         if (b.prev && off + n <= b.prev_capacity) // (prev follows guest memory)
             ctx_->UpdateSubresource(b.prev.Get(), 0, &box, b.snapshot.data() + off, n, n);
@@ -1308,6 +1333,7 @@ D3D11Renderer::GpuBuf* D3D11Renderer::ComputeBuffer(u64 addr, u32 size) {
                     if (!n)
                         continue;
                     const D3D11_BOX box{o, 0, 0, o + n, 1, 1};
+                    CountUpload(kUpComputeMerge, n);
                     ctx_->UpdateSubresource(nb->buf.Get(), 0, &box, nb->snapshot.data() + o, n, n);
                 }
                 if (nb->gpu_dirty) {
@@ -1925,6 +1951,7 @@ bool D3D11Renderer::RefreshGeometry(GeomBuf& b, D3D11_BIND_FLAG bind, bool& fill
             tmp.resize(n);
             g.ReadGpu(b.addr + off, tmp.data(), n);
             const D3D11_BOX box{off, 0, 0, off + n, 1, 1};
+            CountUpload(kUpGeometry, n);
             ctx_->UpdateSubresource(b.buf.Get(), 0, &box, tmp.data(), n, n);
         }
     }
@@ -1969,6 +1996,7 @@ D3D11Renderer::GeomBuf* D3D11Renderer::CachedIndices(u64 addr, u32 count, u32 in
         b.min_v = lo == ~0u ? 0 : lo;
         b.max_v = lo == ~0u ? 0 : hi;
         const D3D11_BOX box{0, 0, 0, b.size, 1, 1};
+        CountUpload(kUpBufferWhole, b.size);
         ctx_->UpdateSubresource(b.buf.Get(), 0, &box, data.data(), b.size, b.size);
     }
     return &b;
@@ -1990,6 +2018,7 @@ D3D11Renderer::GeomBuf* D3D11Renderer::CachedVertices(u64 addr, u32 size) {
         std::vector<u8> data(b.size, 0);
         G().ReadGpuPartial(addr, data.data(), std::min(size, b.size));
         const D3D11_BOX box{0, 0, 0, b.size, 1, 1};
+        CountUpload(kUpBufferWhole, b.size);
         ctx_->UpdateSubresource(b.buf.Get(), 0, &box, data.data(), b.size, b.size);
     }
     return &b;
@@ -3944,6 +3973,7 @@ void D3D11Renderer::Present(const PresentInfo& p) {
         g_cpu_frame0 = frame_counter_;
         capture_ = nullptr; // written: the bug capture thread frees it
     }
+    LogUploads();
     presented_cpu_.insert(p.cpu_addr);
     {
         std::vector<PixelReq> reqs;

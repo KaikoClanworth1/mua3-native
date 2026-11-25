@@ -31,6 +31,11 @@ std::recursive_mutex& ContextMutex();
 std::atomic<u64>& ContextEpoch();
 
 // A render target or depth buffer living on the host GPU, keyed by its guest GPU address.
+// (#8) Bytes passed to UpdateSubresource per call site, logged once a minute: the AMD driver keeps a copy of each
+// call's data while the GPU is behind, and a player's RX 6800 grew to 65 GB of host memory.
+enum UploadSite { kUpComputeSync, kUpComputeMerge, kUpGeometry, kUpBufferWhole, kUpTexturePartial, kUpTextureWhole,
+                  kUpTextureReuse, kUpSites };
+void CountUpload(UploadSite site, u64 bytes);
 struct HostShader;
 
 struct Surface {

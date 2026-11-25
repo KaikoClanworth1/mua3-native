@@ -373,6 +373,7 @@ ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::T
                     tmp.resize(len);
                     G().ReadGpuPartial(addr + o, tmp.data(), len);
                     const D3D11_BOX box{u32(o), 0, 0, u32(o) + len, 1, 1};
+                    CountUpload(kUpTexturePartial, len);
                     ctx_->UpdateSubresource(t.res.Get(), 0, &box, tmp.data(), 0, 0);
                     uploaded += len;
                 }
@@ -383,6 +384,7 @@ ID3D11ShaderResourceView* TextureCache::Get(const TicEntry& tic, const shader::T
             }
             tmp.assign(bd.ByteWidth, 0);
             G().ReadGpuPartial(addr, tmp.data(), bd.ByteWidth);
+            CountUpload(kUpTextureWhole, bd.ByteWidth);
             ctx_->UpdateSubresource(t.res.Get(), 0, nullptr, tmp.data(), 0, 0);
             g_texture_stats.reupload_bytes.fetch_add(bd.ByteWidth, std::memory_order_relaxed);
             HashPages(t);
@@ -613,6 +615,7 @@ bool TextureCache::UpdateRects(const TicEntry& tic, const shader::TextureUse& us
                 lin.resize(size_t(pitch) * r.h);
             decode(r, lin.data(), pitch);
             const D3D11_BOX box = box_of(r);
+            CountUpload(kUpTexturePartial, u64(pitch) * r.h);
             ctx_->UpdateSubresource(t.res.Get(), 0, &box, lin.data(), pitch, 0);
             uploaded += u64(pitch) * r.h;
         }
@@ -811,6 +814,7 @@ ID3D11ShaderResourceView* TextureCache::Upload(const TicEntry& tic, const shader
     // Rewritten texture we already re-created as updatable: decode straight into it.
     if (reuse) {
         g_texture_stats.reupload_bytes.fetch_add(total, std::memory_order_relaxed);
+        CountUpload(kUpTextureReuse, total);
         for (size_t i = 0; i < init.size(); i++)
             ctx_->UpdateSubresource(reuse->res.Get(), UINT(i), nullptr, init[i].pSysMem, init[i].SysMemPitch,
                                     init[i].SysMemSlicePitch);
