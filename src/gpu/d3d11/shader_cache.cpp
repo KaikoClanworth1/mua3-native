@@ -251,7 +251,7 @@ void FxcServerIdle() {
 // is listed in MUA3_FXC_CS (hex, separated by commas or spaces; a base program's hash also covers its variants). main.cpp
 // sets MUA3_FXC_CS from mua3.ini [debug] fxc_cs. Tells a graphics driver's handling of our own bytecode apart from a
 // translation fault on a player's GPU (#23).
-bool ComputeViaFxc(const HostShader& s) {
+bool ComputeViaFxcHash(u64 hash, u64 base_hash) {
     static const bool all = std::getenv("MUA3_FXC_COMPUTE") != nullptr;
     static const std::unordered_set<u64> listed = [] {
         std::unordered_set<u64> set;
@@ -270,7 +270,16 @@ bool ComputeViaFxc(const HostShader& s) {
             LOG_INFO("Shader", "{} compute shader(s) built by FXC instead of the direct backend (fxc_cs)", set.size());
         return set;
     }();
-    return all || listed.count(s.hash) || (s.base && listed.count(s.base->hash));
+    return all || listed.count(hash) || (base_hash && listed.count(base_hash));
+}
+bool ComputeViaFxc(const HostShader& s) {
+    return ComputeViaFxcHash(s.hash, s.base ? s.base->hash : 0);
+}
+// A failure marker stands for the backend that failed. A compute program the direct backend builds ignores a marker an
+// FXC-only run (fxc_cs, MUA3_FXC_COMPUTE) left: honouring it skipped the kernel for good, in every later run (a test
+// instance lost the light-list sort 8d1754b934e53aa0 this way, #23). Vertex and pixel programs are FXC-first: kept.
+bool FailureApplies(shader::Stage stage, u64 hash) {
+    return stage != shader::Stage::Compute || ComputeViaFxcHash(hash, 0);
 }
 } // namespace
 
@@ -1437,7 +1446,7 @@ HostShader* ShaderCache::Get(shader::Stage stage, const u8* code, size_t size, c
         }
         return found;
     }
-    if (HasFailed(hash)) { // failed in an earlier run (or the setup's shader step): not compiled and logged again
+    if (HasFailed(hash) && FailureApplies(stage, hash)) { // failed in an earlier run (or the setup's shader step): not compiled and logged again
         auto s = std::make_unique<HostShader>();
         s->stage = stage;
         s->hash = hash;
@@ -1965,7 +1974,7 @@ void ShaderCache::Prewarm() {
                                     : prog.stage == 1 ? shader::Stage::Fragment
                                                       : shader::Stage::Compute;
         u64 t0 = tick();
-        const bool skip = shaders_.find(hash) != shaders_.end() || HasFailed(hash);
+        const bool skip = shaders_.find(hash) != shaders_.end() || (HasFailed(hash) && FailureApplies(stage, hash));
         t_check += tick() - t0;
         if (skip)
             continue;
