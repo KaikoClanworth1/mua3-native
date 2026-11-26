@@ -2176,6 +2176,45 @@ void D3D11Renderer::Dispatch(const ComputeLaunch& l) {
         if (cs->state != HostShader::Ready)
             return;
     }
+    // [debug] skip_cs=<hash>,... (or MUA3_SKIP_CS_HASH): compute shaders never dispatched, by the hash the dispatch lines
+    // show (a base program's hash covers its variants). #8: an AMD driver whose shader compiler never finishes one held
+    // the D3D11 device lock for good. Logged once per hash, with the memory windows it would have written.
+    static const std::unordered_set<u64> skip_hashes = [] {
+        std::unordered_set<u64> set;
+        std::string list = core::Sys().Cfg().skip_cs;
+        if (const char* e = std::getenv("MUA3_SKIP_CS_HASH"))
+            list += std::string(",") + e;
+        for (const char* p = list.c_str(); *p;) {
+            char* end = nullptr;
+            const u64 h = std::strtoull(p, &end, 16);
+            if (end == p) {
+                p++;
+                continue;
+            }
+            set.insert(h);
+            p = end;
+        }
+        if (!set.empty())
+            LOG_WARN("Renderer", "{} compute shader(s) will not run (skip_cs): what they draw or compute is missing", set.size());
+        return set;
+    }();
+    if (!skip_hashes.empty() && (skip_hashes.count(cs->hash) || (cs->base && skip_hashes.count(cs->base->hash)))) {
+        static std::unordered_set<u64> told;
+        if (told.insert(cs->hash).second) {
+            std::string wins;
+            if (cs->info.uses_gmem && cb_size[0] >= 0x310 + 16 * shader::kGmemWindows) {
+                u32 table[shader::kGmemWindows][4];
+                g.ReadGpu(cb_addr[0] + 0x310, table, sizeof(table));
+                for (u32 i = 0; i < shader::kGmemWindows; i++)
+                    if (const u64 a = (u64(table[i][1]) << 32) | table[i][0]; a && table[i][2])
+                        wins += fmt::format(" window {} {:#x}+{:#x};", i, a, table[i][2]);
+            }
+            LOG_WARN("Renderer", "skipped compute shader {:016x} (skip_cs): program {:#x} grid {}x{}x{} block {}x{}x{}, {} texture(s), "
+                                 "writes{}", cs->hash, prog, grid[0], grid[1], grid[2], opt.block[0], opt.block[1], opt.block[2],
+                     cs->info.textures.size(), wins.empty() ? " no memory windows" : wins);
+        }
+        return;
+    }
     static common::U64Map<int> logged;
     const int nth = logged[key]++;
     const bool log = nth < 2; // (every 600th as well wrote ~10 lines a second from this thread)
