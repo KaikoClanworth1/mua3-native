@@ -98,6 +98,8 @@ bool Config::Load(const fs::path& ini) {
     get_b("stage_select", stage_select);
     if (kv.count("fxc_cs"))
         fxc_cs = kv["fxc_cs"];
+    if (kv.count("skip_cs"))
+        skip_cs = kv["skip_cs"];
     get_b("tex_updatesub", tex_updatesub);
     get_b("mods.enabled", mods_enabled);
     return true;
@@ -125,9 +127,10 @@ bool Config::Save(const fs::path& ini) const {
         for (const auto& [k, v] : keys)
             f << k << "=" << v << "\n";
     }
-    if (bug_capture || stage_select || !fxc_cs.empty() || tex_updatesub) // (only written when on: release players never see the section)
+    if (bug_capture || stage_select || !fxc_cs.empty() || tex_updatesub || !skip_cs.empty()) // (only written when on: release players never see the section)
         f << "[debug]\n" << (bug_capture ? "bug_capture=1\n" : "") << (stage_select ? "stage_select=1\n" : "")
-          << (fxc_cs.empty() ? "" : "fxc_cs=" + fxc_cs + "\n") << (tex_updatesub ? "tex_updatesub=1\n" : "");
+          << (fxc_cs.empty() ? "" : "fxc_cs=" + fxc_cs + "\n") << (tex_updatesub ? "tex_updatesub=1\n" : "")
+          << (skip_cs.empty() ? "" : "skip_cs=" + skip_cs + "\n");
     return bool(f);
 }
 
