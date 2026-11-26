@@ -63,6 +63,7 @@ public:
 private:
     enum State { kArmed, kRecording, kDone };
     std::string SaveBuffer(u64 gpu_va, u64 size, const char* kind); // relative path, "" when not saved
+    std::string SaveGpuBuffer(ID3D11Buffer* buf, u64 offset, u64 size); // a host buffer's range as the GPU has it
     std::string SaveData(const std::vector<u8>& data, const char* kind); // by content hash, within the budget
     void FlushDraw();
     void Finish(D3D11Renderer& r, Surface* presented);
@@ -83,6 +84,7 @@ private:
     std::string events_;               // events.jsonl
     std::string cur_;                  // the open draw's JSON (written at the next draw / present)
     std::string cur_tex_;
+    std::string cur_cs_tex_;           // the open dispatch's textures (its cur_tex_ holds the gmem windows)
     bool cur_open_ = false;
     bool cur_dispatch_ = false;        // the open event is a dispatch (closed with its cs / gmem)
     std::map<u64, std::string> saved_;            // content hash -> file

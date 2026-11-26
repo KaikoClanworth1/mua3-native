@@ -148,7 +148,7 @@ std::string FrameCapture::SaveData(const std::vector<u8>& data, const char* kind
 void FrameCapture::FlushDraw() {
     if (!cur_open_)
         return;
-    events_ += cur_ + (cur_dispatch_ ? ",\"gmem\":[" : ",\"tex\":[") + cur_tex_ + "]}\n";
+    events_ += cur_ + (cur_dispatch_ ? ",\"tex\":[" + cur_cs_tex_ + "],\"gmem\":[" : std::string(",\"tex\":[")) + cur_tex_ + "]}\n";
     cur_open_ = cur_dispatch_ = false;
 }
 
@@ -210,12 +210,25 @@ void FrameCapture::Texture(bool vs, u32 slot, u32 handle, const TicEntry& tic, I
     if (srv) {
         ComPtr<ID3D11Resource> res;
         srv->GetResource(&res);
-        if (auto it = texs_.find(res.Get()); it != texs_.end()) {
+        ComPtr<ID3D11Buffer> tbuf;
+        if (SUCCEEDED(res.As(&tbuf))) {
+            // Texture buffer (TIC type 6): the view's range as the GPU has it. A texel buffer over compute output lives in a
+            // resident buffer that guest memory lags behind; several views may share one buffer at different offsets.
+            D3D11_SHADER_RESOURCE_VIEW_DESC vd{};
+            srv->GetDesc(&vd);
+            bool bc = false;
+            const u64 bpe = std::max<u32>(FormatBytes(vd.Format, bc), 1);
+            file = SaveGpuBuffer(tbuf.Get(), u64(vd.Buffer.FirstElement) * bpe, u64(vd.Buffer.NumElements) * bpe);
+            if (file.empty()) { // (too large, or the copy failed): guest memory, as before
+                D3D11_BUFFER_DESC bd{};
+                tbuf->GetDesc(&bd);
+                file = SaveBuffer(tic.Address(), bd.ByteWidth, "tb");
+            }
+        } else if (auto it = texs_.find(res.Get()); it != texs_.end()) {
             file = it->second;
         } else {
             ComPtr<ID3D11Texture2D> t2;
             ComPtr<ID3D11Texture3D> t3;
-            ComPtr<ID3D11Buffer> tb;
             D3D11_TEXTURE2D_DESC d2{};
             D3D11_TEXTURE3D_DESC d3{};
             TexDesc td;
@@ -229,10 +242,6 @@ void FrameCapture::Texture(bool vs, u32 slot, u32 handle, const TicEntry& tic, I
                 t3->GetDesc(&d3);
                 td = {d3.Format, d3.Width, d3.Height, d3.Depth, d3.MipLevels, 1, false, true};
                 ok = true;
-            } else if (SUCCEEDED(res.As(&tb))) { // texture buffer (TIC type 6): its guest memory, host buffer size
-                D3D11_BUFFER_DESC bd{};
-                tb->GetDesc(&bd);
-                file = SaveBuffer(tic.Address(), bd.ByteWidth, "tb");
             }
             if (ok && FormatBytes(td.format, bc)) {
                 u64 bytes = 0;
@@ -281,10 +290,36 @@ void FrameCapture::Texture(bool vs, u32 slot, u32 handle, const TicEntry& tic, I
     std::string words;
     for (u32 w : tic.w)
         words += fmt::format("{}{}", words.empty() ? "" : ",", Hex(w));
-    cur_tex_ += fmt::format("{}{{\"stage\":\"{}\",\"slot\":{},\"handle\":{},\"addr\":{},\"format\":{},\"type\":{},\"w\":{},"
-                            "\"h\":{},\"rt\":{},\"tic\":[{}],\"file\":\"{}\"}}",
-                            cur_tex_.empty() ? "" : ",", vs ? "vs" : "ps", slot, Hex(handle), Hex(tic.Address()),
-                            tic.Format(), tic.Type(), tic.Width(), tic.Height(), render_target, words, file);
+    std::string& list = cur_dispatch_ ? cur_cs_tex_ : cur_tex_; // (a dispatch's cur_tex_ holds its gmem windows)
+    list += fmt::format("{}{{\"stage\":\"{}\",\"slot\":{},\"handle\":{},\"addr\":{},\"format\":{},\"type\":{},\"w\":{},"
+                        "\"h\":{},\"rt\":{},\"tic\":[{}],\"file\":\"{}\"}}",
+                        list.empty() ? "" : ",", cur_dispatch_ ? "cs" : vs ? "vs" : "ps", slot, Hex(handle), Hex(tic.Address()),
+                        tic.Format(), tic.Type(), tic.Width(), tic.Height(), render_target, words, file);
+}
+
+std::string FrameCapture::SaveGpuBuffer(ID3D11Buffer* buf, u64 offset, u64 size) {
+    if (!buf || !size)
+        return {};
+    if (size > (64u << 20)) {
+        skipped_bytes_ += size;
+        return {};
+    }
+    ComPtr<ID3D11Device> dev;
+    buf->GetDevice(&dev);
+    ComPtr<ID3D11DeviceContext> ctx;
+    dev->GetImmediateContext(&ctx);
+    D3D11_BUFFER_DESC sd{u32(size), D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0};
+    ComPtr<ID3D11Buffer> st;
+    if (FAILED(dev->CreateBuffer(&sd, nullptr, &st)))
+        return {};
+    const D3D11_BOX box{u32(offset), 0, 0, u32(offset + size), 1, 1};
+    ctx->CopySubresourceRegion(st.Get(), 0, 0, 0, 0, buf, 0, &box); // (after every earlier write on this context)
+    D3D11_MAPPED_SUBRESOURCE mp;
+    if (FAILED(ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &mp)))
+        return {};
+    std::vector<u8> data(static_cast<const u8*>(mp.pData), static_cast<const u8*>(mp.pData) + size);
+    ctx->Unmap(st.Get(), 0);
+    return SaveData(data, "tb");
 }
 
 void FrameCapture::Submit(u64 vs_hash, u64 ps_hash, u32 index_count) {
@@ -310,6 +345,7 @@ void FrameCapture::Dispatch(const ComputeLaunch& l) {
                        index_++, Hex(l.program), l.program_offset, l.grid[0], l.grid[1], l.grid[2], l.block[0], l.block[1],
                        l.block[2], l.shared_bytes, cbs, Hex(l.tic_base), Hex(l.tsc_base));
     cur_tex_.clear();
+    cur_cs_tex_.clear();
     cur_open_ = cur_dispatch_ = true;
     dispatches_++;
 }
