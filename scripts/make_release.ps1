@@ -4,12 +4,15 @@
 # the game's icon on the player's PC, from their own files).
 # Runtime DLLs the game loads from its own folder go in sdk\runtime\ (the setup places them beside mua3.exe) with
 # their licences in sdk\runtime\licenses\: Microsoft's d3dcompiler_47.dll from this PC's Windows SDK (Redist\D3D\x64,
-# distributable under the SDK licence), and FFmpeg's DLLs from -Ffmpeg <folder>: the DLLs, its licence text
-# (COPYING.LGPL* or LICENSE*) and BUILD.txt (version and configure line). None of them is in the repository.
+# distributable under the SDK licence), and FFmpeg's DLLs (H.264 movies under Wine / Proton) from -Ffmpeg <folder>,
+# by default third_party\ffmpeg_build (scripts/build_ffmpeg.sh; a worktree links it like the DLSS folder): its DLLs
+# (in the folder or its bin\), its licence text (LICENSE* or COPYING.LGPL*) and its build note (FFMPEG-BUILD.txt or
+# BUILD.txt: version, configure line, source). Not its .lib files or include\. None of them is in the repository.
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\make_release.ps1 -Version 0.2.0 [-Zip] [-Ffmpeg <folder>]
 param([string]$Version = '0.2.0', [switch]$Zip, [string]$Ffmpeg = '')
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
+if (-not $Ffmpeg -and (Test-Path (Join-Path $root 'third_party\ffmpeg_build'))) { $Ffmpeg = Join-Path $root 'third_party\ffmpeg_build' }
 $build = Join-Path $root 'build'
 $cfg = 'RelWithDebInfo'
 $name = "MUA3Native-v$Version-Windows-x64" # (system and processor in the name: launchers pick the file by them)
@@ -89,16 +92,17 @@ MUA3 Native ships it unchanged beside mua3.exe, so the game does not depend on t
 # FFmpeg (LGPL, H.264 decoding): the DLLs, the licence text and how they were built, from -Ffmpeg
 if ($Ffmpeg) {
     $ff = Get-Item $Ffmpeg
-    $ffDlls = @(Get-ChildItem $ff.FullName -File -Filter *.dll)
+    $ffDlls = @(Get-ChildItem $ff.FullName -File -Filter *.dll) + @(Get-ChildItem (Join-Path $ff.FullName 'bin') -File -Filter *.dll -ErrorAction SilentlyContinue)
     $ffLicense = @(Get-ChildItem $ff.FullName -File | Where-Object { $_.Name -match '^(COPYING\.LGPL|LICENSE)' })
-    $ffBuild = Join-Path $ff.FullName 'BUILD.txt'
-    if (-not $ffDlls) { throw "-Ffmpeg $Ffmpeg holds no DLL" }
-    if (-not $ffLicense) { throw "-Ffmpeg $Ffmpeg holds no licence text (COPYING.LGPL* or LICENSE*)" }
-    if (-not (Test-Path $ffBuild)) { throw "-Ffmpeg $Ffmpeg holds no BUILD.txt (FFmpeg version and configure line)" }
+    $ffBuild = @(Get-ChildItem $ff.FullName -File | Where-Object { $_.Name -match '^(FFMPEG-)?BUILD\.txt$' }) | Select-Object -First 1
+    if (-not $ffDlls) { throw "-Ffmpeg $Ffmpeg holds no DLL (in it or its bin\)" }
+    if (-not $ffLicense) { throw "-Ffmpeg $Ffmpeg holds no licence text (LICENSE* or COPYING.LGPL*)" }
+    if (-not $ffBuild) { throw "-Ffmpeg $Ffmpeg holds no build note (FFMPEG-BUILD.txt or BUILD.txt: version and configure line)" }
     $ffDlls | Copy-Item -Destination $rt
     New-Item -ItemType Directory -Force "$rt\licenses\ffmpeg" | Out-Null
     $ffLicense | Copy-Item -Destination "$rt\licenses\ffmpeg"
-    Copy-Item $ffBuild "$rt\licenses\ffmpeg\BUILD.txt"
+    Copy-Item $ffBuild.FullName "$rt\licenses\ffmpeg\BUILD.txt"
+    "FFmpeg: $(($ffDlls | ForEach-Object Name) -join ', ') from $($ff.FullName)"
 } else {
     Write-Warning 'no -Ffmpeg: the package has no FFmpeg DLLs'
 }
