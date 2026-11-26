@@ -101,6 +101,8 @@ bool Config::Load(const fs::path& ini) {
     if (kv.count("skip_cs"))
         skip_cs = kv["skip_cs"];
     get_b("tex_updatesub", tex_updatesub);
+    get_i("gmem_narrow", gmem_narrow);
+    gmem_narrow = std::clamp(gmem_narrow, -1, 1);
     get_b("mods.enabled", mods_enabled);
     return true;
 }
@@ -127,10 +129,11 @@ bool Config::Save(const fs::path& ini) const {
         for (const auto& [k, v] : keys)
             f << k << "=" << v << "\n";
     }
-    if (bug_capture || stage_select || !fxc_cs.empty() || tex_updatesub || !skip_cs.empty()) // (only written when on: release players never see the section)
+    if (bug_capture || stage_select || !fxc_cs.empty() || tex_updatesub || !skip_cs.empty() || gmem_narrow != -1) // (only written when on: release players never see the section)
         f << "[debug]\n" << (bug_capture ? "bug_capture=1\n" : "") << (stage_select ? "stage_select=1\n" : "")
           << (fxc_cs.empty() ? "" : "fxc_cs=" + fxc_cs + "\n") << (tex_updatesub ? "tex_updatesub=1\n" : "")
-          << (skip_cs.empty() ? "" : "skip_cs=" + skip_cs + "\n");
+          << (skip_cs.empty() ? "" : "skip_cs=" + skip_cs + "\n")
+          << (gmem_narrow == -1 ? "" : "gmem_narrow=" + std::to_string(gmem_narrow) + "\n");
     return bool(f);
 }
 

@@ -69,7 +69,7 @@ struct HostShader {
     // Integer variant: built by a worker from `base`'s HLSL (re-translating the base when only its bytecode was
     // cached takes tens of milliseconds); `key` = ShaderCache::VariantKey fields; `record`: append to variants.txt.
     HostShader* base = nullptr;
-    std::array<u32, 7> key{};
+    std::array<u32, 8> key{};
     bool record = false;
     // Motion-vector variant (VariantKey::velocity) whose bytecode carries it: the vertex shader also runs on last
     // frame's constant buffers (t48+i) and outputs VELPREV in ATTR29's place, the pixel shader writes the motion in
@@ -101,6 +101,10 @@ public:
         //       float2 jitter (host pixels, the offset added to the viewport), and an RG16F target at RT7 (blend off)
         //       that gets (last frame's pixel - unjittered pixel), or 65504 where last frame's w <= 0.
         u32 velocity = 0;
+        // Compute: the global memory helpers (window search and per-window switches) cover only the first N windows the
+        // dispatch binds (0: all). #8: one kernel with 96 accesses was 768 switch cases over 8 windows, and AMD's shader
+        // compiler never finished it; over its 2 windows FXC builds it in 6 s instead of 114, 4,148 instructions not 9,649.
+        u32 gmem_windows = 0;
     };
     HostShader* GetVariant(HostShader* base, const VariantKey& v);
     // Queues every vertex/pixel program seen in earlier runs (shader_dump/*.bin) and, once their bases are built,

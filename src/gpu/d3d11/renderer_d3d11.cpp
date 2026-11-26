@@ -2172,6 +2172,36 @@ void D3D11Renderer::Dispatch(const ComputeLaunch& l) {
             default: break;
             }
         }
+        // (#8) the global memory helpers over the windows this dispatch binds (the table below), not all 8: a kernel's
+        // shape is then far smaller for the driver's compiler. Not with images, which take the windows after these.
+        // On AMD GPUs only by default: elsewhere each narrowed kernel's first driver compile is a stall of seconds in
+        // the first fights (the variants are new bytecode); AMD's compiler never finished the 8-window kernel at all.
+        // [debug] gmem_narrow=0/1 or MUA3_GMEM_NARROW=0/1 overrides (testing).
+        static const bool narrow = [&] {
+            int mode = core::Sys().Cfg().gmem_narrow;
+            if (const char* e = std::getenv("MUA3_GMEM_NARROW"))
+                mode = std::atoi(e) ? 1 : 0;
+            u32 vendor = 0;
+            Microsoft::WRL::ComPtr<IDXGIDevice> dd;
+            Microsoft::WRL::ComPtr<IDXGIAdapter> ad;
+            DXGI_ADAPTER_DESC desc{};
+            if (SUCCEEDED(dev_->QueryInterface(IID_PPV_ARGS(&dd))) && SUCCEEDED(dd->GetAdapter(&ad)) && SUCCEEDED(ad->GetDesc(&desc)))
+                vendor = desc.VendorId;
+            const bool on = mode == 1 || (mode == -1 && vendor == 0x1002);
+            LOG_INFO("Renderer", "compute global memory helpers {} (gmem_narrow {}, GPU vendor {:#06x})",
+                     on ? "narrowed to the bound windows" : "over all windows", mode, vendor);
+            return on;
+        }();
+        if (narrow && cs->info.uses_gmem && cs->info.images.empty() && cb_size[0] >= 0x310 + 16 * shader::kGmemWindows) {
+            u32 table[shader::kGmemWindows][4];
+            g.ReadGpu(cb_addr[0] + 0x310, table, sizeof(table));
+            for (u32 i = 0; i < shader::kGmemWindows; i++) {
+                const u64 a = (u64(table[i][1]) << 32) | table[i][0];
+                const u32 size = u32(common::AlignUp(table[i][2], 4));
+                if (a && size && size <= (64u << 20))
+                    vk.gmem_windows = i + 1;
+            }
+        }
         cs = shaders_->GetVariant(cs, vk);
         if (cs->state != HostShader::Ready)
             return;
