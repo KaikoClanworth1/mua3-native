@@ -17,3 +17,5 @@ GameFiles/
 
 # NVIDIA DLSS SDK (proprietary: never committed; fetched by setup / placed by hand)
 third_party/dlss/
+third_party/ffmpeg_src/
+third_party/ffmpeg_build/

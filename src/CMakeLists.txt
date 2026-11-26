@@ -155,6 +155,19 @@ else()
     message(STATUS "DLSS: mua3_dlss.dll not built (no NVIDIA SDK in third_party/dlss)")
 endif()
 
+# FFmpeg's H.264 decoder for the movies where Media Foundation has none (Wine/Proton: core/hle/video_output.cpp).
+# LGPL DLLs built by scripts/build_ffmpeg.sh into third_party/ffmpeg_build (git-ignored); the game loads them at run
+# time from its own folder, so it builds and runs without them (movies then fall back to Media Foundation / black).
+set(FFMPEG_DIR ${CMAKE_SOURCE_DIR}/third_party/ffmpeg_build)
+if(EXISTS ${FFMPEG_DIR}/include/libavcodec/avcodec.h)
+    target_include_directories(nxcore PRIVATE ${FFMPEG_DIR}/include)
+    target_compile_definitions(nxcore PRIVATE MUA3_HAVE_FFMPEG=1)
+    file(GLOB FFMPEG_DLLS ${FFMPEG_DIR}/bin/*.dll)
+    message(STATUS "FFmpeg: H.264 movie decoder enabled (${FFMPEG_DIR})")
+else()
+    message(STATUS "FFmpeg: not found in third_party/ffmpeg_build (scripts/build_ffmpeg.sh); movies use Media Foundation only")
+endif()
+
 add_executable(mua3 app/main.cpp app/alloc_trace.cpp app/debug_chapter.cpp)
 target_link_libraries(mua3 PRIVATE nxcore platform dbghelp)
 # incremental-link thunks would sit between every pair of recompiled functions
@@ -164,6 +177,10 @@ target_link_options(mua3 PRIVATE /INCREMENTAL:NO /PDBALTPATH:mua3.pdb /DELAYLOAD
 target_link_libraries(mua3 PRIVATE delayimp) # (the HLSL compiler from mua3.exe's folder first: shader_cache.cpp)
 if(TARGET mua3_dlss)
     add_dependencies(mua3 mua3_dlss) # (built with the game: it loads it from its own folder)
+endif()
+if(FFMPEG_DLLS) # FFmpeg's DLLs next to the game, which loads them from its own folder (video_output.cpp)
+    add_custom_command(TARGET mua3 POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FFMPEG_DLLS}
+                       $<TARGET_FILE_DIR:mua3>)
 endif()
 
 add_executable(MUA3Launcher WIN32 launcher/launcher.cpp launcher/game_builder.cpp launcher/report.cpp)
