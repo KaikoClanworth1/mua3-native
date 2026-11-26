@@ -102,6 +102,7 @@ private:
         if (i == PT)
             return;
         preds_used_.insert(i);
+        GwPredWritten(i);
         Line(fmt::format("p{} = {};", i, v));
     }
     std::string Cbuf(u32 index, u32 byte_off) {
@@ -333,22 +334,35 @@ private:
     bool gmem_written_ = false;
     // (#8) Global memory addresses built from NVN's storage-buffer table (c0 + 0x310 + 16 * i: base lo, base hi): per
     // register, window i + 1 when it holds "something + window i's base" (gw_lo_ for the low word, gw_hi_ for the high
-    // word), 0 when unknown. Only inside one basic block (BuildStructuredBlocks resets it per block), never set by a
-    // predicated instruction, cleared by every other write. An access through a tagged pair reads that window directly
-    // instead of the 8-way window search and switch of GmemLoad / GmemStore, which made AMD's compiler run for minutes.
-    bool gw_track_ = false, cur_guarded_ = false;
-    u8 gw_lo_[256] = {}, gw_hi_[256] = {};
+    // word), 0 when unknown. Only inside one basic block (BuildStructuredBlocks resets it per block), cleared by every
+    // other write. An access through a tagged pair reads that window directly instead of the 8-way window search and
+    // switch of GmemLoad / GmemStore, which made AMD's compiler run for minutes.
+    // Each tag holds under a guard (gw_lok_ / gw_hik_): 0 always, or the predicate (index * 2 + negated, + 1) of the
+    // predicated instruction that set it: the guest compiler predicates whole address-and-access sequences (@P ISCADD,
+    // @P IADD.X, @P LDG). Such a tag serves accesses under the same guard only, and goes when that predicate is written.
+    bool gw_track_ = false;
+    u8 cur_key_ = 0; // the guard of the instruction being emitted (0xFF: nested guards, never sets a tag)
+    u8 gw_lo_[256] = {}, gw_hi_[256] = {}, gw_lok_[256] = {}, gw_hik_[256] = {};
+    bool GwUsable(u8 key) const { return key == 0 || (cur_key_ != 0xFF && key == cur_key_); }
     void TagGmemBase(u32 d, u64 insn) {
-        if (!gw_track_ || cur_guarded_ || d >= RZ || Bits(insn, 34, 5) != 0)
+        if (!gw_track_ || cur_key_ == 0xFF || d >= RZ || Bits(insn, 34, 5) != 0)
             return;
         const u32 off = u32(Bits(insn, 20, 14)) * 4;
         if (off < 0x310 || off >= 0x310 + 16 * kGmemWindows)
             return;
         const u32 w = (off - 0x310) / 16, part = (off - 0x310) % 16;
         if (part == 0)
-            gw_lo_[d] = u8(w + 1);
+            gw_lo_[d] = u8(w + 1), gw_lok_[d] = cur_key_;
         else if (part == 4)
-            gw_hi_[d] = u8(w + 1);
+            gw_hi_[d] = u8(w + 1), gw_hik_[d] = cur_key_;
+    }
+    void GwPredWritten(u32 p) { // tags that held only under predicate p
+        for (u32 r = 0; r < 256; r++) {
+            if (gw_lo_[r] && gw_lok_[r] && gw_lok_[r] != 0xFF && u32(gw_lok_[r] - 1) >> 1 == p)
+                gw_lo_[r] = 0;
+            if (gw_hi_[r] && gw_hik_[r] && gw_hik_[r] != 0xFF && u32(gw_hik_[r] - 1) >> 1 == p)
+                gw_hi_[r] = 0;
+        }
     }
     // Atomic op (Maxwell order: ADD MIN MAX INC DEC AND OR XOR EXCH) on `dst`; `orig` receives the old value.
     std::string AtomicOp(u32 aop, const std::string& dst, const std::string& v, const std::string& orig) {
@@ -1107,10 +1121,13 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
     // ---------------- moves
     case Op::MOV_reg: {
         const u32 s = u32(Bits(insn, 20, 8));
-        const u8 lo = s < RZ ? gw_lo_[s] : 0, hi = s < RZ ? gw_hi_[s] : 0;
+        // a usable tag of the source moves with the value (held under the source's guard, or this one's)
+        const bool lo_ok = s < RZ && gw_lo_[s] && GwUsable(gw_lok_[s]), hi_ok = s < RZ && gw_hi_[s] && GwUsable(gw_hik_[s]);
+        const u8 lo = lo_ok ? gw_lo_[s] : 0, hi = hi_ok ? gw_hi_[s] : 0;
+        const u8 lok = lo_ok ? (cur_key_ ? cur_key_ : gw_lok_[s]) : 0, hik = hi_ok ? (cur_key_ ? cur_key_ : gw_hik_[s]) : 0;
         SetR(d, R(s));
-        if (d < RZ && !cur_guarded_ && gw_track_)
-            gw_lo_[d] = lo, gw_hi_[d] = hi;
+        if (d < RZ && cur_key_ != 0xFF && gw_track_)
+            gw_lo_[d] = lo, gw_hi_[d] = hi, gw_lok_[d] = lok, gw_hik_[d] = hik;
         return;
     }
     case Op::MOV_cbuf:
@@ -1377,13 +1394,17 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
     // ---------------- integer arithmetic
     case Op::IADD_reg: case Op::IADD_cbuf: case Op::IADD_imm: {
         // (#8 window tags) one operand "something + window base", the other not negated: so is the sum
-        u8 tag_lo = 0, tag_hi = 0;
-        if (gw_track_ && !cur_guarded_ && !Bit(insn, 48) && !Bit(insn, 49)) {
+        u8 tag_lo = 0, tag_hi = 0, key_lo = 0, key_hi = 0;
+        if (gw_track_ && cur_key_ != 0xFF && !Bit(insn, 48) && !Bit(insn, 49)) {
             const u32 rb = op == Op::IADD_reg ? u32(Bits(insn, 20, 8)) : RZ;
-            const u8 alo = a < RZ ? gw_lo_[a] : 0, ahi = a < RZ ? gw_hi_[a] : 0;
-            const u8 blo = rb < RZ ? gw_lo_[rb] : 0, bhi = rb < RZ ? gw_hi_[rb] : 0;
+            // (an operand's tag counts only where it holds here; the sum holds under its guard or this one's)
+            auto lo = [&](u32 r) -> u8 { return r < RZ && gw_lo_[r] && GwUsable(gw_lok_[r]) ? gw_lo_[r] : 0; };
+            auto hi = [&](u32 r) -> u8 { return r < RZ && gw_hi_[r] && GwUsable(gw_hik_[r]) ? gw_hi_[r] : 0; };
+            const u8 alo = lo(a), ahi = hi(a), blo = lo(rb), bhi = hi(rb);
             tag_lo = alo && !blo ? alo : blo && !alo ? blo : 0;
             tag_hi = ahi && !bhi ? ahi : bhi && !ahi ? bhi : 0;
+            key_lo = !tag_lo ? 0 : cur_key_ ? cur_key_ : alo ? gw_lok_[a] : gw_lok_[rb];
+            key_hi = !tag_hi ? 0 : cur_key_ ? cur_key_ : ahi ? gw_hik_[a] : gw_hik_[rb];
         }
         std::string b = SrcB(insn, form3(op, Op::IADD_reg, Op::IADD_cbuf));
         std::string av = R(a);
@@ -1402,7 +1423,7 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
             SetR(d, v);
         }
         if (d < RZ && (tag_lo || tag_hi))
-            gw_lo_[d] = tag_lo, gw_hi_[d] = tag_hi;
+            gw_lo_[d] = tag_lo, gw_hi_[d] = tag_hi, gw_lok_[d] = key_lo, gw_hik_[d] = key_hi;
         if (op == Op::IADD_cbuf && !Bit(insn, 48))
             TagGmemBase(d, insn);
         return;
@@ -1775,6 +1796,8 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
         const u32 shift = u32(Bits(insn, 41, 2)) * 8;
         Line(fmt::format("tmpu.x = {} >> {}u; tmpu.y = {};", R(a), shift, mask));
         for (u32 i = 0; i < 7; i++)
+            GwPredWritten(i);
+        for (u32 i = 0; i < 7; i++)
             Line(fmt::format("if ((tmpu.y >> {}u) & 1u) p{} = ((tmpu.x >> {}u) & 1u) != 0u;", i, i, i)), preds_used_.insert(i);
         return;
     }
@@ -1932,10 +1955,15 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
                 Line(fmt::format("if ({}) {{", P(pidx, pneg)));
                 indent_++;
             }
+            // (window tags: under the call's guard or the instruction's; under both, untracked)
+            const u8 outer_key = cur_key_;
+            const u8 own_key = guarded ? u8((pidx * 2 + (pneg ? 1 : 0)) + 1) : 0;
+            cur_key_ = !guarded ? outer_key : outer_key == 0 ? own_key : u8(0xFF);
             if (IsTexOp(so))
                 TexSample(si, t, so);
             else
                 EmitInstruction(t, si, so);
+            cur_key_ = outer_key;
             if (guarded) {
                 indent_--;
                 Line("}");
@@ -1987,8 +2015,10 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
     case Op::SHFL: {
         SetR(d, R(a));
         const u32 pd = u32(Bits(insn, 48, 3));
-        if (pd != PT)
+        if (pd != PT) {
+            GwPredWritten(pd);
             Line(fmt::format("{} = true;", P(pd, false)));
+        }
         return;
     }
     case Op::ATOMS: {
@@ -2045,20 +2075,18 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
             // search does; outside it loads read 0 and stores are dropped). Window 0 only: the search takes the first
             // window holding an address, and windows may alias (two table entries for one 4-byte counter, each its own
             // buffer here), so an access built from a later entry still goes through the search.
-            if (wide && a != RZ && a + 1 < RZ && gw_lo_[a] == 1 && gw_hi_[a + 1] == 1) {
-                const u32 w = gw_lo_[a] - 1u;
-                Line(fmt::format("tmpu.w = tmpu.x - drv_gmem[{}].x;", w));
+            const bool w0 = wide && a != RZ && a + 1 < RZ && gw_lo_[a] == 1 && gw_hi_[a + 1] == 1 && GwUsable(gw_lok_[a]) &&
+                            GwUsable(gw_hik_[a + 1]);
+            if (w0) { // (through small helpers: one call each in the direct backend's bytecode, not the code inlined)
                 if (op == Op::LDG) {
                     for (u32 i = 0; i < words; i++)
-                        Line(fmt::format("tmpu4_[{0}] = (tmpu.w + {1}u < drv_gmem[{2}].z) ? gmem{2}.Load((tmpu.w + {1}u) & ~3u) : 0u;",
-                                         i, i * 4, w));
+                        Line(fmt::format("tmpu4_[{0}] = Gmem0Load(tmpu.x + {1}u);", i, i * 4));
                     for (u32 i = 0; i < words; i++)
                         SetR(d == RZ ? RZ : d + i, fmt::format("tmpu4_[{}]", i));
                 } else {
                     gmem_written_ = true;
                     for (u32 i = 0; i < words; i++)
-                        Line(fmt::format("if (tmpu.w + {0}u < drv_gmem[{1}].z) gmem{1}.Store((tmpu.w + {0}u) & ~3u, {2});", i * 4, w,
-                                         R(d == RZ ? RZ : d + i)));
+                        Line(fmt::format("Gmem0Store(tmpu.x + {}u, {});", i * 4, R(d == RZ ? RZ : d + i)));
                 }
                 return;
             }
@@ -2099,8 +2127,10 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
         Line(fmt::format("tmpb = {};", pv));
         SetR(d, "(tmpb ? 1u : 0u)");
         const u32 pd = u32(Bits(insn, 45, 3));
-        if (pd != PT)
+        if (pd != PT) {
+            GwPredWritten(pd);
             Line(fmt::format("{} = {};", P(pd, false), vop == 2 ? "true" : "tmpb"));
+        }
         return;
     }
     case Op::FSWZADD:
@@ -2453,12 +2483,12 @@ bool Translator::BuildStructuredBlocks() {
                 Line(fmt::format("if ({}) {{", guard));
                 indent_++;
             }
-            cur_guarded_ = guarded;
+            cur_key_ = guarded ? u8((pidx * 2 + (pneg ? 1 : 0)) + 1) : 0;
             if (IsTexOp(op))
                 TexSample(insn, pc, op);
             else
                 EmitInstruction(pc, insn, op);
-            cur_guarded_ = false;
+            cur_key_ = 0;
             if (guarded) {
                 indent_--;
                 Line("}");
@@ -2996,6 +3026,11 @@ bool Translator::Run() {
             src += "        uint4 w = drv_gmem[i];\n"
                    "        if (w.z != 0u && hi == w.y && lo >= w.x && lo - w.x < w.z) { off = lo - w.x; return i; }\n"
                    "    }\n    off = 0u;\n    return 0xFFFFFFFFu;\n}\n";
+            // window 0 at a known address (window tags): bounds-checked like the search, nothing else
+            src += "uint Gmem0Load(uint lo) {\n    uint off = lo - drv_gmem[0].x;\n"
+                   "    return off < drv_gmem[0].z ? gmem0.Load(off & ~3u) : 0u;\n}\n";
+            src += "void Gmem0Store(uint lo, uint v) {\n    uint off = lo - drv_gmem[0].x;\n"
+                   "    if (off < drv_gmem[0].z) gmem0.Store(off & ~3u, v);\n}\n";
             src += "uint GmemLoad(uint lo, uint hi) {\n    uint off; uint w = GmemWindow(lo, hi, off);\n    switch (w) {\n";
             for (u32 i = 0; i < kGmemWindows; i++)
                 src += fmt::format("    case {0}u: return gmem{0}.Load(off & ~3u);\n", i);
