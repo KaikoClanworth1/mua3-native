@@ -88,6 +88,7 @@ private:
     void SetR(u32 i, const std::string& v) {
         if (i >= RZ) // writes to RZ (and past it) are discarded
             return;
+        gw_lo_[i] = gw_hi_[i] = 0;
         Line(fmt::format("{} = {};", R(i), v));
     }
     void SetF(u32 i, const std::string& v) { SetR(i, fmt::format("asuint({})", v)); }
@@ -330,6 +331,25 @@ private:
     std::set<u32> vs_inputs_, out_attrs_, in_attrs_;
     bool uses_lmem_ = false, uses_smem_ = false, uses_gmem_ = false, uses_frag_coord_ = false, uses_front_face_ = false;
     bool gmem_written_ = false;
+    // (#8) Global memory addresses built from NVN's storage-buffer table (c0 + 0x310 + 16 * i: base lo, base hi): per
+    // register, window i + 1 when it holds "something + window i's base" (gw_lo_ for the low word, gw_hi_ for the high
+    // word), 0 when unknown. Only inside one basic block (BuildStructuredBlocks resets it per block), never set by a
+    // predicated instruction, cleared by every other write. An access through a tagged pair reads that window directly
+    // instead of the 8-way window search and switch of GmemLoad / GmemStore, which made AMD's compiler run for minutes.
+    bool gw_track_ = false, cur_guarded_ = false;
+    u8 gw_lo_[256] = {}, gw_hi_[256] = {};
+    void TagGmemBase(u32 d, u64 insn) {
+        if (!gw_track_ || cur_guarded_ || d >= RZ || Bits(insn, 34, 5) != 0)
+            return;
+        const u32 off = u32(Bits(insn, 20, 14)) * 4;
+        if (off < 0x310 || off >= 0x310 + 16 * kGmemWindows)
+            return;
+        const u32 w = (off - 0x310) / 16, part = (off - 0x310) % 16;
+        if (part == 0)
+            gw_lo_[d] = u8(w + 1);
+        else if (part == 4)
+            gw_hi_[d] = u8(w + 1);
+    }
     // Atomic op (Maxwell order: ADD MIN MAX INC DEC AND OR XOR EXCH) on `dst`; `orig` receives the old value.
     std::string AtomicOp(u32 aop, const std::string& dst, const std::string& v, const std::string& orig) {
         switch (aop) {
@@ -1085,8 +1105,18 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
         return;
 
     // ---------------- moves
-    case Op::MOV_reg: SetR(d, R(u32(Bits(insn, 20, 8)))); return;
-    case Op::MOV_cbuf: SetR(d, CbufOperand(insn)); return;
+    case Op::MOV_reg: {
+        const u32 s = u32(Bits(insn, 20, 8));
+        const u8 lo = s < RZ ? gw_lo_[s] : 0, hi = s < RZ ? gw_hi_[s] : 0;
+        SetR(d, R(s));
+        if (d < RZ && !cur_guarded_ && gw_track_)
+            gw_lo_[d] = lo, gw_hi_[d] = hi;
+        return;
+    }
+    case Op::MOV_cbuf:
+        SetR(d, CbufOperand(insn));
+        TagGmemBase(d, insn);
+        return;
     case Op::MOV_imm: SetR(d, IntImm20(insn)); return;
     case Op::MOV32I: SetR(d, Imm32(insn)); return;
     case Op::SEL_reg: case Op::SEL_cbuf: case Op::SEL_imm: {
@@ -1175,6 +1205,8 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
         auto store = [&](const std::string& v) {
             Line(fmt::format("{{ double dv_ = {}; uint lo_, hi_; asuint(dv_, lo_, hi_); {} = lo_; {} = hi_; }}", v,
                              d == RZ ? "tmpu.x" : R(d), d == RZ ? "tmpu.y" : R(d + 1)));
+            if (d < RZ)
+                gw_lo_[d] = gw_hi_[d] = gw_lo_[d + 1] = gw_hi_[d + 1] = 0;
         };
         const std::string av = dreg(a);
         if (op == Op::DADD_reg || op == Op::DADD_cbuf || op == Op::DADD_imm) {
@@ -1344,6 +1376,15 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
 
     // ---------------- integer arithmetic
     case Op::IADD_reg: case Op::IADD_cbuf: case Op::IADD_imm: {
+        // (#8 window tags) one operand "something + window base", the other not negated: so is the sum
+        u8 tag_lo = 0, tag_hi = 0;
+        if (gw_track_ && !cur_guarded_ && !Bit(insn, 48) && !Bit(insn, 49)) {
+            const u32 rb = op == Op::IADD_reg ? u32(Bits(insn, 20, 8)) : RZ;
+            const u8 alo = a < RZ ? gw_lo_[a] : 0, ahi = a < RZ ? gw_hi_[a] : 0;
+            const u8 blo = rb < RZ ? gw_lo_[rb] : 0, bhi = rb < RZ ? gw_hi_[rb] : 0;
+            tag_lo = alo && !blo ? alo : blo && !alo ? blo : 0;
+            tag_hi = ahi && !bhi ? ahi : bhi && !ahi ? bhi : 0;
+        }
         std::string b = SrcB(insn, form3(op, Op::IADD_reg, Op::IADD_cbuf));
         std::string av = R(a);
         if (Bit(insn, 49)) av = "(0u - " + av + ")";
@@ -1360,6 +1401,10 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
         } else {
             SetR(d, v);
         }
+        if (d < RZ && (tag_lo || tag_hi))
+            gw_lo_[d] = tag_lo, gw_hi_[d] = tag_hi;
+        if (op == Op::IADD_cbuf && !Bit(insn, 48))
+            TagGmemBase(d, insn);
         return;
     }
     case Op::IADD32I: {
@@ -1393,9 +1438,11 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
             Line("cc_c = tmpu.z < tmpu.x; cc_z = tmpu.z == 0u; cc_s = int(tmpu.z) < 0;"
                  " cc_o = ((~(tmpu.x ^ tmpu.y)) & (tmpu.x ^ tmpu.z) & 0x80000000u) != 0u;");
             SetR(d, "tmpu.z");
-            return;
+        } else {
+            SetR(d, fmt::format("({} << {}u) + {}", av, Bits(insn, 39, 5), b));
         }
-        SetR(d, fmt::format("({} << {}u) + {}", av, Bits(insn, 39, 5), b));
+        if (op == Op::ISCADD_cbuf && !Bit(insn, 48))
+            TagGmemBase(d, insn);
         return;
     }
     case Op::ISCADD32I:
@@ -1404,11 +1451,14 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
     case Op::IMUL_reg: case Op::IMUL_cbuf: case Op::IMUL_imm: {
         const std::string b = SrcB(insn, form3(op, Op::IMUL_reg, Op::IMUL_cbuf));
         const bool high = Bit(insn, 39);
-        if (high)
+        if (high) {
             Line(fmt::format("{{ uint hi_, lo_; {}(hi_, lo_, {}, {}); {} = hi_; }}",
                              Bit(insn, 40) ? "imul" : "umul", R(a), b, d == RZ ? "tmpu.x" : R(d)));
-        else
+            if (d < RZ)
+                gw_lo_[d] = gw_hi_[d] = 0;
+        } else {
             SetR(d, fmt::format("{} * {}", R(a), b));
+        }
         return;
     }
     case Op::IMUL32I:
@@ -1657,11 +1707,13 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
             Line(fmt::format("tmpu.x = {} << {}u; tmpu.y = {}; tmpu.z = tmpu.x + tmpu.y{};", av, shift, b, xin));
             Line("cc_c = tmpu.z < tmpu.x || (tmpu.z == tmpu.x && tmpu.y != 0u); cc_z = tmpu.z == 0u; cc_s = int(tmpu.z) < 0;");
             SetR(d, "tmpu.z");
-            return;
+        } else {
+            if (!xin.empty())
+                cc_used_ = true;
+            SetR(d, fmt::format("({} << {}u) + {}{}", av, shift, b, xin));
         }
-        if (!xin.empty())
-            cc_used_ = true;
-        SetR(d, fmt::format("({} << {}u) + {}{}", av, shift, b, xin));
+        if (op == Op::LEA_lo_cbuf)
+            TagGmemBase(d, insn);
         return;
     }
     case Op::LEA_hi_reg: case Op::LEA_hi_cbuf: {
@@ -1684,6 +1736,8 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
         if (x)
             cc_used_ = true;
         SetR(d, fmt::format("tmpu.z + {}{}", b, x ? " + (cc_c ? 1u : 0u)" : ""));
+        if (!reg)
+            TagGmemBase(d, insn);
         return;
     }
 
@@ -1987,6 +2041,27 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
             const u32 words = size == 5 ? 2 : size == 6 ? 4 : 1;
             if (size < 4)
                 res_.unimplemented.insert(fmt::format("{}_subword", OpName(op)));
+            // (#8) the address pair is window 0's base plus an offset: window 0, directly (bounds checked as the window
+            // search does; outside it loads read 0 and stores are dropped). Window 0 only: the search takes the first
+            // window holding an address, and windows may alias (two table entries for one 4-byte counter, each its own
+            // buffer here), so an access built from a later entry still goes through the search.
+            if (wide && a != RZ && a + 1 < RZ && gw_lo_[a] == 1 && gw_hi_[a + 1] == 1) {
+                const u32 w = gw_lo_[a] - 1u;
+                Line(fmt::format("tmpu.w = tmpu.x - drv_gmem[{}].x;", w));
+                if (op == Op::LDG) {
+                    for (u32 i = 0; i < words; i++)
+                        Line(fmt::format("tmpu4_[{0}] = (tmpu.w + {1}u < drv_gmem[{2}].z) ? gmem{2}.Load((tmpu.w + {1}u) & ~3u) : 0u;",
+                                         i, i * 4, w));
+                    for (u32 i = 0; i < words; i++)
+                        SetR(d == RZ ? RZ : d + i, fmt::format("tmpu4_[{}]", i));
+                } else {
+                    gmem_written_ = true;
+                    for (u32 i = 0; i < words; i++)
+                        Line(fmt::format("if (tmpu.w + {0}u < drv_gmem[{1}].z) gmem{1}.Store((tmpu.w + {0}u) & ~3u, {2});", i * 4, w,
+                                         R(d == RZ ? RZ : d + i)));
+                }
+                return;
+            }
             if (op == Op::LDG) {
                 for (u32 i = 0; i < words; i++)
                     Line(fmt::format("tmpu4_[{}] = GmemLoad(tmpu.x + {}u, tmpu.y);", i, i * 4));
@@ -2310,10 +2385,17 @@ float4 ApplySwizzle(float4 v, uint s) {
 
 bool Translator::BuildStructuredBlocks() {
     sblocks_.assign(blocks_.size(), {});
+    gw_track_ = true; // (window tags: within one block only)
+    struct GwOff {
+        bool& f;
+        ~GwOff() { f = false; }
+    } gw_off{gw_track_};
     for (auto& [start, b] : blocks_) {
         cur_block_ = start;
         out_.clear();
         indent_ = 0;
+        std::fill(std::begin(gw_lo_), std::end(gw_lo_), u8(0));
+        std::fill(std::begin(gw_hi_), std::end(gw_hi_), u8(0));
         SBlock& sb = sblocks_[b.id];
         bool has_term = false;
         for (u32 pc = b.start; pc < b.end; pc = NextPc(pc)) {
@@ -2371,10 +2453,12 @@ bool Translator::BuildStructuredBlocks() {
                 Line(fmt::format("if ({}) {{", guard));
                 indent_++;
             }
+            cur_guarded_ = guarded;
             if (IsTexOp(op))
                 TexSample(insn, pc, op);
             else
                 EmitInstruction(pc, insn, op);
+            cur_guarded_ = false;
             if (guarded) {
                 indent_--;
                 Line("}");
