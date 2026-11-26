@@ -2279,6 +2279,9 @@ void D3D11Renderer::Dispatch(const ComputeLaunch& l) {
         g.ReadGpu(tsc_base + u64((h >> 20) & 0xFFF) * 32, tsc, 32);
         u32 swz = 0xB1A;
         srvs[t.slot] = textures_->Get(tic, t, swz);
+        // F4 capture: a dispatch's textures too (texel buffers as the GPU has them), so a kernel replays from its inputs
+        if (FrameCapture* c = capture_.load(std::memory_order_relaxed); c && c->Recording())
+            c->Texture(false, t.slot, h, tic, srvs[t.slot], FindSurfaceByGpu(tic.Address()) != nullptr);
         drv.swizzle[t.slot][0] = swz;
         drv.swizzle[t.slot][1] = TextureScale(tic.Address(), t.dim == shader::TexDim::Tex2D && !t.array);
         if (t.sampler < 16)
