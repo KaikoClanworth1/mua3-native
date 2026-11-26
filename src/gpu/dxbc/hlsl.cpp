@@ -2330,6 +2330,22 @@ private:
             EmitRaw(m == "Sample" ? OP_SAMPLE : OP_SAMPLE_B, 0, tok, ext);
             return TempVal(rt, out);
         }
+        if (m == "SampleGrad") { // sample_d: explicit derivatives (Maxwell TXD), any stage
+            Val c = coords();
+            Val ddx = arg(2), ddy = arg(3);
+            ddx = Plain(Convert(ddx, {B::Float, ddx.t.n}));
+            ddy = Plain(Convert(ddy, {B::Float, ddy.t.n}));
+            const u32 out = Scratch();
+            std::vector<u32> tok;
+            PutDst(tok, {OT_TEMP, out, 0xF});
+            PutSrc(tok, Spread(c, 4), false);
+            PutResource(tok, OT_RESOURCE, r.reg);
+            sampler(tok, -1);
+            PutSrc(tok, Spread(ddx, 4), false);
+            PutSrc(tok, Spread(ddy, 4), false);
+            EmitRaw(OP_SAMPLE_D, 0, tok, ext);
+            return TempVal(rt, out);
+        }
         if (m == "SampleCmp") {
             Val c = coords();
             Val ref = Plain(Convert(arg(2), {B::Float, 1}));

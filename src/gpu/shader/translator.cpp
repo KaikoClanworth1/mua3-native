@@ -18,6 +18,13 @@ constexpr u32 kProgramStart = 0x50; // instructions follow the 0x50-byte SPH
 // Generic varyings passed VS->PS (D3D11 PS input limit is 32 incl. position and front-face).
 constexpr u32 kMaxVaryings = 30;
 
+// The instructions Translator::TexSample emits.
+bool IsTexOp(Op op) {
+    return op == Op::TEX || op == Op::TEX_b || op == Op::TEXS || op == Op::TLD || op == Op::TLD_b || op == Op::TLDS ||
+           op == Op::TLD4 || op == Op::TLD4_b || op == Op::TLD4S || op == Op::TXQ || op == Op::TXQ_b || op == Op::TMML ||
+           op == Op::TMML_b || op == Op::TXD;
+}
+
 u32 NextPc(u32 pc) {
     pc += 8;
     if (pc % 32 == 0)
@@ -554,6 +561,39 @@ void Translator::TexSample(u64 insn, u32 pc, Op op) {
         for (u32 i = 0; i < 4; i++)
             regs.push_back(d == RZ ? RZ : d + i);
         EmitTexWrites(mask, regs, sample(slot, coords, lk, lod, dref), slot);
+        return;
+    }
+    case Op::TXD: {
+        // Sample with explicit derivatives (#23: the G-buffer decals sample their atlas with it). Unlike TEX the
+        // coordinates come first and an array layer follows them (low 16 bits); rb holds the derivatives interleaved,
+        // d/dx then d/dy of each coordinate. 1D and 2D only (as on the hardware's common paths); offsets and the LOD
+        // clamp are left out, like TEX's offsets.
+        const u32 d = u32(Bits(insn, 0, 8));
+        const u32 type3 = u32(Bits(insn, 28, 3));
+        const TexDim dim = TexDim(type3 >> 1);
+        const bool array = type3 & 1;
+        const u32 mask = u32(Bits(insn, 31, 4));
+        if (dim != TexDim::Tex1D && dim != TexDim::Tex2D) {
+            Unimpl(op, pc, insn);
+            return;
+        }
+        const u32 ncoord = dim == TexDim::Tex1D ? 1 : 2;
+        auto fr = [&](u32 base, u32 i) { return base == RZ ? std::string("0.0f") : F(base + i); };
+        std::string coords;
+        for (u32 i = 0; i < ncoord; i++)
+            coords += (i ? ", " : "") + fr(ra, i);
+        if (array)
+            coords += ra == RZ ? std::string(", 0.0f") : fmt::format(", float({} & 0xFFFFu)", R(ra + ncoord));
+        const u32 n = ncoord + (array ? 1 : 0);
+        coords = n == 1 ? coords : fmt::format("float{}({})", n, coords);
+        const std::string ddx = ncoord == 1 ? fr(rb, 0) : fmt::format("float2({}, {})", fr(rb, 0), fr(rb, 2));
+        const std::string ddy = ncoord == 1 ? fr(rb, 1) : fmt::format("float2({}, {})", fr(rb, 1), fr(rb, 3));
+        const u32 slot = TexSlot(cbuf_off, dim, array, false);
+        std::vector<u32> regs;
+        for (u32 i = 0; i < 4; i++)
+            regs.push_back(d == RZ ? RZ : d + i);
+        EmitTexWrites(mask, regs, fmt::format("tex{}.SampleGrad({}, {}, {}, {})", slot, Sampler(slot), coords, ddx, ddy),
+                      slot);
         return;
     }
     case Op::TLDS: {
@@ -1500,11 +1540,14 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
         else { b = IntImm20(insn); lut = u32(Bits(insn, 48, 8)); }
         const std::string c = R(u32(Bits(insn, 39, 8)));
         Line(fmt::format("tmpu.x = {}; tmpu.y = {}; tmpu.z = {}; tmpu.w = 0u;", R(a), b, c));
+        // LUT bit i is the result for a = bit 2 of i, b = bit 1, c = bit 0 (the table is F(0xF0, 0xCC, 0xAA)).
+        // (#23: read with a and c swapped, 0xF8 = a | (b & c) became c | (a & b), and the decal pass packing a G-buffer
+        // field with it scrambled the normals target in every tile a decal box touched.)
         for (u32 i = 0; i < 8; i++) {
             if (!(lut & (1u << i)))
                 continue;
-            Line(fmt::format("tmpu.w |= {} & {} & {};", (i & 1) ? "tmpu.x" : "~tmpu.x", (i & 2) ? "tmpu.y" : "~tmpu.y",
-                             (i & 4) ? "tmpu.z" : "~tmpu.z"));
+            Line(fmt::format("tmpu.w |= {} & {} & {};", (i & 4) ? "tmpu.x" : "~tmpu.x", (i & 2) ? "tmpu.y" : "~tmpu.y",
+                             (i & 1) ? "tmpu.z" : "~tmpu.z"));
         }
         SetR(d, "tmpu.w");
         if (op == Op::LOP3_reg) {
@@ -1835,9 +1878,7 @@ void Translator::EmitInstruction(u32 pc, u64 insn, Op op) {
                 Line(fmt::format("if ({}) {{", P(pidx, pneg)));
                 indent_++;
             }
-            if (so == Op::TEX || so == Op::TEX_b || so == Op::TEXS || so == Op::TLD || so == Op::TLD_b || so == Op::TLDS ||
-                so == Op::TLD4 || so == Op::TLD4_b || so == Op::TLD4S || so == Op::TXQ || so == Op::TXQ_b ||
-                so == Op::TMML || so == Op::TMML_b)
+            if (IsTexOp(so))
                 TexSample(si, t, so);
             else
                 EmitInstruction(t, si, so);
@@ -2330,9 +2371,7 @@ bool Translator::BuildStructuredBlocks() {
                 Line(fmt::format("if ({}) {{", guard));
                 indent_++;
             }
-            if (op == Op::TEX || op == Op::TEX_b || op == Op::TEXS || op == Op::TLD || op == Op::TLD_b ||
-                op == Op::TLDS || op == Op::TLD4 || op == Op::TLD4_b || op == Op::TLD4S || op == Op::TXQ ||
-                op == Op::TXQ_b || op == Op::TMML || op == Op::TMML_b)
+            if (IsTexOp(op))
                 TexSample(insn, pc, op);
             else
                 EmitInstruction(pc, insn, op);
@@ -2740,9 +2779,7 @@ bool Translator::Run() {
                 Line(fmt::format("if ({}) {{", guard));
                 indent_++;
             }
-            if (op == Op::TEX || op == Op::TEX_b || op == Op::TEXS || op == Op::TLD || op == Op::TLD_b ||
-                op == Op::TLDS || op == Op::TLD4 || op == Op::TLD4_b || op == Op::TLD4S || op == Op::TXQ ||
-                op == Op::TXQ_b || op == Op::TMML || op == Op::TMML_b)
+            if (IsTexOp(op))
                 TexSample(insn, pc, op);
             else
                 EmitInstruction(pc, insn, op);

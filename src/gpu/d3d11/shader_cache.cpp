@@ -26,7 +26,7 @@
 namespace gpu {
 
 // Bump kTranslatorVersion whenever the translator output changes, to invalidate cached bytecode.
-constexpr int kTranslatorVersion = 33; // 33: one iteration budget per invocation for all loops (AMD hang, #8)
+constexpr int kTranslatorVersion = 34; // 34: TXD (gradient sampling) and LOP3 a/c order (#23)
 // Failure markers carry this: older ones (before the direct backend took over what FXC fails on) are retried once.
 // 3: constant buffers 13+ read 0, BRX tables found through a clamp further back (only programs that failed change,
 // so no kTranslatorVersion bump: their failure markers are retried instead)
