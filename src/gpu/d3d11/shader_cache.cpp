@@ -9,6 +9,7 @@
 #include <fstream>
 #include <shared_mutex>
 #include "gpu/d3d11/shader_cache.h"
+#include "core/system.h"
 #include "gpu/dxbc/dxbc.h"
 #include "gpu/gpu.h"
 #include "gpu/shader/anticipate.h"
@@ -275,6 +276,30 @@ bool ComputeViaFxcHash(u64 hash, u64 base_hash) {
 bool ComputeViaFxc(const HostShader& s) {
     return ComputeViaFxcHash(s.hash, s.base ? s.base->hash : 0);
 }
+// [debug] skip_cs (or MUA3_SKIP_CS_HASH): compute shaders the renderer never dispatches (a base program's hash covers
+// its variants). Never handed to the graphics driver either: for compute the driver compiles at CreateComputeShader,
+// and #8's AMD compiler ran for minutes and took tens of GB of host memory on some kernels, dispatched or not.
+bool SkippedCompute(const HostShader& s) {
+    static const std::unordered_set<u64> listed = [] {
+        std::string list = core::Sys().Cfg().skip_cs;
+        if (const char* e = std::getenv("MUA3_SKIP_CS_HASH"))
+            list += std::string(",") + e;
+        std::unordered_set<u64> set;
+        for (const char* p = list.c_str(); *p;) {
+            char* end = nullptr;
+            const u64 h = std::strtoull(p, &end, 16);
+            if (end == p) {
+                p++;
+                continue;
+            }
+            set.insert(h);
+            p = end;
+        }
+        return set;
+    }();
+    return s.stage == shader::Stage::Compute && !listed.empty() &&
+           (listed.count(s.hash) || (s.base && listed.count(s.base->hash)));
+}
 // A failure marker stands for the backend that failed. A compute program the direct backend builds ignores a marker an
 // FXC-only run (fxc_cs, MUA3_FXC_COMPUTE) left: honouring it skipped the kernel for good, in every later run (a test
 // instance lost the light-list sort 8d1754b934e53aa0 this way, #23). Vertex and pixel programs are FXC-first: kept.
@@ -502,6 +527,20 @@ bool ShaderCache::Build(HostShader& s, bool slow) {
         }
         cv_.notify_all();
         return false;
+    }
+    // skip_cs: Ready with its translation (the renderer's dispatch reaches its skip check, which logs what goes
+    // missing), but no driver object and no bytecode.
+    if (s.info.ok && SkippedCompute(s)) {
+        LOG_WARN("Shader", "{} {:016x}: in skip_cs, not given to the graphics driver", tag, s.hash);
+        s.ok = true;
+        s.code.clear();
+        s.code.shrink_to_fit();
+        {
+            std::lock_guard lk(ready_mutex_);
+            s.state = HostShader::Ready;
+        }
+        ready_cv_.notify_all();
+        return true;
     }
     std::string err;
     const auto c0 = std::chrono::steady_clock::now();
