@@ -59,6 +59,9 @@ struct Config {
     // [debug] rewritten (video) textures through UpdateSubresource instead of the staging ring, as MUA3_TEX_UPDATESUB=1
     // (#22: a player's test of the grey movie without the ring)
     bool tex_updatesub = false;
+    // [debug] compute global-memory helpers narrowed to the windows a dispatch binds (#8): -1 auto (AMD GPUs only),
+    // 0 off, 1 on (gpu/d3d11/renderer_d3d11.cpp; MUA3_GMEM_NARROW=0/1 wins)
+    int gmem_narrow = -1;
     bool mods_enabled = true;  // [mods] enabled: master switch for the mods folder (core/hle/mods.h, docs/mods.md)
     // [keys]: keyboard / mouse bindings that differ from the defaults, action -> "KEY[, MOUSE BUTTON]" (hle::keybinds)
     std::map<std::string, std::string> keys;

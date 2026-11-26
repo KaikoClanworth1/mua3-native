@@ -1643,12 +1643,16 @@ HostShader* ShaderCache::GetVariant(HostShader* base, const VariantKey& key_in) 
     // A pixel shader already writing RT7 has no room for the motion output.
     if (v.velocity && base->stage == shader::Stage::Fragment && (base->info.rt_mask & 0x80))
         v.velocity = 0;
-    if (!(v.attr_uint | v.attr_sint | v.attr_snorm10 | v.tex_uint | v.tex_sint | v.velocity))
+    if (base->stage != shader::Stage::Compute || v.gmem_windows >= shader::kGmemWindows)
+        v.gmem_windows = 0;
+    if (!(v.attr_uint | v.attr_sint | v.attr_snorm10 | v.tex_uint | v.tex_sint | v.velocity | v.gmem_windows))
         return base;
     // (hashed without the velocity field, so every variant keyed before it existed keeps its hash)
     u64 vh = Hash64(&v, offsetof(VariantKey, velocity));
     if (v.velocity)
         vh = ~vh ^ 0x56454C4F43495459ull;
+    if (v.gmem_windows) // (likewise outside the first hash: variants keyed before it keep theirs)
+        vh = (vh ^ (0x474D454D00000000ull | v.gmem_windows)) * 0xBF58476D1CE4E5B9ull;
     const u64 key = base->hash ^ (vh * 0x9E3779B97F4A7C15ull);
     auto it = shaders_.find(key);
     if (it != shaders_.end()) {
@@ -1669,8 +1673,10 @@ HostShader* ShaderCache::GetVariant(HostShader* base, const VariantKey& key_in) 
     s->prewarm = replaying_; // replayed from variants.txt: part of the backlog until a draw asks for it
     s->seq = replaying_ ? ++queued_ : 0;
     s->base = base;
-    s->key = {v.attr_uint, v.attr_sint, v.attr_scaled, v.attr_snorm10, v.tex_uint, v.tex_sint, v.velocity};
-    s->record = !replaying_; // newly seen (not replayed from the manifest): remember it for the next prewarm
+    s->key = {v.attr_uint, v.attr_sint, v.attr_scaled, v.attr_snorm10, v.tex_uint, v.tex_sint, v.velocity, v.gmem_windows};
+    // newly seen (not replayed from the manifest): remember it for the next prewarm. Not a window-count variant: its
+    // direct build takes milliseconds at first use, and variants.txt has no field for it.
+    s->record = !replaying_ && !v.gmem_windows;
     new_variants += !replaying_;
     auto* raw = s.get();
     shaders_[key] = std::move(s);
@@ -1690,9 +1696,9 @@ void ShaderCache::BuildVariantSource(HostShader& s) {
     HostShader* base = s.base;
     VariantKey v;
     v.attr_uint = s.key[0], v.attr_sint = s.key[1], v.attr_scaled = s.key[2], v.attr_snorm10 = s.key[3];
-    v.tex_uint = s.key[4], v.tex_sint = s.key[5], v.velocity = s.key[6];
-    LOG_INFO("Shader", "variant {:016x} of {:016x} (tex uint {:#x} sint {:#x}{})", s.hash, base->hash, v.tex_uint, v.tex_sint,
-             v.velocity ? ", motion vectors" : "");
+    v.tex_uint = s.key[4], v.tex_sint = s.key[5], v.velocity = s.key[6], v.gmem_windows = s.key[7];
+    LOG_INFO("Shader", "variant {:016x} of {:016x} (tex uint {:#x} sint {:#x}{}{})", s.hash, base->hash, v.tex_uint, v.tex_sint,
+             v.velocity ? ", motion vectors" : "", v.gmem_windows ? fmt::format(", {} gmem windows", v.gmem_windows) : "");
     if (s.record)
         AppendLine(dump_dir_ / (v.velocity ? "variants_vel.txt" : "variants.txt"), fmt::format("{:016x} {:x} {:x} {:x} {:x} {:x} {:x}\n", base->hash, v.attr_uint,
                                                            v.attr_sint, v.attr_scaled, v.attr_snorm10, v.tex_uint, v.tex_sint));
@@ -1778,6 +1784,37 @@ void ShaderCache::BuildVariantSource(HostShader& s) {
             src.insert(q, ")");
             src.insert(at, "asfloat(");
             at = q + 9;
+        }
+    }
+    // Compute: the global memory helpers over the first gmem_windows windows only (the rest are never bound for this
+    // dispatch). Only inside the helpers: the program's own code may hold switches too.
+    if (v.gmem_windows) {
+        const std::string loop = fmt::format("[unroll] for (uint i = 0u; i < {}u; i++) {{", shader::kGmemWindows);
+        const size_t first = src.find("uint GmemWindow(uint lo, uint hi, out uint off) {");
+        const size_t atomic = src.find("uint GmemAtomic(uint op, uint lo, uint hi, uint v) {");
+        const size_t last = atomic == std::string::npos ? atomic : src.find("\n}\n", atomic);
+        const size_t lp = first == std::string::npos ? first : src.find(loop, first);
+        if (lp != std::string::npos && last != std::string::npos && lp < last) {
+            std::string helpers = src.substr(first, last + 3 - first), out;
+            helpers.replace(helpers.find(loop), loop.size(),
+                            fmt::format("[unroll] for (uint i = 0u; i < {}u; i++) {{", v.gmem_windows));
+            bool skip = false;
+            for (size_t at = 0; at < helpers.size();) {
+                size_t nl = helpers.find('\n', at);
+                nl = nl == std::string::npos ? helpers.size() : nl + 1;
+                const std::string_view line(helpers.data() + at, nl - at);
+                u32 window = 0;
+                if (line.starts_with("    case ") && std::sscanf(std::string(line).c_str(), "    case %uu:", &window) == 1)
+                    skip = window >= v.gmem_windows;
+                else if (line.starts_with("    default:") || line.starts_with("    }"))
+                    skip = false;
+                if (!skip)
+                    out += line;
+                at = nl;
+            }
+            src.replace(first, last + 3 - first, out);
+        } else {
+            LOG_WARN("Shader", "variant {:016x}: global memory helpers not found, all windows kept", s.hash);
         }
     }
     if (v.velocity) {
