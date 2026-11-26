@@ -14,6 +14,7 @@
 #include "common/crash.h"
 #include "crypto/crypto.h"
 #include "loader/formats.h"
+#include "launcher/game_builder.h"
 #include "setup/updater.h"
 
 #pragma comment(lib, "windowscodecs.lib")
@@ -512,6 +513,8 @@ bool SaveInstalled(const Installed& in) {
         f << "dev=1\n";
     if (!in.version.empty())
         f << "version=" << in.version << "\n";
+    for (auto& r : in.runtime)
+        f << "runtime=" << r << "\n";
     for (auto& p : in.files)
         f << "file=" << U8(p) << "\n";
     return bool(f);
@@ -538,6 +541,7 @@ std::optional<Installed> LoadInstalled(const fs::path& dir) {
         else if (k == "start_menu") in.start_menu = v == "1";
         else if (k == "dev") in.dev = v == "1";
         else if (k == "version") in.version = v;
+        else if (k == "runtime") in.runtime.push_back(v);
         else if (k == "file") in.files.push_back(fs::u8path(v));
     }
     return in;
@@ -563,6 +567,29 @@ bool GameOlder(const Installed& in, const std::string& running) {
         return false;
     const std::string game = GameVersion(in);
     return game.empty() || updater::Newer(running, game);
+}
+
+std::vector<std::string> InstallRuntime(const fs::path& sdk_dir, const fs::path& install_dir, std::string& error) {
+    std::vector<std::string> placed;
+    std::error_code ec;
+    const fs::path src = sdk_dir / "runtime";
+    if (!fs::is_directory(src, ec))
+        return placed; // (a package without one: nothing to place)
+    for (auto it = fs::recursive_directory_iterator(src, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (!it->is_regular_file(ec))
+            continue;
+        const fs::path rel = fs::relative(it->path(), src, ec);
+        const fs::path dst = install_dir / rel;
+        fs::create_directories(dst.parent_path(), ec);
+        if (!builder::ReplaceExe(it->path(), dst, error)) // (a DLL the running game holds: say so, change nothing)
+            return {};
+        placed.push_back(U8(rel));
+    }
+    if (ec) {
+        error = "Could not read " + src.string() + ": " + ec.message();
+        return {};
+    }
+    return placed;
 }
 
 std::optional<Installed> FindInstalled() {
@@ -642,6 +669,12 @@ std::vector<std::string> Uninstall(const Installed& in, bool keep_saves) {
     if (!in.dir.empty() && (fs::exists(in.dir / "mua3.exe", ec) || fs::exists(in.dir / kSetupIni, ec))) {
         for (const char* p : {"mua3.exe", "mua3.exe.new", "mua3.ini", "mua3.ico", "mua3.log", "mua3.pdb", "setup.ini", "game",
                               "shader_cache", "shader_dump", "logs", "crash", "romfs_index.bin", "launcher.log", ".mod_install"})
+            remove_all(in.dir / p);
+        // the runtime the setup placed (sdk\runtime: DLLs and their licences), also by name for older setup.ini files
+        for (auto& r : in.runtime)
+            if (!r.empty() && fs::u8path(r).is_relative() && r.find("..") == std::string::npos)
+                remove_all(in.dir / fs::u8path(r));
+        for (const char* p : {"d3dcompiler_47.dll", "licenses"})
             remove_all(in.dir / p);
         for (auto it = fs::directory_iterator(in.dir, ec); !ec && it != fs::directory_iterator(); it.increment(ec)) {
             const std::string n = Lower(it->path().filename().string());

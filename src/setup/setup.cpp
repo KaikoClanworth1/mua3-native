@@ -1148,6 +1148,18 @@ void BuildThread(Wizard& w, std::vector<fs::path> files, fs::path keys) {
         }
     }
 
+    // the runtime the game loads from its own folder (Microsoft's D3D compiler, FFmpeg): before the build, whose
+    // shader step runs the game
+    std::vector<std::string> runtime;
+    {
+        std::string err;
+        runtime = setup::InstallRuntime(w.sdk_dir, w.install_dir, err);
+        if (!err.empty())
+            return fail(err);
+        Log(w, runtime.empty() ? std::string("No runtime files in this package.")
+                               : fmt::format("Runtime files placed beside the game: {}", runtime.size()));
+    }
+
     // 2.-5. translate, compile, link, shaders (game_builder), from the install folder (shader_cache\ lands there)
     builder::Paths p;
     p.game_dir = game;
@@ -1241,6 +1253,7 @@ void BuildThread(Wizard& w, std::vector<fs::path> files, fs::path keys) {
     in.desktop = w.want_desktop;
     in.start_menu = w.want_start_menu;
     in.version = common::Version(); // (the launcher and the next setup compare with it: issue #8)
+    in.runtime = runtime;
     const fs::path self = setup::SetupDir() / "MUA3Setup.exe";
     {
         // The install always gets "MUA3 Launcher.exe", also when setup runs from the install folder itself
@@ -2236,6 +2249,21 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         const bool ok = builder::ReplaceExe(fs::path(args[1]), fs::path(args[2]), why);
         Out(ok ? "replaced" : "error " + why);
         return ok ? 0 : 4;
+    }
+    if (args.size() == 3 && args[0] == L"--test-runtime") { // developer test: setup::InstallRuntime <sdk> <install>
+        std::string why;
+        const auto placed = setup::InstallRuntime(fs::path(args[1]), fs::path(args[2]), why);
+        if (!why.empty()) {
+            Out("error " + why);
+            return 4;
+        }
+        setup::Installed in = setup::LoadInstalled(fs::path(args[2])).value_or(setup::Installed{});
+        in.dir = fs::path(args[2]);
+        in.runtime = placed;
+        setup::SaveInstalled(in);
+        for (auto& r : placed)
+            Out("placed " + r);
+        return 0;
     }
     if (want_prepare) {
         if (auto here = setup::LoadInstalled(setup::SetupDir()); here && here->dev) {

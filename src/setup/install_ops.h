@@ -89,7 +89,12 @@ struct Installed {
     // update, repair or uninstall, and wins over the Apps entry when the launcher runs from there.
     bool dev = false;
     std::string version; // the setup version that built mua3.exe (empty: built by a setup older than v0.4.3)
+    std::vector<std::string> runtime; // files the setup put beside mua3.exe from the package's sdk\runtime (uninstall)
 };
+// Copies the package's sdk\runtime\ (Microsoft's d3dcompiler_47.dll, FFmpeg's DLLs, their licences\) into the
+// install folder. Each file replaces its old copy in one step. Returns the names placed (relative paths), or empty
+// with `error` set.
+std::vector<std::string> InstallRuntime(const fs::path& sdk_dir, const fs::path& install_dir, std::string& error);
 // The version that built the installed mua3.exe: setup.ini's version, else the first line of the game's last
 // mua3.log ("MUA3 Native v0.4.1"), else empty (unknown).
 std::string GameVersion(const Installed& in);

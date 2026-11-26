@@ -2,8 +2,12 @@
 # build the game on their own PC from their own files. It contains none of the game: no recompiled code (nxrecomp*.lib,
 # recomp_full/), no game data, no keys, and the setup is built without the icon made from the game (the setup makes
 # the game's icon on the player's PC, from their own files).
-#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\make_release.ps1 -Version 0.2.0 [-Zip]
-param([string]$Version = '0.2.0', [switch]$Zip)
+# Runtime DLLs the game loads from its own folder go in sdk\runtime\ (the setup places them beside mua3.exe) with
+# their licences in sdk\runtime\licenses\: Microsoft's d3dcompiler_47.dll from this PC's Windows SDK (Redist\D3D\x64,
+# distributable under the SDK licence), and FFmpeg's DLLs from -Ffmpeg <folder>: the DLLs, its licence text
+# (COPYING.LGPL* or LICENSE*) and BUILD.txt (version and configure line). None of them is in the repository.
+#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\make_release.ps1 -Version 0.2.0 [-Zip] [-Ffmpeg <folder>]
+param([string]$Version = '0.2.0', [switch]$Zip, [string]$Ffmpeg = '')
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $build = Join-Path $root 'build'
@@ -63,6 +67,42 @@ foreach ($s in ($m.Groups[1].Value -split '\s+' | Where-Object { $_ -like '*.cpp
 # version needs built unoptimised (noopt) or left out (skip). Addresses only.
 $work = Join-Path $build 'recomp_work'
 Get-ChildItem $work -File | Where-Object { $_.Name -match '^(prof\d+|missing\d+|noopt|skip|nogm|hugeopt)\.txt$' } | Copy-Item -Destination "$out\sdk\recomp"
+
+# runtime DLLs (see the top). Microsoft's D3D compiler: the Windows SDK's redistributable copy and the SDK licence.
+$rt = "$out\sdk\runtime"
+New-Item -ItemType Directory -Force "$rt\licenses" | Out-Null
+$kits = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
+$d3dc = Join-Path $kits 'Redist\D3D\x64\d3dcompiler_47.dll'
+if (-not (Test-Path $d3dc)) { throw "d3dcompiler_47.dll not found: install the Windows SDK ($d3dc)" }
+Copy-Item $d3dc $rt
+$sdkLicense = Get-ChildItem (Join-Path $kits 'Licenses') -Directory | Sort-Object { [version]$_.Name } -Descending |
+    ForEach-Object { Join-Path $_.FullName 'sdk_license.rtf' } | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $sdkLicense) { throw "the Windows SDK licence (Licenses\<version>\sdk_license.rtf) was not found under $kits" }
+Copy-Item $sdkLicense "$rt\licenses\Microsoft Windows SDK license.rtf"
+$d3dVer = (Get-Item $d3dc).VersionInfo.FileVersion
+@"
+d3dcompiler_47.dll (version $d3dVer) is Microsoft's Direct3D shader compiler, from the Windows SDK's Redist\D3D\x64
+folder. It is Distributable Code under the Windows SDK licence ("Microsoft Windows SDK license.rtf" here; the
+REDIST list is at http://go.microsoft.com/fwlink/?LinkId=524842). (c) Microsoft Corporation. All rights reserved.
+MUA3 Native ships it unchanged beside mua3.exe, so the game does not depend on the copy in Windows.
+"@ | Set-Content "$rt\licenses\d3dcompiler_47.txt" -Encoding utf8
+# FFmpeg (LGPL, H.264 decoding): the DLLs, the licence text and how they were built, from -Ffmpeg
+if ($Ffmpeg) {
+    $ff = Get-Item $Ffmpeg
+    $ffDlls = @(Get-ChildItem $ff.FullName -File -Filter *.dll)
+    $ffLicense = @(Get-ChildItem $ff.FullName -File | Where-Object { $_.Name -match '^(COPYING\.LGPL|LICENSE)' })
+    $ffBuild = Join-Path $ff.FullName 'BUILD.txt'
+    if (-not $ffDlls) { throw "-Ffmpeg $Ffmpeg holds no DLL" }
+    if (-not $ffLicense) { throw "-Ffmpeg $Ffmpeg holds no licence text (COPYING.LGPL* or LICENSE*)" }
+    if (-not (Test-Path $ffBuild)) { throw "-Ffmpeg $Ffmpeg holds no BUILD.txt (FFmpeg version and configure line)" }
+    $ffDlls | Copy-Item -Destination $rt
+    New-Item -ItemType Directory -Force "$rt\licenses\ffmpeg" | Out-Null
+    $ffLicense | Copy-Item -Destination "$rt\licenses\ffmpeg"
+    Copy-Item $ffBuild "$rt\licenses\ffmpeg\BUILD.txt"
+} else {
+    Write-Warning 'no -Ffmpeg: the package has no FFmpeg DLLs'
+}
+"runtime: $((Get-ChildItem $rt -File -Filter *.dll | ForEach-Object Name) -join ', ')"
 @"
 MUA3 Native v$Version
 =====================
@@ -90,6 +130,12 @@ https://github.com/KaikoClanworth1/mua3-native
 # nothing of the game may be in here
 $bad = Get-ChildItem $out -Recurse -File | Where-Object { $_.Name -match 'nxrecomp|recomp_\d+|\.ico$|\.nso$|\.nca$|\.keys$|^main\.bin$' -or $_.FullName -match '\\game\\|recomp_full' }
 if ($bad) { throw "game material in the package: $($bad.FullName -join ', ')" }
+# third-party DLLs: only the named runtime ones, only in sdk\runtime, each with its licence
+$dlls = @(Get-ChildItem $out -Recurse -File -Filter *.dll)
+$strayDll = $dlls | Where-Object { $_.DirectoryName -ne $rt -or $_.Name -notmatch '^(d3dcompiler_47|(avcodec|avutil|avformat|swresample|swscale)-\d+)\.dll$' }
+if ($strayDll) { throw "DLLs outside the runtime allow-list: $($strayDll.FullName -join ', ')" }
+if (-not (Test-Path "$rt\licenses\Microsoft Windows SDK license.rtf")) { throw 'd3dcompiler_47.dll without the SDK licence' }
+if (($dlls | Where-Object Name -match '^(av|sw)') -and -not (Test-Path "$rt\licenses\ffmpeg\BUILD.txt")) { throw 'FFmpeg DLLs without their licence and BUILD.txt' }
 # NVIDIA's DLSS SDK (third_party/dlss: headers, nvsdk_ngx*.lib, nvngx_dlss.dll) is never packaged, nor linked into the
 # packaged libraries.
 $nv = Get-ChildItem $out -Recurse -File | Where-Object { $_.Name -match '^(nvngx|nvsdk)' -or $_.FullName -match '\\third_party\\dlss\\' }
