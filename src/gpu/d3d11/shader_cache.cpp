@@ -23,6 +23,59 @@
 #include <windows.h>
 
 #pragma comment(lib, "d3dcompiler.lib")
+#pragma comment(lib, "version.lib")
+#include <delayimp.h>
+
+// The HLSL compiler: d3dcompiler_47.dll is delay-loaded (mua3's link: /DELAYLOAD), and this hook picks the file at the
+// first D3DCompile from anywhere in the process: the copy next to mua3.exe (Microsoft's, shipped with the release),
+// else the system's. Under Proton / Wine the system's is vkd3d-shader's HLSL compiler, which lacks parts of the
+// language our shaders use; Microsoft's runs there as it does on Windows. Logged once: which file, which version.
+namespace {
+std::string FileVersion(const wchar_t* path) {
+    DWORD h = 0;
+    const DWORD n = GetFileVersionInfoSizeW(path, &h);
+    if (!n)
+        return "no version";
+    std::vector<u8> buf(n);
+    VS_FIXEDFILEINFO* fi = nullptr;
+    UINT len = 0;
+    if (!GetFileVersionInfoW(path, 0, n, buf.data()) || !VerQueryValueW(buf.data(), L"\\", (void**)&fi, &len) || !fi)
+        return "no version";
+    return fmt::format("{}.{}.{}.{}", HIWORD(fi->dwFileVersionMS), LOWORD(fi->dwFileVersionMS),
+                       HIWORD(fi->dwFileVersionLS), LOWORD(fi->dwFileVersionLS));
+}
+HMODULE LoadShaderCompiler() {
+    wchar_t exe[MAX_PATH];
+    const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    HMODULE m = nullptr;
+    if (n && n < MAX_PATH) {
+        const fs::path local = fs::path(exe).parent_path() / L"d3dcompiler_47.dll";
+        std::error_code ec;
+        if (fs::exists(local, ec))
+            m = LoadLibraryExW(local.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (!m && fs::exists(local, ec))
+            LOG_WARN("Shader", "{} is there but did not load (error {}): using the system's", local.string(), GetLastError());
+    }
+    if (!m)
+        m = LoadLibraryExW(L"d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!m)
+        m = LoadLibraryW(L"d3dcompiler_47.dll");
+    if (m) {
+        wchar_t path[MAX_PATH] = {};
+        GetModuleFileNameW(m, path, MAX_PATH);
+        LOG_INFO("Shader", "HLSL compiler: {} (version {})", fs::path(path).string(), FileVersion(path));
+    } else {
+        LOG_ERROR("Shader", "HLSL compiler: d3dcompiler_47.dll could not be loaded (error {})", GetLastError());
+    }
+    return m;
+}
+FARPROC WINAPI DelayLoadHook(unsigned note, PDelayLoadInfo info) {
+    if (note == dliNotePreLoadLibrary && info && info->szDll && _stricmp(info->szDll, "d3dcompiler_47.dll") == 0)
+        return reinterpret_cast<FARPROC>(LoadShaderCompiler());
+    return nullptr;
+}
+} // namespace
+extern "C" const PfnDliHook __pfnDliNotifyHook2 = DelayLoadHook;
 
 namespace gpu {
 
@@ -275,6 +328,45 @@ bool ComputeViaFxcHash(u64 hash, u64 base_hash) {
 }
 bool ComputeViaFxc(const HostShader& s) {
     return ComputeViaFxcHash(s.hash, s.base ? s.base->hash : 0);
+}
+// Proton / Wine: its d3dcompiler_47 (vkd3d-shader's HLSL compiler) has no isnan() ("E5005 Function isnan is not
+// defined", the translator's unordered float compares). There the source compiled spells it out with the bits; on
+// Windows it stays as it is (FXC's bytecode, and so the cached bytecode, unchanged).
+bool UnderWine() {
+    static const bool wine = [] {
+        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        const bool w = ntdll && GetProcAddress(ntdll, "wine_get_version") != nullptr;
+        if (w)
+            LOG_INFO("Shader", "running under Wine: isnan() spelled out for its HLSL compiler");
+        return w;
+    }();
+    return wine;
+}
+std::string WithoutIsnan(const std::string& src) {
+    std::string out;
+    out.reserve(src.size() + src.size() / 16);
+    size_t at = 0;
+    for (;;) {
+        const size_t p = src.find("isnan(", at);
+        if (p == std::string::npos || (p > 0 && (std::isalnum((unsigned char)src[p - 1]) || src[p - 1] == '_'))) {
+            if (p == std::string::npos)
+                break;
+            out.append(src, at, p + 6 - at); // (part of a longer name)
+            at = p + 6;
+            continue;
+        }
+        size_t q = p + 6;
+        int depth = 1;
+        while (q < src.size() && depth)
+            depth += src[q] == '(' ? 1 : src[q] == ')' ? -1 : 0, q++;
+        if (depth) // (unbalanced: leave the rest alone)
+            break;
+        out.append(src, at, p - at);
+        out += "((asuint(" + src.substr(p + 6, q - 1 - (p + 6)) + ") & 0x7FFFFFFFu) > 0x7F800000u)";
+        at = q;
+    }
+    out.append(src, at, std::string::npos);
+    return out;
 }
 // [debug] skip_cs (or MUA3_SKIP_CS_HASH): compute shaders the renderer never dispatches (a base program's hash covers
 // its variants). Never handed to the graphics driver either: for compute the driver compiles at CreateComputeShader,
@@ -979,7 +1071,7 @@ bool ShaderCache::Compile(HostShader& s, const std::string& hlsl, std::string& e
     if (!s.no_cache && GetBytecode(s, blob))
         cache_hits++;
     // Debug aid: shader_override/<hash>.<vs|ps>.hlsl replaces the translated HLSL (never cached).
-    std::string source = hlsl;
+    std::string source = UnderWine() ? WithoutIsnan(hlsl) : hlsl;
     const fs::path override_path =
         fs::path("shader_override") / fmt::format("{:016x}.{}.hlsl", s.hash, StageTag(s.stage));
     if (overrides_ && fs::exists(override_path)) {

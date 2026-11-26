@@ -749,7 +749,8 @@ bool BuildGame(const Paths& p, int jobs, Progress& prog) {
     {
         std::ofstream r(rsp);
         r << "/NOLOGO /MACHINE:X64 " << (p.windowed ? "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup" : "/SUBSYSTEM:CONSOLE")
-          << " /INCREMENTAL:NO /OPT:REF /OPT:NOICF\n";
+          << " /INCREMENTAL:NO /OPT:REF /OPT:NOICF\n"
+          << "/DELAYLOAD:d3dcompiler_47.dll delayimp.lib\n"; // (the HLSL compiler next to mua3.exe first: shader_cache.cpp)
         if (!res.empty())
             r << Q(res) << "\n";
         r << "/OUT:" << Q(p.work_dir / "mua3.exe") << "\n/LIBPATH:" << Q(p.sdk_dir / "lib") << "\n";

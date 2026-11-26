@@ -160,7 +160,8 @@ target_link_libraries(mua3 PRIVATE nxcore platform dbghelp)
 # incremental-link thunks would sit between every pair of recompiled functions
 # /PDBALTPATH: the exe names its PDB without a path, so copies of the game load the PDB next to them (and a running
 # copy does not lock the build's PDB).
-target_link_options(mua3 PRIVATE /INCREMENTAL:NO /PDBALTPATH:mua3.pdb)
+target_link_options(mua3 PRIVATE /INCREMENTAL:NO /PDBALTPATH:mua3.pdb /DELAYLOAD:d3dcompiler_47.dll)
+target_link_libraries(mua3 PRIVATE delayimp) # (the HLSL compiler from mua3.exe's folder first: shader_cache.cpp)
 if(TARGET mua3_dlss)
     add_dependencies(mua3 mua3_dlss) # (built with the game: it loads it from its own folder)
 endif()
